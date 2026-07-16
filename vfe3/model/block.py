@@ -93,6 +93,7 @@ def vfe_block(
     capture:         Optional[MStepCapture]        = None,   # out-param: stashes the CONVERGED (pre-transform) belief under 'converged'
     grad_record:     Optional[EStepGradientRecord] = None,   # diag out-param: E-step belief-grad norms (None -> no capture)
     state_record:    Optional[dict]                = None,   # diag out-param: E-step belief/F trace (None -> no capture)
+    transport_status: Optional[dict]               = None,   # run-sticky covariant-feature status
 
     prebuilt_transport: Optional[object]       = None,   # share_refine_s_transport: caller-built flat transport (None -> e_step builds its own)
     gauge_parameterization: str                = "phi",  # 'phi' (exp(phi.G) path) | 'omega_direct' (stored GL(K) element, read from belief.omega)
@@ -131,6 +132,8 @@ def vfe_block(
         compact_phi_block_transport=compact_phi_blocks,
         exp_fp64_mode=cfg.exp_fp64_mode,
         exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
+        transport_chart_max_norm=cfg.transport_chart_max_norm,
+        transport_status=transport_status,
         randomize_e_steps=cfg.randomize_e_steps,
         e_steps_min=cfg.e_steps_min, e_steps_max=cfg.e_steps_max,
         e_steps_backprop_last=cfg.e_steps_backprop_last,

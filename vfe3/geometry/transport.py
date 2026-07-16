@@ -495,16 +495,31 @@ def _soft_cap_frobenius(
     return (matrix64 * scale64).to(matrix.dtype)
 
 
+def _record_covariant_feature_exactness(
+    exactness_out: Dict,
+    exact:         'bool | torch.Tensor',
+
+    *,
+    device:        torch.device,
+) -> None:
+    r"""Merge one covariant-feature exactness result into a run-sticky status sink."""
+    key = "regime_ii_covariant_feature_exact"
+    current = torch.as_tensor(exactness_out.get(key, True), dtype=torch.bool, device=device)
+    update = torch.as_tensor(exact, dtype=torch.bool, device=device)
+    exactness_out[key] = current & update
+
+
 @register_transport("flat", covariance_class="covariant (flat)")
 def _build_flat(
     phi:        torch.Tensor,             # (B, N, n_gen) gauge frames
     group:      GaugeGroup,               # supplies generators, skew flag, irrep_dims
 
     *,
-    gauge_mode:              str   = "learned",   # 'learned' (Regime I flat) or 'trivial'
-    exp_fp64_mode:           str   = "dim",       # stable_matrix_exp_pair float64-island keying ('dim' | 'norm')
-    exp_fp64_norm_threshold: float = 5.0,         # 'norm' mode: max clamped block ||M||_F upcast threshold
-    clamp_monitor:           bool  = False,       # opt-in: warn when the exp Frobenius clamp fires
+    gauge_mode:              str             = "learned",   # 'learned' (Regime I flat) or 'trivial'
+    exp_fp64_mode:           str             = "dim",       # stable_matrix_exp_pair float64-island keying ('dim' | 'norm')
+    exp_fp64_norm_threshold: float           = 5.0,         # 'norm' mode: max clamped block ||M||_F upcast threshold
+    clamp_monitor:           bool            = False,       # opt-in: warn when the exp Frobenius clamp fires
+    validity_max_norm:       Optional[float] = None,        # opt-in fail-closed pre-clamp chart bound
     **kwargs,                             # tolerated (a future non-flat builder shares this shape)
 ) -> TransportDict:
     r"""Flat (Regime I) phi-cocycle transport: the registered default.
@@ -517,7 +532,8 @@ def _build_flat(
     return compute_transport_operators(phi, group, gauge_mode=gauge_mode,
                                        exp_fp64_mode=exp_fp64_mode,
                                        exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-                                       clamp_monitor=clamp_monitor)
+                                       clamp_monitor=clamp_monitor,
+                                       validity_max_norm=validity_max_norm)
 
 
 @register_transport(
@@ -534,6 +550,7 @@ def _build_regime_ii(
     cocycle_relaxation: float                     = 1.0,         # homotopy alpha in [0,1]; 0 -> flat
     delta_soft_cap:     float                     = 12.0,        # smooth bound on ||delta_ij . G||_F (< exp clamp max_norm=15)
     clamp_monitor:      bool                      = False,       # opt-in: warn when the exp Frobenius clamp fires
+    validity_max_norm:  Optional[float]           = None,        # opt-in fail-closed pre-clamp chart bound
     mu:                 Optional[torch.Tensor]    = None,        # (B, N, K) QUERY-slot means; the bilinear delta reads these
     connection_W:       Optional[torch.Tensor]    = None,        # (n_gen, K, K) learned bilinear connection (NN exception)
     mu_key:             Optional[torch.Tensor]    = None,        # (B, N, K) KEY-slot means (None -> mu); the filtering
@@ -605,12 +622,16 @@ def _build_regime_ii(
     # short-circuiting there would sever the autograd graph and freeze the parameter at init. The full
     # einsum path keeps W in the graph so the loss backpropagates to it.
     if connection_W is None or cocycle_relaxation == 0.0:
-        return compute_transport_operators(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
+        return compute_transport_operators(
+            phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor,
+            validity_max_norm=validity_max_norm)
 
     # Vertex factors exp(phi_i), exp(-phi_j) in FACTORED form (audit 2026-06-10 F8a): the same
     # stable exp machinery as the flat builder, WITHOUT materializing the dense (B, N, N, K, K)
     # flat Omega this path would immediately discard.
-    fac = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
+    fac = build_factored_transport(
+        phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor,
+        validity_max_norm=validity_max_norm)
     exp_phi, exp_neg_phi = fac.exp_phi, fac.exp_neg_phi                         # (B, N, K, K)
 
     mu_k = mu_key if mu_key is not None else mu
@@ -663,6 +684,7 @@ def _build_regime_ii(
         exp_delta_c, _ = stable_matrix_exp_pair(
             delta_mat_c, skew_symmetric=group.skew_symmetric, only_forward=True,
             block_dims=block_dims, exp_dim=exp_dim, clamp_monitor=clamp_monitor,
+            validity_max_norm=validity_max_norm,
         )                                                                      # (B, C, N, K, K)
         # Omega_ij = exp(phi_i) @ exp_delta_ij @ exp(-phi_j)
         omega_chunks.append(
@@ -716,6 +738,7 @@ def _build_regime_ii_covariant(
     cocycle_relaxation: float                     = 1.0,         # homotopy alpha in [0,1]; 0 -> flat
     delta_soft_cap:     float                     = 12.0,        # smooth bound on ||delta_ij . G||_F
     clamp_monitor:      bool                      = False,       # opt-in: warn when the exp Frobenius clamp fires
+    validity_max_norm:  Optional[float]           = None,        # opt-in fail-closed pre-clamp chart bound
     mu:                 Optional[torch.Tensor]    = None,        # (B, N, K) QUERY means
     sigma:              Optional[torch.Tensor]    = None,        # (B, N, K) diag OR (B, N, K, K) full QUERY covariance
     connection_M:       Optional[torch.Tensor]    = None,        # (n_gen, 3) learned invariant-feature map (NN exception)
@@ -766,9 +789,10 @@ def _build_regime_ii_covariant(
     # in the autograd graph (it would otherwise freeze at init).
     if connection_M is None or cocycle_relaxation == 0.0:
         if exactness_out is not None:
-            exactness_out["regime_ii_covariant_feature_exact"] = torch.ones(
-                (), dtype=torch.bool, device=phi.device)
-        return compute_transport_operators(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
+            _record_covariant_feature_exactness(exactness_out, True, device=phi.device)
+        return compute_transport_operators(
+            phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor,
+            validity_max_norm=validity_max_norm)
 
     # Contract guard (audit 2026-06-18): with a connection the edge features need the query belief
     # (mu, sigma); a missing one would otherwise raise an opaque AttributeError on `.dim()` below.
@@ -779,7 +803,9 @@ def _build_regime_ii_covariant(
             f"sigma={'None' if sigma is None else 'tensor'}."
         )
 
-    fac = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
+    fac = build_factored_transport(
+        phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor,
+        validity_max_norm=validity_max_norm)
     exp_phi, exp_neg_phi = fac.exp_phi, fac.exp_neg_phi                         # (B, N, K, K)
 
     mu_k     = mu_key   if mu_key   is not None else mu
@@ -850,6 +876,7 @@ def _build_regime_ii_covariant(
         exp_delta_c, _ = stable_matrix_exp_pair(
             delta_mat_c, skew_symmetric=group.skew_symmetric, only_forward=True,
             block_dims=block_dims, exp_dim=exp_dim, clamp_monitor=clamp_monitor,
+            validity_max_norm=validity_max_norm,
         )                                                                      # (B, C, N, K, K)
         # Omega_ij = exp(phi_i) @ exp_delta_ij @ exp(-phi_j)
         omega_chunks.append(
@@ -857,7 +884,8 @@ def _build_regime_ii_covariant(
 
     omega = torch.cat(omega_chunks, dim=1) if len(omega_chunks) > 1 else omega_chunks[0]
     if exactness_out is not None:
-        exactness_out["regime_ii_covariant_feature_exact"] = feature_exact
+        _record_covariant_feature_exactness(
+            exactness_out, feature_exact, device=feature_exact.device)
     return {
         "exp_phi": exp_phi,
         "exp_neg_phi": exp_neg_phi,
@@ -872,11 +900,12 @@ def _direct_link_edge_exp(
     n_tok:         int,                       # active sequence length N
 
     *,
-    link_alpha:    float = 1.0,
-    link_soft_cap: float = 6.0,
-    clamp_monitor: bool  = False,             # opt-in: warn when the exp Frobenius clamp fires
-    device:        Optional[torch.device] = None,
-    dtype:         Optional[torch.dtype]  = None,
+    link_alpha:        float                  = 1.0,
+    link_soft_cap:     float                  = 6.0,
+    clamp_monitor:     bool                   = False,  # opt-in: warn when the exp Frobenius clamp fires
+    validity_max_norm: Optional[float]        = None,   # opt-in fail-closed pre-clamp chart bound
+    device:            Optional[torch.device] = None,
+    dtype:             Optional[torch.dtype]  = None,
 ) -> torch.Tensor:                            # (N, N, K, K) exp(link_alpha * A_ij . G)
     r"""The per-edge direct-link factor exp(link_alpha * A_ij . G), shared by the bare and charted
     direct-link builders.
@@ -915,6 +944,7 @@ def _direct_link_edge_exp(
         link_mat, skew_symmetric=group.skew_symmetric, only_forward=True,
         block_dims=block_dims, exp_dim=(max(block_dims) if block_dims is not None else None),
         clamp_monitor=clamp_monitor,
+        validity_max_norm=validity_max_norm,
     )                                                                              # (N, N, K, K)
     return exp_link.to(dtype)
 
@@ -933,6 +963,7 @@ def _build_regime_ii_link(
     link_alpha:         float                  = 1.0,
     link_soft_cap:      float                  = 6.0,
     clamp_monitor:      bool                   = False,  # opt-in: warn when the exp Frobenius clamp fires
+    validity_max_norm:  Optional[float]        = None,   # opt-in fail-closed pre-clamp chart bound
     materialize:        bool                   = True,   # compatibility callers may request explicit Omega
     connection_L:       Optional[torch.Tensor] = None,   # (max_seq_len, max_seq_len, n_gen) learned direct link (NN exception)
     **kwargs,                                            # tolerated (shares the flat builder's call shape)
@@ -974,6 +1005,7 @@ def _build_regime_ii_link(
             link_alpha=link_alpha,
             link_soft_cap=link_soft_cap,
             clamp_monitor=clamp_monitor,
+            validity_max_norm=validity_max_norm,
             device=device,
             dtype=dtype,
         )
@@ -992,6 +1024,7 @@ def _build_regime_ii_link_charted(
     link_alpha:         float                  = 1.0,
     link_soft_cap:      float                  = 6.0,
     clamp_monitor:      bool                   = False,  # opt-in: warn when the exp Frobenius clamp fires
+    validity_max_norm:  Optional[float]        = None,   # opt-in fail-closed pre-clamp chart bound
     materialize:        bool                   = True,   # compatibility callers may request explicit Omega
     connection_L:       Optional[torch.Tensor] = None,   # (max_seq_len, max_seq_len, n_gen) learned direct link (NN exception)
     **kwargs,                                            # tolerated (shares the flat builder's call shape)
@@ -1019,7 +1052,9 @@ def _build_regime_ii_link_charted(
     without materializing ``(B,N,N,K,K)``. ``materialize=True`` remains the explicit compatibility
     boundary for direct registry callers and diagnostics.
     """
-    fac = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor)
+    fac = build_factored_transport(
+        phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor,
+        validity_max_norm=validity_max_norm)
     exp_phi, exp_neg_phi = fac.exp_phi, fac.exp_neg_phi                         # (B, N, K, K)
     N = phi.shape[1]
     K = group.generators.shape[-1]
@@ -1033,6 +1068,7 @@ def _build_regime_ii_link_charted(
             link_alpha=link_alpha,
             link_soft_cap=link_soft_cap,
             clamp_monitor=clamp_monitor,
+            validity_max_norm=validity_max_norm,
             device=phi.device,
             dtype=phi.dtype,
         )
@@ -1260,10 +1296,11 @@ def compute_transport_operators(
     group:      GaugeGroup,               # supplies generators, skew flag, irrep_dims
 
     *,
-    gauge_mode:              str   = "learned",   # 'learned' (Regime I flat) or 'trivial'
-    exp_fp64_mode:           str   = "dim",       # stable_matrix_exp_pair float64-island keying ('dim' | 'norm')
-    exp_fp64_norm_threshold: float = 5.0,         # 'norm' mode: max clamped block ||M||_F upcast threshold
-    clamp_monitor:           bool  = False,       # opt-in: warn when the exp Frobenius clamp fires
+    gauge_mode:              str             = "learned",   # 'learned' (Regime I flat) or 'trivial'
+    exp_fp64_mode:           str             = "dim",       # stable_matrix_exp_pair float64-island keying ('dim' | 'norm')
+    exp_fp64_norm_threshold: float           = 5.0,         # 'norm' mode: max clamped block ||M||_F upcast threshold
+    clamp_monitor:           bool            = False,       # opt-in: warn when the exp Frobenius clamp fires
+    validity_max_norm:       Optional[float] = None,        # opt-in fail-closed pre-clamp chart bound
 ) -> TransportDict:
     r"""phi/exp transport Omega_ij = exp(phi_i) @ exp(-phi_j) in GL+(K).
 
@@ -1320,6 +1357,7 @@ def compute_transport_operators(
         # non-compact groups (glk/block_glk/sp_n) keep the clamp as a genuine exp-overflow safeguard.
         max_norm=(float("inf") if group.skew_symmetric else TRANSPORT_CLAMP_MAX_NORM),
         clamp_monitor=clamp_monitor,
+        validity_max_norm=validity_max_norm,
     )
     omega = torch.einsum("bikl,bjlm->bijkm", exp_phi, exp_neg_phi)
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
@@ -1446,13 +1484,28 @@ def _stable_compact_glk_exp_pair(
     blocks:                  torch.Tensor,       # (..., H, d, d) block-diagonal gl(d)^H element
 
     *,
-    exp_fp64_mode:           str   = "dim",     # float64-island keying: 'dim' | 'norm'
-    exp_fp64_norm_threshold: float = 5.0,
-    clamp_monitor:           bool  = False,
+    exp_fp64_mode:           str             = "dim",     # float64-island keying: 'dim' | 'norm'
+    exp_fp64_norm_threshold: float           = 5.0,
+    clamp_monitor:           bool            = False,
+    validity_max_norm:       Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Exponentiate packed equal blocks with the dense path's global clamp and dtype rules."""
+    if validity_max_norm is not None and (
+        not math.isfinite(validity_max_norm) or validity_max_norm <= 0.0
+    ):
+        raise ValueError(
+            "validity_max_norm must be None or finite and positive, got "
+            f"{validity_max_norm!r}"
+        )
     with torch.no_grad():
-        mat_norm = blocks.square().sum(dim=(-3, -2, -1), keepdim=True).sqrt().clamp(min=1e-8)
+        raw_mat_norm = blocks.square().sum(dim=(-3, -2, -1), keepdim=True).sqrt()
+        if validity_max_norm is not None and bool((raw_mat_norm > validity_max_norm).any()):
+            observed = float(raw_mat_norm.max())
+            raise ValueError(
+                "transport chart validity bound exceeded before matrix-exponential clamp: "
+                f"observed ||M||_F={observed:.6g} > {validity_max_norm:.6g}"
+            )
+        mat_norm = raw_mat_norm.clamp(min=1e-8)
         scale = (TRANSPORT_CLAMP_MAX_NORM / mat_norm).clamp(max=1.0)
         if clamp_monitor:
             frac = (scale < 1.0).float().mean()
@@ -1488,13 +1541,14 @@ def build_factored_transport(
     group:      GaugeGroup,               # block-diagonal with equal blocks (len(irrep_dims) > 1)
 
     *,
-    gauge_mode:              str   = "learned",   # 'learned' (Regime I flat) or 'trivial'
-    exp_fp64_mode:           str   = "dim",       # stable_matrix_exp_pair float64-island keying ('dim' | 'norm')
-    exp_fp64_norm_threshold: float = 5.0,         # 'norm' mode: max clamped block ||M||_F upcast threshold
-    clamp_monitor:           bool  = False,       # opt-in: warn when the exp Frobenius clamp fires
-    mean_per_head:           bool  = False,       # container flag: transport_mean contracts per gauge block
-    compact_blocks:          bool  = False,       # canonical block_glk: retain (..., N, H, d, d) factors
-    right_phi:               Optional[torch.Tensor] = None,  # (..., N, n_gen) exact right factor exp(Y)
+    gauge_mode:              str                    = "learned",   # 'learned' (Regime I flat) or 'trivial'
+    exp_fp64_mode:           str                    = "dim",       # stable_matrix_exp_pair float64-island keying ('dim' | 'norm')
+    exp_fp64_norm_threshold: float                  = 5.0,         # 'norm' mode: max clamped block ||M||_F upcast threshold
+    clamp_monitor:           bool                   = False,       # opt-in: warn when the exp Frobenius clamp fires
+    mean_per_head:           bool                   = False,       # container flag: transport_mean contracts per gauge block
+    compact_blocks:          bool                   = False,       # canonical block_glk: retain (..., N, H, d, d) factors
+    validity_max_norm:       Optional[float]        = None,        # opt-in fail-closed pre-clamp chart bound
+    right_phi:               Optional[torch.Tensor] = None,        # (..., N, n_gen) exact right factor exp(Y)
 ) -> 'CompactFactoredTransport | FactoredTransport':
     r"""Flat phi-cocycle transport in FACTORED form, skipping the dense (..., N, N, K, K) Omega.
 
@@ -1551,6 +1605,7 @@ def build_factored_transport(
             exp_fp64_mode=exp_fp64_mode,
             exp_fp64_norm_threshold=exp_fp64_norm_threshold,
             clamp_monitor=clamp_monitor,
+            validity_max_norm=validity_max_norm,
         )
         if right_phi is not None:
             right_blocks = right_phi.reshape(*right_phi.shape[:-1], H, d, d)
@@ -1561,6 +1616,7 @@ def build_factored_transport(
                 exp_fp64_mode=exp_fp64_mode,
                 exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                 clamp_monitor=clamp_monitor,
+                validity_max_norm=validity_max_norm,
             )
             exp_blocks = exp_blocks @ right_exp
             inv_blocks = right_inv @ inv_blocks
@@ -1581,6 +1637,7 @@ def build_factored_transport(
         # non-compact groups (glk/block_glk/sp_n) keep the clamp as a genuine exp-overflow safeguard.
         max_norm=(float("inf") if group.skew_symmetric else TRANSPORT_CLAMP_MAX_NORM),
         clamp_monitor=clamp_monitor,
+        validity_max_norm=validity_max_norm,
     )
     if right_phi is not None:
         right_matrix = torch.einsum("...na,aij->...nij", right_phi, group.generators)
@@ -1593,6 +1650,7 @@ def build_factored_transport(
             exp_fp64_norm_threshold=exp_fp64_norm_threshold,
             max_norm=(float("inf") if group.skew_symmetric else TRANSPORT_CLAMP_MAX_NORM),
             clamp_monitor=clamp_monitor,
+            validity_max_norm=validity_max_norm,
         )
         exp_phi = exp_phi @ right_exp
         exp_neg_phi = right_inv @ exp_neg_phi

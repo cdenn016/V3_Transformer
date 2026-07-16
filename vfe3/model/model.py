@@ -201,6 +201,7 @@ class VFEModel(nn.Module):
         # before model + loader are built), NOT here: seeding inside __init__ would clobber a
         # caller-set RNG state (e.g. a test that seeds then constructs several models).
         self.cfg = cfg
+        self._transport_status = {"regime_ii_covariant_feature_exact": True}
         self.group = build_group(cfg)
         # ALiBi-family priors carry a per-head (n_heads, N, N) axis, while the energy's head axis
         # is len(irrep_dims); a mismatch right-aligns the prior's head axis against the BATCH axis
@@ -890,6 +891,8 @@ class VFEModel(nn.Module):
             reuse_pairwise_kl_stats=cfg.reuse_pairwise_kl_stats,
             exp_fp64_mode=cfg.exp_fp64_mode,
             exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
+            transport_chart_max_norm=cfg.transport_chart_max_norm,
+            transport_status=self._transport_status,
             e_step_update=cfg.e_step_update,
             mm_damping=cfg.mm_damping,
             randomize_e_steps=cfg.randomize_e_steps,
@@ -1045,6 +1048,8 @@ class VFEModel(nn.Module):
                     compact_phi_block_transport=self._compact_phi_blocks_enabled(),
                     exp_fp64_mode=self.cfg.exp_fp64_mode,
                     exp_fp64_norm_threshold=self.cfg.exp_fp64_norm_threshold,
+                    validity_max_norm=self.cfg.transport_chart_max_norm,
+                    exactness_out=self._transport_status,
                 )
             s_belief = None
             if self.cfg.s_e_step:
@@ -1100,6 +1105,7 @@ class VFEModel(nn.Module):
                 rope=rope, rope_on_cov=self.cfg.rope_full_gauge,
                 rope_on_value=self.cfg.rope_on_value,
                 capture=capture, grad_record=grad_rec,
+                transport_status=self._transport_status,
                 prebuilt_transport=shared_omega,
                 gauge_parameterization=self.cfg.gauge_parameterization,
                 kappa_beta_override=self.effective_kappa_beta(token_ids.device))
@@ -1857,6 +1863,8 @@ class VFEModel(nn.Module):
                                        rope=self._rope_rotation(n_pos, token_ids.device),
                                        rope_on_cov=cfg.rope_full_gauge,
                                        rope_on_value=cfg.rope_on_value,
+                                       validity_max_norm=cfg.transport_chart_max_norm,
+                                       exactness_out=self._transport_status,
                                        **self._model_channel_connection_kwargs())
         s_mu_t = transport_mean(omega, s_mu)                         # (B, N, N, K)
         # diagonal_out resolves the diagonal (B,N,K) vs full (B,N,K,K) sandwich EXACTLY as the belief
@@ -2112,6 +2120,7 @@ class VFEModel(nn.Module):
             connection_M=getattr(self, "connection_M", None),
             connection_L=getattr(self, "connection_L", None),
             rope=rope, rope_on_cov=self.cfg.rope_full_gauge, rope_on_value=self.cfg.rope_on_value,
+            transport_status=self._transport_status,
             gauge_parameterization=self.cfg.gauge_parameterization,
             kappa_beta_override=self.effective_kappa_beta(belief.mu.device),
         )
@@ -2581,6 +2590,8 @@ class VFEModel(nn.Module):
             connection_L=getattr(self, "connection_L", None),
             link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
             clamp_monitor=cfg.transport_clamp_monitor,
+            validity_max_norm=cfg.transport_chart_max_norm,
+            exactness_out=self._transport_status,
             cocycle_relaxation=cfg.cocycle_relaxation,
             gauge_parameterization=cfg.gauge_parameterization,
             omega=belief.omega,
@@ -2780,6 +2791,7 @@ class VFEModel(nn.Module):
                 rope=rope, rope_on_cov=cfg.rope_full_gauge,
                 rope_on_value=cfg.rope_on_value,
                 capture=cap,
+                transport_status=self._transport_status,
                 gauge_parameterization=cfg.gauge_parameterization,
                 kappa_beta_override=self.effective_kappa_beta(belief.mu.device),
             )
@@ -2816,6 +2828,8 @@ class VFEModel(nn.Module):
             connection_L=getattr(self, "connection_L", None),
             link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
             clamp_monitor=cfg.transport_clamp_monitor,
+            validity_max_norm=cfg.transport_chart_max_norm,
+            exactness_out=self._transport_status,
             cocycle_relaxation=cfg.cocycle_relaxation,
             gauge_parameterization=cfg.gauge_parameterization,
             omega=out.omega,                                          # omega_direct: Omega_ij = U_i U_j^{-1} (det<0 visible)
@@ -2907,6 +2921,8 @@ class VFEModel(nn.Module):
                 d.update({key: float(item) for key, item in value.items()})
             else:
                 d[output_name] = float(value)
+        d["regime_ii_covariant_feature_exact"] = float(bool(
+            self._transport_status["regime_ii_covariant_feature_exact"]))
         # Raw (un-regularized) belief->prior drift sum_i D(q_i||p_i): the divergence WITHOUT the
         # alpha_i coefficient OR the R(alpha_i) regularizer that free_energy_terms folds into
         # self_coupling. Under lambda_alpha_mode='constant' (alpha=1, R=0) the two coincide; under the
@@ -3034,11 +3050,13 @@ class VFEModel(nn.Module):
                     exp_fp64_mode=cfg.exp_fp64_mode,
                     exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
                     clamp_monitor=cfg.transport_clamp_monitor,
+                    validity_max_norm=cfg.transport_chart_max_norm,
                     right_phi=out.right_phi,
                 ).exp_phi
             else:
                 active_vertex = compute_transport_operators(
-                    out.phi.unsqueeze(0), self.group)["exp_phi"][0]             # (N,K,K)
+                    out.phi.unsqueeze(0), self.group,
+                    validity_max_norm=cfg.transport_chart_max_norm)["exp_phi"][0]  # (N,K,K)
             if out.reflection is not None:
                 # Active disconnected-component frame g_i = R_i exp(phi_i). Scaling row zero
                 # applies the left factor R_i = diag(sign_i, 1, ...) used by the transport fold.
@@ -3252,6 +3270,7 @@ class VFEModel(nn.Module):
                 cg_coupling=self.cg_coupling,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge,            # match forward: converge WITH rope
                 rope_on_value=cfg.rope_on_value,
+                transport_status=self._transport_status,
                 gauge_parameterization=cfg.gauge_parameterization,
                 # query_adaptive_tau replay fidelity: the ENTERING belief's per-query tau, exactly as
                 # vfe_stack passes the forward E-step; OFF path returns _base_tau (value-identical to
@@ -3270,6 +3289,8 @@ class VFEModel(nn.Module):
                 connection_L=getattr(self, "connection_L", None),
                 link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
                 clamp_monitor=cfg.transport_clamp_monitor,
+                validity_max_norm=cfg.transport_chart_max_norm,
+                exactness_out=self._transport_status,
                 cocycle_relaxation=cfg.cocycle_relaxation,
                 gauge_parameterization=cfg.gauge_parameterization,
                 omega=belief.omega,                                  # omega_direct: Omega_ij = U_i U_j^{-1} (det<0 visible)
@@ -3396,6 +3417,7 @@ class VFEModel(nn.Module):
                     connection_M=getattr(self, "connection_M", None),
                     connection_L=getattr(self, "connection_L", None),
                     rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+                    transport_status=self._transport_status,
                     gauge_parameterization=cfg.gauge_parameterization,
                     tau=self._beta_tau(belief.sigma, belief.mu, _tau),
                     capture=cap,
@@ -3415,6 +3437,8 @@ class VFEModel(nn.Module):
                 connection_L=getattr(self, "connection_L", None),
                 link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
                 clamp_monitor=cfg.transport_clamp_monitor,
+                validity_max_norm=cfg.transport_chart_max_norm,
+                exactness_out=self._transport_status,
                 cocycle_relaxation=cfg.cocycle_relaxation,
                 gauge_parameterization=cfg.gauge_parameterization,
                 omega=belief.omega,                                  # omega_direct: Omega_ij = U_i U_j^{-1} (det<0 visible)
@@ -3499,7 +3523,8 @@ class VFEModel(nn.Module):
                 rec["gauge_trace_spread"].append(float(
                     metrics.gauge_trace_spread(belief.phi, self.group.generators)))
                 active_vertex = compute_transport_operators(
-                    belief.phi.unsqueeze(0), self.group)["exp_phi"][0]
+                    belief.phi.unsqueeze(0), self.group,
+                    validity_max_norm=cfg.transport_chart_max_norm)["exp_phi"][0]
                 if belief.reflection is not None:
                     active_vertex = active_vertex.clone()
                     active_vertex[..., 0, :] *= belief.reflection[..., None]

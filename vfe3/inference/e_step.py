@@ -70,27 +70,32 @@ def _transport(
     group:              GaugeGroup,
 
     *,
-    transport_mode:     str                    = "flat",   # connection-regime registry key (default = flat)
-    gauge_mode:         str                    = "learned", # 'learned' | 'trivial' (forwarded to the builder)
-    cocycle_relaxation: float                  = 1.0,       # regime_ii homotopy alpha; 0 -> flat
-    mu:                 Optional[torch.Tensor] = None,      # (N, K) or (B, N, K) means; regime_ii edge connection reads these
-    sigma:              Optional[torch.Tensor] = None,      # variances; regime_ii_covariant features read these
-    link_alpha:         float                  = 1.0,       # direct-link scale (regime_ii_link / _charted)
-    link_soft_cap:      float                  = 6.0,       # direct-link embedded-Frobenius soft cap
-    exp_fp64_mode:           str   = "dim",                 # stable_matrix_exp_pair island keying (flat builder; 'dim' | 'norm')
-    exp_fp64_norm_threshold: float = 5.0,                   # 'norm': max clamped block ||M||_F upcast threshold
-    clamp_monitor:      bool                   = False,     # opt-in: warn when the exp Frobenius clamp fires (host sync)
-    transport_mean_per_head: bool  = False,                 # omega-direct factored mean contracts per gauge block
-    materialize:        bool                   = True,      # compatibility/diagnostic boundary for direct-link containers
-    connection_W:       Optional[torch.Tensor] = None,      # (n_gen, K, K) learned bilinear connection (regime_ii, NN exception)
-    connection_M:       Optional[torch.Tensor] = None,      # (n_gen, 3) learned covariant connection (regime_ii_covariant, NN exception)
-    connection_L:       Optional[torch.Tensor] = None,      # (max_seq, max_seq, n_gen) learned direct link (regime_ii_link*, NN exception)
-    mu_key:             Optional[torch.Tensor] = None,      # regime_ii KEY-slot means (None -> mu; oracle detach split)
-    sigma_key:          Optional[torch.Tensor] = None,      # regime_ii_covariant KEY-slot variances (None -> sigma)
-    gauge_parameterization: str                    = "phi",   # 'phi' (exp path) | 'omega_direct' (stored element)
-    omega:              'torch.Tensor | CompactBlockElement | None' = None,  # stored U_i (omega_direct only)
-    reflection:         Optional[torch.Tensor] = None,      # (N,) or (B, N) per-token sign s_i; phi-path fold (None -> off)
-    right_phi:          Optional[torch.Tensor] = None,      # exact right positional factor exp(Y)
+    transport_mode:         str   = "flat",     # connection-regime registry key (default = flat)
+    gauge_mode:             str   = "learned",  # 'learned' | 'trivial' (forwarded to the builder)
+    exp_fp64_mode:          str   = "dim",      # stable_matrix_exp_pair island keying ('dim' | 'norm')
+    gauge_parameterization: str   = "phi",      # 'phi' (exp path) | 'omega_direct' (stored element)
+
+    cocycle_relaxation:     float = 1.0,         # regime_ii homotopy alpha; 0 -> flat
+    link_alpha:             float = 1.0,         # direct-link scale (regime_ii_link / _charted)
+    link_soft_cap:          float = 6.0,         # direct-link embedded-Frobenius soft cap
+    exp_fp64_norm_threshold: float = 5.0,        # 'norm': max clamped block ||M||_F upcast threshold
+
+    clamp_monitor:          bool = False,        # opt-in: warn when the exp Frobenius clamp fires
+    transport_mean_per_head: bool = False,       # omega-direct factored mean contracts per block
+    materialize:            bool = True,         # compatibility/diagnostic boundary
+
+    validity_max_norm:      Optional[float]        = None,  # fail-closed pre-clamp chart bound
+    mu:                     Optional[torch.Tensor] = None,  # (N,K) or (B,N,K) means
+    sigma:                  Optional[torch.Tensor] = None,  # variances for covariant features
+    connection_W:           Optional[torch.Tensor] = None,  # learned bilinear connection
+    connection_M:           Optional[torch.Tensor] = None,  # learned covariant connection
+    connection_L:           Optional[torch.Tensor] = None,  # learned direct-link table
+    mu_key:                 Optional[torch.Tensor] = None,  # detached key-slot means
+    sigma_key:              Optional[torch.Tensor] = None,  # detached key-slot variances
+    omega:                  'torch.Tensor | CompactBlockElement | None' = None,  # stored U_i
+    reflection:             Optional[torch.Tensor] = None,  # per-token sign
+    right_phi:              Optional[torch.Tensor] = None,  # exact right positional factor
+    exactness_out:          Optional[dict]         = None,  # run-sticky feature status sink
 ) -> 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport':
     r"""Build the pairwise transport Omega_ij via the connection-regime registry.
 
@@ -122,6 +127,7 @@ def _transport(
             exp_fp64_mode=exp_fp64_mode,
             exp_fp64_norm_threshold=exp_fp64_norm_threshold,
             clamp_monitor=clamp_monitor,
+            validity_max_norm=validity_max_norm,
             mean_per_head=transport_mean_per_head,
             right_phi=right_phi,
         )
@@ -140,7 +146,8 @@ def _transport(
                       connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
                       link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
                       exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-                      cocycle_relaxation=cocycle_relaxation, materialize=False)["Omega"]
+                      cocycle_relaxation=cocycle_relaxation, materialize=False,
+                      validity_max_norm=validity_max_norm, exactness_out=exactness_out)["Omega"]
         # A batch-independent bare direct link has no batch axis. Ordinary dense builders return
         # (1,N,N,K,K), and a charted direct link has batch-of-one vertex factors, on this unbatched
         # compatibility/diagnostic path -> strip that batch-of-one while retaining the edge table.
@@ -158,7 +165,8 @@ def _transport(
                       connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
                       link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
                       exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-                      cocycle_relaxation=cocycle_relaxation, materialize=False)["Omega"]
+                      cocycle_relaxation=cocycle_relaxation, materialize=False,
+                      validity_max_norm=validity_max_norm, exactness_out=exactness_out)["Omega"]
     # Reflection fold (phi-reflection design sec 3): R_i Omega_ij R_j on the phi path. Direct-link
     # containers fold the signs into their optional vertex factors; dense transports retain the
     # established row/column scaling. None (default) is byte-identical. free_energy_value's global-F
@@ -275,6 +283,7 @@ def build_belief_transport(
     exp_fp64_norm_threshold:     float                                       = 5.0,      # 'norm': upcast only when max clamped block ||M||_F >= this
     transport_mean_per_head:     bool                                        = False,    # factored transport_mean contracts per gauge block (fused path only)
     compact_phi_block_transport: bool                                        = False,    # packed phi factors for canonical flat block_glk
+    validity_max_norm:           Optional[float]                             = None,     # opt-in fail-closed pre-clamp chart bound
     mu:                          Optional[torch.Tensor]                      = None,     # regime_ii edge connection reads these
     sigma:                       Optional[torch.Tensor]                      = None,     # regime_ii_covariant features read these
     connection_W:                Optional[torch.Tensor]                      = None,     # regime_ii learned bilinear connection
@@ -285,6 +294,7 @@ def build_belief_transport(
     rope:                        Optional[torch.Tensor]                      = None,     # (N, K, K) gauge-RoPE rotation (None -> off)
     reflection:                  Optional[torch.Tensor]                      = None,     # (B, N) per-token sign s_i in {+1,-1}; phi-path fold (None -> off)
     right_phi:                   Optional[torch.Tensor]                      = None,     # exact right positional factor exp(Y)
+    exactness_out:               Optional[dict]                              = None,     # run-sticky covariant-feature status sink
 ) -> 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport':
     r"""Build the FORWARD belief-transport for one E-step iteration (the hot path, P0 #2).
 
@@ -331,6 +341,7 @@ def build_belief_transport(
                                          exp_fp64_mode=exp_fp64_mode,
                                          exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                                          mean_per_head=transport_mean_per_head,
+                                         validity_max_norm=validity_max_norm,
                                          right_phi=right_phi,
                                          compact_blocks=(compact_phi_block_transport
                                                          and reflection is None))
@@ -346,7 +357,8 @@ def build_belief_transport(
                            connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
                            link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
                            exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
-                           cocycle_relaxation=cocycle_relaxation, materialize=False)
+                           cocycle_relaxation=cocycle_relaxation, materialize=False,
+                           validity_max_norm=validity_max_norm, exactness_out=exactness_out)
     # Reflection fold (phi-reflection design sec 3): fold R_i = diag(s_i, 1, ...) into the built
     # transport, Omega_ij -> R_i Omega_ij R_j, BEFORE the RoPE wrap (RoPE composes on the reflected
     # base). phi-path ONLY -- omega_direct carries its own omega_reflection det-sign and ignores this.
@@ -744,6 +756,8 @@ def e_step_iteration(
     rope_on_cov:               bool                          = False,  # full-gauge: rotate covariance too
     rope_on_value:             bool                          = True,   # False -> value aggregation uses the un-rotated base
     grad_record:               Optional[EStepGradientRecord] = None,   # diag out-param: stashes ||grad_mu/sigma/phi|| (None -> no capture)
+    transport_chart_max_norm: Optional[float]               = None,   # fail-closed pre-clamp chart bound
+    transport_status:         Optional[dict]                = None,   # run-sticky covariant-feature status
 
     _prebuilt_omega:           'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport | None' = None,   # PRIVATE: forward-transport cache from e_step
 ) -> BeliefState:
@@ -804,6 +818,8 @@ def e_step_iteration(
                 sigma=sigma_q, sigma_key=sigma_k, connection_M=connection_M,
                 reflection=belief.reflection,
                 cocycle_relaxation=cocycle_relaxation, clamp_monitor=clamp_monitor,
+                validity_max_norm=transport_chart_max_norm,
+                exactness_out=transport_status,
                 rope=rope, rope_on_cov=rope_on_cov,
                 rope_on_value=rope_on_value,
             )
@@ -826,6 +842,8 @@ def e_step_iteration(
                 exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                 transport_mean_per_head=transport_mean_per_head,
                 compact_phi_block_transport=compact_phi_block_transport,
+                validity_max_norm=transport_chart_max_norm,
+                exactness_out=transport_status,
                 rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
             )
         omega_builder = None
@@ -1102,6 +1120,8 @@ def e_step(
     state_record:                Optional[dict]                = None,   # diag out-param: every belief iterate + matching F tensor
     rope:                        Optional[torch.Tensor]        = None,
     log_prior:                   Optional[torch.Tensor]        = None,
+    transport_chart_max_norm:   Optional[float]               = None,
+    transport_status:           Optional[dict]                = None,
 
     prebuilt_transport: 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport | None' = None,   # share_refine_s_transport: caller-built forward transport
     **kwargs,
@@ -1171,6 +1191,8 @@ def e_step(
                 exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                 transport_mean_per_head=transport_mean_per_head,
                 compact_phi_block_transport=compact_phi_block_transport,
+                validity_max_norm=transport_chart_max_norm,
+                exactness_out=transport_status,
                 rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
             )
 
@@ -1262,6 +1284,8 @@ def e_step(
                     exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                     transport_mean_per_head=transport_mean_per_head,
                     compact_phi_block_transport=compact_phi_block_transport,
+                    transport_chart_max_norm=transport_chart_max_norm,
+                    transport_status=transport_status,
                     grad_record=grad_record,
                     gauge_parameterization=gauge_param_kw,
                     log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
@@ -1298,6 +1322,8 @@ def e_step(
                         exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                         transport_mean_per_head=transport_mean_per_head,
                         compact_phi_block_transport=compact_phi_block_transport,
+                        validity_max_norm=transport_chart_max_norm,
+                        exactness_out=transport_status,
                         rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
                     )
         else:
@@ -1308,6 +1334,8 @@ def e_step(
                 exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                 transport_mean_per_head=transport_mean_per_head,
                 compact_phi_block_transport=compact_phi_block_transport,
+                transport_chart_max_norm=transport_chart_max_norm,
+                transport_status=transport_status,
                 grad_record=grad_record,                       # last iteration overwrites -> converged-ish grad
                 gauge_parameterization=gauge_param_kw,
                 log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,

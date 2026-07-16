@@ -50,6 +50,7 @@ def vfe_stack(
 
     capture:         Optional[MStepCapture]        = None,   # out-param: LAST block's converged belief + live prior
     grad_record:     Optional[EStepGradientRecord] = None,   # diag out-param: LAST block's E-step belief-grad norms (None -> no capture)
+    transport_status: Optional[dict]               = None,   # run-sticky covariant-feature status
 
     prebuilt_transport: Optional[object]       = None,   # share_refine_s_transport: one flat transport shared across blocks (valid: e_phi_lr==0 + flat, phi loop-invariant)
     gauge_parameterization: str                = "phi",  # 'phi' (exp(phi.G) path) | 'omega_direct' (stored GL(K) element, read from belief.omega)
@@ -125,6 +126,7 @@ def vfe_stack(
                            e_step_gradient=e_step_gradient, rope=rope, rope_on_cov=rope_on_cov,
                            rope_on_value=rope_on_value, tau=tau_b,
                            capture=capture, grad_record=grad_record,   # each block overwrites; last wins
+                           transport_status=transport_status,
                            state_record=(diagnostic_capture.setdefault(
                                "e_step_trace", {"sequence_index": 0})
                                          if diagnostic_capture is not None and layer_index == 0 else None),

@@ -142,7 +142,12 @@ class VFE3Config:
     # into every production stable_matrix_exp_pair transport build, emitting a RuntimeWarning when
     # the hard Frobenius clamp (max_norm=15) fires (the returned factor is then a surrogate, not
     # exp(M)). Costs a tensor-reduction host sync per build; keep OFF on the training hot path.
-    transport_clamp_monitor:   bool  = False
+    transport_clamp_monitor:   bool            = False
+
+    # Optional fail-closed chart-validity domain for every production transport exponential.
+    # None preserves the existing permissive clamp behavior; a positive finite bound rejects the
+    # raw Lie-algebra matrix before the numerical clamp can silently change the modeled operator.
+    transport_chart_max_norm:  Optional[float] = None
 
     # Cross-head GL(K) coupling: a list of directed (head_a, head_b) index pairs that add off-block
     # generators (and a genuinely larger-than-direct-sum subalgebra under the builder's bracket
@@ -866,6 +871,14 @@ class VFE3Config:
             raise ValueError(
                 "phi_mstep_max_matrix_norm must be None or finite and positive, got "
                 f"{self.phi_mstep_max_matrix_norm}"
+            )
+        if self.transport_chart_max_norm is not None and not (
+            math.isfinite(self.transport_chart_max_norm)
+            and self.transport_chart_max_norm > 0.0
+        ):
+            raise ValueError(
+                "transport_chart_max_norm must be None or finite and positive, got "
+                f"{self.transport_chart_max_norm}"
             )
         if self.pos_phi_compose == "group_product" and (
             self.gauge_parameterization != "phi"

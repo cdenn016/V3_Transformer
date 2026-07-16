@@ -1,6 +1,9 @@
-import torch
-import pytest
+from pathlib import Path
 
+import pytest
+import torch
+
+from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.geometry import lie_ops
 from vfe3.geometry.groups import get_group
@@ -14,7 +17,7 @@ from vfe3.geometry.transport import (
 )
 from vfe3.gradients.pairwise_stats import diagonal_kl_pair_stats
 from vfe3.model.model import VFEModel
-from vfe3.run_artifacts import _pure_path_report
+from vfe3.run_artifacts import RunArtifacts, _pure_path_report
 
 
 def _congruence(
@@ -81,6 +84,48 @@ def test_covariant_builder_exposes_jitter_exactness_status() -> None:
     assert not bool(exactness["regime_ii_covariant_feature_exact"])
 
 
+def test_production_jitter_status_reaches_logged_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path:    Path,
+) -> None:
+    cfg = VFE3Config(
+        vocab_size=5,
+        embed_dim=2,
+        n_heads=1,
+        max_seq_len=2,
+        n_layers=1,
+        n_e_steps=1,
+        family="gaussian_full",
+        transport_mode="regime_ii_covariant",
+    )
+    model = VFEModel(cfg)
+    original_encode = model.prior_bank.encode
+
+    def _singular_encode(token_ids: torch.Tensor) -> BeliefState:
+        belief = original_encode(token_ids)
+        singular = torch.zeros_like(belief.sigma)
+        singular[..., 1, 1] = 1.0
+        return belief._replace(sigma=singular)
+
+    monkeypatch.setattr(model.prior_bank, "encode", _singular_encode)
+    tokens = torch.tensor([[0, 1]])
+    model.forward_beliefs(tokens)
+    metrics = model.diagnostics(tokens)
+
+    monkeypatch.setattr(model.prior_bank, "encode", original_encode)
+    model.forward_beliefs(tokens)
+    recovered_metrics = model.diagnostics(tokens)
+
+    artifacts = RunArtifacts(tmp_path / "run", cfg, model)
+    artifacts.log_metrics({"step": 1.0, **recovered_metrics})
+    report = _pure_path_report(cfg, artifacts.history)
+
+    assert metrics["regime_ii_covariant_feature_exact"] == 0.0
+    assert recovered_metrics["regime_ii_covariant_feature_exact"] == 0.0
+    assert report["config_toggles"]["regime_ii_covariant_exact"] is False
+    assert report["config_toggles"]["regime_ii_covariant_exactness"] == "jitter_recovered_approximation"
+
+
 def test_artifact_exactness_is_false_after_feature_jitter_recovery() -> None:
     cfg = VFE3Config(transport_mode="regime_ii_covariant", family="gaussian_full")
     report = _pure_path_report(cfg, [{"regime_ii_covariant_feature_exact": 0.0}])
@@ -104,6 +149,53 @@ def test_transport_chart_bound_fails_before_exponential_clamp() -> None:
 
     with pytest.raises(ValueError, match="transport chart validity bound"):
         stable_matrix_exp_pair(matrix, validity_max_norm=20.0)
+
+
+def test_configured_transport_chart_bound_reaches_flat_model_vertex_exponential() -> None:
+    cfg = VFE3Config(
+        vocab_size=5,
+        embed_dim=2,
+        n_heads=1,
+        max_seq_len=2,
+        n_layers=1,
+        n_e_steps=1,
+        transport_chart_max_norm=0.5,
+    )
+    model = VFEModel(cfg)
+    with torch.no_grad():
+        model.prior_bank.phi_embed.fill_(2.0)
+
+    with pytest.raises(ValueError, match="transport chart validity bound"):
+        model.forward_beliefs(torch.tensor([[0, 1]]))
+
+
+def test_configured_transport_chart_bound_reaches_covariant_connection_exponential() -> None:
+    cfg = VFE3Config(
+        vocab_size=5,
+        embed_dim=2,
+        n_heads=1,
+        max_seq_len=2,
+        n_layers=1,
+        n_e_steps=1,
+        family="gaussian_full",
+        transport_mode="regime_ii_covariant",
+        transport_chart_max_norm=1.0,
+    )
+    model = VFEModel(cfg)
+    with torch.no_grad():
+        model.prior_bank.mu_embed.copy_(
+            torch.arange(model.prior_bank.mu_embed.numel()).reshape_as(model.prior_bank.mu_embed)
+        )
+        model.connection_M.fill_(1000.0)
+
+    with pytest.raises(ValueError, match="transport chart validity bound"):
+        model.forward_beliefs(torch.tensor([[0, 1]]))
+
+
+@pytest.mark.parametrize("bound", [0.0, -1.0, float("inf"), float("nan")])
+def test_transport_chart_bound_config_requires_positive_finite_value(bound: float) -> None:
+    with pytest.raises(ValueError, match="transport_chart_max_norm"):
+        VFE3Config(transport_chart_max_norm=bound)
 
 
 def test_bch_residual_bound_fails_closed() -> None:

@@ -1468,7 +1468,8 @@ def train(
                         "pos_phi_matrix_norm_p95", "pos_phi_matrix_norm_p99", "pos_phi_matrix_norm_max",
                         "pos_phi_exp_clamp_frac", "pos_phi_exp_scale_min",
                         "connection_w_norm", "connection_m_norm",
-                        "connection_l_norm", "connection_l_offdiag_norm", "head_mixer_drift"):
+                        "connection_l_norm", "connection_l_offdiag_norm", "head_mixer_drift",
+                        "regime_ii_covariant_feature_exact"):
                 if _dk in d:
                     row[_dk] = d[_dk]
             # Gradient health (Tier-1/2): global + per-group (mu/sigma/phi) grad AND weight norms (so
