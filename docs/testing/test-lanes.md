@@ -10,21 +10,32 @@ function Invoke-VFE3TestEnv {
         $previous[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
         [Environment]::SetEnvironmentVariable($name, [string]$Variables[$name], "Process")
     }
+    $exitCode = $null
     try {
         & $Command
+        $exitCode = $LASTEXITCODE
     } finally {
         foreach ($name in $Variables.Keys) {
             [Environment]::SetEnvironmentVariable($name, $previous[$name], "Process")
         }
     }
+    if ($null -ne $exitCode -and $exitCode -ne 0) {
+        throw "Test command exited with code $exitCode."
+    }
 }
 ```
 
-The serial CPU commands pin `VFE3_TEST_DEVICE=cpu` and exclude the dedicated CUDA and external cohorts. This makes the selected nodes independent of the caller's environment and installed Torch build.
+The serial CPU commands pin `VFE3_TEST_DEVICE=cpu`, hide CUDA from libraries that probe it directly, and exclude the dedicated CUDA and external cohorts. This makes the selected nodes independent of the caller's environment and installed Torch build. Each native command gets its own wrapper call so a later trial cannot mask an earlier nonzero exit.
 
 ```powershell
-Invoke-VFE3TestEnv @{ VFE3_TEST_DEVICE = "cpu" } {
+$cpuSerialEnv = @{
+    VFE3_TEST_DEVICE   = "cpu"
+    CUDA_VISIBLE_DEVICES = "-1"
+}
+Invoke-VFE3TestEnv $cpuSerialEnv {
     python -m pytest -m "not cuda and not external" --junitxml=C:\tmp\vfe3-default-cpu.xml --durations=100
+}
+Invoke-VFE3TestEnv $cpuSerialEnv {
     python -m pytest --runslow -m "not cuda and not external" --junitxml=C:\tmp\vfe3-full-cpu-serial.xml --durations=100
 }
 ```
@@ -32,12 +43,16 @@ Invoke-VFE3TestEnv @{ VFE3_TEST_DEVICE = "cpu" } {
 The parallel CPU fast lane excludes every prerequisite-specific or heavyweight integration case. Cap numerical-library threads so each pytest worker does not create its own competing thread pool. Use a fixed worker count selected from recorded two-worker and four-worker trials; never use `-n auto` as a repository default. `loadscope` keeps module-scoped immutable artifact evidence on one worker.
 
 ```powershell
-Invoke-VFE3TestEnv @{
-    VFE3_TEST_DEVICE = "cpu"
-    OMP_NUM_THREADS  = "1"
-    MKL_NUM_THREADS  = "1"
-} {
+$cpuParallelEnv = @{
+    VFE3_TEST_DEVICE    = "cpu"
+    CUDA_VISIBLE_DEVICES = "-1"
+    OMP_NUM_THREADS     = "1"
+    MKL_NUM_THREADS     = "1"
+}
+Invoke-VFE3TestEnv $cpuParallelEnv {
     python -m pytest -n 2 --dist loadscope -m "not slow and not cuda and not external" --junitxml=C:\tmp\vfe3-fast-n2.xml --durations=100
+}
+Invoke-VFE3TestEnv $cpuParallelEnv {
     python -m pytest -n 4 --dist loadscope -m "not slow and not cuda and not external" --junitxml=C:\tmp\vfe3-fast-n4.xml --durations=100
 }
 ```
@@ -46,9 +61,10 @@ The slow CPU lane enables `--runslow` and uses `loadgroup`, which keeps the real
 
 ```powershell
 Invoke-VFE3TestEnv @{
-    VFE3_TEST_DEVICE = "cpu"
-    OMP_NUM_THREADS  = "1"
-    MKL_NUM_THREADS  = "1"
+    VFE3_TEST_DEVICE    = "cpu"
+    CUDA_VISIBLE_DEVICES = "-1"
+    OMP_NUM_THREADS     = "1"
+    MKL_NUM_THREADS     = "1"
 } {
     python -m pytest --runslow -n 4 --dist loadgroup -m "slow and not cuda and not external" --junitxml=C:\tmp\vfe3-slow-cpu.xml --durations=100
 }
@@ -76,7 +92,10 @@ Invoke-VFE3TestEnv @{
 Branch coverage is measured over `vfe3`. The checked-in configuration enables branch measurement and parallel data-file support. This command covers the complete available CPU union while excluding unavailable CUDA and external prerequisites.
 
 ```powershell
-Invoke-VFE3TestEnv @{ VFE3_TEST_DEVICE = "cpu" } {
+Invoke-VFE3TestEnv @{
+    VFE3_TEST_DEVICE    = "cpu"
+    CUDA_VISIBLE_DEVICES = "-1"
+} {
     python -m pytest --runslow -m "not cuda and not external" --cov=vfe3 --cov-branch --cov-report=term-missing --cov-report=xml:C:\tmp\vfe3-coverage.xml --junitxml=C:\tmp\vfe3-coverage-junit.xml
 }
 ```
