@@ -748,7 +748,8 @@ def run_cell(
         logger.warning("  [config rejected] %s: %s", label, exc)
         return {"label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
                 "error_kind": "config", "error": str(exc), "seed": int(seed),
-                "test_ce": None, "n_params": None}
+                "test_ce": None, "test_ppl": None, "test_bits_per_token": None,
+                "test_bpc": None, "n_params": None}
 
     if CONFIG["resume"] and _cell_is_current(run_dir, cfg, dataset, max_tokens=max_tokens):
         summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
@@ -756,7 +757,12 @@ def run_cell(
         print(f"    [CACHED] {label} s{seed}  test_ce={sp.get('test_ce')}  N={sp.get('n_params')}")
         return {"label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
                 "error_kind": None, "seed": int(seed), "cached": True,
-                "test_ce": sp.get("test_ce"), "n_params": sp.get("n_params")}
+                "test_ce": sp.get("test_ce", summary.get("test_ce")),
+                "test_ppl": sp.get("test_ppl", summary.get("test_ppl")),
+                "test_bits_per_token": sp.get(
+                    "test_bits_per_token", summary.get("test_bits_per_token")),
+                "test_bpc": sp.get("test_bpc", summary.get("test_bpc")),
+                "n_params": sp.get("n_params", summary.get("n_params"))}
 
     pred_n, n_gen = predict_n_params(cfg)
     seed_everything(cfg.seed, deterministic=cfg.deterministic)
@@ -822,6 +828,8 @@ def run_cell(
     return {"label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
             "error_kind": None, "seed": int(cfg.seed), "cached": False,
             "test_ce": results.get("test_ce"), "test_ppl": results.get("test_ppl"),
+            "test_bits_per_token": results.get("test_bits_per_token"),
+            "test_bpc": results.get("test_bpc"),
             "n_params": actual_n, "n_gen": n_gen, "wall_time_s": wall}
 
 
@@ -864,7 +872,9 @@ def main() -> None:
                 except Exception as exc:                     # a training crash must not kill the suite
                     logger.exception("route %s / %s s%d crashed", name, cell["label"], seed)
                     res = {"label": cell["label"], "route": name, "error_kind": "train",
-                           "error": str(exc), "seed": int(seed), "test_ce": None, "n_params": None}
+                           "error": str(exc), "seed": int(seed), "test_ce": None,
+                           "test_ppl": None, "test_bits_per_token": None,
+                           "test_bpc": None, "n_params": None}
                 finally:
                     _cleanup()
                 if res.get("error_kind") is None and not res.get("cached"):

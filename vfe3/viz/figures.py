@@ -4096,10 +4096,13 @@ PUB_LABELS: Dict[str, str] = {
     # -- losses / headline scalars --
     "train_ce":           "train cross-entropy (nats)",
     "val_ppl":            "validation perplexity",
+    "val_bits_per_token": "validation bits per token",
+    "val_bpc":            "validation bits per character",
     "generalization_gap": r"generalization gap $\mathrm{CE}_{\mathrm{val}}-\mathrm{CE}_{\mathrm{train}}$ (nats)",
     "test_ppl":           "test perplexity",
     "best_val_ppl":       "best validation perplexity",
     "test_ce":            "test cross-entropy (nats)",
+    "test_bits_per_token": "test bits per token",
     "test_bpc":           "test bits per character",
     "test_ce_no_estep":   "test CE without E-step (nats)",
     "estep_capacity_gain": "E-step capacity gain (nats)",

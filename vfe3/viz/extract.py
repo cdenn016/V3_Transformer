@@ -185,7 +185,8 @@ def per_unit_eval_nats(
 ) -> Dict[str, torch.Tensor]:
     r"""Per-SEQUENCE and per-TOKEN cross-entropy (nats) over a loader.
 
-    The training ``evaluate`` retains only the aggregate token-weighted {ce, ppl, bpc}; the
+    The training ``evaluate`` retains only the aggregate token-weighted
+    {ce, ppl, bits_per_token, bpc}; the
     single-seed bootstrap bands (``metrics.bootstrap_ce_band`` over sequences,
     ``metrics.bootstrap_token_ce_band`` over tokens) need the per-unit nats this produces. Runs
     ``model(tokens)`` for full logits (the inference path; the fused chunked decode is bypassed by

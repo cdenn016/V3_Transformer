@@ -56,7 +56,8 @@ CONFIG: Dict[str, Any] = {
 _CSV_COLUMNS = [
     "route", "scale_knob", "label", "seed", "n_params", "n_learnable_params", "embed_dim", "n_heads",
     "n_gen", "gauge_group", "n_layers", "n_e_steps", "family", "tokens_seen", "est_flops_6ND",
-    "est_flops_analytic", "active_params_per_token", "test_ce", "test_ppl", "test_bpc",
+    "est_flops_analytic", "active_params_per_token", "test_ce", "test_ppl",
+    "test_bits_per_token", "test_bpc",
     "estep_final_f_per_token", "best_val_ppl",
     "wall_time_s", "data_sha256", "train_data_sha256", "val_data_sha256", "test_data_sha256",
     "git_sha",
@@ -115,7 +116,12 @@ def harvest(input_dir: Path) -> List[Dict[str, Any]]:
             "active_params_per_token": sp.get("active_params_per_token"),
             "test_ce":     test_ce,
             "test_ppl":    test.get("test_ppl", sp.get("test_ppl")),
-            "test_bpc":    test.get("test_bpc", summ.get("test_bpc")),
+            "test_bits_per_token": test.get(
+                "test_bits_per_token",
+                sp.get("test_bits_per_token", summ.get("test_bits_per_token")),
+            ),
+            "test_bpc": test.get(
+                "test_bpc", sp.get("test_bpc", summ.get("test_bpc"))),
             "estep_final_f_per_token": (summ.get("estep_final_f_per_token")          # C2/EXP-5 join
                                         if summ.get("estep_final_f_per_token") is not None
                                         else test.get("estep_final_f_per_token")),
@@ -248,8 +254,12 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         npars = [_as_float(g["n_params"]) for g in grp if np.isfinite(_as_float(g["n_params"]))]
         if npars and (max(npars) - min(npars)) > 0:
             logger.warning("n_params varies across seeds for %s/%s (%s); using the mean", route, label, npars)
-        # C2/EXP-5: per-seed converged final E-step F/token and test BPC (NaN when absent on older runs).
+        # C2/EXP-5: per-seed converged final E-step F/token and named bit metrics.
         f_seeds = [c for c in (_as_float(g.get("estep_final_f_per_token")) for g in grp) if np.isfinite(c)]
+        bits_per_token = [
+            value for value in (_as_float(g.get("test_bits_per_token")) for g in grp)
+            if np.isfinite(value)
+        ]
         bpc = [c for c in (_as_float(g.get("test_bpc")) for g in grp) if np.isfinite(c)]
         # F1/EXP-6: per-seed test PPL for the muP K-stability figure (CE is the L(N) fit quantity above).
         ppl = [c for c in (_as_float(g.get("test_ppl")) for g in grp) if np.isfinite(c) and c > 0]
@@ -268,6 +278,10 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "ce_sem": float(np.std(ce, ddof=1) / np.sqrt(len(ce))) if len(ce) > 1 else 0.0,
             "f_seeds": f_seeds,
             "f_mean": float(np.mean(f_seeds)) if f_seeds else float("nan"),
+            "bits_per_token_seeds": bits_per_token,
+            "bits_per_token_mean": (
+                float(np.mean(bits_per_token)) if bits_per_token else float("nan")),
+            "bpc_seeds": bpc,
             "bpc_mean": float(np.mean(bpc)) if bpc else float("nan"),
             "ppl_mean": float(np.mean(ppl)) if ppl else float("nan"),
             "ppl_sem": float(np.std(ppl, ddof=1) / np.sqrt(len(ppl))) if len(ppl) > 1 else 0.0,

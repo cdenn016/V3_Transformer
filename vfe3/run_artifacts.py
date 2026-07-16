@@ -118,7 +118,8 @@ def _normalized_data_identity(
     missing = sorted(_DATA_IDENTITY_FIELDS - normalized.keys())
     if missing:
         raise ValueError(f"data_state data_identity is missing required field(s) {missing}")
-    if normalized.get("schema_version") != _DATA_IDENTITY_SCHEMA_VERSION:
+    schema_version = normalized.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version != _DATA_IDENTITY_SCHEMA_VERSION:
         raise ValueError(
             f"data_state data_identity schema_version must be {_DATA_IDENTITY_SCHEMA_VERSION}")
     for field in ("dataset", "split"):
@@ -166,6 +167,9 @@ def _normalized_data_identity(
             not isinstance(source_tokenizer, str) or not source_tokenizer):
         raise ValueError(
             "data_state data_identity source tokenizer_tag must be a nonempty string or null")
+    if source_tokenizer != tokenizer_tag:
+        raise ValueError(
+            "data_state data_identity tokenizer_tag must agree with source tokenizer_tag")
     size_bytes = _require_identity_positive_int(source.get("size_bytes"), "source size_bytes")
     _require_identity_sha256(source.get("sha256"), "source sha256")
 
@@ -1598,10 +1602,13 @@ def finalize_run(
     # _cost_model_fields block adds the structural axes + active-params-per-token + a faithful
     # analytic proxy so each point is standalone; best-effort, never blocks the saved numbers.
     scaling_point: Dict[str, object] = {
-        "n_params":      n_params,
-        "tokens_seen":   tokens_seen,
-        "est_flops_6ND": 6 * n_params * tokens_seen,
-        "test_ce":       results.get("test_ce"),
+        "n_params":             n_params,
+        "tokens_seen":          tokens_seen,
+        "est_flops_6ND":        6 * n_params * tokens_seen,
+        "test_ce":              results.get("test_ce"),
+        "test_ppl":             results.get("test_ppl"),
+        "test_bits_per_token":  results.get("test_bits_per_token"),
+        "test_bpc":             results.get("test_bpc"),
     }
     try:
         scaling_point.update(_cost_model_fields(model, cfg, n_params, tokens_seen, wall_time=wall_time))

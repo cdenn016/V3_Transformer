@@ -379,7 +379,8 @@ CONFIG: Dict[str, Any] = {
 # Headline scalars to aggregate (searched in summary.json -> test_results.json -> research.json).
 # Dotted keys dig into nested research blocks.
 SCALAR_KEYS: List[str] = [
-    "test_ppl", "best_val_ppl", "test_ce", "test_bpc", "test_ce_no_estep", "estep_capacity_gain",
+    "test_ppl", "best_val_ppl", "test_ce", "test_bits_per_token", "test_bpc",
+    "test_ce_no_estep", "estep_capacity_gain",
     "wall_time_s", "ece", "overall_ce", "sigma_trace_cv", "sigma_ce_spearman",
     "fd_gradient_worst_rel_error",
     "corpus_freq_strata_ce.rare", "corpus_freq_strata_ce.mid", "corpus_freq_strata_ce.frequent",
@@ -390,6 +391,8 @@ SCALAR_KEYS: List[str] = [
 CURVE_SPECS: List[tuple] = [
     ("train_ce",           False),
     ("val_ppl",            False),
+    ("val_bits_per_token", False),
+    ("val_bpc",            False),
     ("free_energy_total",  False),
     ("self_coupling",      False),
     ("belief_coupling",    False),

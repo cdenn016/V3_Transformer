@@ -1703,17 +1703,15 @@ def get_loader(
 ) -> Any:
     r"""DataLoader for ``dataset``/``split``. A missing cache raises ``FileNotFoundError``.
 
-    Memoised on ``(dataset, seq_len, batch_size, split, cap, vocab_size)`` so runs that do not change
-    those reuse one cached loader (the corpus cache loads once), while a sweep over
+    Memoized on ``(dataset, seq_len, batch_size, split, cap, vocab_size)`` so runs that do not change
+    those reuse the already-loaded immutable dataset and its attached byte identity, while a sweep over
     ``batch_size`` / ``max_seq_len`` / ``vocab_size`` correctly builds a distinct, matching loader.
     ``max_tokens`` caps only the train split (validation is always full). The loader never
     substitutes synthetic data for a missing real corpus -- that would mislabel synthetic numbers
     as a corpus measurement.
     """
     cap = max_tokens if split == "train" else None
-    source_identity = cache_source_identity(dataset, split)
-    source_key = json.dumps(source_identity, sort_keys=True, separators=(",", ":"))
-    key = (dataset, seq_len, batch_size, split, cap, vocab_size, source_key)
+    key = (dataset, seq_len, batch_size, split, cap, vocab_size)
     if key in _LOADER_CACHE:
         return _LOADER_CACHE[key]
     # Split-aware loader semantics, mirroring train_vfe3._select_loader: only the train stream is

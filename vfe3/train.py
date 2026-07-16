@@ -1358,14 +1358,16 @@ def train(
                 step + 1, n_steps, losses[-1], ce, d["attn_entropy"],
                 train_timing.train_steps_per_s, math.exp(min(ce, 20.0)),
             )
-            bit_value = ce / math.log(2.0)
-            bit_label = "BPT" if tokens_per_char is None else "BPC"
-            if tokens_per_char is not None:
-                bit_value *= tokens_per_char
+            bits_per_token = ce / math.log(2.0)
+            bpc_text = (
+                f" | BPC {bits_per_token * tokens_per_char:.4f}"
+                if tokens_per_char is not None
+                else " | BPC unavailable"
+            )
             logger.info(
-                "    F: self %.4f | belief %.4f | entropy %.4f | total %.4f | eff_rank %.2f | %s %.4f",
+                "    F: self %.4f | belief %.4f | entropy %.4f | total %.4f | eff_rank %.2f | BPT %.4f%s",
                 d["self_coupling"], d["belief_coupling"], d["attention_entropy"],
-                d["total"], d["effective_rank"], bit_label, bit_value,
+                d["total"], d["effective_rank"], bits_per_token, bpc_text,
             )
 
         if do_eval:

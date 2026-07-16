@@ -96,9 +96,6 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-_CACHE_SOURCE_IDENTITY_MEMO: dict = {}
-
-
 def _binary_cache_metadata(
     path: Path,
 ) -> Tuple[Dict[str, object], np.dtype]:
@@ -151,20 +148,16 @@ def cache_source_identity(
     changes ``n_tokens`` is still caught. Raises ``FileNotFoundError`` when neither cache exists
     (the caller treats an unhashable source as "forbid reuse").
 
-    Identities are memoized within one process by ``(resolved path, byte size, nanosecond mtime)``
-    so a sweep hashes each unchanged corpus once; a file that changes size or mtime lands under a
-    new key and is re-hashed, so the memo never serves a stale digest.
+    Every call re-hashes the source bytes. Filesystem stat tuples are not content identities: an
+    in-place writer can preserve path, size, timestamps, and inode while changing the corpus. Run
+    code that owns an immutable loaded dataset may retain the returned contract on that dataset,
+    but a fresh filesystem identity request never trusts prior stat metadata.
     """
     tokenizer_tag = _tokenizer_tag(dataset)
     pt = cache_path(dataset, split, suffix="pt", cache_dir=cache_dir)
     if pt.exists():
         resolved = pt.resolve()
         stat = resolved.stat()
-        key = ("pt", str(resolved), stat.st_size, stat.st_mtime_ns,
-               stat.st_ctime_ns, getattr(stat, "st_ino", None))
-        cached = _CACHE_SOURCE_IDENTITY_MEMO.get(key)
-        if cached is not None:
-            return dict(cached)
         identity: Dict[str, object] = {
             "format":        "pt",
             "tokenizer_tag": tokenizer_tag,
@@ -173,7 +166,6 @@ def cache_source_identity(
             "meta":          None,
             "meta_sha256":   None,
         }
-        _CACHE_SOURCE_IDENTITY_MEMO[key] = dict(identity)
         return identity
 
     binp = cache_path(dataset, split, suffix="bin", cache_dir=cache_dir)
@@ -182,14 +174,6 @@ def cache_source_identity(
         meta, _ = _binary_cache_metadata(resolved)
         stat = resolved.stat()
         meta_path = Path(str(binp) + ".meta.json")
-        meta_stat = meta_path.stat()
-        key = ("bin", str(resolved), stat.st_size, stat.st_mtime_ns,
-               stat.st_ctime_ns, getattr(stat, "st_ino", None),
-               meta_stat.st_size, meta_stat.st_mtime_ns, meta_stat.st_ctime_ns,
-               getattr(meta_stat, "st_ino", None))
-        cached = _CACHE_SOURCE_IDENTITY_MEMO.get(key)
-        if cached is not None:
-            return dict(cached)
         identity = {
             "format":        "bin",
             "tokenizer_tag": tokenizer_tag,
@@ -198,7 +182,6 @@ def cache_source_identity(
             "meta":          meta,
             "meta_sha256":   _sha256_file(meta_path),
         }
-        _CACHE_SOURCE_IDENTITY_MEMO[key] = dict(identity)
         return identity
 
     raise FileNotFoundError(
@@ -269,6 +252,30 @@ def load_cached_tokens(
     raise FileNotFoundError(
         f"no tokenized cache for {dataset!r}/{split!r}: tried {pt} and {binp}"
     )
+
+
+def _load_identity_bound_tokens(
+    dataset:   str,
+    split:     str,
+
+    *,
+    cache_dir: Optional[Path] = None,
+    limit:     Optional[int]  = None,
+) -> Tuple[torch.Tensor, Dict[str, object]]:
+    r"""Load tokens only when the exact source identity is stable across the load."""
+    identity_before = cache_source_identity(dataset, split, cache_dir=cache_dir)
+    tokens = load_cached_tokens(dataset, split, cache_dir=cache_dir, limit=limit)
+    identity_after = cache_source_identity(dataset, split, cache_dir=cache_dir)
+    if identity_before != identity_after:
+        differing = sorted(
+            key for key in set(identity_before) | set(identity_after)
+            if identity_before.get(key) != identity_after.get(key)
+        )
+        raise RuntimeError(
+            f"token cache for {dataset!r}/{split!r} changed while loading "
+            f"(identity fields: {', '.join(differing)})"
+        )
+    return tokens, identity_before
 
 
 def cached_token_count(
@@ -365,8 +372,9 @@ def tokens_per_char(
     split:      str,
 
     *,
-    cache_dir:   Optional[Path] = None,
-    chunk_tokens: int          = 64 * 1024,
+    chunk_tokens: int = 64 * 1024,
+
+    cache_dir: Optional[Path] = None,
 ) -> Optional[float]:
     r"""Corpus constant ``n_tokens / n_unicode_codepoints`` for ``dataset``/``split``, or None.
 
@@ -387,8 +395,8 @@ def tokens_per_char(
     if decode_bytes is None and decode_text is None:              # synthetic anchor / no tiktoken
         return None
     try:
-        source_identity = cache_source_identity(dataset, split, cache_dir=cache_dir)
-        tokens = load_cached_tokens(dataset, split, cache_dir=cache_dir)
+        tokens, source_identity = _load_identity_bound_tokens(
+            dataset, split, cache_dir=cache_dir)
     except FileNotFoundError:
         return None
     key = (
@@ -426,8 +434,9 @@ class TokenWindows(Dataset):
         seq_len: int,
 
         *,
-        stride:    Optional[int] = None,   # None -> non-overlapping seq_len stride
-        pad_final: bool          = False,  # eval: pad the final partial window, target pad=-100
+        pad_final: bool = False,  # eval: pad the final partial window, target pad=-100
+
+        stride: Optional[int] = None,   # None -> non-overlapping seq_len stride
     ) -> None:
         if tokens.dim() != 1:
             raise ValueError(f"tokens must be 1-D, got shape {tuple(tokens.shape)}")
@@ -481,13 +490,14 @@ def make_dataloader(
     batch_size:  int,
 
     *,
-    stride:      Optional[int] = None,
-    shuffle:     bool          = True,
-    drop_last:   bool          = True,
-    cache_dir:   Optional[Path] = None,
-    max_tokens:  Optional[int] = None,   # cap the stream (fast smoke runs)
-    vocab_size:  Optional[int] = None,   # check token ids fit cfg.vocab_size-sized tables
-    generator:   Optional[torch.Generator] = None,   # fix the shuffle order independent of global RNG
+    shuffle:    bool = True,
+    drop_last:  bool = True,
+
+    stride:     Optional[int]             = None,
+    cache_dir:  Optional[Path]            = None,
+    max_tokens: Optional[int]             = None,   # cap the stream (fast smoke runs)
+    vocab_size: Optional[int]             = None,   # check token ids fit cfg.vocab_size-sized tables
+    generator:  Optional[torch.Generator] = None,   # fix shuffle order independent of global RNG
 ) -> DataLoader:
     """Build a DataLoader of causal-LM windows from the cached ``dataset``/``split``.
 
@@ -497,8 +507,8 @@ def make_dataloader(
     ``train.evaluate`` is order-independent, but a dropped tail and a randomly-varying drawn subset
     are not -- see _select_loader). ``max_tokens`` is applied while loading; when supplied,
     ``vocab_size`` rejects cached ids that cannot index the model's vocabulary-sized tables."""
-    source_identity = cache_source_identity(dataset, split, cache_dir=cache_dir)
-    tokens = load_cached_tokens(dataset, split, cache_dir=cache_dir, limit=max_tokens)
+    tokens, source_identity = _load_identity_bound_tokens(
+        dataset, split, cache_dir=cache_dir, limit=max_tokens)
     if vocab_size is not None:
         validate_token_range(tokens, vocab_size, dataset=dataset)
     ds = TokenWindows(

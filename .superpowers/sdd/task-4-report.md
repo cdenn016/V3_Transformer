@@ -123,3 +123,29 @@ Pytest reported `1 passed in 0.25s`; JUnit recorded `tests=1 failures=0 errors=0
 ## Scope and handoff
 
 The task changes are limited to the data loader/cache path, data-state contracts, checkpoint and artifact handling, training/evaluation metric semantics, click-to-run, ablation, and scaling integration, focused regressions, and directly affected neighboring expectations. No Research-vault file, live checkout, default data choice, default tokenizer, configured cap, daily edit ledger, push, merge, or full/slow test run is part of this task. There is no unresolved public identity choice: cache-backed loaders use their exact source contract, direct tensor-backed loaders use an exact bounded content identity, and opaque resumable loaders fail closed.
+
+## Independent-review remediation
+
+The independent review exposed three stale mismatch fixtures: they mutated persisted identity fields into malformed schemas and still expected a runtime mismatch, although malformed contracts correctly fail closed with `ValueError`. The initial review RED therefore reported `3 failed, 33 passed in 1.44s`; its JUnit attributes were `tests=36 failures=3 errors=0 skipped=0 time=1.439`. The fixtures now distinguish malformed contracts from schema-valid identity differences.
+
+The expanded RED covered every remaining review item with the complete focused module:
+
+```text
+python -m pytest tests/test_2026_07_15_data_integrity_remediation.py --junitxml=C:\tmp\vfe3-task4-review-red-expanded-20260716.xml
+```
+
+Pytest reported `11 failed, 40 passed in 1.52s`; JUnit recorded `tests=51 failures=11 errors=0 skipped=0 time=1.515`. The failures proved that training suppressed the BPT name when BPC was available, three signatures violated defined-before-optional ordering, fresh and cached scaling harvests omitted BPT, the nested scaling point omitted both named bit fields, scaling analysis omitted BPT, same-stat in-place rewrites evaded both `.pt` and `.bin` identities, the loader lacked post-load identity revalidation, and contradictory top-level/nested tokenizer tags were accepted.
+
+The remediation removes filesystem-stat memoization entirely: every fresh source-identity request hashes the exact source and sidecar bytes. Cache-backed token loading now compares exact identities before and after loading and aborts when any field changes. Ablation performance reuse is confined to the already-loaded dataset and its attached identity instead of trusting a filesystem stat tuple. The versioned contract rejects Boolean schema aliases and requires the top-level tokenizer tag to agree with the nested source tag. The schema-valid resume mismatch matrix now covers dataset, split, tokenizer tags and encoding, tokenizer and model vocabularies, cap, source format, byte size, content digest, arbitrary binary metadata, logical token count, dtype, and metadata digest without mutating model, RNG, or cursor state.
+
+Metric publication now always preserves named bits per token and keeps bits per character as an additional nullable field. This applies to the training logger, fresh/cached/config-failure/training-failure scaling result schemas, nested `summary.scaling_point`, scaling-analysis harvest/CSV/seed aggregation, multiseed scalar and validation-curve keys, and publication labels. The affected signatures now place defined `chunk_tokens`, `pad_final`, `shuffle`, and `drop_last` parameters before optional parameters.
+
+The complete focused GREEN command was identical to the expanded RED command except for its final output path, `C:\tmp\vfe3-task4-review-green-focused-final-20260716.xml`. After the final signature cleanup, pytest reported `51 passed in 1.41s`; JUnit recorded `tests=51 failures=0 errors=0 skipped=0 time=1.403`.
+
+The only neighboring verification covered the named scaling, scaling-analysis, and multiseed modules:
+
+```text
+python -m pytest tests/test_scaling_mup.py tests/test_reporting_additions.py tests/test_exp5_buildout.py tests/test_multiseed.py --junitxml=C:\tmp\vfe3-task4-review-green-reporting-final-20260716.xml
+```
+
+Pytest reported `74 passed, 26 warnings in 8.30s`; JUnit recorded `tests=74 failures=0 errors=0 skipped=0 time=8.300`. `git diff --check` produced no whitespace errors. Ruff was not available in this environment (`No module named ruff`). No broad, full, or slow suite was run, and no configuration default was changed.
