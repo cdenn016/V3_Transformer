@@ -21,6 +21,7 @@ had no figures. These tests pin:
  (10) _save_figures routes model_channel_terms.png iff its history contains model-channel terms.
 """
 
+from dataclasses import dataclass
 import csv
 import logging
 import math
@@ -50,6 +51,94 @@ def _cfg(**kw) -> VFE3Config:
                 n_e_steps=2, e_q_mu_lr=0.1, e_phi_lr=0.05)
     base.update(kw)
     return VFE3Config(**base)
+
+
+@dataclass(frozen=True)
+class ChannelTrainingEvidence:
+    metrics_columns: frozenset[str]
+    metric_values:  tuple[tuple[str, tuple[float, ...]], ...]
+    attention_names: frozenset[str]
+
+
+def _build_channel_training_evidence(
+    tmp_path_factory,
+
+    *,
+    active: bool,
+) -> ChannelTrainingEvidence:
+    cpu_rng_state   = torch.random.get_rng_state()
+    cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    open_figures    = frozenset(figs.plt.get_fignums())
+    cfg = model = artifacts = train_loader = val_loader = run_dir = None
+    reader = reader_handle = rows = evidence = None
+    try:
+        run_dir = tmp_path_factory.mktemp(
+            "active-channel-evidence" if active else "pure-channel-evidence"
+        ) / "run"
+        cfg = (
+            _cfg(
+                s_e_step=True,
+                prior_source="model_channel",
+                lambda_h=0.25,
+                lambda_gamma=0.75,
+            )
+            if active
+            else _cfg()
+        )
+        train_loader = _loader()
+        val_loader   = _loader(seed=1)
+        torch.manual_seed(0)
+        model     = VFEModel(cfg)
+        artifacts = RunArtifacts(run_dir, cfg, model, dataset="synthetic-period3")
+        train(
+            model,
+            train_loader,
+            cfg,
+            n_steps=4,
+            log_interval=2,
+            eval_interval=2,
+            val_loader=val_loader,
+            artifacts=artifacts,
+        )
+        with (run_dir / "metrics.csv").open(encoding="utf-8", newline="") as reader_handle:
+            reader = csv.DictReader(reader_handle)
+            rows = tuple(reader)
+            metrics_columns = frozenset(reader.fieldnames or ())
+        model_channel_columns = ("hyper_prior", "gamma_coupling", "gamma_meta_entropy")
+        metric_values = tuple(
+            (column, tuple(float(row[column]) for row in rows))
+            for column in model_channel_columns
+            if column in metrics_columns
+        )
+        attention_names = frozenset(
+            path.name for path in (run_dir / "attention").glob("*.png")
+        )
+        evidence = ChannelTrainingEvidence(
+            metrics_columns=metrics_columns,
+            metric_values=metric_values,
+            attention_names=attention_names,
+        )
+    finally:
+        for figure_number in set(figs.plt.get_fignums()).difference(open_figures):
+            figs.plt.close(figure_number)
+        cfg = model = artifacts = train_loader = val_loader = run_dir = None
+        reader = reader_handle = rows = None
+        torch.random.set_rng_state(cpu_rng_state)
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
+        cpu_rng_state = cuda_rng_states = None
+    assert evidence is not None
+    return evidence
+
+
+@pytest.fixture(scope="module")
+def active_channel_training_evidence(tmp_path_factory) -> ChannelTrainingEvidence:
+    return _build_channel_training_evidence(tmp_path_factory, active=True)
+
+
+@pytest.fixture(scope="module")
+def pure_channel_training_evidence(tmp_path_factory) -> ChannelTrainingEvidence:
+    return _build_channel_training_evidence(tmp_path_factory, active=False)
 
 
 def _model(**kw) -> VFEModel:
@@ -284,53 +373,38 @@ def test_model_channel_terms_figure_renders(tmp_path):
 
 # ---- (8) metrics.csv columns under an active channel, NONE on the pure path -----------------------
 
-def test_metrics_csv_has_model_channel_columns(tmp_path):
-    cfg = _cfg(s_e_step=True, prior_source="model_channel", lambda_h=0.25, lambda_gamma=0.75)
-    torch.manual_seed(0)
-    model = VFEModel(cfg)
-    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
-    train(model, _loader(), cfg, n_steps=4, log_interval=2, eval_interval=2,
-          val_loader=_loader(seed=1), artifacts=art)
-    rows = list(csv.DictReader(open(tmp_path / "run" / "metrics.csv")))
+def test_metrics_csv_has_model_channel_columns(active_channel_training_evidence):
     for col in ("hyper_prior", "gamma_coupling", "gamma_meta_entropy"):
-        assert col in rows[0], f"{col} column missing"
-        assert all(math.isfinite(float(r[col])) for r in rows)
+        assert col in active_channel_training_evidence.metrics_columns, f"{col} column missing"
+        values = next(
+            values
+            for name, values in active_channel_training_evidence.metric_values
+            if name == col
+        )
+        assert all(math.isfinite(value) for value in values)
 
 
-def test_metrics_csv_pure_path_has_no_model_channel_columns(tmp_path):
-    cfg = _cfg()
-    torch.manual_seed(0)
-    model = VFEModel(cfg)
-    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
-    train(model, _loader(), cfg, n_steps=4, log_interval=2, eval_interval=2,
-          val_loader=_loader(seed=1), artifacts=art)
-    rows = list(csv.DictReader(open(tmp_path / "run" / "metrics.csv")))
-    assert not ({"hyper_prior", "gamma_coupling", "gamma_meta_entropy"} & set(rows[0]))
+def test_metrics_csv_pure_path_has_no_model_channel_columns(pure_channel_training_evidence):
+    assert not (
+        {"hyper_prior", "gamma_coupling", "gamma_meta_entropy"}
+        & pure_channel_training_evidence.metrics_columns
+    )
 
 
 # ---- (8b) per-eval attention files: belief beta (magma) + model gamma (viridis), full parity ------
 
-def test_training_writes_per_head_gamma_attention_files(tmp_path):
+def test_training_writes_per_head_gamma_attention_files(
+    active_channel_training_evidence,
+    pure_channel_training_evidence,
+):
     r"""Training-side parity: an active model channel writes per-head gamma heatmaps
     (attention/step_*_gamma_head*.png) alongside the belief beta maps; the pure path writes beta only."""
-    cfg = _cfg(s_e_step=True, prior_source="model_channel", lambda_h=0.25, lambda_gamma=0.75)
-    torch.manual_seed(0)
-    model = VFEModel(cfg)
-    art = RunArtifacts(tmp_path / "on", cfg, model, dataset="synthetic-period3")
-    train(model, _loader(), cfg, n_steps=4, log_interval=2, eval_interval=2,
-          val_loader=_loader(seed=1), artifacts=art)
-    attn = list((tmp_path / "on" / "attention").glob("*.png"))
-    assert any("gamma_head" in p.name for p in attn)              # model-channel gamma maps present
-    assert any("layer0_head" in p.name for p in attn)            # belief beta maps present
-
-    cfg0 = _cfg()
-    torch.manual_seed(0)
-    model0 = VFEModel(cfg0)
-    art0 = RunArtifacts(tmp_path / "off", cfg0, model0, dataset="synthetic-period3")
-    train(model0, _loader(), cfg0, n_steps=4, log_interval=2, eval_interval=2,
-          val_loader=_loader(seed=1), artifacts=art0)
-    attn0 = list((tmp_path / "off" / "attention").glob("*.png"))
-    assert attn0 and not any("gamma_head" in p.name for p in attn0)   # beta only on the pure path
+    assert any("gamma_head" in name for name in active_channel_training_evidence.attention_names)
+    assert any("layer0_head" in name for name in active_channel_training_evidence.attention_names)
+    assert pure_channel_training_evidence.attention_names
+    assert not any(
+        "gamma_head" in name for name in pure_channel_training_evidence.attention_names
+    )
 
 
 # ---- (9) pure report planning routes model-channel publication figures ----------------------------
