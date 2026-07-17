@@ -31,6 +31,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from contextlib import contextmanager
@@ -430,6 +431,120 @@ def _write_json_atomic(final: Path, obj: object) -> Path:
         tmp.write_text(json.dumps(obj, indent=2, default=str), encoding="utf-8")
         _atomic_replace(final, tmp)
     return final
+
+
+_CONTROLLED_FIGURE_BANK_TOKENS = 16_384
+
+
+def _snapshot_report_batches(
+    loader: Iterable,
+    cfg:    VFE3Config,
+) -> List[object]:
+    """Copy the bounded report input batches to CPU for a fresh plotting process."""
+    tokens_per_batch = max(int(cfg.batch_size) * int(cfg.max_seq_len), 1)
+    n_batches = max(1, -(-_CONTROLLED_FIGURE_BANK_TOKENS // tokens_per_batch))
+    batches: List[object] = []
+    for index, batch in enumerate(loader):
+        if index >= n_batches:
+            break
+        if isinstance(batch, (tuple, list)):
+            copied = tuple(
+                item.detach().cpu() if isinstance(item, torch.Tensor) else item
+                for item in batch
+            )
+        elif isinstance(batch, torch.Tensor):
+            copied = batch.detach().cpu()
+        else:
+            raise TypeError(
+                "figure report loader must yield a tensor or a tuple/list containing tensors"
+            )
+        batches.append(copied)
+    return batches
+
+
+def _run_figures_isolated(
+    model:     torch.nn.Module,
+    artifacts: 'RunArtifacts',
+    losses:    Optional[List[float]],
+    logger:    logging.Logger,
+
+    *,
+    generate_publication: bool,
+    report_loader:        Optional[Iterable] = None,
+) -> bool:
+    r"""Generate every end-of-run figure in a disposable process.
+
+    Anaconda NumPy and PyTorch can load distinct copies of Intel OpenMP.  A plotting-time NumPy or
+    SciPy kernel may then call the native runtime's fatal ``abort`` path, which Python exception
+    handlers cannot contain.  The compatibility setting is therefore scoped to this child only:
+    training numerics and the long-lived Spyder kernel never inherit it.  A child failure returns
+    ``False`` after all numeric artifacts have already been published.
+    """
+    run_dir = artifacts.run_dir.resolve()
+    model_device = next(model.parameters()).device
+    report_batches: Optional[List[object]] = None
+    if generate_publication and report_loader is not None:
+        report_batches = _snapshot_report_batches(report_loader, artifacts.cfg)
+
+    with _unique_sibling_temp(run_dir / "figure_request.json") as request_path:
+        with _unique_sibling_temp(run_dir / "figure_report_batches.pt") as batches_path:
+            if report_batches is not None:
+                torch.save(report_batches, batches_path)
+            request = {
+                "run_dir":             str(run_dir),
+                "losses":              ([float(value) for value in losses] if losses else None),
+                "generate_publication": bool(generate_publication),
+                "report_batches_path": (str(batches_path) if report_batches is not None else None),
+                "device":              str(model_device),
+                "max_tokens":          _CONTROLLED_FIGURE_BANK_TOKENS,
+                "allow_large":         bool(getattr(artifacts.cfg, "force_large_figures", False)),
+            }
+            request_path.write_text(json.dumps(request), encoding="utf-8")
+
+            environment = os.environ.copy()
+            environment["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+            environment["VFE3_FIGURE_REQUEST"] = str(request_path)
+            environment["PYTHONUNBUFFERED"] = "1"
+            command = [sys.executable, "-m", "vfe3.viz.figure_worker"]
+            repo_root = Path(__file__).resolve().parent.parent
+            offloaded = generate_publication and model_device.type == "cuda"
+            if offloaded:
+                model.to("cpu")
+                torch.cuda.empty_cache()
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=str(repo_root),
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                logger.warning(
+                    "isolated figure process could not start (%s); numeric results are saved", exc
+                )
+                return False
+            finally:
+                if offloaded:
+                    model.to(model_device)
+
+    if completed.stdout.strip():
+        logger.info("isolated figure process:\n%s", completed.stdout.rstrip())
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or "no stderr"
+        logger.warning(
+            "isolated figure process exited with code %d (%s); numeric results are saved",
+            completed.returncode,
+            detail[-4000:],
+        )
+        return False
+    if completed.stderr.strip():
+        logger.info("isolated figure process diagnostics:\n%s", completed.stderr.rstrip())
+    return True
 
 
 def _selection_semantic_config(
@@ -2363,24 +2478,21 @@ def finalize_run(
     # test-eval n_e_steps restore so the model is in its trained state. Run before the figure pass.
     _write_research_artifacts(model, artifacts, cfg, train_loader, test_loader, device, logger)
 
-    _save_figures(artifacts, losses, logger)
-    # Single-run publication figure set (model-replay), auto-run at the end of training unless
-    # cfg.generate_figures is False. Best-effort and off the hot path -- the runners are expensive
-    # (UMAP, E-step replay, holonomy sampling, a belief bank over many sequences), so a failure is
-    # logged and never disturbs the saved numeric results. Drives the BEST-val model reloaded above.
-    if getattr(cfg, "generate_figures", True):
-        try:
-            from vfe3.viz.report import generate_figures
-            generate_figures(
-                artifacts.run_dir,
-                model=model,
-                loader=test_loader,
-                device=device,
-                allow_large=bool(getattr(cfg, "force_large_figures", False)),
-                logger=logger,
-            )
-        except Exception as exc:
-            logger.warning("publication figure generation failed (%s); numeric results are saved", exc)
+    # Plotting is a separate process because Anaconda NumPy/SciPy and PyTorch may initialize
+    # incompatible Intel OpenMP copies. A native abort then kills only the disposable worker, not
+    # the long-lived Spyder kernel. The worker also drives the model-replay publication set when
+    # enabled, using the exact bounded test batches snapshotted from this invocation.
+    try:
+        _run_figures_isolated(
+            model,
+            artifacts,
+            losses,
+            logger,
+            generate_publication=bool(getattr(cfg, "generate_figures", True)),
+            report_loader=test_loader,
+        )
+    except Exception as exc:
+        logger.warning("isolated figure preparation failed (%s); numeric results are saved", exc)
     return results
 
 
@@ -2663,7 +2775,16 @@ def finalize_validation_run(
             artifacts.save_json("pure_path_report.json", _pure_path_report(cfg, artifacts.history))
         except Exception as exc:
             logger.warning("pure-path report failed (%s); skipped", exc)
-        _save_figures(artifacts, losses, logger)
+        try:
+            _run_figures_isolated(
+                model,
+                artifacts,
+                losses,
+                logger,
+                generate_publication=False,
+            )
+        except Exception as exc:
+            logger.warning("isolated figure preparation failed (%s); validation results are saved", exc)
     finally:
         # Strict raw-state reload + RNG restore, on BOTH the success and failure paths: the terminal
         # checkpoint below pairs the RAW model with the raw optimizer moments (never the EMA weights),

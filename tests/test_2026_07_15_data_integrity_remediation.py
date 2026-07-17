@@ -443,7 +443,7 @@ def test_finalize_run_scaling_point_names_bit_metrics_when_unavailable(
     artifacts = RunArtifacts(tmp_path / "run", cfg, model)
     monkeypatch.setattr(artifacts_mod, "_write_provenance", lambda *args, **kwargs: None)
     monkeypatch.setattr(artifacts_mod, "_write_research_artifacts", lambda *args, **kwargs: None)
-    monkeypatch.setattr(artifacts_mod, "_save_figures", lambda *args, **kwargs: None)
+    monkeypatch.setattr(artifacts_mod, "_run_figures_isolated", lambda *args, **kwargs: True)
     artifacts_mod.finalize_run(model, artifacts, cfg)
     summary = json.loads((artifacts.run_dir / "summary.json").read_text(encoding="utf-8"))
     assert "test_bits_per_token" in summary["scaling_point"]

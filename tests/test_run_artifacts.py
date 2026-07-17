@@ -10,6 +10,7 @@ covered by tests/test_train.py::test_silent_and_logging_paths_are_bitwise_identi
 import hashlib
 import json
 import logging
+import math
 import os
 import subprocess
 import types
@@ -145,6 +146,39 @@ def test_log_metrics_writes_csv_with_header(tmp_path):
     lines = (tmp_path / "r" / "metrics.csv").read_text().strip().splitlines()
     assert lines[0].split(",") == ["step", "val_ppl"]
     assert len(lines) == 3                                     # header + 2 rows
+
+
+def test_history_figures_run_in_disposable_process_without_mutating_parent_openmp_env(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.delenv("KMP_DUPLICATE_LIB_OK", raising=False)
+    cfg = _cfg(generate_figures=False)
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "isolated-figures", cfg, model, dataset="synthetic")
+    for step, train_loss, val_ce in ((1, 1.4, 1.3), (2, 1.2, 1.1), (3, 1.0, 0.9)):
+        art.log_metrics({
+            "step":              step,
+            "train_loss":        train_loss,
+            "val_ce":            val_ce,
+            "val_ppl":           math.exp(val_ce),
+            "self_coupling":     0.20,
+            "belief_coupling":   0.15,
+            "attention_entropy": 0.05,
+        })
+
+    completed = run_artifacts._run_figures_isolated(
+        model,
+        art,
+        [1.4, 1.2, 1.0],
+        logging.getLogger("test-isolated-figures"),
+        generate_publication=False,
+    )
+
+    assert completed is True
+    assert "KMP_DUPLICATE_LIB_OK" not in os.environ
+    assert (art.run_dir / "loss_curve.png").is_file()
+    assert (art.run_dir / "free_energy_codescent.png").is_file()
 
 
 def test_maybe_save_best_only_on_improvement(tmp_path):
