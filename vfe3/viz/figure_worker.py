@@ -66,12 +66,40 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     logger = logging.getLogger(__name__)
     artifacts = SimpleNamespace(run_dir=run_dir, cfg=cfg, history=history)
+
+    from vfe3.viz.figures import plot_estep_depth_sensitivity, plot_phi_numerics_reference
+
+    saved_probes = (
+        (
+            "estep_depth_sensitivity.json",
+            "estep_depth_sensitivity.png",
+            plot_estep_depth_sensitivity,
+        ),
+        ("phi_numerics.json", "phi_numerics_reference.png", plot_phi_numerics_reference),
+    )
+    for source_name, figure_name, plotter in saved_probes:
+        source_path = run_dir / source_name
+        if not source_path.is_file():
+            continue
+        try:
+            record = json.loads(source_path.read_text(encoding="utf-8"))
+            figure = plotter(record, path=str(run_dir / figure_name))
+            if figure is not None:
+                from matplotlib import pyplot as plt
+                plt.close(figure)
+        except Exception as exc:
+            logger.warning(
+                "saved probe figure %s failed (%s); remaining figures continue",
+                figure_name,
+                exc,
+            )
     _save_figures(artifacts, losses, logger)
 
     if request.get("generate_publication") is True:
         from vfe3.viz.report import generate_figures
 
         batches_path = request.get("report_batches_path")
+        model_bundle_path = request.get("model_bundle_path")
         loader = (
             torch.load(Path(batches_path), map_location="cpu", weights_only=True)
             if isinstance(batches_path, str)
@@ -79,6 +107,9 @@ def main() -> int:
         )
         generate_figures(
             run_dir,
+            checkpoint_path=(
+                Path(model_bundle_path) if isinstance(model_bundle_path, str) else None
+            ),
             split="test",
             max_tokens=int(request.get("max_tokens", 16_384)),
             allow_large=bool(request.get("allow_large", False)),

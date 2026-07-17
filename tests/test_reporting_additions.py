@@ -448,7 +448,10 @@ def test_finalize_run_delegates_memory_guard_to_figure_driver(tmp_path, monkeypa
     model = VFEModel(real_cfg).to(DEVICE)
     art = RunArtifacts(str(tmp_path), real_cfg, model, dataset="synthetic", device=str(DEVICE))
     calls = []
-    monkeypatch.setattr("vfe3.viz.report.generate_figures", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(
+        "vfe3.run_artifacts._run_figures_isolated",
+        lambda *a, **k: calls.append((a, k)) or True,
+    )
     finalize_run(model, art, _finalize_ns(), test_loader=None)
     assert len(calls) == 1
     assert calls[0][1]["allow_large"] is False
@@ -463,7 +466,10 @@ def test_finalize_run_force_large_figures_overrides_guard(tmp_path, monkeypatch)
     model = VFEModel(real_cfg).to(DEVICE)
     art = RunArtifacts(str(tmp_path), real_cfg, model, dataset="synthetic", device=str(DEVICE))
     calls = []
-    monkeypatch.setattr("vfe3.viz.report.generate_figures", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(
+        "vfe3.run_artifacts._run_figures_isolated",
+        lambda *a, **k: calls.append((a, k)) or True,
+    )
     finalize_run(model, art, _finalize_ns(force_large_figures=True), test_loader=None)
     assert len(calls) == 1
     assert calls[0][1]["allow_large"] is True

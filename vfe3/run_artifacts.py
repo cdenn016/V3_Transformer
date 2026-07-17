@@ -470,6 +470,7 @@ def _run_figures_isolated(
 
     *,
     generate_publication: bool,
+    allow_large:          bool               = False,
     report_loader:        Optional[Iterable] = None,
 ) -> bool:
     r"""Generate every end-of-run figure in a disposable process.
@@ -488,49 +489,61 @@ def _run_figures_isolated(
 
     with _unique_sibling_temp(run_dir / "figure_request.json") as request_path:
         with _unique_sibling_temp(run_dir / "figure_report_batches.pt") as batches_path:
-            if report_batches is not None:
-                torch.save(report_batches, batches_path)
-            request = {
-                "run_dir":             str(run_dir),
-                "losses":              ([float(value) for value in losses] if losses else None),
-                "generate_publication": bool(generate_publication),
-                "report_batches_path": (str(batches_path) if report_batches is not None else None),
-                "device":              str(model_device),
-                "max_tokens":          _CONTROLLED_FIGURE_BANK_TOKENS,
-                "allow_large":         bool(getattr(artifacts.cfg, "force_large_figures", False)),
-            }
-            request_path.write_text(json.dumps(request), encoding="utf-8")
+            with _unique_sibling_temp(run_dir / "figure_live_model.pt") as model_path:
+                if report_batches is not None:
+                    torch.save(report_batches, batches_path)
+                best_path = Path(getattr(artifacts, "best_path", run_dir / "best_model.pt"))
+                live_model_path: Optional[str] = None
+                if generate_publication and not best_path.is_file():
+                    config = asdict(artifacts.cfg)
+                    torch.save({
+                        "model_state":        model.state_dict(),
+                        "config":             config,
+                        "config_fingerprint": semantic_config_fingerprint(config),
+                    }, model_path)
+                    live_model_path = str(model_path)
+                request = {
+                    "run_dir":             str(run_dir),
+                    "losses":              ([float(value) for value in losses] if losses else None),
+                    "generate_publication": bool(generate_publication),
+                    "report_batches_path": (str(batches_path) if report_batches is not None else None),
+                    "model_bundle_path":   live_model_path,
+                    "device":              str(model_device),
+                    "max_tokens":          _CONTROLLED_FIGURE_BANK_TOKENS,
+                    "allow_large":         bool(allow_large),
+                }
+                request_path.write_text(json.dumps(request), encoding="utf-8")
 
-            environment = os.environ.copy()
-            environment["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-            environment["VFE3_FIGURE_REQUEST"] = str(request_path)
-            environment["PYTHONUNBUFFERED"] = "1"
-            command = [sys.executable, "-m", "vfe3.viz.figure_worker"]
-            repo_root = Path(__file__).resolve().parent.parent
-            offloaded = generate_publication and model_device.type == "cuda"
-            if offloaded:
-                model.to("cpu")
-                torch.cuda.empty_cache()
-            try:
-                completed = subprocess.run(
-                    command,
-                    cwd=str(repo_root),
-                    env=environment,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    check=False,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-            except (OSError, subprocess.SubprocessError) as exc:
-                logger.warning(
-                    "isolated figure process could not start (%s); numeric results are saved", exc
-                )
-                return False
-            finally:
-                if offloaded:
-                    model.to(model_device)
+                environment = os.environ.copy()
+                environment["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+                environment["VFE3_FIGURE_REQUEST"] = str(request_path)
+                environment["PYTHONUNBUFFERED"] = "1"
+                command = [sys.executable, "-m", "vfe3.viz.figure_worker"]
+                repo_root = Path(__file__).resolve().parent.parent
+                offloaded = generate_publication and model_device.type == "cuda"
+                try:
+                    if offloaded:
+                        model.to("cpu")
+                        torch.cuda.empty_cache()
+                    completed = subprocess.run(
+                        command,
+                        cwd=str(repo_root),
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        check=False,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    logger.warning(
+                        "isolated figure process could not start (%s); numeric results are saved", exc
+                    )
+                    return False
+                finally:
+                    if offloaded:
+                        model.to(model_device)
 
     if completed.stdout.strip():
         logger.info("isolated figure process:\n%s", completed.stdout.rstrip())
@@ -2380,14 +2393,6 @@ def finalize_run(
                 depths=(0, 1, 2, 3, 5, 8),
             )
             artifacts.save_json("estep_depth_sensitivity.json", _depth_record)
-            from vfe3.viz.figures import plot_estep_depth_sensitivity
-            _depth_figure = plot_estep_depth_sensitivity(
-                _depth_record,
-                path=str(artifacts.run_dir / "estep_depth_sensitivity.png"),
-            )
-            if _depth_figure is not None:
-                from matplotlib import pyplot as plt
-                plt.close(_depth_figure)
         except Exception as exc:
             logger.warning("estep depth-sensitivity probe failed (%s); skipped", exc)
         try:
@@ -2397,14 +2402,6 @@ def finalize_run(
             ).to(device)
             _phi_record = collect_phi_numerics(model, _phi_tokens)
             artifacts.save_json("phi_numerics.json", _phi_record)
-            from vfe3.viz.figures import plot_phi_numerics_reference
-            _phi_figure = plot_phi_numerics_reference(
-                _phi_record,
-                path=str(artifacts.run_dir / "phi_numerics_reference.png"),
-            )
-            if _phi_figure is not None:
-                from matplotlib import pyplot as plt
-                plt.close(_phi_figure)
         except Exception as exc:
             logger.warning("phi numerical-reference probe failed (%s); skipped", exc)
     artifacts.save_json("test_results.json", results)
@@ -2489,6 +2486,7 @@ def finalize_run(
             losses,
             logger,
             generate_publication=bool(getattr(cfg, "generate_figures", True)),
+            allow_large=bool(getattr(cfg, "force_large_figures", False)),
             report_loader=test_loader,
         )
     except Exception as exc:

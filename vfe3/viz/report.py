@@ -23,7 +23,7 @@ experiment to set up). Neither is produced here.
 
 import json
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Mapping, Optional, Sequence
 
@@ -31,7 +31,7 @@ import torch
 
 from vfe3 import metrics
 from vfe3.config import VFE3Config, config_from_serialized
-from vfe3.run_artifacts import semantic_config_fingerprint
+from vfe3.run_artifacts import _selection_semantic_config, semantic_config_fingerprint
 from vfe3.viz import extract
 from vfe3.viz import embedding_comparison
 from vfe3.viz import figures as figs
@@ -132,7 +132,7 @@ def _load_best_model_state(
     if payload["config_fingerprint"] != raw_fingerprint:
         raise ValueError(f"best checkpoint {path} has a config fingerprint mismatch")
     embedded_cfg = config_from_serialized(embedded, source=f"{path} embedded config")
-    if asdict(embedded_cfg) != asdict(cfg):
+    if _selection_semantic_config(embedded_cfg) != _selection_semantic_config(cfg):
         raise ValueError(f"best checkpoint {path} has a semantic config mismatch with config.json")
     model_state = payload["model_state"]
     if not isinstance(model_state, Mapping) or not model_state:
@@ -209,25 +209,27 @@ def _estimated_full_vocab_bank_bytes(cfg: VFE3Config, n_batches: int) -> int:
 
 
 def generate_figures(
-    run_dir:       'str | Path',
+    run_dir:         'str | Path',
 
     *,
-    split:         str                         = "validation",
-    max_tokens:    Optional[int]               = None,
-    max_sequences: Optional[int]               = None,
-    allow_large:   bool                        = False,
-    model:         Optional[torch.nn.Module]   = None,   # skip the reload; drive this live model
-    loader:        Optional[object]            = None,   # skip the default loader build
-    device:        Optional[torch.device]      = None,
-    n_e_steps:     Optional[int]               = None,
-    logger:        Optional[logging.Logger]    = None,
+    split:           str                         = "validation",
+    max_tokens:      Optional[int]               = None,
+    max_sequences:   Optional[int]               = None,
+    allow_large:     bool                        = False,
+    checkpoint_path: Optional[Path]              = None,
+    model:           Optional[torch.nn.Module]   = None,   # skip the reload; drive this live model
+    loader:          Optional[object]            = None,   # skip the default loader build
+    device:          Optional[torch.device]      = None,
+    n_e_steps:       Optional[int]               = None,
+    logger:          Optional[logging.Logger]    = None,
 ) -> List[Path]:
     r"""Drive the model and write the single-run publication figures into ``run_dir/figures/``.
 
     With ``model=None`` the trained model is rebuilt from ``run_dir/config.json`` and
-    ``run_dir/best_model.pt``; pass ``model`` to drive a live in-memory model instead (the test
-    path, and any post-train call that still holds the weights). ``loader`` defaults to a stable
-    unshuffled loader for the run's dataset (raises if the cache is absent; pass ``loader`` to override).
+    ``checkpoint_path`` (default: ``run_dir/best_model.pt``); pass ``model`` to drive a live
+    in-memory model instead (the test path, and any post-train call that still holds the weights).
+    ``loader`` defaults to a stable unshuffled loader for the run's dataset (raises if the cache is
+    absent; pass ``loader`` to override).
     When both population caps are omitted, the belief/model banks use the controlled default of
     exactly 16,384 tokens. Explicit ``max_sequences`` calls preserve the exploratory compatibility
     path; the two caps are mutually exclusive. ``allow_large`` opts into the two full-vocabulary
@@ -245,9 +247,9 @@ def generate_figures(
         from vfe3.model.model import VFEModel
         cfg, dataset = _load_config(run_dir)
         model = VFEModel(cfg)
-        best = run_dir / "best_model.pt"
+        best = checkpoint_path if checkpoint_path is not None else run_dir / "best_model.pt"
         if not best.exists():
-            raise FileNotFoundError(f"no best_model.pt in {run_dir}; train with RunArtifacts first")
+            raise FileNotFoundError(f"no model checkpoint at {best}; train with RunArtifacts first")
         model.load_state_dict(
             _load_best_model_state(best, cfg, map_location=device or "cpu"),
             strict=True,
