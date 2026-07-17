@@ -436,3 +436,20 @@ def test_no_grad_identity_shortcut_does_not_call_tensor_item(monkeypatch) -> Non
 
     assert copied_mean is not mean
     assert torch.allclose(copied_mean, mean @ torch.tensor([[1.0, 0.0], [0.25, 1.0]]))
+
+
+def test_grad_forward_invalidates_identity_shortcut_before_versionless_write() -> None:
+    mixer = HeadMixer([1, 1])
+    mean = torch.tensor([[2.0, 3.0]])
+    variance = torch.ones_like(mean)
+
+    mixer(mean, variance)
+    version_before = mixer.mixer_delta._version
+    mixer.mixer_delta.data.copy_(torch.tensor([[0.0, 0.25], [0.0, 0.0]]))
+    assert mixer.mixer_delta._version == version_before
+
+    with torch.no_grad():
+        mixed_mean, _ = mixer(mean, variance)
+
+    assert mixed_mean is not mean
+    assert torch.equal(mixed_mean, torch.tensor([[2.75, 3.0]]))

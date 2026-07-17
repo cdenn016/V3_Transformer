@@ -163,11 +163,10 @@ class HeadMixer(nn.Module):
     def _identity_shortcut_available(self) -> bool:
         r"""Whether identity passthrough is still certified without reading tensor values.
 
-        Parameters initialize exactly to zero. Replacement changes Python identity and any
-        in-place write increments ``Tensor._version``; after either change the shortcut fails
-        closed and the small mixer operation executes. This preserves the no-grad object-identity
-        contract at initialization without a device-to-host scalar transfer on each evaluation
-        forward.
+        Parameters initialize exactly to zero. Replacement or a version-visible in-place write
+        invalidates this certificate before training, while the first grad-enabled forward
+        invalidates it unconditionally. This preserves the no-grad object-identity contract at
+        initialization without relying on optimizer-specific version-counter behavior.
         """
         states = tuple((id(delta), delta._version) for delta in self.mixer_deltas)
         if states != self._identity_states:
@@ -196,7 +195,9 @@ class HeadMixer(nn.Module):
         # Grad-free identity short-circuit only: under autograd a zero-delta short-circuit
         # would sever mixer_deltas from the graph and the zero-init deltas could never train
         # (audit 2026-06-09 overnight CR3 verifier correction).
-        if not torch.is_grad_enabled() and self._identity_shortcut_available():
+        if torch.is_grad_enabled():
+            self._identity_for_forward = False
+        elif self._identity_shortcut_available():
             return mu, sigma
         mu_parts, sig_parts = [], []
         for t, (s, m, d) in enumerate(self.components):

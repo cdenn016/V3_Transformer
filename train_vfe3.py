@@ -26,7 +26,7 @@ if os.environ.get("VFE3_ALLOW_DUPLICATE_OPENMP") == "1":
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Optional
 
 import torch
 from torch.utils.data import DataLoader
