@@ -2,12 +2,305 @@ import gc
 import math
 import weakref
 
+import pytest
 import torch
 
 import vfe3.geometry.phi_preconditioner as phi_preconditioner
 from vfe3.geometry.generators import generate_glk, generate_glk_multihead, generate_son
 from vfe3.geometry.groups import get_group
-from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
+from vfe3.geometry.lie_ops import gram_pinv
+from vfe3.geometry.phi_preconditioner import (
+    PullbackGroupDirectionResult,
+    _PHI_GROUP_DIRECTIONS,
+    _PRECOND,
+    precondition_phi_gradient,
+    pullback_group_direction,
+)
+
+
+def test_pullback_group_registry_is_separate_from_estep_registry():
+    assert set(_PHI_GROUP_DIRECTIONS) == {"pullback", "pullback_per_block"}
+    assert _PHI_GROUP_DIRECTIONS is not _PRECOND
+
+
+def test_pullback_group_direction_returns_float64_gram_relative_zero_chart_solution():
+    generators = generate_glk(2)
+    generators = generators * torch.tensor([0.5, 1.0, 2.0, 3.0]).view(-1, 1, 1)
+    grad = torch.tensor([0.25, -0.5, 0.75, -1.0], dtype=torch.float32)
+    phi = torch.zeros(4, dtype=torch.float32)
+    input_dtypes = (grad.dtype, phi.dtype, generators.dtype)
+
+    result = pullback_group_direction(grad, phi, generators, mode="pullback")
+
+    assert isinstance(result, PullbackGroupDirectionResult)
+    gram = torch.einsum("aij,bij->ab", generators.double(), generators.double())
+    expected = torch.linalg.solve((1.0 + 1e-6) * gram, grad.double())
+    assert torch.allclose(result.v_phi, expected, rtol=1e-10, atol=1e-12)
+    assert torch.allclose(result.xi, result.v_phi, rtol=1e-10, atol=1e-12)
+    for value in (
+        result.v_phi,
+        result.xi,
+        result.min_undamped_generalized_eigenvalue,
+        result.undamped_generalized_condition,
+        result.damped_generalized_condition,
+        result.scaled_solve_residual,
+    ):
+        assert value.dtype == torch.float64
+    assert (grad.dtype, phi.dtype, generators.dtype) == input_dtypes
+
+
+def _augmented_matrix_exp_differential(
+    X: torch.Tensor,
+    H: torch.Tensor,
+) -> torch.Tensor:
+    """Float64 oracle for D exp_X[H] from an augmented matrix exponential."""
+    zeros = torch.zeros_like(X)
+    augmented = torch.cat(
+        (
+            torch.cat((X, H), dim=-1),
+            torch.cat((zeros, X), dim=-1),
+        ),
+        dim=-2,
+    )
+    return torch.linalg.matrix_exp(augmented)[:X.shape[-1], X.shape[-1]:]
+
+
+def _pullback_oracle(
+    phi:       torch.Tensor,
+    generators: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return J, J^T J, and the left-trivialized coordinate differential."""
+    X = torch.einsum("a,aij->ij", phi, generators)
+    U = torch.linalg.matrix_exp(X)
+    differential = torch.stack(
+        [_augmented_matrix_exp_differential(X, H) for H in generators],
+        dim=0,
+    )
+    metric = torch.einsum("aij,bij->ab", differential, differential)
+    left_matrices = torch.linalg.solve(U, differential)
+    gram = torch.einsum("aij,bij->ab", generators, generators)
+    pairings = torch.einsum("bij,aij->ba", generators, left_matrices)
+    left_coordinates = torch.linalg.solve(gram, pairings)
+    return differential, metric, left_coordinates
+
+
+def _gl_chart_fixture(
+    kind: str,
+    norm: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if kind == "symmetric":
+        X = torch.tensor(
+            [[0.7, 0.2, -0.1], [0.2, -0.4, 0.15], [-0.1, 0.15, -0.3]],
+            dtype=torch.float64,
+        )
+    elif kind == "random_nonnormal":
+        X = torch.tensor(
+            [[0.3, 0.8, -0.2], [-0.1, -0.2, 0.5], [0.05, -0.4, -0.1]],
+            dtype=torch.float64,
+        )
+    elif kind == "jordan_like":
+        X = torch.tensor(
+            [[0.2, 1.0, 0.0], [0.0, 0.2, 1.0], [0.0, 0.0, -0.4]],
+            dtype=torch.float64,
+        )
+    elif kind == "traceless_diagonal":
+        X = torch.diag(torch.tensor([1.0, 0.5, 0.0, -0.5, -1.0], dtype=torch.float64))
+    else:
+        raise AssertionError(f"unknown chart fixture {kind!r}")
+    if norm == 0.0:
+        X = torch.zeros_like(X)
+    else:
+        X = X * (norm / torch.linalg.matrix_norm(X))
+    return X.reshape(-1), generate_glk(X.shape[-1]).double()
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ("symmetric", "random_nonnormal", "jordan_like", "traceless_diagonal"),
+)
+@pytest.mark.parametrize("norm", (0.0, 1.0, 3.0, 5.0))
+def test_pullback_group_differentials_match_augmented_exp_oracle(kind, norm):
+    phi, generators = _gl_chart_fixture(kind, norm)
+    differential, metric, left_coordinates = _pullback_oracle(phi, generators)
+    gram = torch.einsum("aij,bij->ab", generators, generators)
+    damped = metric + 1e-6 * gram
+    n_gen = generators.shape[0]
+    batched_phi = phi.expand(n_gen, -1).clone()
+
+    inverse_result = pullback_group_direction(
+        torch.eye(n_gen, dtype=torch.float64),
+        batched_phi,
+        generators,
+        mode="pullback",
+    )
+    recovered_damped = torch.linalg.solve(
+        inverse_result.v_phi,
+        torch.eye(n_gen, dtype=torch.float64),
+    )
+    recovered_metric = recovered_damped - 1e-6 * gram
+    metric_error = (
+        torch.linalg.matrix_norm(recovered_metric - metric)
+        / torch.linalg.matrix_norm(metric).clamp_min(1.0)
+    )
+    assert metric_error <= 1e-9
+
+    differential_result = pullback_group_direction(
+        damped,
+        batched_phi,
+        generators,
+        mode="pullback",
+    )
+    direction_error = torch.linalg.matrix_norm(
+        differential_result.v_phi - torch.eye(n_gen, dtype=torch.float64)
+    ) / math.sqrt(n_gen)
+    assert direction_error <= 1e-8
+    left_error = (
+        torch.linalg.matrix_norm(differential_result.xi.transpose(-1, -2) - left_coordinates)
+        / torch.linalg.matrix_norm(left_coordinates).clamp_min(1.0)
+    )
+    assert left_error <= 1e-9
+    assert torch.isfinite(differential).all()
+
+
+def test_pullback_group_adaptive_series_accepts_traceless_gl5_norm_five():
+    phi, generators = _gl_chart_fixture("traceless_diagonal", 5.0)
+    result = pullback_group_direction(
+        torch.linspace(-0.5, 0.5, generators.shape[0], dtype=torch.float64),
+        phi,
+        generators,
+        mode="pullback",
+    )
+    assert result.series_order in range(40, 129, 8)
+    assert all(
+        torch.isfinite(value).all()
+        for value in (
+            result.v_phi,
+            result.xi,
+            result.min_undamped_generalized_eigenvalue,
+            result.undamped_generalized_condition,
+            result.damped_generalized_condition,
+            result.scaled_solve_residual,
+        )
+    )
+
+
+def test_pullback_group_adaptive_series_rejects_uncertified_chart():
+    generators = generate_glk(2).double()
+    phi = torch.tensor([100.0, 0.0, 0.0, -100.0], dtype=torch.float64)
+    with pytest.raises(ValueError, match="series|certificate|certif"):
+        pullback_group_direction(
+            torch.ones(4, dtype=torch.float64),
+            phi,
+            generators,
+            mode="pullback",
+        )
+
+
+def _legacy_pullback_metric(
+    phi:       torch.Tensor,
+    generators: torch.Tensor,
+) -> torch.Tensor:
+    """Frozen copy of the pre-task E-step pullback arithmetic."""
+    n_gen = generators.shape[0]
+    G = generators.double()
+    phi_64 = phi.double()
+    bracket = (
+        torch.einsum("aij,bjk->abik", G, G)
+        - torch.einsum("bij,ajk->abik", G, G)
+    )
+    coordinates = torch.einsum("cij,abij->abc", G, bracket)
+    structure = torch.einsum("abc,cd->abd", coordinates, gram_pinv(G))
+    ad = torch.einsum("...a,abc->...cb", phi_64, structure)
+    eye = torch.eye(n_gen, dtype=ad.dtype, device=ad.device).expand_as(ad).clone()
+    psi = eye.clone()
+    ad_power = eye.clone()
+    for k in range(1, 40):
+        ad_power = torch.einsum("...ij,...jk->...ik", ad_power, ad)
+        psi = psi + ad_power * (1.0 / float(math.factorial(k + 1)))
+    pushed = torch.einsum("...ca,cij->...aij", psi, G)
+    exp_phi = torch.linalg.matrix_exp(torch.einsum("...a,aij->...ij", phi_64, G))
+    differential = torch.einsum("...aij,...jk->...aik", pushed, exp_phi)
+    return torch.einsum("...aij,...bij->...ab", differential, differential)
+
+
+def _legacy_estep_preconditioner(
+    grad_phi:   torch.Tensor,
+    phi:        torch.Tensor,
+    generators: torch.Tensor,
+
+    *,
+    mode:       str,
+) -> torch.Tensor:
+    """Frozen copy of every pre-task E-step preconditioner route."""
+    if mode == "none":
+        return grad_phi
+    if mode == "clip":
+        norm = grad_phi.norm(dim=-1, keepdim=True)
+        return torch.where(norm > 10.0, grad_phi * (10.0 / (norm + 1e-6)), grad_phi)
+
+    def killing_inverse(local_generators: torch.Tensor) -> torch.Tensor:
+        K = local_generators.shape[-1]
+        gram = torch.einsum("aij,bij->ab", local_generators, local_generators)
+        traces = local_generators.diagonal(dim1=-2, dim2=-1).sum(-1)
+        metric = (2.0 * K * gram - 2.0 * torch.outer(traces, traces)).double()
+        metric = 0.5 * (metric + metric.transpose(-1, -2))
+        eigenvalues, eigenvectors = torch.linalg.eigh(metric)
+        eigenvalues = torch.where(
+            eigenvalues.abs() < 1e-6,
+            torch.full_like(eigenvalues, float(2 * K)),
+            eigenvalues,
+        )
+        inverse = (
+            eigenvectors * (1.0 / eigenvalues).unsqueeze(-2)
+        ) @ eigenvectors.transpose(-1, -2)
+        return inverse.to(local_generators.dtype)
+
+    if mode == "killing":
+        return torch.einsum("...a,ab->...b", grad_phi, killing_inverse(generators))
+    if mode == "killing_per_block":
+        inverse = torch.zeros(8, 8, dtype=generators.dtype, device=generators.device)
+        for block, start in ((slice(0, 4), 0), (slice(4, 8), 2)):
+            local = generators[block, start:start + 2, start:start + 2].contiguous()
+            inverse[block, block] = killing_inverse(local)
+        return torch.einsum("...a,ab->...b", grad_phi, inverse)
+
+    if mode == "pullback":
+        metric = _legacy_pullback_metric(phi, generators)
+    elif mode == "pullback_per_block":
+        metric = torch.zeros(*phi.shape[:-1], 8, 8, dtype=torch.float64, device=phi.device)
+        for block, start in ((slice(0, 4), 0), (slice(4, 8), 2)):
+            local = generators[block, start:start + 2, start:start + 2].contiguous()
+            metric[..., block, block] = _legacy_pullback_metric(phi[..., block], local)
+    else:
+        raise AssertionError(f"uncovered legacy mode {mode!r}")
+    eye = torch.eye(metric.shape[-1], dtype=metric.dtype, device=metric.device)
+    solution = torch.linalg.solve(metric + 1e-6 * eye, grad_phi.double().unsqueeze(-1))
+    return solution.squeeze(-1).to(grad_phi.dtype)
+
+
+def test_estep_preconditioner_modes_are_byte_identical_to_legacy_goldens():
+    torch.manual_seed(20260717)
+    generators = generate_glk_multihead(4, 2)
+    phi = 0.2 * torch.randn(3, 8, dtype=torch.float32)
+    grad = torch.randn(3, 8, dtype=torch.float32)
+    for mode in (
+        "none",
+        "clip",
+        "killing",
+        "killing_per_block",
+        "pullback",
+        "pullback_per_block",
+    ):
+        kwargs = {"irrep_dims": [2, 2]} if mode.endswith("per_block") else {}
+        actual = precondition_phi_gradient(
+            grad,
+            phi,
+            generators,
+            mode=mode,
+            **kwargs,
+        )
+        expected = _legacy_estep_preconditioner(grad, phi, generators, mode=mode)
+        assert torch.equal(actual, expected), mode
 
 
 def test_none_is_identity():

@@ -26,6 +26,7 @@ position-dependent alternative for the non-compact regime.
 """
 
 from collections import OrderedDict
+from dataclasses import dataclass
 import math
 import warnings
 import weakref
@@ -36,6 +37,29 @@ import torch
 from vfe3.geometry.lie_ops import gram_pinv, warn_if_basis_not_closed
 
 _PRECOND: Dict[str, Callable[..., torch.Tensor]] = {}
+
+
+@dataclass(frozen=True)
+class PullbackGroupDirectionResult:
+    v_phi:                               torch.Tensor
+    xi:                                  torch.Tensor
+    min_undamped_generalized_eigenvalue: torch.Tensor
+    undamped_generalized_condition:      torch.Tensor
+    damped_generalized_condition:        torch.Tensor
+    scaled_solve_residual:               torch.Tensor
+    series_order:                        int
+
+
+_PHI_GROUP_DIRECTIONS: Dict[str, Callable[..., PullbackGroupDirectionResult]] = {}
+
+_PHI_GROUP_MIN_SERIES_ORDER: int   = 40
+_PHI_GROUP_MAX_SERIES_ORDER: int   = 128
+_PHI_GROUP_SERIES_ORDER_STEP: int  = 8
+_PHI_GROUP_TAIL_TOL: float         = 1e-12
+_PHI_GROUP_GRAM_RIDGE: float       = 1e-6
+_PHI_GROUP_MIN_UNDAMPED_EIG: float = 1e-8
+_PHI_GROUP_MAX_DAMPED_COND: float  = 1e6
+_PHI_GROUP_SOLVE_RESIDUAL: float   = 1e-10
 
 
 def register_precond(name: str, *, override: bool = False) -> Callable:
@@ -57,6 +81,230 @@ def get_precond(name: str) -> Callable[..., torch.Tensor]:
     if name not in _PRECOND:
         raise KeyError(f"no preconditioner {name!r}; available: {sorted(_PRECOND)}")
     return _PRECOND[name]
+
+
+def register_phi_group_direction(
+    name: str,
+
+    *,
+    override: bool = False,
+) -> Callable:
+    """Register one strict M-step pullback-group direction rule."""
+    def _wrap(
+        fn: Callable[..., PullbackGroupDirectionResult],
+    ) -> Callable[..., PullbackGroupDirectionResult]:
+        if name in _PHI_GROUP_DIRECTIONS and not override:
+            raise KeyError(
+                f"phi group direction {name!r} already registered; pass override=True to replace"
+            )
+        _PHI_GROUP_DIRECTIONS[name] = fn
+        return fn
+    return _wrap
+
+
+def get_phi_group_direction(
+    name: str,
+) -> Callable[..., PullbackGroupDirectionResult]:
+    """Return a registered strict M-step pullback-group direction rule."""
+    if name not in _PHI_GROUP_DIRECTIONS:
+        raise KeyError(
+            f"no phi group direction {name!r}; available: {sorted(_PHI_GROUP_DIRECTIONS)}"
+        )
+    return _PHI_GROUP_DIRECTIONS[name]
+
+
+def pullback_group_direction(
+    grad_phi:   torch.Tensor,             # (..., n_gen) processed outer-objective covector
+    phi:        torch.Tensor,             # (..., n_gen) current chart coordinates
+    generators: torch.Tensor,             # (n_gen, K, K) registered basis
+
+    *,
+    mode:       str,
+    irrep_dims: Optional[List[int]] = None,
+) -> PullbackGroupDirectionResult:
+    """Return the strict ridge-regularized Frobenius-pullback M-step direction."""
+    return get_phi_group_direction(mode)(
+        grad_phi,
+        phi,
+        generators,
+        irrep_dims=irrep_dims,
+    )
+
+
+def _strict_structure_constants(
+    generators: torch.Tensor,             # (n_gen, K, K)
+
+    *,
+    closure_tol: float = 1e-4,
+    max_k:       int   = 12,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return certified bracket coordinates and the generator Gram in float64."""
+    K = generators.shape[-1]
+    if K > max_k:
+        raise ValueError(f"strict phi group direction: K={K} exceeds max_k={max_k}")
+    basis = generators.to(dtype=torch.float64)
+    gram = torch.einsum("aij,bij->ab", basis, basis)
+    gram_factor, info = torch.linalg.cholesky_ex(gram)
+    if bool((info != 0).any()):
+        raise ValueError("strict phi group direction requires an independent generator basis")
+    bracket = (
+        torch.einsum("aij,bjk->abik", basis, basis)
+        - torch.einsum("bij,ajk->abik", basis, basis)
+    )
+    pairings = torch.einsum("cij,abij->abc", basis, bracket)
+    n_gen = basis.shape[0]
+    coordinates = torch.cholesky_solve(
+        pairings.reshape(-1, n_gen).transpose(0, 1),
+        gram_factor,
+    ).transpose(0, 1).reshape(n_gen, n_gen, n_gen)
+    reconstructed = torch.einsum("abc,cij->abij", coordinates, basis)
+    residual = torch.linalg.matrix_norm(reconstructed - bracket, dim=(-2, -1))
+    bracket_norm = torch.linalg.matrix_norm(bracket, dim=(-2, -1))
+    relative = residual / (bracket_norm + torch.finfo(torch.float64).eps)
+    if not bool(torch.isfinite(relative).all()) or float(relative.max()) > closure_tol:
+        raise ValueError(
+            "strict phi group direction requires a bracket-closed generator span; "
+            f"relative reconstruction residual={float(relative.max()):.3e}"
+        )
+    return coordinates, gram
+
+
+def _adaptive_phi_differentials(
+    ad: torch.Tensor,                     # (..., n_gen, n_gen)
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Evaluate certified right and left trivialized exponential differentials."""
+    n_gen = ad.shape[-1]
+    eye = torch.eye(n_gen, dtype=ad.dtype, device=ad.device).expand_as(ad).clone()
+    psi_right = eye.clone()
+    psi_left = eye.clone()
+    term_right = eye.clone()
+    term_left = eye.clone()
+    norm_one = torch.linalg.matrix_norm(ad, ord=1, dim=(-2, -1))
+    norm_inf = torch.linalg.matrix_norm(ad, ord=float("inf"), dim=(-2, -1))
+    use_one = norm_one <= norm_inf
+    alpha = torch.where(use_one, norm_one, norm_inf)
+    bound_k = torch.ones_like(alpha)
+    for k in range(1, _PHI_GROUP_MAX_SERIES_ORDER):
+        term_right = torch.matmul(term_right, ad) / float(k + 1)
+        term_left = -torch.matmul(term_left, ad) / float(k + 1)
+        psi_right = psi_right + term_right
+        psi_left = psi_left + term_left
+        bound_k = bound_k * alpha / float(k + 1)
+        order = k + 1
+        if order < _PHI_GROUP_MIN_SERIES_ORDER or order % _PHI_GROUP_SERIES_ORDER_STEP:
+            continue
+        first_omitted = bound_k * alpha / float(order + 1)
+        ratio = alpha / float(order + 2)
+        tail = torch.where(
+            ratio < 1.0,
+            first_omitted / (1.0 - ratio),
+            torch.full_like(ratio, torch.inf),
+        )
+        right_one = torch.linalg.matrix_norm(psi_right, ord=1, dim=(-2, -1))
+        right_inf = torch.linalg.matrix_norm(psi_right, ord=float("inf"), dim=(-2, -1))
+        left_one = torch.linalg.matrix_norm(psi_left, ord=1, dim=(-2, -1))
+        left_inf = torch.linalg.matrix_norm(psi_left, ord=float("inf"), dim=(-2, -1))
+        right_norm = torch.where(use_one, right_one, right_inf)
+        left_norm = torch.where(use_one, left_one, left_inf)
+        right_ok = tail <= _PHI_GROUP_TAIL_TOL * torch.maximum(torch.ones_like(tail), right_norm)
+        left_ok = tail <= _PHI_GROUP_TAIL_TOL * torch.maximum(torch.ones_like(tail), left_norm)
+        if bool((right_ok & left_ok & torch.isfinite(tail)).all()):
+            return psi_right, psi_left, order
+    raise ValueError(
+        f"strict phi group differential series certificate failed by order "
+        f"{_PHI_GROUP_MAX_SERIES_ORDER}"
+    )
+
+
+def _full_pullback_group_direction(
+    grad_phi:   torch.Tensor,             # (..., n_gen)
+    phi:        torch.Tensor,             # (..., n_gen)
+    generators: torch.Tensor,             # (n_gen, K, K)
+) -> PullbackGroupDirectionResult:
+    """Compute one strict full-block pullback direction in a float64 island."""
+    phi_64 = phi.to(dtype=torch.float64)
+    grad_64 = grad_phi.to(dtype=torch.float64)
+    basis_64 = generators.to(dtype=torch.float64)
+    structure, gram = _strict_structure_constants(basis_64)
+    ad = torch.einsum("...a,abc->...cb", phi_64, structure)
+    psi_right, psi_left, series_order = _adaptive_phi_differentials(ad)
+    pushed = torch.einsum("...ca,cij->...aij", psi_right, basis_64)
+    exp_phi = torch.linalg.matrix_exp(torch.einsum("...a,aij->...ij", phi_64, basis_64))
+    differential = torch.einsum("...aij,...jk->...aik", pushed, exp_phi)
+    metric = torch.einsum("...aij,...bij->...ab", differential, differential)
+    metric = 0.5 * (metric + metric.transpose(-1, -2))
+    gram_factor, gram_info = torch.linalg.cholesky_ex(gram)
+    if bool((gram_info != 0).any()):
+        raise ValueError("strict phi group direction generator Gram factorization failed")
+    identity = torch.eye(gram.shape[-1], dtype=gram.dtype, device=gram.device)
+    gram_inverse_half = torch.linalg.solve_triangular(gram_factor, identity, upper=False)
+    whitened = torch.matmul(torch.matmul(gram_inverse_half, metric), gram_inverse_half.transpose(-1, -2))
+    undamped_eigenvalues = torch.linalg.eigvalsh(0.5 * (whitened + whitened.transpose(-1, -2)))
+    min_undamped = undamped_eigenvalues[..., 0]
+    max_undamped = undamped_eigenvalues[..., -1]
+    undamped_condition = max_undamped / min_undamped
+    damped = metric + _PHI_GROUP_GRAM_RIDGE * gram
+    damped_eigenvalues = undamped_eigenvalues + _PHI_GROUP_GRAM_RIDGE
+    damped_condition = damped_eigenvalues[..., -1] / damped_eigenvalues[..., 0]
+    factor, info = torch.linalg.cholesky_ex(damped)
+    if bool((info != 0).any()):
+        raise ValueError("strict phi group direction damped Cholesky factorization failed")
+    v_phi = torch.cholesky_solve(grad_64.unsqueeze(-1), factor).squeeze(-1)
+    residual = torch.linalg.vector_norm(
+        torch.einsum("...ab,...b->...a", damped, v_phi) - grad_64,
+        dim=-1,
+    )
+    scale = (
+        torch.linalg.matrix_norm(damped, ord=2, dim=(-2, -1))
+        * torch.linalg.vector_norm(v_phi, dim=-1)
+        + torch.linalg.vector_norm(grad_64, dim=-1)
+    )
+    scaled_residual = residual / scale.clamp_min(torch.finfo(torch.float64).tiny)
+    xi = torch.einsum("...ab,...b->...a", psi_left, v_phi)
+    finite = all(
+        bool(torch.isfinite(value).all())
+        for value in (v_phi, xi, min_undamped, undamped_condition, damped_condition, scaled_residual)
+    )
+    if not finite:
+        raise ValueError("strict phi group direction produced a nonfinite certificate")
+    return PullbackGroupDirectionResult(
+        v_phi=v_phi,
+        xi=xi,
+        min_undamped_generalized_eigenvalue=min_undamped,
+        undamped_generalized_condition=undamped_condition,
+        damped_generalized_condition=damped_condition,
+        scaled_solve_residual=scaled_residual,
+        series_order=series_order,
+    )
+
+
+@register_phi_group_direction("pullback")
+def _pullback_group_direction(
+    grad_phi:   torch.Tensor,             # (..., n_gen)
+    phi:        torch.Tensor,             # (..., n_gen)
+    generators: torch.Tensor,             # (n_gen, K, K)
+
+    *,
+    irrep_dims: Optional[List[int]] = None,
+) -> PullbackGroupDirectionResult:
+    del irrep_dims
+    return _full_pullback_group_direction(grad_phi, phi, generators)
+
+
+@register_phi_group_direction("pullback_per_block")
+def _pullback_group_direction_per_block(
+    grad_phi:   torch.Tensor,             # (..., n_gen)
+    phi:        torch.Tensor,             # (..., n_gen)
+    generators: torch.Tensor,             # (n_gen, K, K)
+
+    *,
+    irrep_dims: Optional[List[int]] = None,
+) -> PullbackGroupDirectionResult:
+    if irrep_dims is None:
+        raise ValueError("pullback_per_block requires irrep_dims")
+    if len(irrep_dims) != 1:
+        raise NotImplementedError("strict per-block pullback direction is not implemented yet")
+    return _full_pullback_group_direction(grad_phi, phi, generators)
 
 
 @register_precond("none")
