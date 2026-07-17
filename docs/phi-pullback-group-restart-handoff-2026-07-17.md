@@ -10,10 +10,10 @@ denied because the GitHub destination was not verified as trusted or private.
 Do not remove the separate investigation worktree at
 `C:\tmp\vfe3-mphi-ng-investigation-20260717`.
 
-Task 1 has a tested local implementation in
-`vfe3/geometry/phi_preconditioner.py` and
-`tests/test_phi_preconditioner.py`. It is not yet independently task-reviewed,
-so resume at the Task 1 review gate rather than dispatching Task 1 again.
+Task 1 is complete and independently approved. The restart checkpoint
+`b0bf9cb` was completed by fix commit `843b45c`; no Critical or Important
+review findings remain. Resume at Task 2 rather than dispatching or reviewing
+Task 1 again.
 
 ## Verification captured before restart
 
@@ -35,11 +35,7 @@ Machine-readable checkpoint artifacts live outside the repository at
 
 ## Resume sequence
 
-1. Read `.superpowers/sdd/progress.md`, this handoff, and the Task 1 brief.
-2. Inspect the Task 1 checkpoint commit and generate a review package from
-   `090bcfd` to that commit.
-3. Dispatch a fresh read-only Task 1 reviewer for specification compliance and
-   code quality. Fix and re-review every Critical or Important finding.
-4. Run the Task 1 geometry acceptance matrix while retaining the known stale
-   curated-geometry baseline failure as an explicit exception.
-5. Mark Task 1 complete only after review, then proceed sequentially to Task 2.
+1. Read `.superpowers/sdd/progress.md`, this handoff, and the Task 2 brief.
+2. Preserve commits `b0bf9cb` and `843b45c`; do not re-dispatch Task 1.
+3. Proceed sequentially from Task 2 using the approved Task 1 public geometry
+   interface.
