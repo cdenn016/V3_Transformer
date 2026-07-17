@@ -2411,6 +2411,8 @@ dev = [
 ]
 viz = [
     { name = "arabic-reshaper" },
+    { name = "networkx", version = "3.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "networkx", version = "3.6.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "python-bidi" },
     { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scikit-learn", version = "1.9.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -2424,6 +2426,7 @@ viz = [
 requires-dist = [
     { name = "arabic-reshaper", marker = "extra == 'viz'" },
     { name = "matplotlib" },
+    { name = "networkx", marker = "extra == 'viz'" },
     { name = "numpy" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
