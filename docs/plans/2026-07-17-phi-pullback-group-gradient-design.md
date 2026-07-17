@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-17
 
-**Status:** Approved in conversation and awaiting review of this written specification.
+**Status:** Approved after independent theory, implementation, and numerical review.
 
 ## Purpose
 
