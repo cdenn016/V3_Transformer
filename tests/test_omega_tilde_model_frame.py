@@ -171,9 +171,9 @@ def test_global_gauge_transport_gate_freezes_phi_tilde(gauge_transport: str) -> 
 
 def test_click_run_configs_expose_default_off_model_frame_controls() -> None:
     assert train_vfe3.config["s_frame_mode"] == "tied"
-    assert train_vfe3.config["m_s_phi_lr"] == 0.016
+    assert train_vfe3.config["m_s_phi_lr"] == 0.007
     assert ablation.BASELINE_CONFIG["s_frame_mode"] == "tied"
-    assert ablation.BASELINE_CONFIG["m_s_phi_lr"] == 0.016
+    assert ablation.BASELINE_CONFIG["m_s_phi_lr"] == 0.007
 
 
 def test_model_frame_sweeps_are_registered_but_inactive() -> None:

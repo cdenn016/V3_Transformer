@@ -36,7 +36,8 @@ def test_recommended_estep_and_phi_sweeps_are_registered_and_runnable() -> None:
             VFE3Config(**{**BASELINE_CONFIG, **overrides})
 
 
-def test_recommended_sweeps_remain_opt_in() -> None:
+def test_recommended_sweep_activation_matches_click_run_order() -> None:
     from ablation import SWEEP_ORDER
 
-    assert set(EXPECTED_LABELS).isdisjoint(SWEEP_ORDER)
+    assert SWEEP_ORDER == ["pos_extrapolation", "estep_depth_damping"]
+    assert {"phi_chart_control", "pos_phi_composition"}.isdisjoint(SWEEP_ORDER)

@@ -109,13 +109,13 @@ config = dict(
     #################################
     vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
     
-    embed_dim                 = 80,                  # K, total belief dim (must be divisible by n_heads)
-    n_heads                   = 8,
+    embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
+    n_heads                   = 2,
     
     max_seq_len               = 128,                 # N, context length
     
     batch_size                = 64,
-    max_steps                 = 60000,
+    max_steps                 = 15000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
@@ -136,7 +136,7 @@ config = dict(
     #        Initialization
     #################################
     mu_init_std               = 0.065,     # std of the random mean table mu_embed
-    sigma_init                = 3,         # constant initial coordinate variance (sigma_log = log of this)
+    sigma_init                = 4,         # constant initial coordinate variance (sigma_log = log of this)
     phi_scale                 = 0.06,      # std
     
     
@@ -144,13 +144,16 @@ config = dict(
     #        Encode/Decode          #
     #################################
     decode_bias               = True,     # only if use_prior_bank = False
-    use_head_mixer            = False,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
+    use_head_mixer            = True,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
                                            # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
-    
+
     use_prior_bank            = False,               # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (encode stays on the prior bank)
     decode_tau                = 0.008,
-    decode_mode               = 'diagonal_chunked',
+    decode_mode               = 'diagonal_chunked',  #"full_chunked", "diagonal_chunked", "expected_likelihood_chunked", "full", "family", "family_chunked" (family/family_chunked: divergence-consistent KL-to-prior decode, use_prior_bank=True)
+    encode_mode               = "per_token",   #"per_token_additive"
+
+
     oracle_unroll_grad        = False,
     
     #################################
@@ -162,7 +165,24 @@ config = dict(
                                               #   | "frozen" (random fixed frame: e_phi_lr=m_phi_lr=0, phi_scale kept).
                                               #   NOT transport_mode (flat vs regime_ii). docs/hypotheses/2026-06-21-hypotheses.md
     gauge_parameterization    = "phi",        # "phi" | "omega_direct" (omega_direct: live-rejected, no belief source)
-    
+    s_frame_mode              = "tied",       # "tied" | "phi_tilde" (independent model-channel gauge frame)
+
+
+    omega_retract_mode        = "lie_exp",  # omega_direct group-manifold retraction: 'lie_exp' | 'cayley'
+    omega_reflection           = "off",      # omega_direct det<0 seeding: 'off' (det>0 only) | 'init_seed' | 'metropolis'
+    omega_metropolis_temperature  = 1.0 ,   # T in the metropolis det-sign accept min(1, exp(-dF/T)); >0
+    omega_metropolis_every        = 100,       # cadence in optimizer steps for the metropolis det-sign sweep; >=1
+
+    # (counts train-loop iterations, 1:1 with optimizer steps INCLUDING under grad_accum_steps>1,
+    # which chunks intra-step -- see vfe3/train.py::train_step docstring; diverges only when a step's
+    # update is dropped by the NaN/Inf skip_step guard, see spec Sec.4)
+    omega_compact_storage        = False,     # opt-in compact (V,H,d,d)/(V,d,d) block storage (equal-block groups)
+    omega_reorth_every            = 0 ,        # SO-group re-orthogonalization cadence in M-steps (0 = off)
+    phi_reflection               = "off",      # phi-path det<0 via R*exp(phi): 'off' (default) | 'init_seed' | 'metropolis'; reuses omega_metropolis_temperature/every
+
+
+
+
     m_phi_natural_grad        = False,        # natural gradient on phi m-step
     
     m_gauge_update_rule       = "heavy_ball",       #'adam' or 'heavy_ball'
@@ -195,11 +215,15 @@ config = dict(
 
     use_cg_coupling           = False,               # so_n/sp_n only: CG cross-type coupling (bilinear, exactly
                                                      # equivariant, means-only sigma; zero-init path weights)
+    cg_covariance_mode        = "passthrough",       # CG covariance pushforward: "passthrough" (means-only, pure) |
+                                                     # "delta_full" (delta-method sigma_out=sym(J Sigma J^T); needs family="gaussian_full")
+    cg_energy_weight          = 0.0,                 # CG moment-energy regularizer (0.0 = OFF; >0 adds once
+                                                     # cg_energy_weight*mean_layers(mean_tokens D(q_post||q_pre)); needs use_cg_coupling=True)
 
     ####################################
     # Non-Flat Connection - Regime II
     ####################################
-    transport_mode            = "flat",     # "flat" (Regime-I phi-cocycle) | "regime_ii" (learned bilinear edge
+     transport_mode            = "flat",     # "flat" (Regime-I phi-cocycle) | "regime_ii" (learned bilinear edge
                                             # connection delta=mu^T W mu; gauge-invariant only at W=0; NN exception, default-off)
                                             # | "regime_ii_covariant" (Route B: gauge-COVARIANT non-flat connection
                                             # delta=M . invariant-features(q_i, Omega^0 q_j); covariant for any M; NN exception, default-off)
@@ -227,7 +251,7 @@ config = dict(
     #                Self Energy:  
     #        Sum_i alpha_i * KL(q_i||p_i)
     ######################################
-    lambda_alpha_mode          = "state_dependent",  # "constant" | "state_dependent" | "state_dependent_per_coord"
+    lambda_alpha_mode          = "state_dependent_per_coord",  # "constant" | "state_dependent" | "state_dependent_per_coord"
     lambda_h_mode              = "constant",  # "constant" | "state_dependent" (lambda_h*=c0_h/(b0_h+KL); +R_h)
     
     b0                         = 1.0,                 # state-dependent alpha shape: alpha* = c0/(b0 + D)
@@ -235,7 +259,7 @@ config = dict(
        
     lambda_alpha               = 1,          # constant self-coupling value
     lambda_h                   = 0.25,       # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
-    #lambda h ~0.25/6 = 0.04 for K=160 d=20
+
     
     b0_h                       = 1.0,        # state-dependent lambda_h shape: lambda_h* = c0_h/(b0_h + KL(s||r))
     c0_h                       = 1.0,        # state-dependent lambda_h shape (numerator); max precision c0_h/b0_h
@@ -261,13 +285,18 @@ config = dict(
     
     kappa_beta                = 1, #[1, 0.5],        # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
     kappa_gamma               = 1, #[1, 0.5],        # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
-        
-    beta_attention_prior      = "causal_alibi",        # "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
-    gamma_attention_prior     = "causal_alibi",        # model-channel prior pi^s_ij (same 7 keys): "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
+
+    learnable_kappa_beta      = False,       # learn per-head kappa_beta = exp(log_kappa_beta), init from kappa_beta above
+                                             # (t5-exception family; freezes under detach/straight_through E-step)
+    learnable_kappa_gamma     = False,       # learn per-head kappa_gamma (trains under any estimator on the scored
+                                             # lambda_gamma>0 path; under s_e_step needs an 'unroll' E-step)
+
+    beta_attention_prior      = "causal_alibi_noself",        # "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
+    gamma_attention_prior     = "causal_alibi_noself",        # model-channel prior pi^s_ij (same 7 keys): "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
 
     t5_learnable_bias         = False,           # learn the per-bucket T5 bias table b_{i-j} (sanctioned NN exception, default OFF; needs a t5_relative_bias channel)
 
-    precision_weighted_attention = True,        # down-weight high-variance keys: fold detached -log(b0 + tr Sigma_j)
+    precision_weighted_attention = False,        # down-weight high-variance keys: fold detached -log(b0 + tr Sigma_j)
                                                  # into the attention prior (diagnostic; OFF = position-only prior)
     precision_attention_b0       = 2.0,          # b0 in the per-key reliability -log(b0 + tr Sigma_j); > 0
     precision_attention_per_head = False,        # per-key reliability PER HEAD (trace over each block's coords) vs
@@ -281,15 +310,6 @@ config = dict(
     e_q_sigma_lr              = 0.001,
     e_phi_lr                  = 0.00,
 
-    #################################
-    #      Training Mechanics
-    #################################
-
-    grad_clip                 = 1.0,         # gradient clip: global L2 norm unless grad_clip_per_role; None/0.0 disables
-    grad_clip_per_role        = False,       # baseline: one global-norm clip (train_vfe3.py's ablation default is True)
-
-    skip_belief_sigma_update  = True,
-    share_refine_s_transport  = True,
 
     ####################################
     #       Model E-step LR's
@@ -299,7 +319,7 @@ config = dict(
     
     r_update_mode             = "gradient",          # "gradient" (AdamW M-step; correct under s_e_step) | "barycenter" (closed-form forward-KL centroid of s; exact M-step in the scored s_e_step=False regime)
     prior_source              = "model_channel",    # belief prior p_i: "token" or "model_channel"
-    learnable_r               = True,               # un-freeze hyper-prior centroid r (empirical-Bayes)
+    learnable_r               = False,               # un-freeze hyper-prior centroid r (empirical-Bayes)
     s_e_step                  = True,
     
     e_s_mu_lr                 = 0.85,
@@ -310,12 +330,14 @@ config = dict(
     #        Learning Rates
     #################################
         
-    m_p_mu_lr                 = 0.015,   
-    m_p_sigma_lr              = 0.0045,     
-    m_phi_lr                  = 0.015,   
+    m_p_mu_lr                 = 0.015,     #0.015
+    m_p_sigma_lr              = 0.01,
+    m_phi_lr                  = 0.01,
+
+    m_s_phi_lr                = 0.016,         # M-step LR for independent model-channel frame (phi_tilde)
     
-    weight_decay              = 0.02,
-    phi_weight_decay          = 0.05,
+    weight_decay              = 0.02,   #0.03
+    phi_weight_decay          = 0.03, #0.03
     
     min_lr                    = 0,       # absolute cosine-decay LR floor (0.0 = pure cosine)
     min_lr_frac               = 0.01,    # proportional LR floor, max(min_lr, frac*base); OFF
@@ -325,7 +347,8 @@ config = dict(
     #        and Hand-Off
     #################################
     
-    norm_type_block           = "none",              # "none" | "mahalanobis"
+    layernorm_affine          = False,
+    norm_type_block           = "none",             # "none" | "mahalanobis"
     norm_type_final           = "none",              # "none" | "mahalanobis"
     
     prior_handoff_rho         = 0,                 # 1.0 = full flow; 0.0 = priors frozen
@@ -337,7 +360,7 @@ config = dict(
     
     e_mu_q_trust              = None,
     e_sigma_q_trust           = 10.0,
-    sigma_max                 = 100.0,
+    sigma_max                 = 10.0,
     
     #################################
     #         Misc/Logging
@@ -346,12 +369,78 @@ config = dict(
         
     log_interval              = 100,       # console log every N steps (0 = off)
     eval_interval             = 1500,      # periodic validation every N steps (0 = off)
-    checkpoint_interval       = 25000,     # save a resumable checkpoint every N steps (0 = off)
+    checkpoint_interval       = 15000,     # save a resumable checkpoint every N steps (0 = off)
+
+    generate_figures          = False,     # OFF: skip the heavy-compute figure set at finalize_run (UMAP
+                                           # belief-category triptych, model/belief UMAP, belief bank, E-step
+                                           # replay, holonomy sampling) + the per-eval attention/gamma heatmaps.
+                                           # True re-enables; make_figures.py re-runs them for a trained run.
+                                           # The cheap dashboards (loss/val-ppl/holonomy/free-energy) still write.
 
     use_ema                   = False,     # EMA/Polyak averaging of the trained tables (default OFF = pure
                                            # path: model is the last SGD iterate). ON: eval/best-save/final
                                            # model use the running average s <- ema_decay*s + (1-ema_decay)*theta
     ema_decay                 = 0.95,     # EMA decay in (0,1); only read when use_ema=True
+
+    ############################################################
+    #   Tier-1/Tier-2 improvement toggles (2026-07-05)
+    #   docs/2026-07-05-improvement-ideas.md -- ALL default OFF
+    #   (byte-identical to the pre-toggle build when left as-is)
+    ############################################################
+
+    # --- E-step update rule ---
+    e_step_update             = "mm_exact",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
+                                             # coordinate minimizer at frozen beta: precision fusion in ONE
+                                             # iteration, same cost; kernel route only)
+    mm_damping                = 0.75,         # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
+
+    # --- randomized-depth E-step (recurrent-depth recipe) ---
+    randomize_e_steps         = False,       # training forwards sample T ~ Uniform{e_steps_min..e_steps_max}
+    e_steps_min               = 1,
+    e_steps_max               = 3,
+    e_steps_backprop_last     = 0,           # truncated backprop: no_grad all but the last k iterations (0 = OFF)
+    e_step_halt_tol           = None,        # eval halting: break when mean KL(q^t||q^{t-1}) < tol (None = OFF)
+
+    # --- decode / objective ---
+    decode_unigram_prior      = False,       # add kappa*log pi_v (corpus unigram, data statistic) to decode logits
+    unigram_kappa             = 1.0,         # tempering on log pi_v (1.0 = exact Bayes class prior)
+
+    # decode_mode "expected_likelihood_chunked" is also new: sigma-aware Gaussian-convolution readout
+    # log N(mu_q; mu_v, Sigma_q + Sigma_v) - select it above under use_prior_bank=True.
+    untie_decode_bank         = False,       # use_prior_bank=True only: decode reads its OWN cloned (V,K) tables
+    z_loss_weight             = 0,           # z-loss on the decode partition: w * mean(logsumexp^2) (0 = OFF)
+    sigma_weight_decay        = 0.01,           # AdamW decay for log-variance tables (None = inherit weight_decay;
+                                             # 0.0 exempts sigma from the unintended log-sigma->0 pull)
+
+    # --- attention / coupling ---
+    gamma_as_beta_prior       = True,        # fold DETACHED gamma posterior into beta's prior (h->s->p->q);
+                                             # needs lambda_gamma > 0
+    gamma_prior_weight        = 0.5,         # mixture weight w in [0,1]: pi = (1-w) softmax(B) + w gamma
+    lambda_twohop             = 0.0,         # two-hop coupling F2 = lam2 sum_ik (beta@beta)_ik KL_ik (0 = OFF;
+                                             # exact composed transport, effective depth 2 at L=1)
+    query_adaptive_tau        = False,       # per-query tau_i = tau_h (1 + c tr_h Sigma_i / d_h), detached
+    query_tau_c               = 1.0,         # strength c >= 0 (read only when query_adaptive_tau=True)
+    # New attention priors (select above): "causal_noself" / "causal_alibi_noself" mask the E_ii ~ 0
+    # self-edge attention sink (diagonal -inf except (0,0)).
+
+    # --- training mechanics ---
+    grad_clip                 = 1.0,         # gradient clip: global L2 norm unless grad_clip_per_role; None/0.0 disables
+    grad_clip_per_role        = True,        # clip grads per role (mu/sigma/phi) instead of one global norm
+                                             # (global is phi-dominated and silently rescales other roles)
+    skip_belief_sigma_update  = True,        # skip the belief-channel sigma E-step update (dead-compute ablation
+                                             # for linear-decode configs; user asserts sigma has no consumer)
+
+    # --- compute reclamation (exactness-preserving perf; default OFF) ---
+    compact_phi_block_transport  = True,
+    reuse_pairwise_kl_stats   = True,
+    transport_mean_per_head   = True,       # per-head transport_mean einsum (~n_heads x fewer FLOPs, allclose 1e-6)
+    exp_fp64_mode             = "dim",       # "dim" (long-standing: fp64 when block dim >= 20) | "norm" (fp64 only
+                                             # when clamped ||M||_F >= exp_fp64_norm_threshold; d_head=25 blocks
+                                             # currently run fp64 PERMANENTLY under "dim")
+    exp_fp64_norm_threshold   = 15.0,        # "norm" mode threshold
+    share_refine_s_transport  = True,        # build the flat transport ONCE per forward, share s-refine + belief
+                                             # E-step (+ all layers); valid on flat/e_phi_lr=0/no-rope configs
+    compile_pair_kernel       = False,       # torch.compile the closed-form pair kernel (eager fallback + warn)
 )
 
 # kl_max is the numerical safety-net clamp on EVERY divergence (KL(q||p), KL(s||r), pairwise energy),
@@ -522,7 +611,7 @@ def route_model_channel() -> List[Dict[str, Any]]:
         
         {"label": "token_prior", "route": "model_channel", "scale_knob": "model_channel",
          "overrides": {"prior_source": "token", "s_e_step": False, "learnable_r": False,
-                       "lambda_h": 0.0, "lambda_gamma": 0.0}},
+                       "lambda_h": 0.0, "lambda_gamma": 0.0, "gamma_as_beta_prior": False}},
                                         # baseline already runs the channel
     ]
 
@@ -561,9 +650,9 @@ def route_inference_l(n_layers_list: List[int]) -> List[Dict[str, Any]]:
 #
 # To add your own: call a route builder with a new grid and give it a key; add that key to CONFIG["routes"].
 ROUTES: Dict[str, List[Dict[str, Any]]] = {
-    "grow_K_GL10":   route_grow_k_fixed_block([20, 40, 60, 80, 100], block=10),
+    "grow_K_GL10":   route_grow_k_fixed_block([20, 30, 40, 50, 60, 80, 100], block=10),
     
-    "blocks_K48":    route_vary_block_fixed_k(48, [48]),
+    "blocks_K48":    route_vary_block_fixed_k(48, [3, 6, 8, 12, 24]),
     # blocks_K48 follow-up (S1 window GL(3)..GL(24)) at the current BASELINE batch_size=64 => 491.52M
     # tokens/run, the MATCHED budget that removes the 2x Chinchilla D-slice confound vs grow_K_GL10.
     # Distinct keys/tags so scaling_analysis keeps these points separate from the 245.76M blocks_K48 run.
@@ -582,8 +671,8 @@ ROUTES: Dict[str, List[Dict[str, Any]]] = {
         48, [3, 6, 8, 12, 24], tag="blocks_K48_ctrl_2x",
         extra_overrides={"encode_mode": "per_token_additive", "pos_phi": "none"}),
     
-    "grow_K":        route_grow_k([60, 80, 100], n_heads=4),
-    "grow_K_mup":    route_grow_k_mup([20, 40, 80, 100], n_heads=4, anchor_k=20),  # F1/EXP-6 (fixed vs muP)
+    "grow_K":        route_grow_k([20, 40, 60, 80, 100, 120], n_heads=4),
+    "grow_K_mup":    route_grow_k_mup([20, 40, 60, 80, 100], n_heads=4, anchor_k=20),  # F1/EXP-6 (fixed vs muP)
     "blocksize":     route_blocksize(64, [8, 4, 2]),
     "group":         route_group(64),
     "model_channel": route_model_channel(),

@@ -1517,7 +1517,7 @@ def test_scaling_rejects_integer_enum_seed_values():
 def test_every_ablation_arm_constructs_with_only_invalid_arm_prerequisites_repaired():
     assert ablation.BASELINE_CONFIG["e_step_update"] == "mm_exact"
     assert ablation.BASELINE_CONFIG["phi_precond_mode"] == "pullback_per_block"
-    assert ablation.SWEEP_ORDER == ["gamma_prior_weight", "lambda_twohop"]
+    assert ablation.SWEEP_ORDER == ["pos_extrapolation", "estep_depth_damping"]
 
     transport = dict(ablation.make_run_overrides("transport_mode"))
     assert "e_step_update" not in transport["flat"]

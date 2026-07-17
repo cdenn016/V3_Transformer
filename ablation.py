@@ -201,8 +201,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     max_seq_len               = 128,                 # N, context length
     
-    batch_size                = 64,
-    max_steps                 = 15000,
+    batch_size                = 32,
+    max_steps                 = 30000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
@@ -422,7 +422,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     m_phi_lr                  = 0.01,
     phi_mstep_max_matrix_norm = None,    # opt-in post-M-step projection bound; None leaves the chart unbounded
 
-    m_s_phi_lr                = 0.016,         # M-step LR for independent model-channel frame (phi_tilde)
+    m_s_phi_lr                = 0.007,         # M-step LR for independent model-channel frame (phi_tilde)
     
     weight_decay              = 0.02,   #0.03
     phi_weight_decay          = 0.03, #0.03
@@ -1410,7 +1410,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
 
     "m_s_phi_lr": {
         "description": "M-step LR for the independent model-channel gauge frame (phi_tilde)",
-        "param": "m_s_phi_lr", "values": [0.004, 0.008, 0.016, 0.032],
+        "param": "m_s_phi_lr", "values": [0.005, 0.0065, 0.007, 0.0075, 0.0085, 0.009, 0.01],
         "requires": {
             "gauge_parameterization": "phi",
             "phi_reflection": "off",
@@ -1484,7 +1484,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
 
       "gamma_prior_weight": {
           "description": "gamma_prior_weight",
-          "param": "gamma_prior_weight", "values": [0.0, 0.1, 0.25, 0.5, 0.75, 1],
+          "param": "gamma_prior_weight", "values": [0.4, 0.45, 0.55, 0.6],
       },
 
     "warmup_steps": {  # LR warmup length before the cosine decay (0 = no warmup, straight into cosine).
@@ -1560,10 +1560,22 @@ NON_SWEPT_FIELDS = (
 # CONFIG["sweep"]="<name>"); add or remove names to shape a session. Cheap-to-expensive is a good
 # ordering for a single GPU. Set CONFIG["list_only"]=True (with sweep=None) to print every sweep.
 SWEEP_ORDER: List[str] = [
-   "gamma_prior_weight",
+  #"component_ablation_forest",
+  #"gauge_group",
+  #"transport_mode",
+ # "gauge_equivariance",
+  "pos_extrapolation",
+  "estep_depth_damping",
+  #"e_q_mu_sigma_lr_grid",
+
+
+  #"m_s_phi_lr",
+  #"gamma_prior_weight",
   # "m_phi_lr",
   #"weight_decay",
   #"sigma_init",
+ # "s_frame_mode",
+
 
   # "m_p_mu_lr",
   # "m_p_sigma_lr",
@@ -1586,7 +1598,7 @@ SWEEP_ORDER: List[str] = [
 
 
    # "lambda_beta",
-  # "warmup_steps",
+
   #"gauge_transport",
  # "attention_entropy",
  # "gauge_equivariance",
@@ -1627,7 +1639,7 @@ SWEEP_ORDER: List[str] = [
     #"pos_phi_scale",
 
 
-   "lambda_twohop",
+   #"lambda_twohop",
   # "kappa_beta",
   # "kappa_gamma",
 

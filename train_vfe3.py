@@ -77,7 +77,7 @@ config = dict(
     #################################
     #            Training
     #################################
-    vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*)
+    vocab_size                = 50257,               # gpt2/tiktoken vocab (REQUIRED for wikitext-*/wiki-*  100277)
     
     embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
     n_heads                   = 2,
@@ -106,7 +106,7 @@ config = dict(
     #        Initialization
     #################################
     mu_init_std               = 0.065,     # std of the random mean table mu_embed
-    sigma_init                = 3,         # constant initial coordinate variance (sigma_log = log of this)
+    sigma_init                = 4,         # constant initial coordinate variance (sigma_log = log of this)
     phi_scale                 = 0.06,      # std
     
     
@@ -300,14 +300,14 @@ config = dict(
     #        Learning Rates
     #################################
         
-    m_p_mu_lr                 = 0.0125,     #0.013
+    m_p_mu_lr                 = 0.015,     #0.015
     m_p_sigma_lr              = 0.01,     
-    m_phi_lr                  = 0.010,   
+    m_phi_lr                  = 0.01,
     
-    m_s_phi_lr                = 0.016,         # M-step LR for independent model-channel frame (phi_tilde)
+    m_s_phi_lr                = 0.007,         # M-step LR for independent model-channel frame (phi_tilde)
     
-    weight_decay              = 0.02,
-    phi_weight_decay          = 0.035, #0.035
+    weight_decay              = 0.02,   #0.03
+    phi_weight_decay          = 0.03, #0.03
     
     min_lr                    = 0,       # absolute cosine-decay LR floor (0.0 = pure cosine)
     min_lr_frac               = 0.01,    # proportional LR floor, max(min_lr, frac*base); OFF
@@ -321,8 +321,8 @@ config = dict(
     norm_type_block           = "none",             # "none" | "mahalanobis"
     norm_type_final           = "none",              # "none" | "mahalanobis"
     
-    prior_handoff_rho         = 0,                 # 1.0 = full flow; 0.0 = priors frozen
-    prior_handoff_sigma       = 0,                 # sigma damping in [0,1] (0.0 = frozen at embedding)
+    prior_handoff_rho         = 1,                 # 1.0 = full flow; 0.0 = priors frozen
+    prior_handoff_sigma       = 0.1,                 # sigma damping in [0,1] (0.0 = frozen at embedding)
     
     #################################
     #        Numerical Safety
@@ -341,7 +341,7 @@ config = dict(
     eval_interval             = 1500,      # periodic validation every N steps (0 = off)
     checkpoint_interval       = 15000,     # save a resumable checkpoint every N steps (0 = off)
 
-    generate_figures          = False,     # OFF: strict opt-out for all finalization plots, plot-only
+    generate_figures          = True,      # OFF: strict opt-out for all finalization plots, plot-only
                                            # probes/model replays, and per-eval attention/gamma heatmaps.
                                            # True re-enables; make_figures.py later rebuilds the replayable
                                            # model-report, saved-probe, and persisted-history set.
@@ -378,7 +378,7 @@ config = dict(
     # log N(mu_q; mu_v, Sigma_q + Sigma_v) - select it above under use_prior_bank=True.
     untie_decode_bank         = False,       # use_prior_bank=True only: decode reads its OWN cloned (V,K) tables
     z_loss_weight             = 0,           # z-loss on the decode partition: w * mean(logsumexp^2) (0 = OFF)
-    sigma_weight_decay        = None,           # AdamW decay for log-variance tables (None = inherit weight_decay;
+    sigma_weight_decay        = 0.01,           # AdamW decay for log-variance tables (None = inherit weight_decay;
                                              # 0.0 exempts sigma from the unintended log-sigma->0 pull)
 
     # --- attention / coupling ---
