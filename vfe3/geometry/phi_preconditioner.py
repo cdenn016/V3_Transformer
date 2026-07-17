@@ -122,13 +122,19 @@ def pullback_group_direction(
     mode:       str,
     irrep_dims: Optional[List[int]] = None,
 ) -> PullbackGroupDirectionResult:
-    """Return the strict ridge-regularized Frobenius-pullback M-step direction."""
-    return get_phi_group_direction(mode)(
-        grad_phi,
-        phi,
-        generators,
-        irrep_dims=irrep_dims,
-    )
+    r"""Return the strict M-step direction in an autocast-disabled float64 island.
+
+    The chart covector is solved against the Gram-relative pullback system
+    ``(J(phi)^T J(phi) + 1e-6 B) v_phi = grad_phi`` and then converted to the
+    left-trivialized group velocity ``xi = Psi_L(ad_phi) v_phi``.
+    """
+    with torch.autocast(device_type=grad_phi.device.type, enabled=False):
+        return get_phi_group_direction(mode)(
+            grad_phi,
+            phi,
+            generators,
+            irrep_dims=irrep_dims,
+        )
 
 
 def _strict_structure_constants(
@@ -138,7 +144,12 @@ def _strict_structure_constants(
     closure_tol: float = 1e-4,
     max_k:       int   = 12,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return certified bracket coordinates and the generator Gram in float64."""
+    r"""Return certified bracket coordinates and the generator Gram in float64.
+
+    For ``B_cd = <G_c, G_d>_F`` and ``[G_a, G_b] = f_ab^c G_c``, the coordinates
+    solve ``B_cd f_ab^d = <G_c, [G_a, G_b]>_F`` through the Cholesky factor of
+    ``B``. Reconstruction of every bracket certifies closure of the span.
+    """
     K = generators.shape[-1]
     if K > max_k:
         raise ValueError(f"strict phi group direction: K={K} exceeds max_k={max_k}")
@@ -172,7 +183,13 @@ def _strict_structure_constants(
 def _adaptive_phi_differentials(
     ad: torch.Tensor,                     # (..., n_gen, n_gen)
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """Evaluate certified right and left trivialized exponential differentials."""
+    r"""Evaluate certified right and left trivialized exponential differentials.
+
+    The right series is ``Psi_R(z) = (exp(z) - 1) / z = sum z^k/(k+1)!`` and
+    the left series is ``Psi_L(z) = (1 - exp(-z)) / z = sum (-z)^k/(k+1)!``.
+    A geometric majorant for the first omitted term certifies both series at
+    candidate orders from 40 through 128.
+    """
     n_gen = ad.shape[-1]
     eye = torch.eye(n_gen, dtype=ad.dtype, device=ad.device).expand_as(ad).clone()
     psi_right = eye.clone()
@@ -221,7 +238,13 @@ def _full_pullback_group_direction(
     phi:        torch.Tensor,             # (..., n_gen)
     generators: torch.Tensor,             # (n_gen, K, K)
 ) -> PullbackGroupDirectionResult:
-    """Compute one strict full-block pullback direction in a float64 island."""
+    r"""Compute one certified full-block pullback direction.
+
+    With ``J_a = D exp_X[G_a]`` and ``M_ab = <J_a, J_b>_F``, this solves
+    ``A v_phi = grad_phi`` for ``A = sym(M) + 1e-6 B`` by Cholesky. The returned
+    group velocity is ``xi = Psi_L(ad_phi) v_phi``. Generalized eigenvalues are
+    those of ``B^{-1/2} sym(M) B^{-1/2}`` and are certified before damping.
+    """
     phi_64 = phi.to(dtype=torch.float64)
     grad_64 = grad_phi.to(dtype=torch.float64)
     basis_64 = generators.to(dtype=torch.float64)
@@ -243,9 +266,25 @@ def _full_pullback_group_direction(
     min_undamped = undamped_eigenvalues[..., 0]
     max_undamped = undamped_eigenvalues[..., -1]
     undamped_condition = max_undamped / min_undamped
+    undamped_finite = bool(torch.isfinite(undamped_eigenvalues).all())
+    if not undamped_finite or bool((min_undamped < _PHI_GROUP_MIN_UNDAMPED_EIG).any()):
+        minimum = float(min_undamped.min())
+        raise ValueError(
+            "strict phi group direction undamped generalized eigenvalue "
+            f"{minimum:.3e} is below {_PHI_GROUP_MIN_UNDAMPED_EIG:.1e}"
+        )
     damped = metric + _PHI_GROUP_GRAM_RIDGE * gram
     damped_eigenvalues = undamped_eigenvalues + _PHI_GROUP_GRAM_RIDGE
     damped_condition = damped_eigenvalues[..., -1] / damped_eigenvalues[..., 0]
+    if (
+        not bool(torch.isfinite(damped_condition).all())
+        or bool((damped_condition > _PHI_GROUP_MAX_DAMPED_COND).any())
+    ):
+        maximum = float(damped_condition.max())
+        raise ValueError(
+            "strict phi group direction damped generalized condition "
+            f"{maximum:.3e} exceeds {_PHI_GROUP_MAX_DAMPED_COND:.1e}"
+        )
     factor, info = torch.linalg.cholesky_ex(damped)
     if bool((info != 0).any()):
         raise ValueError("strict phi group direction damped Cholesky factorization failed")
@@ -260,10 +299,19 @@ def _full_pullback_group_direction(
         + torch.linalg.vector_norm(grad_64, dim=-1)
     )
     scaled_residual = residual / scale.clamp_min(torch.finfo(torch.float64).tiny)
+    if (
+        not bool(torch.isfinite(scaled_residual).all())
+        or bool((scaled_residual > _PHI_GROUP_SOLVE_RESIDUAL).any())
+    ):
+        maximum = float(scaled_residual.max())
+        raise ValueError(
+            "strict phi group direction scaled solve residual "
+            f"{maximum:.3e} exceeds {_PHI_GROUP_SOLVE_RESIDUAL:.1e}"
+        )
     xi = torch.einsum("...ab,...b->...a", psi_left, v_phi)
     finite = all(
         bool(torch.isfinite(value).all())
-        for value in (v_phi, xi, min_undamped, undamped_condition, damped_condition, scaled_residual)
+        for value in (v_phi, xi, undamped_condition)
     )
     if not finite:
         raise ValueError("strict phi group direction produced a nonfinite certificate")
@@ -300,11 +348,109 @@ def _pullback_group_direction_per_block(
     *,
     irrep_dims: Optional[List[int]] = None,
 ) -> PullbackGroupDirectionResult:
+    r"""Solve each direct-sum block independently and aggregate global extrema.
+
+    For ``g = direct_sum_h g_h``, each local system is
+    ``A_h v_h = grad_h``. The global generalized condition is
+    ``max_h(lambda_max,h) / min_h(lambda_min,h)`` rather than the largest local
+    condition, while the solve certificate is the maximum local residual.
+    """
     if irrep_dims is None:
         raise ValueError("pullback_per_block requires irrep_dims")
-    if len(irrep_dims) != 1:
-        raise NotImplementedError("strict per-block pullback direction is not implemented yet")
-    return _full_pullback_group_direction(grad_phi, phi, generators)
+    if len(irrep_dims) == 1:
+        return _full_pullback_group_direction(grad_phi, phi, generators)
+    if any(d <= 0 for d in irrep_dims) or sum(irrep_dims) != generators.shape[-1]:
+        raise ValueError("pullback_per_block requires positive irrep_dims summing to K")
+
+    block_of = _generator_block_index(generators, irrep_dims)
+    grad_64 = grad_phi.to(dtype=torch.float64)
+    phi_64 = phi.to(dtype=torch.float64)
+    v_phi = torch.zeros_like(grad_64)
+    xi = torch.zeros_like(grad_64)
+    local_results = []
+    start = 0
+    for block, dimension in enumerate(irrep_dims):
+        index = (block_of == block).nonzero(as_tuple=True)[0]
+        if index.numel() == 0:
+            raise ValueError(f"pullback_per_block block {block} has no generators")
+        local_basis = generators[index][
+            :,
+            start:start + dimension,
+            start:start + dimension,
+        ].contiguous()
+        local = _full_pullback_group_direction(
+            grad_64[..., index],
+            phi_64[..., index],
+            local_basis,
+        )
+        v_phi = v_phi.index_copy(-1, index, local.v_phi)
+        xi = xi.index_copy(-1, index, local.xi)
+        local_results.append(local)
+        start += dimension
+
+    local_min_undamped = torch.stack(
+        [result.min_undamped_generalized_eigenvalue for result in local_results],
+        dim=0,
+    )
+    local_max_undamped = torch.stack(
+        [
+            result.min_undamped_generalized_eigenvalue
+            * result.undamped_generalized_condition
+            for result in local_results
+        ],
+        dim=0,
+    )
+    min_undamped = local_min_undamped.amin(dim=0)
+    max_undamped = local_max_undamped.amax(dim=0)
+    undamped_condition = max_undamped / min_undamped
+    if (
+        not bool(torch.isfinite(min_undamped).all())
+        or bool((min_undamped < _PHI_GROUP_MIN_UNDAMPED_EIG).any())
+    ):
+        minimum = float(min_undamped.min())
+        raise ValueError(
+            "strict phi group direction undamped generalized eigenvalue "
+            f"{minimum:.3e} is below {_PHI_GROUP_MIN_UNDAMPED_EIG:.1e}"
+        )
+
+    local_min_damped = local_min_undamped + _PHI_GROUP_GRAM_RIDGE
+    local_max_damped = local_max_undamped + _PHI_GROUP_GRAM_RIDGE
+    damped_condition = local_max_damped.amax(dim=0) / local_min_damped.amin(dim=0)
+    if (
+        not bool(torch.isfinite(damped_condition).all())
+        or bool((damped_condition > _PHI_GROUP_MAX_DAMPED_COND).any())
+    ):
+        maximum = float(damped_condition.max())
+        raise ValueError(
+            "strict phi group direction damped generalized condition "
+            f"{maximum:.3e} exceeds {_PHI_GROUP_MAX_DAMPED_COND:.1e}"
+        )
+
+    scaled_residual = torch.stack(
+        [result.scaled_solve_residual for result in local_results],
+        dim=0,
+    ).amax(dim=0)
+    if (
+        not bool(torch.isfinite(scaled_residual).all())
+        or bool((scaled_residual > _PHI_GROUP_SOLVE_RESIDUAL).any())
+    ):
+        maximum = float(scaled_residual.max())
+        raise ValueError(
+            "strict phi group direction scaled solve residual "
+            f"{maximum:.3e} exceeds {_PHI_GROUP_SOLVE_RESIDUAL:.1e}"
+        )
+
+    if not all(bool(torch.isfinite(value).all()) for value in (v_phi, xi, undamped_condition)):
+        raise ValueError("strict phi group direction produced a nonfinite certificate")
+    return PullbackGroupDirectionResult(
+        v_phi=v_phi,
+        xi=xi,
+        min_undamped_generalized_eigenvalue=min_undamped,
+        undamped_generalized_condition=undamped_condition,
+        damped_generalized_condition=damped_condition,
+        scaled_solve_residual=scaled_residual,
+        series_order=max(result.series_order for result in local_results),
+    )
 
 
 @register_precond("none")

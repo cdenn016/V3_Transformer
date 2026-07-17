@@ -84,6 +84,21 @@ def _pullback_oracle(
     return differential, metric, left_coordinates
 
 
+def _strict_series_pullback(
+    phi:       torch.Tensor,
+    generators: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the strict kernel's actual right differential and pullback metric."""
+    structure, _ = phi_preconditioner._strict_structure_constants(generators)
+    ad = torch.einsum("a,abc->cb", phi, structure)
+    psi_right, _, _ = phi_preconditioner._adaptive_phi_differentials(ad)
+    pushed = torch.einsum("ca,cij->aij", psi_right, generators)
+    X = torch.einsum("a,aij->ij", phi, generators)
+    differential = torch.einsum("aij,jk->aik", pushed, torch.linalg.matrix_exp(X))
+    metric = torch.einsum("aij,bij->ab", differential, differential)
+    return differential, metric
+
+
 def _gl_chart_fixture(
     kind: str,
     norm: float,
@@ -122,6 +137,20 @@ def _gl_chart_fixture(
 def test_pullback_group_differentials_match_augmented_exp_oracle(kind, norm):
     phi, generators = _gl_chart_fixture(kind, norm)
     differential, metric, left_coordinates = _pullback_oracle(phi, generators)
+    actual_differential, actual_metric = _strict_series_pullback(phi, generators)
+    differential_error = (
+        torch.linalg.matrix_norm(
+            (actual_differential - differential).reshape(generators.shape[0], -1)
+        )
+        / torch.linalg.matrix_norm(differential.reshape(generators.shape[0], -1)).clamp_min(1.0)
+    )
+    direct_metric_error = (
+        torch.linalg.matrix_norm(actual_metric - metric)
+        / torch.linalg.matrix_norm(metric).clamp_min(1.0)
+    )
+    assert differential_error <= 1e-9
+    assert direct_metric_error <= 1e-9
+
     gram = torch.einsum("aij,bij->ab", generators, generators)
     damped = metric + 1e-6 * gram
     n_gen = generators.shape[0]
@@ -194,6 +223,237 @@ def test_pullback_group_adaptive_series_rejects_uncertified_chart():
             generators,
             mode="pullback",
         )
+
+
+def test_pullback_group_direction_matches_cholesky_oracle_and_residual():
+    generators = generate_glk(2).double()
+    generators = generators * torch.tensor([0.5, 1.0, 1.5, 2.0]).view(-1, 1, 1)
+    phi = torch.tensor([0.1, -0.2, 0.15, -0.05], dtype=torch.float64)
+    grad = torch.tensor([0.7, -0.3, 0.2, 0.9], dtype=torch.float64)
+    _, metric, _ = _pullback_oracle(phi, generators)
+    gram = torch.einsum("aij,bij->ab", generators, generators)
+    damped = 0.5 * (metric + metric.transpose(-1, -2)) + 1e-6 * gram
+    factor, info = torch.linalg.cholesky_ex(damped)
+    assert not bool((info != 0).any())
+    expected = torch.cholesky_solve(grad.unsqueeze(-1), factor).squeeze(-1)
+
+    result = pullback_group_direction(grad, phi, generators, mode="pullback")
+
+    relative_error = (
+        torch.linalg.vector_norm(result.v_phi - expected)
+        / torch.linalg.vector_norm(expected).clamp_min(1.0)
+    )
+    assert relative_error <= 1e-8
+    assert result.scaled_solve_residual <= 1e-10
+
+
+def _gl2_rotation_chart(theta: float) -> tuple[torch.Tensor, torch.Tensor]:
+    generators = generate_glk(2).double()
+    phi = torch.tensor([0.0, -theta, theta, 0.0], dtype=torch.float64)
+    return phi, generators
+
+
+def test_pullback_group_rejects_gl2_rotation_pi_singularity_before_ridge():
+    phi, generators = _gl2_rotation_chart(math.pi)
+    with pytest.raises(ValueError, match="undamped generalized eigenvalue"):
+        pullback_group_direction(
+            torch.ones(4, dtype=torch.float64),
+            phi,
+            generators,
+            mode="pullback",
+        )
+
+
+def test_pullback_group_undamped_regularity_threshold_is_stable():
+    failing_phi, generators = _gl2_rotation_chart(math.pi - 3e-4)
+    with pytest.raises(ValueError, match="undamped generalized eigenvalue"):
+        pullback_group_direction(
+            torch.ones(4, dtype=torch.float64),
+            failing_phi,
+            generators,
+            mode="pullback",
+        )
+
+    passing_phi, _ = _gl2_rotation_chart(math.pi - 4.5e-4)
+    result = pullback_group_direction(
+        torch.ones(4, dtype=torch.float64),
+        passing_phi,
+        generators,
+        mode="pullback",
+    )
+    assert result.min_undamped_generalized_eigenvalue >= 1e-8
+    assert result.damped_generalized_condition <= 1e6
+
+
+def test_pullback_group_direction_rejects_damped_condition_above_limit():
+    generators = generate_glk(2).double()
+    phi = torch.tensor(
+        [5.0 / math.sqrt(2.0), 0.0, 0.0, -5.0 / math.sqrt(2.0)],
+        dtype=torch.float64,
+    )
+    _, metric, _ = _pullback_oracle(phi, generators)
+    eigenvalues = torch.linalg.eigvalsh(0.5 * (metric + metric.transpose(-1, -2)))
+    assert eigenvalues[0] >= 1e-8
+    assert (eigenvalues[-1] + 1e-6) / (eigenvalues[0] + 1e-6) > 1e6
+    with pytest.raises(ValueError, match="damped generalized condition"):
+        pullback_group_direction(
+            torch.ones(4, dtype=torch.float64),
+            phi,
+            generators,
+            mode="pullback",
+        )
+
+
+def test_pullback_group_direction_rejects_scaled_solve_residual_above_limit(monkeypatch):
+    original = torch.cholesky_solve
+    call_count = 0
+
+    def inaccurate_solve(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        result = original(*args, **kwargs)
+        if call_count == 2:
+            result = result + 1e-4
+        return result
+
+    monkeypatch.setattr(torch, "cholesky_solve", inaccurate_solve)
+    with pytest.raises(ValueError, match="scaled solve residual"):
+        pullback_group_direction(
+            torch.ones(4, dtype=torch.float64),
+            torch.zeros(4, dtype=torch.float64),
+            generate_glk(2).double(),
+            mode="pullback",
+        )
+
+
+def test_pullback_group_left_trivialization_satisfies_u_xi_equals_dexp_v():
+    generators = generate_glk(2).double()
+    phi = torch.tensor([0.25, -0.4, 0.15, -0.2], dtype=torch.float64)
+    grad = torch.tensor([0.6, -0.2, 0.3, 0.8], dtype=torch.float64)
+    result = pullback_group_direction(grad, phi, generators, mode="pullback")
+    X = torch.einsum("a,aij->ij", phi, generators)
+    H_v = torch.einsum("a,aij->ij", result.v_phi, generators)
+    U = torch.linalg.matrix_exp(X)
+    target = _augmented_matrix_exp_differential(X, H_v)
+    actual = U @ torch.einsum("a,aij->ij", result.xi, generators)
+    opposite_sign = U @ torch.einsum("a,aij->ij", -result.xi, generators)
+    relative_residual = (
+        torch.linalg.matrix_norm(actual - target)
+        / torch.linalg.matrix_norm(target).clamp_min(1.0)
+    )
+    opposite_residual = (
+        torch.linalg.matrix_norm(opposite_sign - target)
+        / torch.linalg.matrix_norm(target).clamp_min(1.0)
+    )
+    assert relative_residual <= 1e-9
+    assert opposite_residual > 1e-3
+
+
+def test_pullback_group_per_block_matches_two_independent_gl5_solves_without_full_structure_constants(
+    monkeypatch,
+):
+    torch.manual_seed(20260717)
+    generators = generate_glk_multihead(10, 2).double()
+    grad = torch.randn(50, dtype=torch.float64)
+    phi = 0.03 * torch.randn(50, dtype=torch.float64)
+    local_generators = generate_glk(5).double()
+    expected = [
+        pullback_group_direction(
+            grad[start:start + 25],
+            phi[start:start + 25],
+            local_generators,
+            mode="pullback",
+        )
+        for start in (0, 25)
+    ]
+    original = phi_preconditioner._strict_structure_constants
+    seen_dimensions = []
+
+    def reject_full_k10(local_basis, **kwargs):
+        dimension = local_basis.shape[-1]
+        seen_dimensions.append(dimension)
+        if dimension == 10:
+            raise AssertionError("full K10 structure constants must not be constructed")
+        return original(local_basis, **kwargs)
+
+    monkeypatch.setattr(phi_preconditioner, "_strict_structure_constants", reject_full_k10)
+    result = pullback_group_direction(
+        grad,
+        phi,
+        generators,
+        mode="pullback_per_block",
+        irrep_dims=[5, 5],
+    )
+
+    assert seen_dimensions == [5, 5]
+    assert torch.allclose(result.v_phi, torch.cat([item.v_phi for item in expected]), atol=1e-10)
+    assert torch.allclose(result.xi, torch.cat([item.xi for item in expected]), atol=1e-10)
+    min_undamped = torch.stack(
+        [item.min_undamped_generalized_eigenvalue for item in expected]
+    ).min(dim=0).values
+    max_undamped = torch.stack(
+        [
+            item.min_undamped_generalized_eigenvalue
+            * item.undamped_generalized_condition
+            for item in expected
+        ]
+    ).max(dim=0).values
+    min_damped = torch.stack(
+        [item.min_undamped_generalized_eigenvalue + 1e-6 for item in expected]
+    ).min(dim=0).values
+    max_damped = torch.stack(
+        [
+            (item.min_undamped_generalized_eigenvalue + 1e-6)
+            * item.damped_generalized_condition
+            for item in expected
+        ]
+    ).max(dim=0).values
+    assert torch.allclose(result.min_undamped_generalized_eigenvalue, min_undamped)
+    assert torch.allclose(result.undamped_generalized_condition, max_undamped / min_undamped)
+    assert torch.allclose(result.damped_generalized_condition, max_damped / min_damped)
+    assert torch.allclose(
+        result.scaled_solve_residual,
+        torch.stack([item.scaled_solve_residual for item in expected]).max(dim=0).values,
+    )
+    assert result.series_order == max(item.series_order for item in expected)
+
+
+def test_pullback_group_rejects_nonclosed_generator_span():
+    generators = torch.tensor(
+        [
+            [[0.0, 1.0], [0.0, 0.0]],
+            [[0.0, 0.0], [1.0, 0.0]],
+        ],
+        dtype=torch.float64,
+    )
+    with pytest.raises(ValueError, match="bracket-closed"):
+        pullback_group_direction(
+            torch.ones(2, dtype=torch.float64),
+            torch.zeros(2, dtype=torch.float64),
+            generators,
+            mode="pullback",
+        )
+
+
+def test_pullback_group_direction_disables_autocast_in_strict_float64_island(monkeypatch):
+    original = phi_preconditioner._strict_structure_constants
+    autocast_states = []
+
+    def record_autocast_state(local_basis, **kwargs):
+        autocast_states.append(torch.is_autocast_enabled(local_basis.device.type))
+        assert local_basis.dtype == torch.float64
+        return original(local_basis, **kwargs)
+
+    monkeypatch.setattr(phi_preconditioner, "_strict_structure_constants", record_autocast_state)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        result = pullback_group_direction(
+            torch.ones(4, dtype=torch.float32),
+            torch.zeros(4, dtype=torch.float32),
+            generate_glk(2),
+            mode="pullback",
+        )
+    assert autocast_states == [False]
+    assert result.v_phi.dtype == torch.float64
 
 
 def _legacy_pullback_metric(
