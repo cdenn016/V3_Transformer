@@ -45,12 +45,18 @@ import os
 if os.environ.get("VFE3_ALLOW_DUPLICATE_OPENMP") == "1":
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+import ast
 import copy
 import csv
 import gc
+import hashlib
 import json
 import logging
 import math
+import shutil
+import stat
+import subprocess
+import sys
 import time
 from collections.abc import Mapping
 from dataclasses import asdict, fields as dataclass_fields
@@ -75,12 +81,14 @@ from vfe3.metrics import (
     rank_one_residual,
 )
 from vfe3.model.model import VFEModel
-from vfe3.path_utils import filesystem_slug
+from vfe3.path_utils import filesystem_slug, portable_path_component_key
+from vfe3.process_utils import run_process_tree
 from vfe3.run_artifacts import (
     RunArtifacts,
     _atomic_replace,
-    _git_code_identity,
+    _pure_path_report,
     _unique_sibling_temp,
+    _verified_process_code_identity,
     _write_json_atomic,
     finalize_validation_run,
     semantic_config_fingerprint,
@@ -93,10 +101,79 @@ from vfe3.viz.extract import (
     converged_state,
     per_unit_eval_nats,
 )
-from vfe3.viz.specs import FigureSpec, emit_registered_figures
-from vfe3.viz.sweep_adapters import ablation_forest_kwargs, lr_grid_heatmap_kwargs
-
 logger = logging.getLogger("ablation")
+_ABLATION_FIGURE_TIMEOUT_SECONDS = 2 * 60 * 60
+_RESERVED_SWEEP_NAMES = {"figures", "__sensitivity__"}
+_RESERVED_SWEEP_KEYS = {
+    portable_path_component_key(name, field="reserved sweep name")
+    for name in _RESERVED_SWEEP_NAMES
+}
+_DECLARATIVE_ABLATION_NAMES = {
+    "BASELINE_CONFIG",
+    "CONFIG",
+    "DATA_SEED",
+    "SWEEPS",
+    "SWEEP_ORDER",
+}
+
+
+def _assignment_root_name(target: ast.expr) -> Optional[str]:
+    """Return the root name assigned by one top-level assignment target."""
+    while isinstance(target, (ast.Attribute, ast.Subscript)):
+        target = target.value
+    return target.id if isinstance(target, ast.Name) else None
+
+
+def _is_declarative_ablation_statement(statement: ast.stmt) -> bool:
+    """Whether a top-level statement changes only registry/config data bound elsewhere."""
+    if isinstance(statement, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        return any(
+            _assignment_root_name(target) in _DECLARATIVE_ABLATION_NAMES
+            for target in targets
+        )
+    return False
+
+
+def _ablation_runner_source_sha256() -> str:
+    r"""Hash executable runner logic while excluding separately contracted declarations."""
+    source_path = Path(__file__).resolve()
+    tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+    tree.body = [
+        statement
+        for statement in tree.body
+        if not _is_declarative_ablation_statement(statement)
+    ]
+    payload = ast.dump(tree, annotate_fields=True, include_attributes=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+_PROCESS_ABLATION_RUNNER_SHA256 = _ablation_runner_source_sha256()
+
+
+def _verified_ablation_runner_source_sha256() -> str:
+    """Return the import-time runner identity or fail after executable runner logic changes."""
+    current = _ablation_runner_source_sha256()
+    if current != _PROCESS_ABLATION_RUNNER_SHA256:
+        raise RuntimeError(
+            "ablation runner logic changed after this Python process imported it; restart the "
+            "Spyder kernel before starting another sweep"
+        )
+    return _PROCESS_ABLATION_RUNNER_SHA256
+
+
+def _git_code_identity() -> Dict[str, object]:
+    r"""Return the exact imported-package and runner-logic identity for ablation contracts.
+
+    The legacy name remains as a monkeypatch seam. Sweep values, order, baseline, output policy, and
+    data seed are excluded here because their effective values are already bound explicitly by the
+    aggregation or per-cell contract. This lets an edit that only adds a sweep value tack onto the
+    prior compatible cohort without treating the declaration edit itself as model-code drift.
+    """
+    return {
+        "package_code_sha256":  _verified_process_code_identity(),
+        "ablation_runner_sha256": _verified_ablation_runner_source_sha256(),
+    }
 
 
 # DATA_SEED (EXP-1 variance floor), mirroring train_vfe3.DATA_SEED: when set to an int, the TRAIN
@@ -743,6 +820,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # entropy term; __post_init__ does not auto-enable the oracle for entropy=False).
         "description": "attention-entropy canonical vs surrogate, kappa in {1.0, 0.25}, on the oracle [C1/EXP-4]",
         "collect_diagnostics": True,
+        "required_diagnostics": ["cov_gap"],
         "requires": {"e_step_update": "gradient"},
         "seeds": [6, 64, 23],                                # I1: across-seed error bar (esp. the low-kappa gap)
         "configs": [
@@ -760,6 +838,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # full-cov certificate -- ~eps for the tied arm, climbing for the untied one.
         "description": "tied (exact) vs untied (head-mixer drift) gauge equivariance, full cov [A2/EXP-9]",
         "collect_diagnostics": True,
+        "required_diagnostics": ["builder_resid"],
         "requires": {"e_step_update": "gradient"},
         # s_e_step=False: the live model-channel E-step is diagonal-only (s/r tables are diagonal by
         # construction) and rejects family='gaussian_full', which EXP-9 requires (the covariance break
@@ -936,6 +1015,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # Omega across depth).
         "description": "prior-anchoring (lambda_alpha x rho x e_phi_lr) vs rank collapse, r(X) by depth [F2/EXP-7]",
         "collect_diagnostics": True,
+        "required_diagnostics": ["rank_resid_by_layer"],
         "configs": [
             {"label": "anchor_rho1",      "lambda_alpha": 1.0,  "prior_handoff_rho": 1.0,
              "lambda_alpha_mode": "constant", "n_layers": 4, "e_phi_lr": 0.0},
@@ -965,6 +1045,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # saturation; the figure measures offset extrapolation, not the bucket horizon).
         "description": "positional extrapolation: offset (alibi/t5) vs absolute (learned/rope), eval @ growing N [H1/EXP-13]",
         "collect_extrapolation": True,
+        "min_extrapolation_points": 2,
         "requires": {
             "oracle_unroll_grad": True,
             "max_seq_len":        128,
@@ -1611,6 +1692,16 @@ def _swept_field_names(sweep: Dict[str, Any]) -> List[str]:
     return names
 
 
+def _validated_sweep_name(value: object) -> str:
+    """Return one safe, non-reserved output-directory component for a sweep."""
+    if not isinstance(value, str):
+        raise ValueError(f"sweep name is unsafe or reserved: {value!r}")
+    key = portable_path_component_key(value, field="sweep name")
+    if key in _RESERVED_SWEEP_KEYS:
+        raise ValueError(f"sweep name is unsafe or reserved: {value!r}")
+    return value
+
+
 def validate_sweeps(sweep_names: List[str]) -> None:
     r"""Abort unless every named arm references real fields and constructs against the baseline.
 
@@ -1619,8 +1710,15 @@ def validate_sweeps(sweep_names: List[str]) -> None:
     that pre-filtered, vanish and make every cell identical). Catching it once at startup
     turns a subtle "this parameter has no effect" result into an immediate, named error.
     """
+    portable_names: Dict[str, str] = {}
     offenders: List[Tuple[str, str]] = []
     for name in sweep_names:
+        validated = _validated_sweep_name(name)
+        key = portable_path_component_key(validated, field="sweep name")
+        prior = portable_names.get(key)
+        if prior is not None and prior != validated:
+            raise ValueError(f"sweep names {prior!r} and {validated!r} alias on a portable filesystem")
+        portable_names[key] = validated
         sweep = SWEEPS[name]
         if "configs" not in sweep and "param" not in sweep:
             raise ValueError(f"sweep {name!r} declares neither 'param'/'values' nor 'configs'")
@@ -1635,7 +1733,14 @@ def validate_sweeps(sweep_names: List[str]) -> None:
         )
     construction_errors: List[Tuple[str, str, str]] = []
     for name in sweep_names:
-        for label, overrides in make_run_overrides(name):
+        runs = make_run_overrides(name)
+        labels = [label for label, _overrides in runs]
+        if any(not isinstance(label, str) or not label for label in labels):
+            raise ValueError(f"sweep {name!r} has a non-string or empty label")
+        duplicate_labels = sorted({label for label in labels if labels.count(label) > 1})
+        if duplicate_labels:
+            raise ValueError(f"sweep {name!r} has duplicate expanded label(s): {duplicate_labels}")
+        for label, overrides in runs:
             cfg = dict(BASELINE_CONFIG)
             cfg.update(overrides)
             try:
@@ -1786,6 +1891,16 @@ def _cell_cfg_dict(
     return d
 
 
+def _gauge_reporting_fields(cfg: VFE3Config) -> Dict[str, object]:
+    """Return the executable gauge-purity classification carried by every ablation row."""
+    report = _pure_path_report(cfg, [])
+    return {
+        "head_mixer_compatibility":    cfg.head_mixer_compatibility,
+        "head_mixer_gauge_compatible": bool(cfg.head_mixer_gauge_compatible),
+        "on_gauge_pure_path":          bool(report["on_gauge_pure_path"]),
+    }
+
+
 @torch.no_grad()
 def _cell_diagnostics(
     model:   VFEModel,
@@ -1830,7 +1945,16 @@ def _cell_diagnostics(
     _probe("attn_entropy", lambda: attention_entropy(cstate["beta"]))
 
     def _omega_identity_dev() -> torch.Tensor:
-        omega = cstate["omega"]                               # (N, N, K, K)
+        omega = cstate["omega"]
+        if not isinstance(omega, torch.Tensor):
+            to_dense = getattr(omega, "to_dense_omega", None)
+            if not callable(to_dense):
+                raise TypeError(
+                    "omega identity diagnostics require a tensor or an explicit dense converter"
+                )
+            omega = to_dense()
+        if not isinstance(omega, torch.Tensor) or omega.ndim < 4:
+            raise TypeError("omega identity diagnostics require (..., N, N, K, K) transport")
         n, k = omega.shape[0], omega.shape[-1]
         off = ~torch.eye(n, dtype=torch.bool, device=omega.device)
         eye = torch.eye(k, device=omega.device, dtype=omega.dtype)
@@ -2031,6 +2155,7 @@ def run_single(
         "max_tokens":           (int(max_tokens) if max_tokens is not None else None),
         "_loaded_data_sources": loaded_data_sources,
     }
+    result.update(_gauge_reporting_fields(cfg))
     result.update(terminal_result)                           # primary/final/best/terminal_checkpoint headline
 
     # PB-07 opt-in: publish the per-token validation nats (the paired within-run bootstrap the
@@ -2095,7 +2220,8 @@ def _cleanup() -> None:
 _CSV_COLUMNS = [
     "sweep", "label", "error_kind", "primary_val_ppl", "final_val_ppl",
     "final_val_ce", "final_val_bits_per_token", "final_val_bpc", "best_val_ppl", "final_train_loss",
-    "n_params",
+    "n_params", "head_mixer_compatibility", "head_mixer_gauge_compatible",
+    "on_gauge_pure_path",
     # opt-in per-cell converged-state diagnostics (S2; empty unless the sweep sets collect_diagnostics)
     "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in", "gauge_resid_out",
     "rank_resid", "cov_gap", "energy_klmax_frac",
@@ -2109,9 +2235,25 @@ _DIAGNOSTIC_RESULT_KEYS = {
     "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in", "gauge_resid_out",
     "rank_resid", "rank_resid_by_layer", "cov_gap", "energy_klmax_frac",
 }
+_BASE_REQUIRED_DIAGNOSTIC_KEYS = {
+    "attn_entropy",
+    "energy_klmax_frac",
+    "gauge_resid_in",
+    "gauge_resid_out",
+    "omega_identity_dev",
+    "rank_resid",
+}
 
 
-_CELL_CONTRACT_SCHEMA_VERSION = 1
+_CELL_CONTRACT_SCHEMA_VERSION = 3
+_SWEEP_AGGREGATION_CONTRACT_SCHEMA_VERSION = 4
+_ABLATION_CELL_OWNER_SCHEMA_VERSION = 1
+_ABLATION_CELL_OWNER_FILENAME = "ablation_cell_owner.json"
+_SWEEP_DIAGNOSTIC_FLAG_KEYS = {
+    "collect_diagnostics",
+    "collect_extrapolation",
+    "paired_token_bootstrap",
+}
 
 
 def _require_exact_seed(value: object, field: str) -> int:
@@ -2222,11 +2364,21 @@ def _loader_ablation_source_identities(
 
 
 def _validated_ablation_code_identity(value: object) -> Dict[str, object]:
-    """Return one detached, usable Git identity for an ablation invocation."""
+    """Return one detached, usable source identity for an ablation invocation."""
     if not isinstance(value, Mapping):
         raise TypeError("ablation code identity must be a mapping")
     detached = json.loads(json.dumps(
         dict(value), sort_keys=True, ensure_ascii=False, allow_nan=False))
+    if set(detached) == {"package_code_sha256", "ablation_runner_sha256"}:
+        for field in ("package_code_sha256", "ablation_runner_sha256"):
+            digest = detached[field]
+            if (not isinstance(digest, str) or len(digest) != 64
+                    or any(character not in "0123456789abcdef" for character in digest)):
+                raise ValueError(f"ablation code identity {field} is not a SHA-256 digest")
+        return detached
+
+    # Legacy shape remains accepted for persisted-fixture and direct-API compatibility. A current
+    # production contract uses the two source digests above, so a legacy cohort never equals it.
     git_sha = detached.get("git_sha")
     git_dirty = detached.get("git_dirty")
     fingerprint = detached.get("git_dirty_fingerprint")
@@ -2238,6 +2390,253 @@ def _validated_ablation_code_identity(value: object) -> Dict[str, object]:
     return detached
 
 
+def _validated_diagnostic_flags(value: object) -> Dict[str, bool]:
+    """Validate the three invocation-wide artifact requests bound into every cell contract."""
+    if not isinstance(value, Mapping) or set(value) != _SWEEP_DIAGNOSTIC_FLAG_KEYS:
+        raise ValueError(
+            "ablation diagnostic flags must contain exactly collect_diagnostics, "
+            "collect_extrapolation, and paired_token_bootstrap"
+        )
+    if any(type(value[key]) is not bool for key in _SWEEP_DIAGNOSTIC_FLAG_KEYS):
+        raise TypeError("ablation diagnostic flags must be exact booleans")
+    return {key: bool(value[key]) for key in sorted(_SWEEP_DIAGNOSTIC_FLAG_KEYS)}
+
+
+def _validated_required_diagnostic_keys(value: object) -> List[str]:
+    """Return a unique, sorted list of diagnostic marker fields required for completion."""
+    if not isinstance(value, (list, tuple)):
+        raise TypeError("required diagnostic keys must be a list or tuple")
+    keys = list(value)
+    if (any(not isinstance(key, str) or key not in _DIAGNOSTIC_RESULT_KEYS for key in keys)
+            or len(set(keys)) != len(keys)):
+        raise ValueError("required diagnostic keys must be unique known result fields")
+    return sorted(keys)
+
+
+def _validated_min_extrapolation_points(value: object) -> int:
+    """Return the exact non-negative number of finite distinct-N extrapolation points required."""
+    if type(value) is not int or value < 0:
+        raise ValueError("min_extrapolation_points must be an exact non-negative integer")
+    return value
+
+
+def _validated_seed_design(value: object) -> List[int]:
+    """Return the sorted, unique model-seed panel used for cross-sweep comparisons."""
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError("ablation seed design must be a non-empty list or tuple")
+    seeds = [_require_exact_seed(seed, "seed_design") for seed in value]
+    if len(seeds) != len(set(seeds)):
+        raise ValueError("ablation seed design must not contain duplicates")
+    return sorted(seeds)
+
+
+def _baseline_semantic_config_fingerprint(max_steps: Optional[int]) -> str:
+    """Fingerprint the effective unswept operating point independently of model seed."""
+    cfg = VFE3Config(**_cell_cfg_dict({}, seed=0, max_steps=max_steps))
+    return semantic_config_fingerprint(asdict(cfg))
+
+
+def _sweep_required_outputs(sweep: Mapping[str, object]) -> Tuple[List[str], int]:
+    """Resolve the output-completeness profile declared by one sweep."""
+    collect_diagnostics = bool(sweep.get("collect_diagnostics", False))
+    extra = sweep.get("required_diagnostics", ())
+    required = _validated_required_diagnostic_keys(extra)
+    if collect_diagnostics:
+        required = sorted(set(required) | _BASE_REQUIRED_DIAGNOSTIC_KEYS)
+    elif required:
+        raise ValueError("required_diagnostics needs collect_diagnostics=True")
+
+    collect_extrapolation = bool(sweep.get("collect_extrapolation", False))
+    default_points = 2 if collect_extrapolation else 0
+    minimum = _validated_min_extrapolation_points(
+        sweep.get("min_extrapolation_points", default_points)
+    )
+    if collect_extrapolation and minimum < 2:
+        raise ValueError("collect_extrapolation requires at least two extrapolation points")
+    if not collect_extrapolation and minimum:
+        raise ValueError("min_extrapolation_points needs collect_extrapolation=True")
+    return required, minimum
+
+
+def _requested_outputs_are_complete(
+    result: Mapping[str, object],
+
+    *,
+    required_diagnostic_keys: Sequence[str],
+    min_extrapolation_points: int,
+) -> bool:
+    """Whether one result contains every finite output promised by its sweep contract."""
+    try:
+        required = _validated_required_diagnostic_keys(required_diagnostic_keys)
+        minimum = _validated_min_extrapolation_points(min_extrapolation_points)
+    except (TypeError, ValueError):
+        return False
+    for key in required:
+        value = result.get(key)
+        if key == "rank_resid_by_layer":
+            if not isinstance(value, list) or len(value) < 2:
+                return False
+            try:
+                if any(not math.isfinite(float(item)) for item in value):
+                    return False
+            except (TypeError, ValueError):
+                return False
+            continue
+        try:
+            if not math.isfinite(float(value)):
+                return False
+        except (TypeError, ValueError):
+            return False
+    if minimum == 0:
+        return True
+    curve = result.get("extrap_ce")
+    if not isinstance(curve, list) or len(curve) < minimum:
+        return False
+    seen_n = set()
+    for point in curve:
+        if not isinstance(point, Mapping):
+            return False
+        n = point.get("n")
+        if type(n) is not int or n <= 0 or n in seen_n:
+            return False
+        seen_n.add(n)
+        try:
+            ce = float(point["ce"])
+            ppl = float(point["ppl"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not math.isfinite(ce) or not math.isfinite(ppl) or ppl <= 0.0:
+            return False
+    return True
+
+
+def _validated_sweep_aggregation_contract(value: object) -> Dict[str, object]:
+    """Return one normalized invocation contract for cross-cell scientific aggregation."""
+    if not isinstance(value, Mapping):
+        raise TypeError("sweep aggregation contract must be a mapping")
+    required = {
+        "schema_version",
+        "baseline_semantic_config_fingerprint",
+        "seed_design",
+        "dataset",
+        "device",
+        "tokenizer_tag",
+        "data_seed_override",
+        "max_tokens",
+        "max_steps",
+        "source_identities",
+        "code_identity",
+        "diagnostic_flags",
+        "required_diagnostic_keys",
+        "min_extrapolation_points",
+    }
+    if set(value) != required:
+        raise ValueError("sweep aggregation contract has missing or unknown fields")
+    if value.get("schema_version") != _SWEEP_AGGREGATION_CONTRACT_SCHEMA_VERSION:
+        raise ValueError("unsupported sweep aggregation contract schema")
+    baseline_fingerprint = value.get("baseline_semantic_config_fingerprint")
+    if (not isinstance(baseline_fingerprint, str) or len(baseline_fingerprint) != 64
+            or any(character not in "0123456789abcdefABCDEF" for character in baseline_fingerprint)):
+        raise ValueError("ablation baseline semantic config fingerprint must be a SHA-256 digest")
+    seed_design = _validated_seed_design(value.get("seed_design"))
+    dataset = value.get("dataset")
+    device = value.get("device")
+    tokenizer_tag = value.get("tokenizer_tag")
+    if not isinstance(dataset, str) or not dataset:
+        raise ValueError("sweep aggregation dataset must be a non-empty string")
+    if not isinstance(device, str) or not device:
+        raise ValueError("sweep aggregation device must be a non-empty string")
+    if not isinstance(tokenizer_tag, str) or not tokenizer_tag:
+        raise ValueError("sweep aggregation tokenizer_tag must be a non-empty string")
+
+    data_seed_override = value.get("data_seed_override")
+    if data_seed_override is not None:
+        data_seed_override = _require_exact_seed(data_seed_override, "data_seed_override")
+    max_tokens = value.get("max_tokens")
+    if max_tokens is not None and (type(max_tokens) is not int or max_tokens < 0):
+        raise ValueError("sweep aggregation max_tokens must be an exact non-negative integer or null")
+    max_steps = value.get("max_steps")
+    if max_steps is not None and (type(max_steps) is not int or max_steps <= 0):
+        raise ValueError("sweep aggregation max_steps must be an exact positive integer or null")
+
+    diagnostic_flags = _validated_diagnostic_flags(value.get("diagnostic_flags"))
+    required_diagnostic_keys = _validated_required_diagnostic_keys(
+        value.get("required_diagnostic_keys")
+    )
+    min_extrapolation_points = _validated_min_extrapolation_points(
+        value.get("min_extrapolation_points")
+    )
+    if diagnostic_flags["collect_diagnostics"] != bool(required_diagnostic_keys):
+        raise ValueError("diagnostic collection and required keys are inconsistent")
+    if diagnostic_flags["collect_extrapolation"]:
+        if min_extrapolation_points < 2:
+            raise ValueError("extrapolation collection requires at least two points")
+    elif min_extrapolation_points != 0:
+        raise ValueError("unrequested extrapolation cannot require output points")
+
+    return {
+        "schema_version":     _SWEEP_AGGREGATION_CONTRACT_SCHEMA_VERSION,
+        "baseline_semantic_config_fingerprint": baseline_fingerprint.lower(),
+        "seed_design":        seed_design,
+        "dataset":            dataset,
+        "device":             device,
+        "tokenizer_tag":      tokenizer_tag,
+        "data_seed_override": data_seed_override,
+        "max_tokens":         max_tokens,
+        "max_steps":          max_steps,
+        "source_identities":  _validated_ablation_source_identities(
+            value.get("source_identities")
+        ),
+        "code_identity":      _validated_ablation_code_identity(value.get("code_identity")),
+        "diagnostic_flags":   diagnostic_flags,
+        "required_diagnostic_keys": required_diagnostic_keys,
+        "min_extrapolation_points": min_extrapolation_points,
+    }
+
+
+def _sweep_aggregation_contract(
+    dataset:          str,
+    diagnostic_flags: Mapping[str, bool],
+
+    *,
+    data_seed_override: Optional[int],
+    max_tokens:        Optional[int],
+    max_steps:         Optional[int],
+    seed_design:       Sequence[int],
+    source_identities: Mapping[str, object],
+    code_identity:     Mapping[str, object],
+    device:            str = "cpu",
+    required_diagnostic_keys: Optional[Sequence[str]] = None,
+    min_extrapolation_points: Optional[int]           = None,
+) -> Dict[str, object]:
+    """Build the common invocation identity under which unlike labels, values, and seeds compare."""
+    flags = _validated_diagnostic_flags(diagnostic_flags)
+    required_keys = _validated_required_diagnostic_keys(
+        (_BASE_REQUIRED_DIAGNOSTIC_KEYS if flags["collect_diagnostics"] else ())
+        if required_diagnostic_keys is None else required_diagnostic_keys
+    )
+    minimum = _validated_min_extrapolation_points(
+        (2 if flags["collect_extrapolation"] else 0)
+        if min_extrapolation_points is None else min_extrapolation_points
+    )
+    return _validated_sweep_aggregation_contract({
+        "schema_version":     _SWEEP_AGGREGATION_CONTRACT_SCHEMA_VERSION,
+        "baseline_semantic_config_fingerprint": _baseline_semantic_config_fingerprint(max_steps),
+        "seed_design":        list(seed_design),
+        "dataset":            dataset,
+        "device":             device,
+        "tokenizer_tag":      _tokenizer_tag(dataset),
+        "data_seed_override": data_seed_override,
+        "max_tokens":         max_tokens,
+        "max_steps":          max_steps,
+        "source_identities":  source_identities,
+        "code_identity":      code_identity,
+        "diagnostic_flags":   flags,
+        "required_diagnostic_keys": required_keys,
+        "min_extrapolation_points": minimum,
+    })
+
+
 def _cell_contract(
     cfg:              VFE3Config,
     dataset:          str,
@@ -2245,10 +2644,13 @@ def _cell_contract(
 
     *,
     data_seed:         int,
+    device:            str                          = "cpu",
     max_tokens:        Optional[int]                  = None,
     cache_dir:         Optional[Path]                 = None,
     source_identities: Optional[Mapping[str, object]] = None,
     code_identity:     Optional[Mapping[str, object]] = None,
+    required_diagnostic_keys: Optional[Sequence[str]] = None,
+    min_extrapolation_points: Optional[int]           = None,
 ) -> Dict[str, object]:
     r"""Build the versioned contract that authorizes reuse of one ablation cell.
 
@@ -2262,6 +2664,8 @@ def _cell_contract(
     absent, which the caller converts into "forbid reuse" rather than a stale hit.
     """
     data_seed = _require_exact_seed(data_seed, "data_seed")
+    if not isinstance(device, str) or not device:
+        raise ValueError("ablation cell device must be a non-empty string")
     sources = (
         _ablation_source_identities(dataset, cache_dir=cache_dir)
         if source_identities is None
@@ -2272,17 +2676,85 @@ def _cell_contract(
         if code_identity is None
         else _validated_ablation_code_identity(code_identity)
     )
+    flags = _validated_diagnostic_flags(diagnostic_flags)
+    required_keys = _validated_required_diagnostic_keys(
+        (_BASE_REQUIRED_DIAGNOSTIC_KEYS if flags["collect_diagnostics"] else ())
+        if required_diagnostic_keys is None else required_diagnostic_keys
+    )
+    minimum = _validated_min_extrapolation_points(
+        (2 if flags["collect_extrapolation"] else 0)
+        if min_extrapolation_points is None else min_extrapolation_points
+    )
+    if flags["collect_diagnostics"] != bool(required_keys):
+        raise ValueError("diagnostic collection and required keys are inconsistent")
+    if flags["collect_extrapolation"] != (minimum >= 2):
+        raise ValueError("extrapolation collection and minimum output points are inconsistent")
     return {
         "schema_version":              _CELL_CONTRACT_SCHEMA_VERSION,
         "semantic_config_fingerprint": semantic_config_fingerprint(asdict(cfg)),
         "dataset":                     dataset,
+        "device":                      device,
         "data_seed":                   data_seed,
         "max_tokens":                  int(max_tokens) if max_tokens is not None else None,
         "tokenizer_tag":               _tokenizer_tag(dataset),
         "train_source":                sources["train"],
         "validation_source":           sources["validation"],
         "code_identity":               code,
-        "diagnostic_flags":            dict(sorted(diagnostic_flags.items())),
+        "diagnostic_flags":            flags,
+        "required_diagnostic_keys":    required_keys,
+        "min_extrapolation_points":    minimum,
+    }
+
+
+def _expected_cell_contract_from_aggregation(
+    result:               Mapping[str, object],
+    aggregation_contract: Mapping[str, object],
+) -> Tuple[Dict[str, object], Dict[str, object]]:
+    """Reconstruct one adjacent row's exact cell contract under the current common cohort."""
+    aggregation = _validated_sweep_aggregation_contract(aggregation_contract)
+    overrides = result.get("overrides")
+    if not isinstance(overrides, Mapping):
+        raise TypeError("ablation result overrides must be a mapping")
+    seed = _require_exact_seed(result.get("seed"), "ablation result seed")
+    if seed not in aggregation["seed_design"]:
+        raise ValueError("ablation result seed is outside the sweep aggregation seed design")
+    cfg = VFE3Config(**_cell_cfg_dict(
+        dict(overrides),
+        seed=seed,
+        max_steps=aggregation["max_steps"],
+    ))
+    data_seed_override = aggregation["data_seed_override"]
+    contract = _cell_contract(
+        cfg,
+        str(aggregation["dataset"]),
+        aggregation["diagnostic_flags"],
+        data_seed=(seed if data_seed_override is None else int(data_seed_override)),
+        device=str(aggregation["device"]),
+        max_tokens=aggregation["max_tokens"],
+        source_identities=aggregation["source_identities"],
+        code_identity=aggregation["code_identity"],
+        required_diagnostic_keys=aggregation["required_diagnostic_keys"],
+        min_extrapolation_points=int(aggregation["min_extrapolation_points"]),
+    )
+    contract["tokenizer_tag"] = aggregation["tokenizer_tag"]
+    return contract, _gauge_reporting_fields(cfg)
+
+
+def _gauge_purity_summary(results: List[Dict[str, Any]]) -> Dict[str, object]:
+    """Summarize row-level gauge classifications without collapsing mixed sweeps into a pure claim."""
+    classifications = {
+        str(result["label"]): str(result["head_mixer_compatibility"])
+        for result in results
+    }
+    return {
+        "classifications_by_label": classifications,
+        "contains_independent_head_nonintertwiner": any(
+            value == "independent_head_nonintertwiner"
+            for value in classifications.values()
+        ),
+        "all_rows_on_gauge_pure_path": bool(results) and all(
+            result.get("on_gauge_pure_path") is True for result in results
+        ),
     }
 
 
@@ -2292,10 +2764,13 @@ def _expected_cell_contract_or_none(
     diagnostic_flags: Mapping[str, bool],
     *,
     seed:              int,
+    device:            str                              = "cpu",
     max_steps:         Optional[int]                  = None,
     max_tokens:        Optional[int]                  = None,
     source_identities: Optional[Mapping[str, object]] = None,
     code_identity:     Optional[Mapping[str, object]] = None,
+    required_diagnostic_keys: Optional[Sequence[str]] = None,
+    min_extrapolation_points: Optional[int]           = None,
 ) -> Optional[Dict[str, object]]:
     r"""Build the reuse contract inside the per-cell failure boundary, else forbid reuse.
 
@@ -2317,13 +2792,58 @@ def _expected_cell_contract_or_none(
             dataset,
             diagnostic_flags,
             data_seed=data_seed,
+            device=device,
             max_tokens=max_tokens,
             source_identities=source_identities,
             code_identity=code_identity,
+            required_diagnostic_keys=required_diagnostic_keys,
+            min_extrapolation_points=min_extrapolation_points,
         )
     except Exception as exc:                                  # unbuildable config / unhashable corpus
         logger.warning("  [contract unavailable -> reuse forbidden] %s", exc)
         return None
+
+
+def _terminal_checkpoint_identity(
+    run_dir: Path,
+    marker:  Mapping[str, object],
+) -> Optional[Dict[str, object]]:
+    """Return the owned terminal checkpoint's immutable identity, or ``None`` if unsafe."""
+    raw_path = marker.get("terminal_checkpoint")
+    if not isinstance(raw_path, str) or not raw_path:
+        return None
+    root = run_dir.resolve()
+    raw = Path(raw_path)
+    candidates = [raw] if raw.is_absolute() else [raw, run_dir / raw]
+    for candidate in candidates:
+        try:
+            if candidate.is_symlink() or _path_is_junction(candidate):
+                continue
+            resolved = candidate.resolve(strict=True)
+            relative = resolved.relative_to(root)
+            if not relative.parts or not resolved.is_file():
+                continue
+            if any(part in {"", ".", ".."} for part in relative.parts):
+                continue
+            return {
+                "terminal_checkpoint_relpath":    relative.as_posix(),
+                "terminal_checkpoint_sha256":     _sha256_file(resolved),
+                "terminal_checkpoint_size_bytes": resolved.stat().st_size,
+            }
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _terminal_checkpoint_is_current(
+    run_dir: Path,
+    marker:  Mapping[str, object],
+) -> bool:
+    """Revalidate a published terminal checkpoint's location and exact bytes on every reuse."""
+    current = _terminal_checkpoint_identity(run_dir, marker)
+    if current is None:
+        return False
+    return all(marker.get(key) == value for key, value in current.items())
 
 
 def _cell_is_current(
@@ -2356,6 +2876,14 @@ def _cell_is_current(
     except (KeyError, TypeError, ValueError):
         return False
     if not math.isfinite(terminal_ppl):
+        return False
+    if not _requested_outputs_are_complete(
+        marker,
+        required_diagnostic_keys=expected_contract.get("required_diagnostic_keys", ()),
+        min_extrapolation_points=expected_contract.get("min_extrapolation_points", 0),
+    ):
+        return False
+    if not _terminal_checkpoint_is_current(run_dir, marker):
         return False
     contract_path = run_dir / "cell_contract.json"
     if not contract_path.exists():                           # legacy dir / never-published contract
@@ -2435,32 +2963,57 @@ def _sanitize(label: str) -> str:
 
 
 def _write_sweep_csv(sweep_dir: Path, results: List[Dict[str, Any]]) -> None:
-    r"""Rewrite ``sweep_results.csv`` as the complete frame (fixed columns; missing keys blank)."""
-    with open(sweep_dir / "sweep_results.csv", "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=_CSV_COLUMNS, extrasaction="ignore")
-        writer.writeheader()
-        for r in results:
-            writer.writerow({k: r.get(k, "") for k in _CSV_COLUMNS})
+    r"""Atomically replace ``sweep_results.csv`` with one complete fixed-column frame."""
+    final_path = sweep_dir / "sweep_results.csv"
+    with _unique_sibling_temp(final_path) as temporary_path:
+        with open(temporary_path, "w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=_CSV_COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            for result in results:
+                writer.writerow({key: result.get(key, "") for key in _CSV_COLUMNS})
+        _atomic_replace(final_path, temporary_path)
 
 
-def _collect_sweep_results(sweep_dir: Path) -> List[Dict[str, Any]]:
-    r"""The union of every persisted cell under ``sweep_dir`` (each ``*/ablation_result.json``).
+def _collect_sweep_results(
+    sweep_dir: Path,
 
-    This is what makes a re-run "tack on": every cell label maps to its own subdirectory, so a
-    sweep re-run with a DIFFERENT value list (e.g. ``kappa_beta=0.5,2.2,3.7`` after ``1,2,3,4``) writes
-    new cell dirs alongside the old ones, and this union picks up all of them. Re-running the SAME
-    label overwrites that one marker while the others persist, so the union is additive and never
-    subtracts (to drop a point, delete its cell directory). ``sorted`` keeps CSV row order
-    deterministic. Unreadable, non-object, failed, errored, and nonfinite-terminal markers are
-    skipped rather than entering the analysis frame.
+    *,
+    aggregation_contract: Optional[Mapping[str, object]] = None,
+) -> List[Dict[str, Any]]:
+    r"""Collect only successful cells whose full contracts belong to one invocation cohort.
+
+    Labels and swept values may differ. Every row is nevertheless reconstructed from the cohort's
+    common code, corpus, tokenizer, token budget, diagnostic requests, and baseline plus that row's
+    own overrides and seed. A base label is retained only with exactly one admitted row for every
+    seed in the cohort's declared panel. Missing, malformed, fingerprint-mismatched, adjacent, or
+    seed-incomplete contracts are excluded before CSV publication, plotting, or winner selection.
     """
+    if aggregation_contract is None:
+        try:
+            meta = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8"))
+            aggregation_contract = meta["aggregation_contract"]
+        except Exception:
+            return []
+    try:
+        aggregation = _validated_sweep_aggregation_contract(aggregation_contract)
+    except (TypeError, ValueError):
+        return []
+
     results: List[Dict[str, Any]] = []
     for marker in sorted(sweep_dir.glob("*/ablation_result.json")):
+        run_dir = marker.parent
+        if not _cell_dir_is_owned(sweep_dir, run_dir):
+            continue
         try:
             result = json.loads(marker.read_text(encoding="utf-8"))
         except Exception:                                       # unreadable marker -> skip
             continue
         if not isinstance(result, Mapping):
+            continue
+        label = result.get("label")
+        if (not isinstance(label, str) or not label
+                or result.get("sweep") != sweep_dir.name
+                or run_dir.name != _sanitize(label)):
             continue
         if result.get("status") != "success" or result.get("error_kind") is not None:
             continue
@@ -2470,8 +3023,244 @@ def _collect_sweep_results(sweep_dir: Path) -> List[Dict[str, Any]]:
             continue
         if not math.isfinite(terminal_ppl):
             continue
+        try:
+            expected_contract, gauge_fields = _expected_cell_contract_from_aggregation(
+                result,
+                aggregation,
+            )
+        except Exception:
+            continue
+        if not _cell_is_current(run_dir, expected_contract):
+            continue
+        if not _paired_token_artifact_is_current(
+            run_dir,
+            required=bool(aggregation["diagnostic_flags"]["paired_token_bootstrap"]),
+        ):
+            continue
+        if any(result.get(key) != value for key, value in gauge_fields.items()):
+            continue
         results.append(dict(result))
-    return results
+
+    required_seeds = set(aggregation["seed_design"])
+    panels: Dict[str, List[Dict[str, Any]]] = {}
+    for result in results:
+        panels.setdefault(_base_label(str(result["label"])), []).append(result)
+    complete_bases = {
+        base
+        for base, members in panels.items()
+        if (
+            len(members) == len(required_seeds)
+            and {member["seed"] for member in members} == required_seeds
+        )
+    }
+    return [
+        result
+        for result in results
+        if _base_label(str(result["label"])) in complete_bases
+    ]
+
+
+def _path_is_junction(path: Path) -> bool:
+    """Return whether ``path`` is any Windows reparse point, including pre-3.12 junctions."""
+    probe = getattr(os.path, "isjunction", None)
+    if probe is not None and probe(path):
+        return True
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    try:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except OSError:
+        return False
+    return bool(reparse_flag and attributes & reparse_flag)
+
+
+def _cell_dir_is_owned(sweep_dir: Path, run_dir: Path) -> bool:
+    """Return true only for a real direct child directory that cannot redirect cleanup elsewhere."""
+    try:
+        return bool(
+            run_dir.parent == sweep_dir
+            and run_dir.is_dir()
+            and not run_dir.is_symlink()
+            and not _path_is_junction(run_dir)
+            and run_dir.resolve().parent == sweep_dir.resolve()
+        )
+    except OSError:
+        return False
+
+
+def _prepare_owned_output_child(root: Path, name: str, *, role: str) -> Path:
+    """Create or validate one real direct-child directory under an explicit output root."""
+    if not isinstance(name, str) or not name or name in {".", ".."}:
+        raise ValueError(f"{role} name must be one non-empty path component")
+    component = Path(name)
+    if component.name != name or component.is_absolute() or component.drive:
+        raise ValueError(f"{role} name must be one safe path component: {name!r}")
+
+    root.mkdir(parents=True, exist_ok=True)
+    if not root.is_dir():
+        raise ValueError(f"{role} output root is not a directory: {root}")
+    child = root / name
+    if child.is_symlink() or _path_is_junction(child):
+        raise ValueError(f"{role} directory may not be a symlink, junction, or reparse point")
+    if child.exists() and not child.is_dir():
+        raise ValueError(f"{role} path exists but is not a directory: {child}")
+    child.mkdir(parents=False, exist_ok=True)
+    if not _cell_dir_is_owned(root, child):
+        raise ValueError(f"{role} directory resolves outside its output root")
+    return child
+
+
+def _ablation_cell_owner_payload(
+    sweep_name: str,
+    label:      str,
+    seed:       int,
+) -> Dict[str, object]:
+    """Return the exact versioned identity that authorizes destructive cell cleanup."""
+    if type(sweep_name) is not str or not sweep_name:
+        raise ValueError("ablation cell ownership sweep must be a nonempty string")
+    if type(label) is not str or not label:
+        raise ValueError("ablation cell ownership label must be a nonempty string")
+    return {
+        "schema_version": _ABLATION_CELL_OWNER_SCHEMA_VERSION,
+        "sweep":          sweep_name,
+        "label":          label,
+        "seed":           _require_exact_seed(seed, "ablation cell ownership seed"),
+    }
+
+
+def _read_regular_json_mapping(path: Path, *, role: str) -> Dict[str, object]:
+    """Read one direct regular, non-reparse JSON object or fail without following a redirect."""
+    if path.is_symlink() or _path_is_junction(path) or not path.is_file():
+        raise ValueError(f"{role} must be a regular non-reparse file")
+    try:
+        if path.resolve(strict=True).parent != path.parent.resolve(strict=True):
+            raise ValueError(f"{role} resolves outside its cell directory")
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{role} is unreadable") from exc
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{role} must contain a JSON object")
+    return dict(value)
+
+
+def _authorize_ablation_cell_cleanup(
+    run_dir:    Path,
+    sweep_name: str,
+    label:      str,
+    seed:       int,
+) -> Path:
+    r"""Validate existing ownership or promote one exact legacy marker before any overwrite.
+
+    An empty cell receives a fresh sentinel. A nonempty cell must already carry that exact sentinel,
+    except that a pre-sentinel generation may be promoted once from its regular result marker when
+    label, seed, and any present sweep field match this invocation exactly. Malformed or mismatched
+    state never authorizes cleanup.
+    """
+    expected = _ablation_cell_owner_payload(sweep_name, label, seed)
+    owner_path = run_dir / _ABLATION_CELL_OWNER_FILENAME
+    children = list(run_dir.iterdir())
+    if not children:
+        _write_json_atomic(owner_path, expected)
+        return owner_path
+
+    owner_present = (
+        owner_path.exists()
+        or owner_path.is_symlink()
+        or _path_is_junction(owner_path)
+    )
+    if owner_present:
+        owner = _read_regular_json_mapping(
+            owner_path,
+            role="ablation cell ownership sentinel",
+        )
+        exact_owner = (
+            set(owner) == set(expected)
+            and type(owner.get("schema_version")) is int
+            and type(owner.get("sweep")) is str
+            and type(owner.get("label")) is str
+            and type(owner.get("seed")) is int
+            and owner == expected
+        )
+        if not exact_owner:
+            raise ValueError(
+                "ablation cell ownership sentinel does not match the requested sweep, label, and seed"
+            )
+        return owner_path
+
+    marker_path = run_dir / "ablation_result.json"
+    try:
+        legacy = _read_regular_json_mapping(
+            marker_path,
+            role="legacy ablation cell ownership marker",
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "nonempty ablation cell has no valid ownership sentinel or promotable legacy marker"
+        ) from exc
+    if (
+        legacy.get("label") != label
+        or type(legacy.get("seed")) is not int
+        or legacy.get("seed") != seed
+        or ("sweep" in legacy and legacy.get("sweep") != sweep_name)
+    ):
+        raise ValueError(
+            "legacy ablation cell ownership marker does not match the requested sweep, label, and seed"
+        )
+    _write_json_atomic(owner_path, expected)
+    return owner_path
+
+
+def _start_owned_cell_generation(
+    sweep_dir: Path,
+    run_dir:   Path,
+
+    *,
+    sweep_name: str,
+    label:      str,
+    seed:       int,
+) -> None:
+    r"""Invalidate the old marker, then empty only this owned cell directory before recomputation.
+
+    A matching resume never calls this helper. Before any existing file is overwritten, a versioned
+    sentinel must bind the directory to this exact sweep, label, and seed; one regular legacy result
+    marker may establish that ownership once. Writing the ``running`` marker then makes a partial
+    cleanup or process crash non-reportable. Every other direct child except the sentinel is removed,
+    preventing optional artifacts, figures, and checkpoints from a prior owned generation from
+    surviving beside the new one. Symlinks and junctions are removed as links and never traversed.
+    """
+    if run_dir.parent != sweep_dir:
+        raise ValueError("ablation cell directory must be a direct child of its sweep directory")
+    if run_dir.exists() and (run_dir.is_symlink() or _path_is_junction(run_dir)):
+        raise ValueError("ablation cell directory may not be a symlink or junction")
+    if run_dir.exists() and not run_dir.is_dir():
+        raise ValueError("ablation cell path exists but is not a directory")
+    run_dir.mkdir(parents=False, exist_ok=True)
+    if not _cell_dir_is_owned(sweep_dir, run_dir):
+        raise ValueError("ablation cell directory resolves outside its sweep directory")
+
+    owner_path = _authorize_ablation_cell_cleanup(
+        run_dir,
+        sweep_name,
+        label,
+        seed,
+    )
+    marker = run_dir / "ablation_result.json"
+    _write_json_atomic(marker, {
+        "status": "running",
+        "sweep":  sweep_name,
+        "label":  label,
+        "seed":   seed,
+    })
+    for child in list(run_dir.iterdir()):
+        if child in {marker, owner_path}:
+            continue
+        if child.is_symlink():
+            child.unlink()
+        elif _path_is_junction(child):
+            child.rmdir()
+        elif child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
 
 
 def _invalidate_code_drifted_cells(
@@ -2518,21 +3307,24 @@ def run_sweep(
     max_steps:   Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     r"""Run every cell of one sweep; per-cell failures are isolated so the sweep completes."""
+    sweep_name = _validated_sweep_name(sweep_name)
     sweep = SWEEPS[sweep_name]
     cell_seeds = _validated_sweep_seeds(sweep, seed)
-    _validated_data_seed_override()
-    try:
-        invocation_code_identity = _validated_ablation_code_identity(_git_code_identity())
-    except Exception as exc:
-        logger.error("  [pre-sweep code identity unavailable -> sweep aborted] %s", exc)
-        return []
-    contract_code_identity: Mapping[str, object] = invocation_code_identity
-    sweep_dir = output_dir / sweep_name
-    sweep_dir.mkdir(parents=True, exist_ok=True)
+    data_seed_override = _validated_data_seed_override()
+    sweep_dir = _prepare_owned_output_child(output_dir, sweep_name, role="ablation sweep")
     runs = make_run_overrides(sweep_name)
+    run_labels = [label for label, _overrides in runs]
+    if any(not isinstance(label, str) or not label for label in run_labels):
+        raise ValueError(f"sweep {sweep_name!r} has a non-string or empty label")
+    duplicate_labels = sorted({label for label in run_labels if run_labels.count(label) > 1})
+    if duplicate_labels:
+        raise ValueError(
+            f"sweep {sweep_name!r} has duplicate expanded label(s): {duplicate_labels}"
+        )
     collect_diagnostics    = bool(sweep.get("collect_diagnostics", False))
     collect_extrapolation  = bool(sweep.get("collect_extrapolation", False))
     paired_token_bootstrap = bool(sweep.get("paired_token_bootstrap", False))
+    required_diagnostic_keys, min_extrapolation_points = _sweep_required_outputs(sweep)
     # Multi-seed (I1/EXP-1): a sweep may declare ``seeds`` to replicate every cell across seeds for an
     # across-seed error bar. Each (cell, seed) gets its own ``{label}__s{seed}`` run dir and result row
     # (the seed also lives in the existing ``seed`` column), so the across-seed aggregate is a plain
@@ -2541,6 +3333,54 @@ def run_sweep(
     multiseed = "seeds" in sweep
     cells = [((f"{label}__s{s}" if multiseed else label), overrides, s)
              for (label, overrides) in runs for s in cell_seeds]
+
+    report_metadata = {
+        "paired_token_bootstrap": paired_token_bootstrap,
+        "required_diagnostic_keys": required_diagnostic_keys,
+        "min_extrapolation_points": min_extrapolation_points,
+        "forest_baseline_label":  sweep.get("forest_baseline_label"),
+        "grid_x":                 sweep.get("grid_x"),
+        "grid_y":                 sweep.get("grid_y"),
+        "grid_x_values":          sweep.get("grid_x_values"),
+        "grid_y_values":          sweep.get("grid_y_values"),
+        "grid_baseline":          (list(sweep["grid_baseline"])
+                                   if sweep.get("grid_baseline") is not None else None),
+    }
+    running_meta = {
+        "sweep_name":              sweep_name,
+        "description":             sweep["description"],
+        "n_runs":                  len(cells),
+        "n_successful_requested":  0,
+        "failed_requested_labels": [label for label, _overrides, _seed in cells],
+        "dataset":                 dataset,
+        "device":                  str(device),
+        "seed":                    (cell_seeds if multiseed else seed),
+        "timestamp":               time.strftime("%Y-%m-%d %H:%M:%S"),
+        "status":                  "running",
+        "error":                   None,
+        "aggregation_contract":    None,
+        "gauge_purity":            _gauge_purity_summary([]),
+        **report_metadata,
+    }
+    # Invalidate any prior complete view before even the invocation identity probes run. Cell
+    # artifacts remain available for exact-contract resume, but a crash cannot leave the old
+    # metadata/CSV pair externally visible as the outcome of this new invocation.
+    _write_json_atomic(sweep_dir / "sweep_meta.json", running_meta)
+    _write_sweep_csv(sweep_dir, [])
+
+    try:
+        invocation_code_identity = _validated_ablation_code_identity(_git_code_identity())
+    except Exception as exc:
+        error = f"pre-sweep code identity unavailable: {exc}"
+        logger.error("  [%s -> sweep aborted]", error)
+        running_meta.update({
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "status":    "incomplete",
+            "error":     error,
+        })
+        _write_json_atomic(sweep_dir / "sweep_meta.json", running_meta)
+        return []
+    contract_code_identity: Mapping[str, object] = invocation_code_identity
 
     print(f"\n{'=' * 70}\nSWEEP: {sweep_name} ({len(cells)} runs"
           f"{f' = {len(runs)} cells x {len(cell_seeds)} seeds' if multiseed else ''})"
@@ -2562,10 +3402,31 @@ def run_sweep(
     # It must not fall back to per-cell filesystem hashing; every cell then fails closed at publication.
     contract_source_identities: Mapping[str, object] = (
         sweep_source_identities if sweep_source_identities is not None else {})
+    try:
+        aggregation_contract: Optional[Dict[str, object]] = (
+            _sweep_aggregation_contract(
+                dataset,
+                diagnostic_flags,
+                data_seed_override=data_seed_override,
+                max_tokens=max_tokens,
+                max_steps=max_steps,
+                seed_design=cell_seeds,
+                source_identities=contract_source_identities,
+                code_identity=contract_code_identity,
+                device=str(device),
+                required_diagnostic_keys=required_diagnostic_keys,
+                min_extrapolation_points=min_extrapolation_points,
+            )
+            if sweep_source_identities is not None else None
+        )
+    except Exception as exc:
+        logger.warning("  [aggregation contract unavailable -> sweep incomplete] %s", exc)
+        aggregation_contract = None
+    running_meta["aggregation_contract"] = aggregation_contract
+    _write_json_atomic(sweep_dir / "sweep_meta.json", running_meta)
     results: List[Dict[str, Any]] = []
     for i, (label, overrides, cell_seed) in enumerate(cells):
         run_dir = sweep_dir / _sanitize(label)
-        run_dir.mkdir(parents=True, exist_ok=True)
         marker = run_dir / "ablation_result.json"
         contract_path = run_dir / "cell_contract.json"
 
@@ -2576,32 +3437,57 @@ def run_sweep(
         # success publication because the generation active at training start is unknown.
         expected_contract = _expected_cell_contract_or_none(
             overrides, dataset, diagnostic_flags, seed=cell_seed,
+            device=str(device),
             max_steps=max_steps, max_tokens=max_tokens,
             source_identities=contract_source_identities,
-            code_identity=contract_code_identity)
+            code_identity=contract_code_identity,
+            required_diagnostic_keys=required_diagnostic_keys,
+            min_extrapolation_points=min_extrapolation_points)
+        expected_gauge_fields: Dict[str, object] = {}
+        try:
+            if aggregation_contract is None:
+                raise ValueError("invocation aggregation contract is unavailable")
+            cohort_cell_contract, expected_gauge_fields = _expected_cell_contract_from_aggregation(
+                {"overrides": overrides, "seed": cell_seed},
+                aggregation_contract,
+            )
+            if expected_contract is None or cohort_cell_contract != expected_contract:
+                raise ValueError("cell contract does not match the invocation aggregation contract")
+        except Exception as exc:
+            logger.warning("  [contract unavailable -> reuse forbidden] %s", exc)
+            expected_contract = None
         if resume and marker.exists():
             # The contract binds the request (diagnostic_flags carries paired_token_bootstrap); a
             # separate post-contract validator binds the requested artifact's exact bytes/schema, so a
             # missing or drifted val_token_nats.pt forbids reuse even when the contract still matches.
-            if (expected_contract is not None
+            if (_cell_dir_is_owned(sweep_dir, run_dir)
+                    and expected_contract is not None
                     and _cell_is_current(run_dir, expected_contract)
                     and _paired_token_artifact_is_current(run_dir, required=paired_token_bootstrap)):
                 print(f"\n--- {i + 1}/{len(cells)}: {label}  [CACHED] ---")
-                results.append(json.loads(marker.read_text(encoding="utf-8")))
+                cached_result = json.loads(marker.read_text(encoding="utf-8"))
+                cached_result.update(expected_gauge_fields)
+                cached_result["sweep"] = sweep_name
+                cached_result["label"] = label
+                cached_result["seed"] = cell_seed
+                cached_result["overrides"] = _jsonable(overrides)
+                _write_json_atomic(marker, cached_result)
+                results.append(cached_result)
                 continue
             print(f"\n--- {i + 1}/{len(cells)}: {label}  [contract changed -> re-running] ---")
         else:
             print(f"\n--- {i + 1}/{len(cells)}: {label} ---")
-        # Invalidate any older completion marker BEFORE starting a recomputation. If the process
-        # crashes after publishing new contract metadata but before the new result, the next launch
-        # sees this non-success marker rather than pairing a prior result with a new generation.
-        _write_json_atomic(marker, {
-            "status": "running",
-            "label":  label,
-            "seed":   cell_seed,
-        })
         t0 = time.perf_counter()
+        generation_started = False
         try:
+            _start_owned_cell_generation(
+                sweep_dir,
+                run_dir,
+                sweep_name=sweep_name,
+                label=label,
+                seed=cell_seed,
+            )
+            generation_started = True
             result = run_single(label, overrides, run_dir, dataset=dataset, device=device,
                                  seed=cell_seed, collect_diagnostics=collect_diagnostics,
                                  collect_extrapolation=collect_extrapolation,
@@ -2621,6 +3507,14 @@ def run_sweep(
         except (TypeError, ValueError):
             loaded_source_identities = None
         result.setdefault("error_kind", None)
+        result["label"] = label
+        result["seed"] = int(cell_seed)
+        result["overrides"] = _jsonable(overrides)
+        result.update(expected_gauge_fields or {
+            "head_mixer_compatibility":    "unavailable",
+            "head_mixer_gauge_compatible": False,
+            "on_gauge_pure_path":          False,
+        })
         result["collect_diagnostics"]   = collect_diagnostics
         result["collect_extrapolation"] = collect_extrapolation
         # The request flag always lands in the marker; the artifact identity fields default to null on
@@ -2638,31 +3532,24 @@ def run_sweep(
         result["final_val_ppl"] = terminal_ppl
         successful = result["error_kind"] is None and math.isfinite(terminal_ppl)
 
-        # Requested collections are terminal artifacts, so their OUTPUT presence is part of
-        # "complete": _cell_diagnostics returns {} on wholesale converged_state failure (and
-        # silently skips failed probes) while error_kind stays None and the terminal PPL stays
-        # finite, so a headline-only "success" under collect_diagnostics=True would otherwise
-        # publish a contract and be served as [CACHED] forever. Convert such an incomplete cell
-        # to a failed result (no contract published) so the next run recomputes it.
-        if successful and collect_diagnostics and not any(
-                key in result for key in _DIAGNOSTIC_RESULT_KEYS):
-            logger.warning("  [%s] requested diagnostics output missing -> cell marked failed", label)
-            successful = False
-        if successful and collect_extrapolation and not isinstance(result.get("extrap_ce"), list):
-            logger.warning("  [%s] requested extrapolation output missing -> cell marked failed", label)
+        # Requested collections are terminal artifacts. Every declared diagnostic must be finite,
+        # and extrapolation must contain the contracted number of distinct finite sequence lengths.
+        if successful and not _requested_outputs_are_complete(
+                result,
+                required_diagnostic_keys=required_diagnostic_keys,
+                min_extrapolation_points=min_extrapolation_points):
+            logger.warning("  [%s] requested outputs incomplete -> cell marked failed", label)
             successful = False
 
-        # Terminal artifact completeness (PB-02): the reuse contract is published only after the
-        # terminal finalizer wrote a resumable checkpoint. run_single's finalizer returns
-        # terminal_checkpoint pointing at checkpoints/step_<max_steps>.pt; require it to exist so a cell
-        # that finished with only a headline (no resumable bundle) is never served as complete. A result
-        # that carries no terminal_checkpoint key at all (a stubbed run_single in a unit test) is exempt;
-        # a real trained cell always sets it, so the gate binds exactly the cells that actually finalized.
-        if successful and "terminal_checkpoint" in result:
-            terminal_checkpoint = result.get("terminal_checkpoint")
-            if not (isinstance(terminal_checkpoint, str) and Path(terminal_checkpoint).exists()):
-                logger.warning("  [%s] terminal checkpoint missing -> cell marked failed", label)
+        # A production terminal checkpoint must be a real owned file under this cell. Its relative
+        # path, size, and SHA-256 are published into the marker and revalidated on every resume.
+        if successful:
+            checkpoint_identity = _terminal_checkpoint_identity(run_dir, result)
+            if checkpoint_identity is None:
+                logger.warning("  [%s] terminal checkpoint is missing or unowned -> cell marked failed", label)
                 successful = False
+            else:
+                result.update(checkpoint_identity)
 
         # A successful recomputation is cached only when its contract can be rebuilt now. Never
         # publish the pre-run resume contract: code or corpus identity can drift while training. If
@@ -2677,9 +3564,12 @@ def run_sweep(
             else:
                 post_run_contract = _expected_cell_contract_or_none(
                     overrides, dataset, diagnostic_flags, seed=cell_seed,
+                    device=str(device),
                     max_steps=max_steps, max_tokens=max_tokens,
                     source_identities=loaded_source_identities,
-                    code_identity=contract_code_identity)
+                    code_identity=contract_code_identity,
+                    required_diagnostic_keys=required_diagnostic_keys,
+                    min_extrapolation_points=min_extrapolation_points)
                 if expected_contract is None or post_run_contract is None:
                     successful = False
                 elif dict(post_run_contract) != dict(expected_contract):
@@ -2688,6 +3578,10 @@ def run_sweep(
                     successful = False
                 else:
                     contract = post_run_contract
+        if successful and not _terminal_checkpoint_is_current(run_dir, result):
+            logger.warning("  [%s] terminal checkpoint changed before publication -> cell marked failed", label)
+            successful = False
+            contract = None
         result["status"] = "success" if successful else "failed"
         result["cell_contract_fingerprint"] = (
             semantic_config_fingerprint(contract)
@@ -2699,9 +3593,10 @@ def run_sweep(
         # Publish the contract atomically (same-dir tmp + os.replace) BEFORE the completion marker, so
         # a reader that sees the success marker always sees a fully-written contract; a failed cell
         # publishes no contract. Neither file is written after a training exception.
-        if successful and contract is not None:
+        if generation_started and successful and contract is not None:
             _write_json_atomic(contract_path, contract)
-        _write_json_atomic(marker, result)
+        if generation_started:
+            _write_json_atomic(marker, result)
         results.append(result)
 
         ppl = result["primary_val_ppl"]
@@ -2714,7 +3609,10 @@ def run_sweep(
         # Keep the CSV whole AND accumulated after each cell: write the union of every persisted
         # marker (this cell, the rest of this run, and any prior run's cells) so the tacked-on
         # frame is live even mid-sweep.
-        _write_sweep_csv(sweep_dir, _collect_sweep_results(sweep_dir))
+        _write_sweep_csv(sweep_dir, _collect_sweep_results(
+            sweep_dir,
+            aggregation_contract=(aggregation_contract or {}),
+        ))
 
     try:
         terminal_code_identity = _validated_ablation_code_identity(_git_code_identity())
@@ -2732,34 +3630,56 @@ def run_sweep(
     if code_identity_error is not None:
         _invalidate_code_drifted_cells(sweep_dir, cells, code_identity_error)
 
-    (sweep_dir / "sweep_meta.json").write_text(json.dumps({
+    # The final frame is the one compatible cohort only. A requested label counts as successful
+    # exactly when its current marker, contract, optional paired artifact, and gauge disclosure all
+    # passed that collector; historical survivors cannot make an incomplete invocation complete.
+    union = _collect_sweep_results(
+        sweep_dir,
+        aggregation_contract=(aggregation_contract or {}),
+    )
+    collected_labels = {str(result["label"]) for result in union}
+    failed_requested_labels = [
+        label for label, _overrides, _cell_seed in cells
+        if label not in collected_labels
+    ]
+    if code_identity_error is not None:
+        sweep_error = code_identity_error
+    elif aggregation_contract is None:
+        sweep_error = "sweep aggregation contract was unavailable"
+    elif failed_requested_labels:
+        sweep_error = (
+            f"{len(failed_requested_labels)} of {len(cells)} requested cells failed or lacked "
+            "a current contract: " + ", ".join(failed_requested_labels)
+        )
+    else:
+        sweep_error = None
+    sweep_status = "complete" if sweep_error is None else "incomplete"
+    gauge_purity = _gauge_purity_summary(union)
+
+    # Publish the complete accumulated frame before the terminal metadata. A reader that observes
+    # status="complete" therefore cannot see a truncated or previous-generation CSV.
+    _write_sweep_csv(sweep_dir, union)
+    _write_json_atomic(sweep_dir / "sweep_meta.json", {
         "sweep_name":  sweep_name,
         "description": sweep["description"],
         "n_runs":      len(cells),
+        "n_successful_requested": len(cells) - len(failed_requested_labels),
+        "failed_requested_labels": failed_requested_labels,
         "dataset":     dataset,
+        "device":      str(device),
         "seed":        (cell_seeds if multiseed else seed),
         "timestamp":   time.strftime("%Y-%m-%d %H:%M:%S"),
-        "status":      ("incomplete" if code_identity_error is not None else "complete"),
-        "error":       code_identity_error,
+        "status":      sweep_status,
+        "error":       sweep_error,
+        "aggregation_contract": aggregation_contract,
+        "gauge_purity": gauge_purity,
         # PB-07 report metadata (null for ordinary sweeps): lets the ablation-forest / joint-LR-grid
         # adapters operate after a process restart, when only the persisted sweep view survives.
-        "paired_token_bootstrap": paired_token_bootstrap,
-        "forest_baseline_label":  sweep.get("forest_baseline_label"),
-        "grid_x":                 sweep.get("grid_x"),
-        "grid_y":                 sweep.get("grid_y"),
-        "grid_x_values":          sweep.get("grid_x_values"),
-        "grid_y_values":          sweep.get("grid_y_values"),
-        "grid_baseline":          (list(sweep["grid_baseline"])
-                                   if sweep.get("grid_baseline") is not None else None),
-    }, indent=2), encoding="utf-8")
+        **report_metadata,
+    })
 
-    # Final whole-frame write over the accumulated union (also covers the all-cached case, where
-    # the per-cell write above never fires). The best line and the return value are the union too.
-    union = _collect_sweep_results(sweep_dir)
-    _write_sweep_csv(sweep_dir, union)
-
-    if code_identity_error is not None:
-        print(f"\nSWEEP INCOMPLETE: {sweep_name}  ->  {code_identity_error}")
+    if sweep_error is not None:
+        print(f"\nSWEEP INCOMPLETE: {sweep_name}  ->  {sweep_error}")
         return []
     finished = [r for r in union if _as_float(r.get("primary_val_ppl")) < float("inf")]
     if finished:
@@ -2852,13 +3772,13 @@ def analyze_sweep(sweep_dir: Path) -> None:
     rows.sort(key=lambda r: r["_ppl"])
 
     print(f"\n{'=' * 70}\nANALYSIS: {sweep_dir.name}\n{'=' * 70}")
-    print(f"{'label':<34}{'val PPL':>12}{'params':>12}{'note':>10}")
-    print("-" * 68)
+    print(f"{'label':<34}{'val PPL':>12}{'params':>12}  gauge classification")
+    print("-" * 104)
     for r in rows:
         ppl = "inf" if r["_ppl"] == float("inf") else f"{r['_ppl']:.3f}"
         params = f"{int(_as_float(r.get('n_params'))):,}" if r.get("n_params") not in ("", None) else "-"
-        note = r.get("error_kind") or ""
-        print(f"{r['label']:<34}{ppl:>12}{params:>12}{note:>10}")
+        gauge = r.get("head_mixer_compatibility") or "unavailable"
+        print(f"{r['label']:<34}{ppl:>12}{params:>12}  {gauge}")
 
     finished = [r for r in rows if r["_ppl"] < float("inf")]
     if len(finished) > 1:
@@ -2888,7 +3808,52 @@ def _sweep_is_complete(sweep_dir: Path) -> bool:
     return isinstance(meta, Mapping) and meta.get("status") == "complete"
 
 
-def summarize_sweeps(output_dir: Path) -> None:
+def _cross_sweep_cohort_identity(
+    aggregation_contract: Mapping[str, object],
+) -> Dict[str, object]:
+    r"""Project a sweep contract to fields that make validation-PPL comparisons commensurate."""
+    contract = _validated_sweep_aggregation_contract(aggregation_contract)
+    return {
+        key: contract[key]
+        for key in (
+            "schema_version",
+            "baseline_semantic_config_fingerprint",
+            "seed_design",
+            "dataset",
+            "device",
+            "tokenizer_tag",
+            "data_seed_override",
+            "max_tokens",
+            "max_steps",
+            "source_identities",
+            "code_identity",
+        )
+    }
+
+
+def _sweep_matches_cohort(
+    sweep_dir:       Path,
+    cohort_identity: Mapping[str, object],
+) -> bool:
+    """Whether one complete persisted sweep belongs to an exact comparison cohort."""
+    try:
+        meta = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8"))
+        return (
+            isinstance(meta, Mapping)
+            and meta.get("status") == "complete"
+            and _cross_sweep_cohort_identity(meta["aggregation_contract"])
+            == dict(cohort_identity)
+        )
+    except Exception:
+        return False
+
+
+def summarize_sweeps(
+    output_dir: Path,
+
+    *,
+    cohort_identity: Optional[Mapping[str, object]] = None,
+) -> None:
     r"""Cross-sweep comparison table: the best (lowest val PPL) cell of every persisted sweep.
 
     Printed once after all sweeps in a run (the per-sweep tables come from ``analyze_sweep`` as
@@ -2896,20 +3861,28 @@ def summarize_sweeps(output_dir: Path) -> None:
     are included, not just this run's.
     """
     print(f"\n{'=' * 70}\nBEST PER SWEEP  ({output_dir})\n{'=' * 70}")
-    sweep_dirs = [d for d in sorted(output_dir.iterdir())
-                  if (d.is_dir() and (d / "sweep_results.csv").exists()
-                      and _sweep_is_complete(d))]
+    sweep_dirs = [
+        directory
+        for directory in sorted(output_dir.iterdir())
+        if (
+            directory.is_dir()
+            and (directory / "sweep_results.csv").exists()
+            and cohort_identity is not None
+            and _sweep_matches_cohort(directory, cohort_identity)
+        )
+    ]
     if not sweep_dirs:
-        print("No completed sweeps found.")
+        print("No completed sweeps found in the current comparison cohort.")
         return
-    print(f"{'sweep':<24}{'best config':<30}{'val PPL':>10}")
-    print("-" * 64)
+    print(f"{'sweep':<24}{'best config':<30}{'val PPL':>10}  gauge classification")
+    print("-" * 104)
     for d in sweep_dirs:
         rows = [r for r in _read_sweep_csv(d) if _as_float(r.get("primary_val_ppl")) < float("inf")]
         if not rows:
             continue
         best = min(rows, key=lambda r: _as_float(r.get("primary_val_ppl")))
-        print(f"{d.name:<24}{best['label']:<30}{_as_float(best['primary_val_ppl']):>10.3f}")
+        gauge = best.get("head_mixer_compatibility") or "unavailable"
+        print(f"{d.name:<24}{best['label']:<30}{_as_float(best['primary_val_ppl']):>10.3f}  {gauge}")
 
 
 # =============================================================================
@@ -2931,6 +3904,55 @@ def _plt_or_none() -> Any:
     except Exception as exc:                                  # plotting is best-effort, never fatal
         print(f"plotting unavailable ({exc}); skipping figure")
         return None
+
+
+def _gauge_disclosure_text(gauge_purity: object) -> str:
+    """Return the explicit gauge/head-mixer disclosure printed on every ablation figure."""
+    if not isinstance(gauge_purity, Mapping):
+        return "Gauge classification: unavailable"
+    classifications = gauge_purity.get("classifications_by_label")
+    values = (
+        sorted({str(value) for value in classifications.values()})
+        if isinstance(classifications, Mapping) else []
+    )
+    value_text = ", ".join(values) if values else "unavailable"
+    if gauge_purity.get("contains_independent_head_nonintertwiner") is True:
+        return (
+            "Gauge classification: independent_head_nonintertwiner present; "
+            "this figure is not gauge-pure"
+        )
+    if gauge_purity.get("all_rows_on_gauge_pure_path") is True:
+        return f"Gauge classification: all rows gauge-pure; head mixer(s): {value_text}"
+    return f"Gauge classification: not all rows are gauge-pure; head mixer(s): {value_text}"
+
+
+def _sweep_gauge_purity(sweep_dir: Path) -> object:
+    """Read one sweep's persisted gauge-purity summary without trusting plot input rows."""
+    try:
+        metadata = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return metadata.get("gauge_purity") if isinstance(metadata, Mapping) else None
+
+
+def _annotate_gauge_disclosure(fig: Any, gauge_purity: object) -> None:
+    """Add a visible, figure-level gauge disclosure independent of individual axes."""
+    fig.text(
+        0.5,
+        0.01,
+        _gauge_disclosure_text(gauge_purity),
+        ha="center",
+        va="bottom",
+        fontsize=8,
+        color="#b22222",
+    )
+
+
+def _save_ablation_figure(fig: Any, out: Path, sweep_dir: Path, plt: Any) -> None:
+    """Annotate, save, and close one legacy ablation figure under the common disclosure policy."""
+    _annotate_gauge_disclosure(fig, _sweep_gauge_purity(sweep_dir))
+    fig.savefig(out, bbox_inches="tight")
+    plt.close(fig)
 
 
 def _plot_one_sweep(sweep_dir: Path, fig_dir: Path) -> None:
@@ -2986,8 +4008,7 @@ def _plot_one_sweep(sweep_dir: Path, fig_dir: Path) -> None:
     fig.tight_layout()
     fig_dir.mkdir(exist_ok=True)
     out = fig_dir / f"{sweep_dir.name}.png"
-    fig.savefig(out)
-    plt.close(fig)
+    _save_ablation_figure(fig, out, sweep_dir, plt)
     print(f"  figure -> {out}")
 
 
@@ -3013,8 +4034,7 @@ def _plot_seed_aggregate(sweep_dir: Path, fig_dir: Path) -> None:
     fig.tight_layout()
     fig_dir.mkdir(exist_ok=True)
     out = fig_dir / f"{sweep_dir.name}_seed_aggregate.png"
-    fig.savefig(out)
-    plt.close(fig)
+    _save_ablation_figure(fig, out, sweep_dir, plt)
     print(f"  figure -> {out}")
 
 
@@ -3042,8 +4062,8 @@ def _plot_rank_collapse(sweep_dir: Path, fig_dir: Path) -> None:
         return
     fig_dir.mkdir(exist_ok=True)
     out = fig_dir / f"{sweep_dir.name}_rank_collapse.png"
-    fig = plot_rank_residual_by_depth(arms, path=str(out))
-    plt.close(fig)
+    fig = plot_rank_residual_by_depth(arms)
+    _save_ablation_figure(fig, out, sweep_dir, plt)
     print(f"  figure -> {out}")
 
 
@@ -3081,12 +4101,20 @@ def _plot_attention_entropy(sweep_dir: Path, fig_dir: Path) -> None:
         return
     fig_dir.mkdir(exist_ok=True)
     out = fig_dir / f"{sweep_dir.name}_ppl_gap.png"
-    plt.close(plot_entropy_ppl_gap(cells_ppl, path=str(out)))
+    _save_ablation_figure(plot_entropy_ppl_gap(cells_ppl), out, sweep_dir, plt)
     print(f"  figure -> {out}")
     if len(cells_gap) >= 2:
         out = fig_dir / f"{sweep_dir.name}_cov_gap.png"
-        plt.close(plot_cov_gap_vs_kappa(cells_gap, path=str(out)))
+        _save_ablation_figure(plot_cov_gap_vs_kappa(cells_gap), out, sweep_dir, plt)
         print(f"  figure -> {out}")
+
+
+def _compatible_cell_dirs(sweep_dir: Path) -> List[Path]:
+    """Return only cell directories admitted by the persisted aggregation contract."""
+    return [
+        sweep_dir / _sanitize(str(result["label"]))
+        for result in _collect_sweep_results(sweep_dir)
+    ]
 
 
 def _plot_wallclock_convergence(sweep_dir: Path, fig_dir: Path) -> None:
@@ -3095,7 +4123,10 @@ def _plot_wallclock_convergence(sweep_dir: Path, fig_dir: Path) -> None:
     from each cell's ``metrics.csv`` eval rows (val_ppl + wall_clock_s). A no-op unless >= 2 cells carry
     >= 2 eval points, so it is safe to call after every sweep (the gauge M-step sweeps populate it)."""
     arms: List[Dict[str, Any]] = []
-    for cell in sorted(sweep_dir.glob("*/metrics.csv")):
+    for run_dir in _compatible_cell_dirs(sweep_dir):
+        cell = run_dir / "metrics.csv"
+        if not cell.is_file():
+            continue
         steps, ppls, walls = [], [], []
         try:
             with open(cell, newline="", encoding="utf-8") as fh:
@@ -3121,7 +4152,7 @@ def _plot_wallclock_convergence(sweep_dir: Path, fig_dir: Path) -> None:
         return
     fig_dir.mkdir(exist_ok=True)
     out = fig_dir / f"{sweep_dir.name}_wallclock_convergence.png"
-    plt.close(plot_wallclock_convergence(arms, path=str(out)))
+    _save_ablation_figure(plot_wallclock_convergence(arms), out, sweep_dir, plt)
     print(f"  figure -> {out}")
 
 
@@ -3152,7 +4183,7 @@ def _plot_gauge_transport(sweep_dir: Path, fig_dir: Path) -> None:
         return
     fig_dir.mkdir(exist_ok=True)
     out = fig_dir / f"{sweep_dir.name}_gauge_bars.png"
-    plt.close(plot_gauge_transport_bars(cells, path=str(out)))
+    _save_ablation_figure(plot_gauge_transport_bars(cells), out, sweep_dir, plt)
     print(f"  figure -> {out}")
 
 
@@ -3178,7 +4209,7 @@ def _plot_cg_coupling(sweep_dir: Path, fig_dir: Path) -> None:
         return
     fig_dir.mkdir(exist_ok=True)
     out = fig_dir / f"{sweep_dir.name}_ppl_equiv.png"
-    plt.close(plot_ppl_equivariance_bars(cells, path=str(out)))
+    _save_ablation_figure(plot_ppl_equivariance_bars(cells), out, sweep_dir, plt)
     print(f"  figure -> {out}")
 
 
@@ -3213,7 +4244,7 @@ def _plot_kappa_dispersion(sweep_dir: Path, fig_dir: Path) -> None:
         return
     fig_dir.mkdir(exist_ok=True)
     out = fig_dir / f"{sweep_dir.name}_kappa_dispersion.png"
-    plt.close(plot_kappa_dispersion(cells, path=str(out)))
+    _save_ablation_figure(plot_kappa_dispersion(cells), out, sweep_dir, plt)
     print(f"  figure -> {out}")
 
 
@@ -3221,7 +4252,10 @@ def _plot_gauge_residual_drift(sweep_dir: Path, fig_dir: Path) -> None:
     r"""A2/EXP-9 builder-break gauge residual vs step (tied vs untied) from each cell's metrics.csv
     ``val_builder_resid`` eval series. No-op unless >= 2 cells carry >= 2 eval points."""
     arms: List[Dict[str, Any]] = []
-    for cell in sorted(sweep_dir.glob("*/metrics.csv")):
+    for run_dir in _compatible_cell_dirs(sweep_dir):
+        cell = run_dir / "metrics.csv"
+        if not cell.is_file():
+            continue
         steps, res = [], []
         try:
             with open(cell, newline="", encoding="utf-8") as fh:
@@ -3246,7 +4280,7 @@ def _plot_gauge_residual_drift(sweep_dir: Path, fig_dir: Path) -> None:
         return
     fig_dir.mkdir(exist_ok=True)
     out = fig_dir / f"{sweep_dir.name}_residual_drift.png"
-    plt.close(plot_gauge_residual_drift(arms, path=str(out)))
+    _save_ablation_figure(plot_gauge_residual_drift(arms), out, sweep_dir, plt)
     print(f"  figure -> {out}")
 
 
@@ -3255,7 +4289,10 @@ def _plot_holonomy_trainability(sweep_dir: Path, fig_dir: Path) -> None:
     holonomy_deviation per eval). connection_w_norm is logged only on a regime_ii run, so this no-ops
     unless a cell carries >= 2 such eval rows (the flat arm is correctly excluded)."""
     arms: List[Dict[str, Any]] = []
-    for cell in sorted(sweep_dir.glob("*/metrics.csv")):
+    for run_dir in _compatible_cell_dirs(sweep_dir):
+        cell = run_dir / "metrics.csv"
+        if not cell.is_file():
+            continue
         steps, cn, hol = [], [], []
         try:
             with open(cell, newline="", encoding="utf-8") as fh:
@@ -3281,7 +4318,7 @@ def _plot_holonomy_trainability(sweep_dir: Path, fig_dir: Path) -> None:
         return
     fig_dir.mkdir(exist_ok=True)
     out = fig_dir / f"{sweep_dir.name}_holonomy_trainability.png"
-    plt.close(plot_holonomy_trainability(arms, path=str(out)))
+    _save_ablation_figure(plot_holonomy_trainability(arms), out, sweep_dir, plt)
     print(f"  figure -> {out}")
 
 
@@ -3314,7 +4351,7 @@ def _plot_mu_precond(sweep_dir: Path, fig_dir: Path) -> None:
         return
     fig_dir.mkdir(exist_ok=True)
     out = fig_dir / f"{sweep_dir.name}_mu_precond.png"
-    plt.close(plot_mu_precond(cells, path=str(out)))
+    _save_ablation_figure(plot_mu_precond(cells), out, sweep_dir, plt)
     print(f"  figure -> {out}")
 
 
@@ -3345,7 +4382,7 @@ def _plot_renyi_saturation(sweep_dir: Path, fig_dir: Path) -> None:
         return
     fig_dir.mkdir(exist_ok=True)
     out = fig_dir / f"{sweep_dir.name}_renyi_saturation.png"
-    plt.close(plot_renyi_saturation(cells, path=str(out)))
+    _save_ablation_figure(plot_renyi_saturation(cells), out, sweep_dir, plt)
     print(f"  figure -> {out}")
 
 
@@ -3372,27 +4409,54 @@ def _plot_pos_extrapolation(sweep_dir: Path, fig_dir: Path) -> None:
         return
     fig_dir.mkdir(exist_ok=True)
     out = fig_dir / f"{sweep_dir.name}_extrapolation.png"
-    plt.close(plot_pos_extrapolation(arms, train_n=(min(all_n) if all_n else None), path=str(out)))
+    _save_ablation_figure(
+        plot_pos_extrapolation(arms, train_n=(min(all_n) if all_n else None)),
+        out,
+        sweep_dir,
+        plt,
+    )
     print(f"  figure -> {out}")
 
 
-def _plot_sensitivity(output_dir: Path, fig_dir: Path) -> None:
+def _plot_sensitivity(
+    output_dir: Path,
+    fig_dir:    Path,
+
+    *,
+    cohort_identity: Optional[Mapping[str, object]] = None,
+) -> None:
     r"""Cross-sweep comparison: a PPL-range (worst - best) bar per sweep, sorted by sensitivity.
 
     Made once after all sweeps. Scans EVERY persisted sweep under ``output_dir`` (not just this
     run's), matching the per-sweep figures' accumulated view.
     """
-    sweep_dirs = [d for d in sorted(output_dir.iterdir())
-                  if (d.is_dir() and (d / "sweep_results.csv").exists()
-                      and _sweep_is_complete(d))]
-    sensitivity: List[Tuple[str, float, str]] = []           # (sweep, ppl range, best label)
+    sweep_dirs = [
+        directory
+        for directory in sorted(output_dir.iterdir())
+        if (
+            directory.is_dir()
+            and (directory / "sweep_results.csv").exists()
+            and cohort_identity is not None
+            and _sweep_matches_cohort(directory, cohort_identity)
+        )
+    ]
+    sensitivity: List[Tuple[str, float, str, str]] = []      # sweep, PPL range, best label, gauge class
+    gauge_summaries: List[Mapping[str, object]] = []
     for d in sweep_dirs:
         rows = [r for r in _read_sweep_csv(d) if _as_float(r.get("primary_val_ppl")) < float("inf")]
         if not rows:
             continue
+        gauge_summary = _sweep_gauge_purity(d)
+        if isinstance(gauge_summary, Mapping):
+            gauge_summaries.append(gauge_summary)
         ppls = [_as_float(r["primary_val_ppl"]) for r in rows]
         best = min(rows, key=lambda r: _as_float(r["primary_val_ppl"]))
-        sensitivity.append((d.name, max(ppls) - min(ppls), best["label"]))
+        sensitivity.append((
+            d.name,
+            max(ppls) - min(ppls),
+            best["label"],
+            best.get("head_mixer_compatibility") or "unavailable",
+        ))
     if not sensitivity:
         return
     plt = _plt_or_none()
@@ -3402,16 +4466,181 @@ def _plot_sensitivity(output_dir: Path, fig_dir: Path) -> None:
     fig, ax = plt.subplots(figsize=(9, max(3, 0.5 * len(sensitivity))))
     ax.barh(range(len(sensitivity)), [s[1] for s in sensitivity], color="#d62728", alpha=0.8)
     ax.set_yticks(range(len(sensitivity)))
-    ax.set_yticklabels([f"{s[0]}\n(best: {s[2]})" for s in sensitivity])
+    ax.set_yticklabels([f"{s[0]}\n(best: {s[2]}; gauge: {s[3]})" for s in sensitivity])
     ax.invert_yaxis()
     ax.set_xlabel("validation PPL range (worst - best)")
     ax.set_title("hyperparameter sensitivity")
     fig.tight_layout()
+    classifications = {
+        f"{index}:{label}": value
+        for index, summary in enumerate(gauge_summaries)
+        for label, value in (
+            summary.get("classifications_by_label", {}).items()
+            if isinstance(summary.get("classifications_by_label"), Mapping) else ()
+        )
+    }
+    _annotate_gauge_disclosure(fig, {
+        "classifications_by_label": classifications,
+        "contains_independent_head_nonintertwiner": any(
+            summary.get("contains_independent_head_nonintertwiner") is True
+            for summary in gauge_summaries
+        ),
+        "all_rows_on_gauge_pure_path": bool(gauge_summaries) and all(
+            summary.get("all_rows_on_gauge_pure_path") is True
+            for summary in gauge_summaries
+        ),
+    })
     fig_dir.mkdir(exist_ok=True)
     out = fig_dir / "sensitivity_summary.png"
-    fig.savefig(out)
+    fig.savefig(out, bbox_inches="tight")
     plt.close(fig)
     print(f"comparison figure -> {out}")
+
+
+def emit_registered_figures(
+    specs:      Any,
+    context:    Mapping[str, object],
+    output_dir: Path,
+) -> List[Path]:
+    r"""Compatibility wrapper whose Matplotlib-backed implementation is imported only on demand."""
+    from vfe3.viz.specs import emit_registered_figures as _emit_registered_figures
+
+    return _emit_registered_figures(specs, context, output_dir)
+
+
+def _render_sweep_figures(sweep_dir: Path, fig_dir: Path) -> None:
+    r"""Render one complete sweep's registered and legacy figures inside a plotting worker."""
+    from vfe3.viz.specs import FigureSpec
+    from vfe3.viz.sweep_adapters import ablation_forest_kwargs, lr_grid_heatmap_kwargs
+
+    meta_path = sweep_dir / "sweep_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    if not isinstance(meta, Mapping) or meta.get("status") != "complete":
+        raise ValueError(f"sweep {sweep_dir.name!r} has no complete metadata")
+    rows = _collect_sweep_results(sweep_dir)
+    for row in rows:
+        row["_cell_dir"] = str(sweep_dir / _sanitize(str(row["label"])))
+    report_context = {
+        "sweep_dir":      sweep_dir,
+        "rows":           rows,
+        "gauge_purity":   meta.get("gauge_purity"),
+        "baseline_label": meta.get("forest_baseline_label"),
+        "grid_x":         meta.get("grid_x"),
+        "grid_y":         meta.get("grid_y"),
+        "grid_x_values":  meta.get("grid_x_values"),
+        "grid_y_values":  meta.get("grid_y_values"),
+        "baseline":       tuple(meta["grid_baseline"]) if meta.get("grid_baseline") else None,
+    }
+    specs = []
+    if meta.get("paired_token_bootstrap") is True:
+        specs.append(FigureSpec(
+            "ablation_forest",
+            f"{sweep_dir.name}_ablation_forest.png",
+            lambda ctx: ablation_forest_kwargs(
+                ctx["sweep_dir"],
+                ctx["baseline_label"],
+                admitted_rows=ctx["rows"],
+            ),
+            postprocess=lambda fig, ctx: _annotate_gauge_disclosure(
+                fig, ctx["gauge_purity"]
+            ),
+        ))
+    if meta.get("grid_x") and meta.get("grid_y"):
+        specs.append(FigureSpec(
+            "lr_grid_heatmap",
+            f"{sweep_dir.name}_lr_grid_heatmap.png",
+            lambda ctx: lr_grid_heatmap_kwargs(
+                ctx["rows"],
+                ctx["grid_x"],
+                ctx["grid_y"],
+                ctx["grid_x_values"],
+                ctx["grid_y_values"],
+                ctx["baseline"],
+            ),
+            postprocess=lambda fig, ctx: _annotate_gauge_disclosure(
+                fig, ctx["gauge_purity"]
+            ),
+        ))
+    emit_registered_figures(specs, report_context, fig_dir)
+    _plot_one_sweep(sweep_dir, fig_dir)
+    _plot_seed_aggregate(sweep_dir, fig_dir)
+    _plot_rank_collapse(sweep_dir, fig_dir)
+    _plot_attention_entropy(sweep_dir, fig_dir)
+    _plot_wallclock_convergence(sweep_dir, fig_dir)
+    _plot_gauge_transport(sweep_dir, fig_dir)
+    _plot_cg_coupling(sweep_dir, fig_dir)
+    _plot_kappa_dispersion(sweep_dir, fig_dir)
+    _plot_gauge_residual_drift(sweep_dir, fig_dir)
+    _plot_pos_extrapolation(sweep_dir, fig_dir)
+    _plot_renyi_saturation(sweep_dir, fig_dir)
+    _plot_mu_precond(sweep_dir, fig_dir)
+    _plot_holonomy_trainability(sweep_dir, fig_dir)
+
+
+def _run_ablation_figures_isolated(
+    output_dir: Path,
+
+    *,
+    scope:           str,
+    invalidate:      bool                          = False,
+    cohort_identity: Optional[Mapping[str, object]] = None,
+) -> bool:
+    r"""Render one ablation figure scope in a disposable process with child-only OMP policy."""
+    output_dir = output_dir.resolve()
+    with _unique_sibling_temp(output_dir / "ablation_figure_request.json") as request_path:
+        request_path.write_text(json.dumps({
+            "mode":    "ablation",
+            "run_dir": str(output_dir),
+            "scope":   scope,
+            "invalidate": invalidate,
+            "cohort_identity": (
+                dict(cohort_identity) if cohort_identity is not None else None
+            ),
+        }), encoding="utf-8")
+        environment = os.environ.copy()
+        environment["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+        environment["VFE3_FIGURE_REQUEST"] = str(request_path)
+        environment["PYTHONUNBUFFERED"] = "1"
+        try:
+            completed = run_process_tree(
+                [sys.executable, "-m", "vfe3.viz.figure_worker"],
+                cwd=str(Path(__file__).resolve().parent),
+                env=environment,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=_ABLATION_FIGURE_TIMEOUT_SECONDS,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "isolated ablation figure process exceeded %d seconds; numeric sweep results are saved",
+                _ABLATION_FIGURE_TIMEOUT_SECONDS,
+            )
+            return False
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning(
+                "isolated ablation figure process could not start (%s); numeric sweep results are saved",
+                exc,
+            )
+            return False
+    if completed.stdout.strip():
+        logger.info("isolated ablation figure process:\n%s", completed.stdout.rstrip())
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or "no stderr"
+        logger.warning(
+            "isolated ablation figure process exited with code %d (%s); numeric sweep results are saved",
+            completed.returncode,
+            detail[-4000:],
+        )
+        return False
+    if completed.stderr.strip():
+        logger.info(
+            "isolated ablation figure process diagnostics:\n%s",
+            completed.stderr.rstrip(),
+        )
+    return True
 
 
 # =============================================================================
@@ -3451,70 +4680,68 @@ def main() -> None:
     validate_sweeps(list(SWEEPS))                            # all declared arms must construct upfront
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    fig_dir = output_dir / "figures"
     print(f"\nVFE_3.0 ablation suite\n  device:  {device}\n  dataset: {CONFIG['dataset']}"
           f"\n  output:  {output_dir}\n  seed:    {CONFIG['seed']}"
           f"\n  sweeps:  {', '.join(sweep_names)}")
 
+    current_cohort: Optional[Dict[str, object]] = None
+    incomplete_sweeps: List[str] = []
+    if not _run_ablation_figures_isolated(
+            output_dir,
+            scope="__sensitivity__",
+            invalidate=True):
+        raise RuntimeError(
+            "could not invalidate prior sensitivity figures; refusing to publish a mixed generation"
+        )
     for name in sweep_names:
-        union = run_sweep(name, output_dir, dataset=CONFIG["dataset"], device=device,
-                          seed=CONFIG["seed"], resume=CONFIG["resume"],
-                          max_tokens=CONFIG["max_tokens"], max_steps=CONFIG["max_steps"])
+        if not _run_ablation_figures_isolated(output_dir, scope=name, invalidate=True):
+            raise RuntimeError(
+                f"could not invalidate prior {name!r} figures; refusing to run beside stale output"
+            )
+        run_sweep(name, output_dir, dataset=CONFIG["dataset"], device=device,
+                  seed=CONFIG["seed"], resume=CONFIG["resume"],
+                  max_tokens=CONFIG["max_tokens"], max_steps=CONFIG["max_steps"])
         sweep_dir = output_dir / name
 
-        # PB-07 registered ablation figures: dispatch the forest / joint-LR-grid figures through the
-        # figure registry from the persisted sweep view (metadata + accumulated rows). A spec whose
-        # adapter returns None (missing baseline arm / incomplete grid) is skipped, never fabricated;
-        # an ordinary sweep declares neither key, so `specs` is empty and this is a no-op.
-        sweep = SWEEPS[name]
         try:
             meta = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8"))
         except Exception as exc:
             logger.error("sweep %s has no readable completion metadata: %s", name, exc)
-            return
+            incomplete_sweeps.append(name)
+            continue
         if not isinstance(meta, Mapping) or meta.get("status") != "complete":
             logger.error(
-                "sweep %s is incomplete; skipping all per-sweep and cross-sweep analysis", name)
-            return
-        report_context = {
-            "sweep_dir":     sweep_dir,
-            "rows":          union,
-            "baseline_label": meta.get("forest_baseline_label"),
-            "grid_x":        meta.get("grid_x"),
-            "grid_y":        meta.get("grid_y"),
-            "grid_x_values": meta.get("grid_x_values"),
-            "grid_y_values": meta.get("grid_y_values"),
-            "baseline":      tuple(meta["grid_baseline"]) if meta.get("grid_baseline") else None,
-        }
-        specs = []
-        if sweep.get("paired_token_bootstrap"):
-            specs.append(FigureSpec("ablation_forest", "ablation_forest.png",
-                         lambda ctx: ablation_forest_kwargs(ctx["sweep_dir"], ctx["baseline_label"])))
-        if sweep.get("grid_x") and sweep.get("grid_y"):
-            specs.append(FigureSpec("lr_grid_heatmap", "lr_grid_heatmap.png",
-                         lambda ctx: lr_grid_heatmap_kwargs(
-                             ctx["rows"], ctx["grid_x"], ctx["grid_y"],
-                             ctx["grid_x_values"], ctx["grid_y_values"], ctx["baseline"])))
-        emit_registered_figures(specs, report_context, fig_dir)
-
-        analyze_sweep(sweep_dir)                             # this sweep's table (accumulated)
-        _plot_one_sweep(sweep_dir, fig_dir)                 # this sweep's PPL figure (tacked on)
-        _plot_seed_aggregate(sweep_dir, fig_dir)           # multi-seed mean+/-SD forest (no-op if single-seed)
-        _plot_rank_collapse(sweep_dir, fig_dir)            # F2/EXP-7 r(X)-by-depth (no-op if absent)
-        _plot_attention_entropy(sweep_dir, fig_dir)        # C1/EXP-4 PPL-gap + Cov-gap (no-op if absent)
-        _plot_wallclock_convergence(sweep_dir, fig_dir)    # D1/EXP-8 wall-clock convergence (no-op if absent)
-        _plot_gauge_transport(sweep_dir, fig_dir)          # A1/EXP-2 gauge on/off/frozen bars (no-op if absent)
-        _plot_cg_coupling(sweep_dir, fig_dir)              # A3/EXP-10 PPL+equivariance bars (no-op if absent)
-        _plot_kappa_dispersion(sweep_dir, fig_dir)         # H2/EXP-11 kappa dispersion (no-op if absent)
-        _plot_gauge_residual_drift(sweep_dir, fig_dir)     # A2/EXP-9 residual drift (no-op if absent)
-        _plot_pos_extrapolation(sweep_dir, fig_dir)        # H1/EXP-13 CE-vs-N extrapolation (no-op if absent)
-        _plot_renyi_saturation(sweep_dir, fig_dir)         # B2/EXP-12 entropy+saturation vs alpha (no-op if absent)
-        _plot_mu_precond(sweep_dir, fig_dir)               # B3/EXP-14 Fisher-vs-raw mean precond (no-op if absent)
-        _plot_holonomy_trainability(sweep_dir, fig_dir)    # A4/EXP-15 holonomy vs ||connection|| (no-op if absent)
+                "sweep %s is incomplete; later requested sweeps will still run", name)
+            incomplete_sweeps.append(name)
+            continue
+        try:
+            sweep_cohort = _cross_sweep_cohort_identity(meta["aggregation_contract"])
+        except Exception as exc:
+            logger.error("sweep %s has invalid comparison metadata: %s", name, exc)
+            incomplete_sweeps.append(name)
+            continue
+        if current_cohort is None:
+            current_cohort = sweep_cohort
+        elif sweep_cohort != current_cohort:
+            logger.error("sweep %s belongs to a different comparison cohort", name)
+            incomplete_sweeps.append(name)
+            continue
+        analyze_sweep(sweep_dir)                            # this sweep's numeric table (accumulated)
+        _run_ablation_figures_isolated(output_dir, scope=name)
 
     # ---- after all sweeps: the cross-sweep comparison ----
-    _plot_sensitivity(output_dir, fig_dir)
-    summarize_sweeps(output_dir)
+    if current_cohort is not None:
+        _run_ablation_figures_isolated(
+            output_dir,
+            scope="__sensitivity__",
+            cohort_identity=current_cohort,
+        )
+        summarize_sweeps(output_dir, cohort_identity=current_cohort)
+    if incomplete_sweeps:
+        logger.error(
+            "incomplete sweeps withheld from analysis: %s",
+            ", ".join(incomplete_sweeps),
+        )
 
 
 if __name__ == "__main__":

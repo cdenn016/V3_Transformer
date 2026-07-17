@@ -207,11 +207,11 @@ def collect_inference_bank(
 ) -> List[Dict[str, object]]:
     r"""Capture one authoritative belief inference per population batch for report reuse.
 
-    Each record retains CPU-hosted input/target tensors, raw stack output, optional decode logits,
-    and the active model-channel state. Complete CPU offload bounds accelerator residency to the
-    current inference or consumer batch. Population extractors therefore avoid replaying
-    ``forward_beliefs``, the E-step stack, or model-channel refinement without retaining the whole
-    population on the accelerator.
+    Each record retains CPU-hosted input/target tensors, the post-final-norm converged belief, raw
+    stack output, optional decode logits, and the active model-channel state. Complete CPU offload
+    bounds accelerator residency to the current inference or consumer batch. Report callers omit
+    logits and stream decode consumers from the retained converged belief, avoiding both E-step
+    replay and population-wide full-vocabulary retention.
     """
     device = device or _model_device(model)
     was_training = model.training
@@ -243,10 +243,18 @@ def collect_inference_bank(
                     s_mu, s_sigma = model.prior_bank.encode_s(tokens)
                 if model.cfg.s_frame_mode == "phi_tilde":
                     model_phi = model._resolve_model_frame(tokens, prior.phi)
+            out_cpu = _cpu_bank_value(out)
+            belief_mu_cpu = (
+                out_cpu.mu
+                if beliefs.mu is out.mu
+                else _cpu_bank_value(beliefs.mu)
+            )
+            belief_cpu = out_cpu._replace(mu=belief_mu_cpu)
             records.append({
                 "tokens": _cpu_bank_value(tokens),
                 "targets": _cpu_bank_value(targets) if targets is not None else None,
-                "out": _cpu_bank_value(out),
+                "belief": belief_cpu,
+                "out": out_cpu,
                 "logits": _cpu_bank_value(logits) if logits is not None else None,
                 "s_mu": _cpu_bank_value(s_mu) if s_mu is not None else None,
                 "s_sigma": _cpu_bank_value(s_sigma) if s_sigma is not None else None,
@@ -256,13 +264,35 @@ def collect_inference_bank(
             # The record now owns detached CPU copies. Release every accelerator-side inference
             # workset before the next model forward instead of relying on the loop variable overwrite.
             del batch, tokens, targets, capture, beliefs, logits, out, prior
-            del s_mu, s_sigma, model_phi
+            del s_mu, s_sigma, model_phi, out_cpu, belief_mu_cpu, belief_cpu
             if stop:
                 break
     finally:
         if was_training:
             model.train()
     return records
+
+
+def _decode_inference_record(
+    model,
+    record: Dict[str, object],
+    device: torch.device,
+) -> torch.Tensor:
+    r"""Move or reconstruct one record's logits without retaining a population-wide logit bank."""
+    stored_logits = record.get("logits")
+    if isinstance(stored_logits, torch.Tensor):
+        return stored_logits.to(device)
+    belief = record.get("belief")
+    if not isinstance(belief, BeliefState):
+        raise ValueError(
+            "inference records require decoded logits or a converged belief"
+        )
+    mu = belief.mu.to(device)
+    sigma = belief.sigma.to(device)
+    with model._amp_off_context(device):
+        logits = model.prior_bank.decode(mu.float(), sigma.float())
+    del mu, sigma
+    return logits
 
 
 def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -> dict:
@@ -405,14 +435,11 @@ def belief_ce_bank(
         tr_sig, ces, tids, confs, corrects = [], [], [], [], []
         for i, record in enumerate(inference_bank):
             record_targets = record["targets"]
-            record_logits = record["logits"]
             out = record["out"]
-            if record_targets is None or record_logits is None:
-                raise ValueError(
-                    "belief_ce_bank inference records require targets and decoded logits"
-                )
+            if record_targets is None:
+                raise ValueError("belief_ce_bank inference records require targets")
             targets = record_targets.to(device)
-            logits = record_logits.to(device)
+            logits = _decode_inference_record(model, record, device)
             flat_logits = logits.reshape(-1, logits.shape[-1]).float()
             tgt = targets.reshape(-1)
             per = F.cross_entropy(
@@ -1586,12 +1613,7 @@ def vocab_prediction_stats(
             valid = None
             if inference_bank is not None:
                 tokens = batch["tokens"].to(device)
-                decoded = batch["logits"]
-                if decoded is None:
-                    raise ValueError(
-                        "vocab_prediction_stats inference records require decoded logits"
-                    )
-                decoded = decoded.to(device)
+                decoded = _decode_inference_record(model, batch, device)
                 if batch["targets"] is not None:
                     stored_targets = batch["targets"].to(device)
             else:
@@ -1611,6 +1633,7 @@ def vocab_prediction_stats(
                     continue
                 logits = decoded.reshape(-1, V)[valid_flat].float()
                 targets = stored_targets.reshape(-1)[valid_flat]
+                decoded = None
                 probs = torch.softmax(logits, dim=-1)
                 flatp = probs
             else:
@@ -1621,8 +1644,14 @@ def vocab_prediction_stats(
                 targets = tokens[:, 1:]                             # (B, N-1) true next token
                 probs = torch.softmax(logits, dim=-1)               # (B, N-1, V)
                 flatp = probs.reshape(-1, V)                        # (B*(N-1), V)
+            decoded = None
+            logits = None
             prob_sum += flatp.sum(dim=0).double()
-            ent_sum += -(flatp * flatp.clamp_min(1e-12).log()).sum(dim=-1).sum().double()
+            entropy_terms = flatp.clamp_min(1e-12)
+            entropy_terms.log_()
+            entropy_terms.mul_(flatp)
+            ent_sum -= entropy_terms.sum(dim=-1).sum().double()
+            del entropy_terms
             tgt_flat = targets.reshape(-1)
             tgt_count += torch.bincount(tgt_flat, minlength=V).double()
             n_pos += int(tgt_flat.numel())
@@ -1676,6 +1705,157 @@ def vocab_prediction_stats(
         "true_ids":          torch.cat(true_ids) if true_ids else torch.empty(0, dtype=torch.long),
         "pred_ids":          torch.cat(pred_ids) if pred_ids else torch.empty(0, dtype=torch.long),
     }
+
+
+@torch.no_grad()
+def belief_ce_vocab_stats(
+    model,
+    inference_bank: List[Dict[str, object]],
+
+    *,
+    max_rows:      int                     = 40,
+    per_pos_k:     int                     = 3,
+    max_positions: int                     = 64,
+    max_pairs:     int                     = 200_000,
+    max_batches:   Optional[int]           = None,
+    device:        Optional[torch.device]  = None,
+) -> 'Tuple[Dict[str, torch.Tensor], Optional[Dict[str, object]]]':
+    r"""Stream one decode per inference record into both full-vocabulary report products.
+
+    The converged belief is decoded once for each bounded record. Cross-entropy, confidence,
+    vocabulary aggregates, display rows, and confusion pairs are reduced before that record's
+    full-vocabulary tensors are released. The returned dictionaries retain the public schemas of
+    ``belief_ce_bank`` and ``vocab_prediction_stats``; the vocabulary result is ``None`` only when
+    every aligned target is masked.
+    """
+    device = device or _model_device(model)
+    was_training = model.training
+    model.eval()
+    vocab_size = int(model.cfg.vocab_size)
+    tr_sig: List[torch.Tensor] = []
+    ces: List[torch.Tensor] = []
+    tids: List[torch.Tensor] = []
+    confs: List[torch.Tensor] = []
+    corrects: List[torch.Tensor] = []
+    prob_sum = torch.zeros(vocab_size, dtype=torch.float64, device=device)
+    tgt_count = torch.zeros(vocab_size, dtype=torch.float64, device=device)
+    ent_sum = torch.zeros((), dtype=torch.float64, device=device)
+    true_ids: List[torch.Tensor] = []
+    pred_ids: List[torch.Tensor] = []
+    n_pos = 0
+    n_pairs = 0
+    disp: Optional[Dict[str, object]] = None
+    try:
+        for i, record in enumerate(inference_bank):
+            record_targets = record["targets"]
+            if record_targets is None:
+                raise ValueError("belief_ce_vocab_stats inference records require targets")
+            record_tokens = record["tokens"]
+            out = record["out"]
+            tokens = record_tokens.to(device)
+            targets = record_targets.to(device)
+            if tokens.dim() == 1:
+                tokens = tokens.unsqueeze(0)
+            if targets.dim() == 1:
+                targets = targets.unsqueeze(0)
+            decoded = _decode_inference_record(model, record, device)
+            flat_logits = decoded.reshape(-1, vocab_size).float()
+            tgt = targets.reshape(-1)
+            valid = tgt != -100
+            valid_cpu = record_targets.reshape(-1) != -100
+            valid_logits = flat_logits[valid]
+            tgt_valid = tgt[valid]
+            decoded = None
+            flat_logits = None
+            valid_count = int(tgt_valid.numel())
+            if valid_count:
+                per = F.cross_entropy(
+                    valid_logits,
+                    tgt_valid,
+                    reduction="none",
+                )
+                probabilities = valid_logits.softmax(dim=-1)
+                conf_flat, pred_flat = probabilities.max(dim=-1)
+            else:
+                per = valid_logits.new_empty((0,))
+                probabilities = valid_logits.new_empty((0, vocab_size))
+                conf_flat = valid_logits.new_empty((0,))
+                pred_flat = tgt_valid.new_empty((0,))
+            valid_logits = None
+            trs = metrics.sigma_trace(
+                out.sigma,
+                diagonal=model.cfg.diagonal_covariance,
+                family=model.cfg.family,
+            ).reshape(-1)
+            tr_sig.append(_cpu_bank_value(trs[valid_cpu]))
+            ces.append(_cpu_bank_value(per))
+            tids.append(_cpu_bank_value(tgt_valid))
+            confs.append(_cpu_bank_value(conf_flat))
+            corrects.append(_cpu_bank_value((pred_flat == tgt_valid).float()))
+
+            if valid_count:
+                flatp = probabilities
+                pred_valid = pred_flat
+                probabilities = None
+                prob_sum += flatp.sum(dim=0).double()
+                entropy_terms = flatp.clamp_min(1e-12)
+                entropy_terms.log_()
+                entropy_terms.mul_(flatp)
+                ent_sum -= entropy_terms.sum(dim=-1).sum().double()
+                del entropy_terms
+                tgt_count += torch.bincount(tgt_valid, minlength=vocab_size).double()
+                n_pos += valid_count
+                if n_pairs < max_pairs:
+                    take = min(max_pairs - n_pairs, int(tgt_valid.numel()))
+                    true_ids.append(tgt_valid[:take].cpu())
+                    pred_ids.append(pred_valid[:take].cpu())
+                    n_pairs += take
+                if disp is None:
+                    valid_rows = valid.reshape(tokens.shape)
+                    row = int(valid_rows.any(dim=1).nonzero()[0, 0])
+                    offset = int(valid_rows[:row].sum())
+                    length = int(valid_rows[row].sum())
+                    disp = _vocab_display_panel(
+                        flatp[offset:offset + length],
+                        tokens[row][valid_rows[row]],
+                        targets[row][valid_rows[row]],
+                        max_rows=max_rows,
+                        per_pos_k=per_pos_k,
+                        max_positions=max_positions,
+                    )
+                del flatp, pred_valid
+            stop = max_batches is not None and i + 1 >= max_batches
+            del record, record_targets, record_tokens, out, tokens, targets
+            del decoded, flat_logits, valid_logits, tgt, tgt_valid, per, probabilities
+            del conf_flat, pred_flat, trs, valid, valid_cpu
+            if stop:
+                break
+    finally:
+        if was_training:
+            model.train()
+    ce_stats = {
+        "tr_sigma": torch.cat(tr_sig),
+        "ce": torch.cat(ces),
+        "token_ids": torch.cat(tids),
+        "conf": torch.cat(confs),
+        "correct": torch.cat(corrects),
+    }
+    if disp is None:
+        return ce_stats, None
+    denom = max(n_pos, 1)
+    mean_pred_prob = prob_sum / denom
+    unigram = tgt_count / denom
+    vocab_stats: Dict[str, object] = {
+        **disp,
+        "mean_pred_prob": mean_pred_prob.float().cpu(),
+        "unigram": unigram.float().cpu(),
+        "mean_pred_entropy": float(ent_sum / denom),
+        "unigram_entropy": float(-(unigram * unigram.clamp_min(1e-12).log()).sum()),
+        "n_positions": int(n_pos),
+        "true_ids": torch.cat(true_ids) if true_ids else torch.empty(0, dtype=torch.long),
+        "pred_ids": torch.cat(pred_ids) if pred_ids else torch.empty(0, dtype=torch.long),
+    }
+    return ce_stats, vocab_stats
 
 
 @torch.no_grad()

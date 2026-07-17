@@ -41,6 +41,56 @@ def _complete_scaling_summary():
     return {**metrics, "scaling_point": dict(metrics)}
 
 
+def test_scaling_recompute_removes_owned_stale_artifacts_but_preserves_user_notes(tmp_path):
+    run_dir = tmp_path / "cell"
+    (run_dir / "figures").mkdir(parents=True)
+    (run_dir / "checkpoints").mkdir()
+    (run_dir / "attention").mkdir()
+    for path in (
+        run_dir / "figures" / "old.png",
+        run_dir / "checkpoints" / "step_1.pt",
+        run_dir / "attention" / "old.png",
+        run_dir / "loss_curve.png",
+        run_dir / "summary.json",
+        run_dir / "best_model.pt",
+    ):
+        path.write_bytes(b"stale")
+    note = run_dir / "user_notes.txt"
+    note.write_text("preserve me", encoding="utf-8")
+    user_plot = run_dir / "user_plot.png"
+    user_plot.write_bytes(b"preserve me too")
+
+    scaling._reset_stale_scaling_artifacts(run_dir)
+
+    assert note.read_text(encoding="utf-8") == "preserve me"
+    assert user_plot.read_bytes() == b"preserve me too"
+    assert not (run_dir / "figures").exists()
+    assert not (run_dir / "checkpoints").exists()
+    assert not (run_dir / "attention").exists()
+    assert not (run_dir / "loss_curve.png").exists()
+    assert not (run_dir / "summary.json").exists()
+    assert not (run_dir / "best_model.pt").exists()
+
+
+def test_scaling_cell_path_rejects_reparse_ancestor_and_traversal(tmp_path, monkeypatch):
+    output_dir = scaling._trusted_scaling_output_dir(tmp_path / "output")
+    route_dir = output_dir / "grow_K"
+    route_dir.mkdir()
+    real_probe = scaling._path_is_reparse_point
+    monkeypatch.setattr(
+        scaling,
+        "_path_is_reparse_point",
+        lambda path: path == route_dir or real_probe(path),
+    )
+
+    with pytest.raises(ValueError, match="unsafe scaling cell path"):
+        scaling._trusted_scaling_run_dir(output_dir, "grow_K", "K20", 0)
+
+    monkeypatch.setattr(scaling, "_path_is_reparse_point", real_probe)
+    with pytest.raises(ValueError):
+        scaling._trusted_scaling_run_dir(output_dir, "../escape", "K20", 0)
+
+
 def _patch_source_identity(monkeypatch):
     monkeypatch.setattr(
         scaling,

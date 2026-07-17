@@ -6,6 +6,7 @@ trained run produced only one of the publication figures. The proof is PNG files
 integration test asserts the figure set actually appears when the driver runs the real model.
 """
 
+import json
 import logging
 from dataclasses import asdict
 from pathlib import Path
@@ -16,6 +17,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
+from vfe3 import run_artifacts
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
@@ -81,6 +83,34 @@ def test_plan_single_run_figures_skips_english_taxonomies_for_japanese():
         "vocab_calibration.png",
         "decode_readout.png",
     )
+
+
+def test_reliability_bins_come_from_current_report_bank():
+    from vfe3.viz import report
+
+    reliability = report._reliability_from_ce_bank({
+        "conf":    torch.tensor([0.1, 0.4, 0.6, 0.9]),
+        "correct": torch.tensor([1.0, 0.0, 1.0, 1.0]),
+    }, n_bins=2)
+
+    assert reliability == [
+        {"conf": pytest.approx(0.25), "acc": pytest.approx(0.5), "frac": pytest.approx(0.5)},
+        {"conf": pytest.approx(0.75), "acc": pytest.approx(1.0), "frac": pytest.approx(0.5)},
+    ]
+
+
+def test_saved_reliability_requires_matching_split_provenance(tmp_path):
+    from vfe3.viz import report
+
+    saved = [{"conf": 0.8, "acc": 0.5, "frac": 1.0}]
+    (tmp_path / "research.json").write_text(json.dumps({
+        "reliability_split": "test",
+        "reliability": saved,
+    }), encoding="utf-8")
+    logger = logging.getLogger("test_saved_reliability")
+
+    assert report._saved_reliability_for_split(tmp_path, "validation", logger) is None
+    assert report._saved_reliability_for_split(tmp_path, "test", logger) == saved
 
 
 def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
@@ -160,6 +190,7 @@ def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
         "hyper_prior_coupling.png",
         "model_umap_mu.png",
         "model_umap_sigma.png",
+        "reliability_diagram.png",
     } <= written
     assert {
         ("mu", "Model", "model_umap_mu.png"),
@@ -246,18 +277,26 @@ class _MemoryGuardModel(torch.nn.Module):
         )
 
 
-def test_generate_figures_memory_guard_skips_only_full_vocab_extractors(tmp_path, monkeypatch, caplog):
+def test_generate_figures_memory_guard_uses_materialized_batch_peak(tmp_path, monkeypatch, caplog):
     from vfe3.viz import extract
 
     calls = []
     monkeypatch.setattr(extract, "e_step_belief_trace", lambda *args, **kwargs: calls.append("trace"))
     monkeypatch.setattr(extract, "belief_ce_bank", lambda *args, **kwargs: calls.append("ce_bank"))
     monkeypatch.setattr(extract, "vocab_prediction_stats", lambda *args, **kwargs: calls.append("vocab"))
-    loader = [torch.zeros((1, 2), dtype=torch.long)]
+    small_loader = [torch.zeros((1, 2), dtype=torch.long)]
 
-    generate_figures(tmp_path / "guarded", model=_MemoryGuardModel(), loader=loader)
+    generate_figures(tmp_path / "small", model=_MemoryGuardModel(), loader=small_loader)
 
     assert "trace" in calls
+    assert {"ce_bank", "vocab"} <= set(calls)
+    assert "full-vocab" not in caplog.text
+
+    calls.clear()
+    caplog.clear()
+    large_tokens = torch.zeros(1, dtype=torch.long).expand(1, 20_000)
+    generate_figures(tmp_path / "guarded", model=_MemoryGuardModel(), loader=[large_tokens])
+
     assert "ce_bank" not in calls
     assert "vocab" not in calls
     assert "full-vocab" in caplog.text
@@ -266,7 +305,7 @@ def test_generate_figures_memory_guard_skips_only_full_vocab_extractors(tmp_path
     generate_figures(
         tmp_path / "allowed",
         model=_MemoryGuardModel(),
-        loader=loader,
+        loader=[large_tokens],
         allow_large=True,
     )
     assert {"ce_bank", "vocab"} <= set(calls)
@@ -281,6 +320,160 @@ def test_finalize_skips_figures_when_disabled(tmp_path):
                    val_loader=_loader(seed=1), artifacts=art)
     finalize_run(model, art, cfg, test_loader=_loader(seed=2), losses=losses)
     assert not (tmp_path / "run" / "figures").exists()
+
+
+def test_finalize_figure_opt_out_skips_publication_probes(tmp_path, monkeypatch):
+    cfg = _cfg(generate_figures=False)
+    model = _model(generate_figures=False)
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
+    forbidden = []
+
+    monkeypatch.setattr(
+        run_artifacts,
+        "collect_estep_depth_sensitivity",
+        lambda *args, **kwargs: forbidden.append("depth"),
+    )
+    monkeypatch.setattr(
+        run_artifacts,
+        "collect_phi_numerics",
+        lambda *args, **kwargs: forbidden.append("phi"),
+    )
+    monkeypatch.setattr(
+        run_artifacts,
+        "_write_research_artifacts",
+        lambda *args, **kwargs: forbidden.append("research"),
+    )
+    monkeypatch.setattr(
+        run_artifacts,
+        "_run_figures_isolated",
+        lambda *args, **kwargs: forbidden.append("worker"),
+    )
+
+    finalize_run(
+        model,
+        art,
+        cfg,
+        train_loader=_loader(),
+        val_loader=_loader(seed=1),
+        test_loader=_loader(seed=2),
+    )
+
+    assert forbidden == []
+
+
+def test_on_demand_probe_preparation_reuses_retained_batch_and_preserves_existing(tmp_path, monkeypatch):
+    from vfe3.viz import report
+
+    tokens = torch.tensor([[0, 1, 2]])
+    targets = torch.tensor([[1, 2, 0]])
+    calls = []
+
+    def collect_phi(model, seen_tokens):
+        calls.append(("phi", model, seen_tokens.clone()))
+        return {"probe": "phi"}
+
+    def collect_depth(model, seen_tokens, seen_targets, depths):
+        calls.append(("depth", model, seen_tokens.clone(), seen_targets.clone(), tuple(depths)))
+        return {"probe": "depth"}
+
+    monkeypatch.setattr(report, "collect_phi_numerics", collect_phi)
+    monkeypatch.setattr(report, "collect_estep_depth_sensitivity", collect_depth)
+    model = object()
+    logger = logging.getLogger("test_on_demand_probes")
+
+    report._prepare_missing_saved_probes(
+        model,
+        [(tokens, targets)],
+        tmp_path,
+        torch.device("cpu"),
+        logger,
+    )
+
+    assert json.loads((tmp_path / "phi_numerics.json").read_text(encoding="utf-8")) == {
+        "probe": "phi",
+    }
+    assert json.loads((tmp_path / "estep_depth_sensitivity.json").read_text(encoding="utf-8")) == {
+        "probe": "depth",
+    }
+    assert [call[0] for call in calls] == ["phi", "depth"]
+    assert torch.equal(calls[0][2], tokens)
+    assert torch.equal(calls[1][2], tokens)
+    assert torch.equal(calls[1][3], targets)
+    assert calls[1][4] == (0, 1, 2, 3, 5, 8)
+
+    report._prepare_missing_saved_probes(
+        model,
+        [(tokens + 1, targets + 1)],
+        tmp_path,
+        torch.device("cpu"),
+        logger,
+    )
+    assert [call[0] for call in calls] == ["phi", "depth"]
+
+
+def test_report_worker_rebuilds_persisted_figures_without_second_report_replay(
+    tmp_path,
+    monkeypatch,
+):
+    from vfe3.viz import figure_worker, report
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    result_path = run_dir / ".figure_result.json"
+    result_path.touch()
+    request_path = run_dir / ".figure_request.json"
+    request_path.write_text(json.dumps({
+        "mode": "report",
+        "run_dir": str(run_dir),
+        "result_path": str(result_path),
+        "device": "cpu",
+        "split": "validation",
+        "max_sequences": 8,
+        "n_e_steps": None,
+        "allow_large": False,
+    }), encoding="utf-8")
+    monkeypatch.setenv("VFE3_FIGURE_REQUEST", str(request_path))
+
+    publication_path = run_dir / "figures" / "publication.png"
+    calls = []
+
+    def generate_figures(*args, **kwargs):
+        calls.append(("report", args, kwargs))
+        return [publication_path]
+
+    cfg = object()
+    monkeypatch.setattr(report, "generate_figures", generate_figures)
+    monkeypatch.setattr(figure_worker, "_load_worker_config", lambda path: cfg)
+    monkeypatch.setattr(
+        figure_worker,
+        "_render_persisted_run_figures",
+        lambda *args: calls.append(("persisted", args)),
+    )
+
+    assert figure_worker.main() == 0
+    assert [call[0] for call in calls] == ["report", "persisted"]
+    assert calls[0][2]["prepare_saved_probes"] is True
+    assert calls[1][1] == (run_dir.resolve(), cfg, None, calls[0][2]["logger"])
+    assert json.loads(result_path.read_text(encoding="utf-8")) == {
+        "paths": [str(publication_path.resolve())],
+    }
+
+
+def test_figure_worker_snapshot_caps_actual_loader_shapes():
+    tokens = torch.zeros((64, 1024), dtype=torch.long)
+    targets = torch.ones_like(tokens)
+
+    batches = run_artifacts._snapshot_report_batches([(tokens, targets)])
+
+    assert len(batches) == 1
+    assert batches[0][0].numel() <= run_artifacts._CONTROLLED_FIGURE_BANK_TOKENS
+    assert batches[0][0].shape == batches[0][1].shape
+    assert batches[0][0].untyped_storage().data_ptr() != tokens.untyped_storage().data_ptr()
+    assert batches[0][1].untyped_storage().data_ptr() != targets.untyped_storage().data_ptr()
+    tokens.fill_(7)
+    targets.fill_(9)
+    assert torch.equal(batches[0][0], torch.zeros_like(batches[0][0]))
+    assert torch.equal(batches[0][1], torch.ones_like(batches[0][1]))
 
 
 def test_train_skips_periodic_attention_figures_when_generation_disabled(tmp_path, monkeypatch):

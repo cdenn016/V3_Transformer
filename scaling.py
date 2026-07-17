@@ -36,8 +36,9 @@ import hashlib
 import json
 import logging
 import math
+import shutil
+import stat
 import time
-import unicodedata
 from collections.abc import Mapping
 from dataclasses import asdict
 from dataclasses import fields as _dc_fields
@@ -54,6 +55,7 @@ from vfe3.data.datasets import (
     tokens_per_char as _tokens_per_char,
 )
 from vfe3.model.model import VFEModel, build_group
+from vfe3.path_utils import portable_path_component_key
 from vfe3.run_artifacts import RunArtifacts, _git_code_identity, _write_json_atomic, finalize_run
 from vfe3.runtime import seed_everything
 from vfe3.train import coverage_lines, train
@@ -671,7 +673,7 @@ def _cell_cfg_dict(overrides: Dict[str, Any], seed: int, max_steps: Optional[int
     d.update(overrides)
     d["seed"] = _require_scaling_seed(seed)
     d["checkpoint_interval"] = 0                             # no per-cell step_N.pt blowup
-    d["generate_figures"] = False                           # single-run replay figures are off the scaling path
+    d["generate_figures"] = False                           # finalize-time publication probes/figures are off this path
     if max_steps is not None:
         d["max_steps"] = int(max_steps)
     return d
@@ -890,6 +892,136 @@ def _cell_is_current(
             and saved_fingerprint == current_fingerprint)
 
 
+def _path_is_reparse_point(path: Path) -> bool:
+    """Return whether ``path`` is a symlink, junction, or other filesystem reparse point."""
+    junction_probe = getattr(os.path, "isjunction", lambda _path: False)
+    if path.is_symlink() or junction_probe(path):
+        return True
+    try:
+        attributes = getattr(path.lstat(), "st_file_attributes", 0)
+    except OSError:
+        return False
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+
+
+def _trusted_scaling_output_dir(path: Path) -> Path:
+    """Create and return a real output directory reached without any reparse-point ancestor."""
+    absolute = Path(os.path.abspath(path))
+    existing_chain = [candidate for candidate in reversed(absolute.parents) if candidate.exists()]
+    if absolute.exists():
+        existing_chain.append(absolute)
+    for candidate in existing_chain:
+        if _path_is_reparse_point(candidate):
+            raise ValueError(f"scaling output path crosses a symlink or junction: {candidate}")
+    absolute.mkdir(parents=True, exist_ok=True)
+    if _path_is_reparse_point(absolute) or not absolute.is_dir():
+        raise ValueError("scaling output path must be a real directory")
+    return absolute.resolve(strict=True)
+
+
+def _trusted_scaling_run_dir(
+    output_dir: Path,
+    route:      str,
+    label:      str,
+    seed:       int,
+) -> Path:
+    """Return one real direct-child cell tree contained by ``output_dir``."""
+    root = _trusted_scaling_output_dir(output_dir)
+    components = (route, label, f"s{seed}")
+    current = root
+    for component in components:
+        portable_path_component_key(component)
+        candidate = current / component
+        if candidate.exists() and (
+                _path_is_reparse_point(candidate) or not candidate.is_dir()):
+            raise ValueError(f"unsafe scaling cell path: {candidate}")
+        candidate.mkdir(exist_ok=True)
+        if _path_is_reparse_point(candidate) or candidate.resolve(strict=True).parent != current:
+            raise ValueError(f"scaling cell escaped its owned output tree: {candidate}")
+        current = candidate.resolve(strict=True)
+    try:
+        current.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("scaling cell escaped its owned output tree") from exc
+    return current
+
+
+def _reset_stale_scaling_artifacts(run_dir: Path) -> None:
+    r"""Remove only runner-owned artifacts before recomputing one deterministic scaling cell."""
+    if not run_dir.exists():
+        return
+
+    if _path_is_reparse_point(run_dir):
+        raise ValueError("scaling cell directory may not be a symlink or junction")
+    if not run_dir.is_dir():
+        raise ValueError("scaling cell path exists but is not a directory")
+    owned_directories = ("attention", "checkpoints", "figures")
+    owned_files = {
+        "best_model.pt",
+        "config.json",
+        "estep_depth_sensitivity.json",
+        "metrics.csv",
+        "metrics_per_layer.csv",
+        "phi_numerics.json",
+        "provenance.json",
+        "pure_path_report.json",
+        "research.json",
+        "scaling_cell.json",
+        "scaling_failure.json",
+        "scaling_result.json",
+        "summary.json",
+        "test_results.json",
+        "validation_results.json",
+    }
+    owned_figures = {
+        "belief_condition.png",
+        "estep_convergence_trend.png",
+        "estep_depth_sensitivity.png",
+        "estep_grad_norm_decomposition.png",
+        "estep_quality.png",
+        "free_energy_codescent.png",
+        "free_energy_decomposition.png",
+        "gauge_trace_spread.png",
+        "geometry_health.png",
+        "grad_norm.png",
+        "grad_norm_decomposition.png",
+        "holonomy.png",
+        "kappa_beta_history.png",
+        "kappa_block_trajectory.png",
+        "kappa_gamma_history.png",
+        "loss_curve.png",
+        "model_channel_terms.png",
+        "optimizer_geometry.png",
+        "phi_numerics_reference.png",
+        "val_ppl.png",
+        "validation_sanity.png",
+    }
+    for name in owned_directories:
+        path = run_dir / name
+        if path.is_symlink():
+            path.unlink()
+        elif _path_is_reparse_point(path):
+            path.rmdir()
+        elif path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+    for path in run_dir.iterdir():
+        if path.name not in owned_files and path.name not in owned_figures:
+            continue
+        if path.is_symlink():
+            path.unlink()
+        elif _path_is_reparse_point(path):
+            if path.is_dir():
+                path.rmdir()
+            else:
+                path.unlink()
+        elif path.is_file():
+            path.unlink()
+        else:
+            raise ValueError(f"runner-owned scaling file path has an unsafe type: {path}")
+
+
 def run_cell(
     cell:       Dict[str, Any],
     run_dir:    Path,
@@ -920,6 +1052,7 @@ def run_cell(
     try:
         cfg = VFE3Config(**cfg_dict)
     except (ValueError, NotImplementedError, TypeError) as exc:
+        _reset_stale_scaling_artifacts(run_dir)
         logger.warning("  [config rejected] %s: %s", label, exc)
         return {"label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
                 "error_kind": "config", "error": str(exc), "seed": seed,
@@ -937,6 +1070,8 @@ def run_cell(
         return {"label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
                 "error_kind": None, "seed": seed, "cached": True,
                 **metrics}
+
+    _reset_stale_scaling_artifacts(run_dir)
 
     pred_n, n_gen = predict_n_params(cfg)
     seed_everything(cfg.seed, deterministic=cfg.deterministic)
@@ -1082,36 +1217,9 @@ def _validated_scaling_seeds(raw_seeds: object) -> List[int]:
     return seeds
 
 
-_WINDOWS_RESERVED_PATH_STEMS = {
-    "aux",
-    "con",
-    "nul",
-    "prn",
-    *(f"com{index}" for index in range(1, 10)),
-    *(f"lpt{index}" for index in range(1, 10)),
-}
-
-
 def _scaling_path_component_key(value: str, *, field: str) -> str:
     """Validate one portable directory name and return its collision key."""
-    invalid_windows_chars = '<>:"/\\|?*'
-    platform_reserved = getattr(os.path, "isreserved", None)
-    invalid = (
-        not value
-        or value != value.strip()
-        or value in {".", ".."}
-        or len(value) > 255
-        or any(ord(char) < 32 for char in value)
-        or any(char in invalid_windows_chars for char in value)
-        or value[-1] in {" ", "."}
-        or value.split(".", maxsplit=1)[0].casefold() in _WINDOWS_RESERVED_PATH_STEMS
-        or (platform_reserved is not None and platform_reserved(value))
-    )
-    if invalid:
-        raise ValueError(
-            f"{field} must be a safe single path component, got {value!r}"
-        )
-    return unicodedata.normalize("NFC", value).casefold()
+    return portable_path_component_key(value, field=field)
 
 
 def _validated_scaling_routes(raw_routes: object) -> List[str]:
@@ -1223,8 +1331,11 @@ def main() -> int:
         return 1
     device = (torch.device("cuda" if torch.cuda.is_available() else "cpu")
               if CONFIG["device"] == "auto" else torch.device(CONFIG["device"]))
-    output_dir = Path(CONFIG["output_dir"])
-    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        output_dir = _trusted_scaling_output_dir(Path(CONFIG["output_dir"]))
+    except (OSError, ValueError) as exc:
+        logger.error("unsafe scaling output directory: %s", exc)
+        return 1
 
     design = _scaling_design(route_names, seeds)
     design_path = output_dir / "scaling_design.json"
@@ -1244,8 +1355,10 @@ def main() -> int:
         print(f"\n{'=' * 70}\nROUTE: {name}  ({len(cells)} cells x {len(seeds)} seeds)\n{'=' * 70}")
         for cell in cells:
             for seed in seeds:
-                run_dir = output_dir / name / cell["label"] / f"s{seed}"
                 try:
+                    run_dir = _trusted_scaling_run_dir(
+                        output_dir, name, cell["label"], int(seed)
+                    )
                     res = run_cell(cell, run_dir, int(seed), dataset=CONFIG["dataset"], device=device,
                                    max_tokens=CONFIG["max_tokens"], max_steps=CONFIG["max_steps"],
                                    source_identities=invocation_sources,
@@ -1267,16 +1380,28 @@ def main() -> int:
                     if published.get("error") is None:
                         published["error"] = (
                             "scaling result is incomplete, non-finite, non-positive, or inconsistent")
-                run_dir.mkdir(parents=True, exist_ok=True)
-                _write_json_atomic(run_dir / "scaling_result.json", published)
-                if status != "complete":
-                    _write_json_atomic(run_dir / "scaling_failure.json", published)
+                try:
+                    run_dir = _trusted_scaling_run_dir(
+                        output_dir, name, cell["label"], int(seed)
+                    )
+                    _write_json_atomic(run_dir / "scaling_result.json", published)
+                    if status != "complete":
+                        _write_json_atomic(run_dir / "scaling_failure.json", published)
+                        incomplete = True
+                    else:
+                        try:
+                            (run_dir / "scaling_failure.json").unlink()
+                        except FileNotFoundError:
+                            pass
+                except (OSError, ValueError) as exc:
+                    published["status"] = "failed"
+                    published["error_kind"] = "path"
+                    published["error"] = str(exc)
+                    status = "failed"
                     incomplete = True
-                else:
-                    try:
-                        (run_dir / "scaling_failure.json").unlink()
-                    except FileNotFoundError:
-                        pass
+                    logger.error(
+                        "refusing per-cell publication outside the owned scaling tree: %s", exc
+                    )
                 manifest_cell = design_cells[(name, cell["label"], int(seed))]
                 manifest_cell.update({
                     "status": status,
@@ -1284,6 +1409,7 @@ def main() -> int:
                     "error": published.get("error"),
                 })
                 design["status"] = "incomplete" if incomplete else "running"
+                _trusted_scaling_output_dir(output_dir)
                 _write_json_atomic(design_path, design)
                 if status == "complete" and not res.get("cached"):
                     print(f"      -> test_ce={res.get('test_ce')}  ppl={res.get('test_ppl')}  "
@@ -1310,6 +1436,7 @@ def main() -> int:
         design["error"] = "; ".join(invocation_errors)
 
     design["status"] = "incomplete" if incomplete else "complete"
+    _trusted_scaling_output_dir(output_dir)
     _write_json_atomic(design_path, design)
     if incomplete:
         print(f"\nROUTES INCOMPLETE. Inspect {design_path} and per-cell scaling_failure.json files.")

@@ -14,18 +14,390 @@ from pathlib import Path
 import pytest
 
 import ablation
+from vfe3.viz import figure_worker
 
 
-def _write_marker(sweep_dir: Path, label: str, ppl: float) -> None:
-    r"""A minimal headline marker under the cell dir the runner would create for ``label``."""
+_CODE_IDENTITY = {
+    "git_sha": "a" * 40,
+    "git_dirty": False,
+    "git_dirty_fingerprint": None,
+}
+
+
+def test_runner_identity_ignores_declaration_only_tack_on_but_binds_logic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "ablation.py"
+    source.write_text(
+        "SWEEPS = {'probe': {'values': [1]}}\n"
+        "CONFIG = {'sweep': 'probe'}\n"
+        "def run():\n    return 1\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ablation, "__file__", str(source))
+    before = ablation._ablation_runner_source_sha256()
+    monkeypatch.setattr(ablation, "_PROCESS_ABLATION_RUNNER_SHA256", before)
+
+    source.write_text(
+        "SWEEPS = {'probe': {'values': [1, 2]}}\n"
+        "CONFIG = {'sweep': 'probe'}\n"
+        "def run():\n    return 1\n",
+        encoding="utf-8",
+    )
+    assert ablation._ablation_runner_source_sha256() == before
+    assert ablation._verified_ablation_runner_source_sha256() == before
+
+    source.write_text(
+        "SWEEPS = {'probe': {'values': [1, 2]}}\n"
+        "CONFIG = {'sweep': 'probe'}\n"
+        "def run():\n    return 2\n",
+        encoding="utf-8",
+    )
+    assert ablation._ablation_runner_source_sha256() != before
+    with pytest.raises(RuntimeError, match="restart the Spyder kernel"):
+        ablation._verified_ablation_runner_source_sha256()
+
+
+def test_validate_sweeps_rejects_duplicate_expanded_labels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "duplicate_labels"
+    monkeypatch.setitem(ablation.SWEEPS, name, {
+        "description": "duplicate labels",
+        "configs": [
+            {"label": "same", "kappa_beta": 0.5},
+            {"label": "same", "kappa_beta": 1.0},
+        ],
+    })
+
+    with pytest.raises(ValueError, match="duplicate.*label"):
+        ablation.validate_sweeps([name])
+
+
+@pytest.mark.parametrize("name", ("../escape", "figures", "__sensitivity__"))
+def test_validate_sweeps_rejects_unsafe_or_reserved_names(
+    name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(ablation.SWEEPS, name, {
+        "description": "unsafe name",
+        "configs": [{"label": "cell"}],
+    })
+
+    with pytest.raises(ValueError, match="sweep name"):
+        ablation.validate_sweeps([name])
+
+
+def test_prepare_owned_output_child_rejects_a_junction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    child = tmp_path / "sweep"
+    child.mkdir()
+    monkeypatch.setattr(ablation, "_path_is_junction", lambda path: path == child)
+
+    with pytest.raises(ValueError, match="junction|reparse"):
+        ablation._prepare_owned_output_child(tmp_path, "sweep", role="ablation sweep")
+
+
+def test_cell_generation_rejects_and_preserves_an_unowned_nonempty_directory(
+    tmp_path: Path,
+) -> None:
+    sweep_dir = tmp_path / "sweep"
+    run_dir = sweep_dir / "cell"
+    run_dir.mkdir(parents=True)
+    foreign = run_dir / "user-notes.txt"
+    foreign.write_text("preserve me", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="ownership"):
+        ablation._start_owned_cell_generation(
+            sweep_dir,
+            run_dir,
+            sweep_name="sweep",
+            label="cell",
+            seed=6,
+        )
+
+    assert foreign.read_text(encoding="utf-8") == "preserve me"
+    assert sorted(path.name for path in run_dir.iterdir()) == ["user-notes.txt"]
+
+
+def test_cell_generation_promotes_one_exact_legacy_marker_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    sweep_dir = tmp_path / "sweep"
+    run_dir = sweep_dir / "cell"
+    run_dir.mkdir(parents=True)
+    (run_dir / "ablation_result.json").write_text(
+        json.dumps({"status": "success", "label": "cell", "seed": 6}),
+        encoding="utf-8",
+    )
+    stale = run_dir / "stale.txt"
+    stale.write_text("old generation", encoding="utf-8")
+
+    ablation._start_owned_cell_generation(
+        sweep_dir,
+        run_dir,
+        sweep_name="sweep",
+        label="cell",
+        seed=6,
+    )
+
+    owner = json.loads(
+        (run_dir / "ablation_cell_owner.json").read_text(encoding="utf-8")
+    )
+    assert owner == {
+        "schema_version": 1,
+        "sweep": "sweep",
+        "label": "cell",
+        "seed": 6,
+    }
+    running = json.loads(
+        (run_dir / "ablation_result.json").read_text(encoding="utf-8")
+    )
+    assert running == {
+        "status": "running",
+        "sweep": "sweep",
+        "label": "cell",
+        "seed": 6,
+    }
+    assert not stale.exists()
+
+
+def test_cell_generation_rejects_a_mismatched_owner_without_legacy_fallback(
+    tmp_path: Path,
+) -> None:
+    sweep_dir = tmp_path / "sweep"
+    run_dir = sweep_dir / "cell"
+    run_dir.mkdir(parents=True)
+    owner_path = run_dir / "ablation_cell_owner.json"
+    owner_path.write_text(
+        json.dumps({
+            "schema_version": 1,
+            "sweep": "sweep",
+            "label": "cell",
+            "seed": 7,
+        }),
+        encoding="utf-8",
+    )
+    marker_path = run_dir / "ablation_result.json"
+    marker_path.write_text(
+        json.dumps({
+            "status": "success",
+            "sweep": "sweep",
+            "label": "cell",
+            "seed": 6,
+        }),
+        encoding="utf-8",
+    )
+    foreign = run_dir / "user-notes.txt"
+    foreign.write_text("preserve me", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="ownership"):
+        ablation._start_owned_cell_generation(
+            sweep_dir,
+            run_dir,
+            sweep_name="sweep",
+            label="cell",
+            seed=6,
+        )
+
+    assert json.loads(owner_path.read_text(encoding="utf-8"))["seed"] == 7
+    assert json.loads(marker_path.read_text(encoding="utf-8"))["status"] == "success"
+    assert foreign.read_text(encoding="utf-8") == "preserve me"
+
+
+def test_cell_generation_preserves_a_valid_owner_while_cleaning_owned_artifacts(
+    tmp_path: Path,
+) -> None:
+    sweep_dir = tmp_path / "sweep"
+    run_dir = sweep_dir / "cell"
+    run_dir.mkdir(parents=True)
+    owner_path = run_dir / "ablation_cell_owner.json"
+    expected_owner = {
+        "schema_version": 1,
+        "sweep": "sweep",
+        "label": "cell",
+        "seed": 6,
+    }
+    owner_path.write_text(json.dumps(expected_owner), encoding="utf-8")
+    (run_dir / "ablation_result.json").write_text(
+        json.dumps({
+            "status": "failed",
+            "sweep": "sweep",
+            "label": "cell",
+            "seed": 6,
+        }),
+        encoding="utf-8",
+    )
+    (run_dir / "stale.txt").write_text("old generation", encoding="utf-8")
+    stale_dir = run_dir / "figures"
+    stale_dir.mkdir()
+    (stale_dir / "stale.png").write_bytes(b"old figure")
+
+    ablation._start_owned_cell_generation(
+        sweep_dir,
+        run_dir,
+        sweep_name="sweep",
+        label="cell",
+        seed=6,
+    )
+
+    assert json.loads(owner_path.read_text(encoding="utf-8")) == expected_owner
+    assert sorted(path.name for path in run_dir.iterdir()) == [
+        "ablation_cell_owner.json",
+        "ablation_result.json",
+    ]
+
+
+def test_requested_outputs_require_every_declared_diagnostic_and_real_extrapolation() -> None:
+    incomplete = {
+        "attn_entropy": 1.0,
+        "extrap_ce": [],
+    }
+    assert ablation._requested_outputs_are_complete(
+        incomplete,
+        required_diagnostic_keys=("attn_entropy", "builder_resid"),
+        min_extrapolation_points=2,
+    ) is False
+
+    complete = {
+        "attn_entropy": 1.0,
+        "builder_resid": 1e-7,
+        "extrap_ce": [
+            {"n": 16, "ce": 3.0, "ppl": 20.0},
+            {"n": 32, "ce": 3.1, "ppl": 22.2},
+        ],
+    }
+    assert ablation._requested_outputs_are_complete(
+        complete,
+        required_diagnostic_keys=("attn_entropy", "builder_resid"),
+        min_extrapolation_points=2,
+    ) is True
+
+
+def test_terminal_checkpoint_identity_is_owned_and_revalidated(tmp_path: Path) -> None:
+    run_dir = tmp_path / "cell"
+    checkpoint = run_dir / "checkpoints" / "step_2.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint generation one")
+    marker = {"terminal_checkpoint": str(checkpoint)}
+
+    identity = ablation._terminal_checkpoint_identity(run_dir, marker)
+    assert identity is not None
+    marker.update(identity)
+    assert ablation._terminal_checkpoint_is_current(run_dir, marker) is True
+
+    checkpoint.write_bytes(b"checkpoint generation two")
+    assert ablation._terminal_checkpoint_is_current(run_dir, marker) is False
+
+
+def test_gauge_disclosure_names_the_nonintertwiner() -> None:
+    disclosure = ablation._gauge_disclosure_text({
+        "classifications_by_label": {
+            "baseline": "independent_head_nonintertwiner",
+            "pure": "disabled",
+        },
+        "contains_independent_head_nonintertwiner": True,
+        "all_rows_on_gauge_pure_path": False,
+    })
+
+    assert "independent_head_nonintertwiner" in disclosure
+    assert "not gauge-pure" in disclosure
+
+
+def _source_identities() -> dict[str, dict[str, object]]:
+    return {
+        split: {
+            "format": "pt",
+            "tokenizer_tag": "tiktoken",
+            "size_bytes": len(split),
+            "sha256": split[0] * 64,
+            "meta": None,
+            "meta_sha256": None,
+        }
+        for split in ("train", "validation")
+    }
+
+
+def _aggregation_contract(sweep_dir: Path) -> dict[str, object]:
+    meta_path = sweep_dir / "sweep_meta.json"
+    if meta_path.exists():
+        return json.loads(meta_path.read_text(encoding="utf-8"))["aggregation_contract"]
+    contract = ablation._sweep_aggregation_contract(
+        dataset="wikitext-103",
+        diagnostic_flags={
+            "collect_diagnostics": False,
+            "collect_extrapolation": False,
+            "paired_token_bootstrap": False,
+        },
+        data_seed_override=ablation.DATA_SEED,
+        max_tokens=None,
+        max_steps=None,
+        seed_design=[6],
+        source_identities=_source_identities(),
+        code_identity=_CODE_IDENTITY,
+    )
+    meta_path.write_text(
+        json.dumps({"status": "complete", "aggregation_contract": contract}),
+        encoding="utf-8",
+    )
+    return contract
+
+
+def _label_overrides(label: str) -> dict[str, object]:
+    if label.startswith("kappa="):
+        return {"kappa_beta": float(label.split("=", 1)[1])}
+    return {}
+
+
+def _write_marker(
+    sweep_dir: Path,
+    label: str,
+    ppl: float,
+    *,
+    seed: int = 6,
+    overrides: dict[str, object] | None = None,
+    contract_mutation=None,
+) -> None:
+    r"""Write one success marker bound to the sweep's persisted aggregation contract."""
+    aggregation = _aggregation_contract(sweep_dir)
+    overrides = _label_overrides(label) if overrides is None else overrides
+    cfg = ablation.VFE3Config(**ablation._cell_cfg_dict(overrides, seed=seed))
+    sources = aggregation["source_identities"]
+    contract = ablation._cell_contract(
+        cfg,
+        aggregation["dataset"],
+        aggregation["diagnostic_flags"],
+        data_seed=(aggregation["data_seed_override"]
+                   if aggregation["data_seed_override"] is not None else seed),
+        max_tokens=aggregation["max_tokens"],
+        source_identities=sources,
+        code_identity=aggregation["code_identity"],
+    )
+    if contract_mutation is not None:
+        contract_mutation(contract)
+    gauge_fields = ablation._gauge_reporting_fields(cfg)
     cell = sweep_dir / ablation._sanitize(label)
     cell.mkdir(parents=True, exist_ok=True)
+    checkpoint = cell / "checkpoints" / "terminal.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_bytes(f"checkpoint:{label}:{seed}".encode("utf-8"))
+    checkpoint_fields = {"terminal_checkpoint": str(checkpoint)}
+    checkpoint_identity = ablation._terminal_checkpoint_identity(cell, checkpoint_fields)
+    assert checkpoint_identity is not None
+    checkpoint_fields.update(checkpoint_identity)
+    (cell / "cell_contract.json").write_text(json.dumps(contract), encoding="utf-8")
     (cell / "ablation_result.json").write_text(
         json.dumps({
             "sweep": sweep_dir.name, "label": label, "error_kind": None,
             "status": "success", "primary_val_ppl": ppl, "final_val_ppl": ppl,
-            "n_params": 1000, "seed": 6,
+            "n_params": 1000, "seed": seed, "overrides": overrides,
+            "cell_contract_fingerprint": ablation.semantic_config_fingerprint(contract),
             "collect_diagnostics": False, "collect_extrapolation": False,
+            **checkpoint_fields,
+            **gauge_fields,
         }),
         encoding="utf-8",
     )
@@ -111,6 +483,97 @@ def test_collect_sweep_results_rejects_malformed_failed_and_nonfinite_markers(tm
     assert [marker["label"] for marker in union] == ["valid"]
 
 
+def test_collect_sweep_results_accepts_only_current_compatible_contract_cohort(
+    tmp_path: Path,
+) -> None:
+    sweep_dir = tmp_path / "kappa"
+    sweep_dir.mkdir()
+    _write_marker(sweep_dir, "kappa=1", ppl=11.0, seed=6)
+    _write_marker(sweep_dir, "kappa=2", ppl=12.0, seed=23)
+    _write_marker(
+        sweep_dir,
+        "wrong_code",
+        ppl=1.0,
+        contract_mutation=lambda contract: contract["code_identity"].update(
+            {"git_sha": "b" * 40}
+        ),
+    )
+    _write_marker(
+        sweep_dir,
+        "wrong_budget",
+        ppl=2.0,
+        contract_mutation=lambda contract: contract.update(
+            {"semantic_config_fingerprint": "f" * 64}
+        ),
+    )
+    missing = sweep_dir / ablation._sanitize("missing_contract")
+    missing.mkdir()
+    (missing / "ablation_result.json").write_text(
+        json.dumps({
+            "sweep": sweep_dir.name,
+            "label": "missing_contract",
+            "status": "success",
+            "error_kind": None,
+            "primary_val_ppl": 3.0,
+            "final_val_ppl": 3.0,
+            "seed": 6,
+            "overrides": {},
+            "cell_contract_fingerprint": "0" * 64,
+        }),
+        encoding="utf-8",
+    )
+
+    rows = ablation._collect_sweep_results(sweep_dir)
+
+    assert [(row["label"], row["seed"]) for row in rows] == [
+        ("kappa=1", 6),
+    ]
+
+    aggregation = _aggregation_contract(sweep_dir)
+    aggregation["seed_design"] = [23]
+    rows = ablation._collect_sweep_results(
+        sweep_dir,
+        aggregation_contract=aggregation,
+    )
+
+    assert [(row["label"], row["seed"]) for row in rows] == [
+        ("kappa=2", 23),
+    ]
+
+
+def test_collect_sweep_results_requires_a_complete_exact_seed_panel_per_base(
+    tmp_path: Path,
+) -> None:
+    sweep_dir = tmp_path / "seed_panel"
+    sweep_dir.mkdir()
+    aggregation = _aggregation_contract(sweep_dir)
+    aggregation["seed_design"] = [6, 23]
+    (sweep_dir / "sweep_meta.json").write_text(
+        json.dumps({"status": "complete", "aggregation_contract": aggregation}),
+        encoding="utf-8",
+    )
+
+    _write_marker(sweep_dir, "historical_incomplete__s6", ppl=11.0, seed=6)
+    _write_marker(sweep_dir, "historical_complete__s6", ppl=12.0, seed=6)
+    _write_marker(sweep_dir, "historical_complete__s23", ppl=13.0, seed=23)
+    _write_marker(sweep_dir, "requested_incomplete__s6", ppl=14.0, seed=6)
+    _write_marker(sweep_dir, "duplicate__s6", ppl=15.0, seed=6)
+    _write_marker(sweep_dir, "duplicate__s06", ppl=16.0, seed=6)
+    _write_marker(sweep_dir, "duplicate__s23", ppl=17.0, seed=23)
+
+    rows = ablation._collect_sweep_results(sweep_dir)
+
+    assert sorted((row["label"], row["seed"]) for row in rows) == [
+        ("historical_complete__s23", 23),
+        ("historical_complete__s6", 6),
+    ]
+    admitted_labels = {row["label"] for row in rows}
+    assert "historical_incomplete__s6" not in admitted_labels
+    requested_labels = {"requested_incomplete__s6", "requested_incomplete__s23"}
+    assert requested_labels.isdisjoint(admitted_labels)
+    assert not any(label.startswith("duplicate__s") for label in admitted_labels)
+
+
 def test_plot_one_sweep_does_not_raise(tmp_path: Path) -> None:
     r"""Best-effort plotting must never raise, with or without matplotlib installed."""
     sweep_dir = tmp_path / "kappa"
@@ -119,6 +582,102 @@ def test_plot_one_sweep_does_not_raise(tmp_path: Path) -> None:
         _write_marker(sweep_dir, f"kappa={v}", ppl=10.0 + v)
     ablation._write_sweep_csv(sweep_dir, ablation._collect_sweep_results(sweep_dir))
     ablation._plot_one_sweep(sweep_dir, tmp_path / "figures")
+
+
+def test_ablation_figures_run_in_child_with_scoped_openmp_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "ablation"
+    output_dir.mkdir()
+    monkeypatch.delenv("KMP_DUPLICATE_LIB_OK", raising=False)
+    captured: dict[str, object] = {}
+
+    def _fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["environment"] = kwargs["env"]
+        captured["timeout"] = kwargs["timeout"]
+        request_path = Path(kwargs["env"]["VFE3_FIGURE_REQUEST"])
+        captured["request"] = json.loads(request_path.read_text(encoding="utf-8"))
+        return ablation.subprocess.CompletedProcess(command, 0, "rendered", "")
+
+    monkeypatch.setattr(ablation, "run_process_tree", _fake_run)
+
+    assert ablation._run_ablation_figures_isolated(output_dir, scope="kappa_beta") is True
+    assert "KMP_DUPLICATE_LIB_OK" not in ablation.os.environ
+    assert captured["environment"]["KMP_DUPLICATE_LIB_OK"] == "TRUE"
+    assert captured["command"][-1] == "vfe3.viz.figure_worker"
+    assert captured["timeout"] == ablation._ABLATION_FIGURE_TIMEOUT_SECONDS
+    assert captured["request"] == {
+        "mode": "ablation",
+        "run_dir": str(output_dir.resolve()),
+        "scope": "kappa_beta",
+        "cohort_identity": None,
+        "invalidate": False,
+    }
+
+
+def test_ablation_figure_invalidation_request_is_explicit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_dir = tmp_path / "ablation"
+    output_dir.mkdir()
+    captured: dict[str, object] = {}
+
+    def _fake_run(command, **kwargs):
+        del command
+        request_path = Path(kwargs["env"]["VFE3_FIGURE_REQUEST"])
+        captured.update(json.loads(request_path.read_text(encoding="utf-8")))
+        return ablation.subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(ablation, "run_process_tree", _fake_run)
+
+    assert ablation._run_ablation_figures_isolated(
+        output_dir,
+        scope="kappa_beta",
+        invalidate=True,
+    ) is True
+    assert captured["invalidate"] is True
+
+
+def test_figure_worker_invalidation_retires_manifest_and_legacy_outputs(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "ablation"
+    output_dir.mkdir()
+    figure_dir = output_dir / "figures"
+    figure_dir.mkdir()
+    legacy_names = figure_worker._legacy_ablation_scope_files("gauge_transport")
+    for name in legacy_names:
+        (figure_dir / name).write_bytes(b"stale")
+
+    figure_worker._render_ablation_request({
+        "scope": "gauge_transport",
+        "invalidate": True,
+    }, output_dir)
+
+    assert not any((figure_dir / name).exists() for name in legacy_names)
+    manifest = json.loads(
+        (figure_dir / "ablation_figure_manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["scopes"]["gauge_transport"]["files"] == []
+
+
+def test_sensitivity_invalidation_retires_pre_manifest_summary(tmp_path: Path) -> None:
+    output_dir = tmp_path / "ablation"
+    output_dir.mkdir()
+    figure_dir = output_dir / "figures"
+    figure_dir.mkdir()
+    stale = figure_dir / "sensitivity_summary.png"
+    stale.write_bytes(b"stale")
+
+    figure_worker._render_ablation_request({
+        "scope": "__sensitivity__",
+        "invalidate": True,
+    }, output_dir)
+
+    assert not stale.exists()
 
 
 def test_get_loader_threads_split_aware_shuffle_drop_last(monkeypatch) -> None:
@@ -169,17 +728,29 @@ def test_run_sweep_markers_persist_requests_and_terminal_state(tmp_path: Path, m
         ("success", {}), ("failure", {}),
     ])
 
-    def _fake_run_single(label, _overrides, _run_dir, **kwargs):
+    def _fake_run_single(label, _overrides, run_dir, **kwargs):
         assert kwargs["collect_diagnostics"] is True
         assert kwargs["collect_extrapolation"] is True
         if label == "success":
+            checkpoint = run_dir / "checkpoints" / "terminal.pt"
+            checkpoint.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint.write_bytes(b"owned terminal checkpoint")
             return {
                 "label": label,
                 "error_kind": None,
                 "primary_val_ppl": 8.0,
                 "final_val_ppl": 9.0,
                 "attn_entropy": 1.0,
-                "extrap_ce": [],
+                "energy_klmax_frac": 0.1,
+                "gauge_resid_in": 1e-7,
+                "gauge_resid_out": 1e-7,
+                "omega_identity_dev": 0.2,
+                "rank_resid": 0.8,
+                "terminal_checkpoint": str(checkpoint),
+                "extrap_ce": [
+                    {"n": 16, "ce": 3.0, "ppl": 20.0},
+                    {"n": 32, "ce": 3.1, "ppl": 22.2},
+                ],
                 "_loaded_data_sources": {
                     split: {
                         "format": "pt", "tokenizer_tag": "tiktoken",
@@ -198,7 +769,7 @@ def test_run_sweep_markers_persist_requests_and_terminal_state(tmp_path: Path, m
 
     monkeypatch.setattr(ablation, "run_single", _fake_run_single)
     monkeypatch.setattr(ablation, "_cleanup", lambda: None)
-    ablation.run_sweep(
+    returned = ablation.run_sweep(
         sweep_name, tmp_path, dataset="wikitext-103", device=None, seed=6, resume=False,
     )
 
@@ -223,6 +794,122 @@ def test_run_sweep_markers_persist_requests_and_terminal_state(tmp_path: Path, m
     failure_dir = tmp_path / sweep_name / ablation._sanitize("failure")
     assert (success_dir / "cell_contract.json").exists()
     assert not (failure_dir / "cell_contract.json").exists()
+
+    # A survivor-only invocation is not complete and cannot flow into reporting as if both
+    # requested cells finished. The compatible success may remain in the CSV for diagnosis.
+    meta = json.loads(
+        (tmp_path / sweep_name / "sweep_meta.json").read_text(encoding="utf-8")
+    )
+    assert returned == []
+    assert meta["status"] == "incomplete"
+    assert meta["n_successful_requested"] == 1
+    assert meta["n_runs"] == 2
+    assert meta["failed_requested_labels"] == ["failure"]
+
+    # The intentional baseline head mixer is preserved, but every generated reporting surface
+    # states that its independent-head mixer is not a gauge intertwiner.
+    assert markers["success"]["head_mixer_compatibility"] == "independent_head_nonintertwiner"
+    assert markers["success"]["head_mixer_gauge_compatible"] is False
+    assert markers["success"]["on_gauge_pure_path"] is False
+    rows = ablation._read_sweep_csv(tmp_path / sweep_name)
+    assert rows[0]["head_mixer_compatibility"] == "independent_head_nonintertwiner"
+    assert rows[0]["head_mixer_gauge_compatible"] == "False"
+    assert rows[0]["on_gauge_pure_path"] == "False"
+    assert meta["gauge_purity"]["contains_independent_head_nonintertwiner"] is True
+    assert meta["gauge_purity"]["all_rows_on_gauge_pure_path"] is False
+
+
+def test_recompute_owns_a_clean_cell_generation_and_cached_resume_preserves_it(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    sweep_name = "generation_cleanliness"
+    sweep_dir = tmp_path / sweep_name
+    run_dir = sweep_dir / ablation._sanitize("cell")
+    run_dir.mkdir(parents=True)
+    (run_dir / "ablation_result.json").write_text(
+        json.dumps({"status": "success", "label": "cell", "seed": 6}), encoding="utf-8"
+    )
+    (run_dir / "cell_contract.json").write_text("{}", encoding="utf-8")
+    (run_dir / "val_token_nats.pt").write_bytes(b"stale token vector")
+    (run_dir / "figures").mkdir()
+    (run_dir / "figures" / "stale.png").write_bytes(b"stale figure")
+    outside = sweep_dir / "unrelated.txt"
+    outside.write_text("preserve", encoding="utf-8")
+
+    monkeypatch.setitem(ablation.SWEEPS, sweep_name, {"description": "generation ownership"})
+    monkeypatch.setattr(ablation, "make_run_overrides", lambda _name: [("cell", {})])
+    monkeypatch.setattr(ablation, "_git_code_identity", lambda: dict(_CODE_IDENTITY))
+    monkeypatch.setattr(
+        ablation,
+        "cache_source_identity",
+        lambda dataset, split, *, cache_dir=None: _source_identities()[split],
+    )
+    monkeypatch.setattr(ablation, "_cleanup", lambda: None)
+    calls: list[str] = []
+
+    def fresh_run(label, overrides, owned_run_dir, **kwargs):
+        del overrides, kwargs
+        calls.append(label)
+        assert owned_run_dir == run_dir
+        assert sorted(path.name for path in run_dir.iterdir()) == [
+            "ablation_cell_owner.json",
+            "ablation_result.json",
+        ]
+        running = json.loads(
+            (run_dir / "ablation_result.json").read_text(encoding="utf-8")
+        )
+        assert running["status"] == "running"
+        assert running["sweep"] == sweep_name
+        (run_dir / "fresh.txt").write_text("new generation", encoding="utf-8")
+        checkpoint = run_dir / "checkpoints" / "terminal.pt"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_bytes(b"owned terminal checkpoint")
+        return {
+            "label": label,
+            "error_kind": None,
+            "primary_val_ppl": 8.0,
+            "final_val_ppl": 9.0,
+            "terminal_checkpoint": str(checkpoint),
+            "_loaded_data_sources": _source_identities(),
+        }
+
+    monkeypatch.setattr(ablation, "run_single", fresh_run)
+    rows = ablation.run_sweep(
+        sweep_name,
+        tmp_path,
+        dataset="wikitext-103",
+        device=None,
+        seed=6,
+        resume=False,
+    )
+
+    assert calls == ["cell"]
+    assert [row["label"] for row in rows] == ["cell"]
+    assert (run_dir / "fresh.txt").read_text(encoding="utf-8") == "new generation"
+    assert not (run_dir / "val_token_nats.pt").exists()
+    assert not (run_dir / "figures").exists()
+    assert outside.read_text(encoding="utf-8") == "preserve"
+
+    cached_sentinel = run_dir / "cached-sentinel.txt"
+    cached_sentinel.write_text("keep on valid resume", encoding="utf-8")
+    monkeypatch.setattr(
+        ablation,
+        "run_single",
+        lambda *args, **kwargs: pytest.fail("valid resume unexpectedly recomputed the cell"),
+    )
+    cached = ablation.run_sweep(
+        sweep_name,
+        tmp_path,
+        dataset="wikitext-103",
+        device=None,
+        seed=6,
+        resume=True,
+    )
+
+    assert [row["label"] for row in cached] == ["cell"]
+    assert cached_sentinel.read_text(encoding="utf-8") == "keep on valid resume"
+    assert outside.read_text(encoding="utf-8") == "preserve"
 
 
 def test_expand_range_sign_mismatch_raises() -> None:

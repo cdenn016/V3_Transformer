@@ -249,7 +249,13 @@ def _load_token_vector(sweep_dir: Path, marker: Mapping[str, Any]) -> Optional[t
     return tensor
 
 
-def ablation_forest_kwargs(sweep_dir: Path, baseline_label: str) -> Optional[Dict[str, Any]]:
+def ablation_forest_kwargs(
+    sweep_dir:      Path,
+    baseline_label: str,
+
+    *,
+    admitted_rows: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
     r"""Build ``plot_ablation_forest``'s ``rows`` kwarg from persisted, aligned paired-token vectors.
 
     The named baseline arm must exist and load; every arm must be aligned (same token length) with
@@ -257,7 +263,19 @@ def ablation_forest_kwargs(sweep_dir: Path, baseline_label: str) -> Optional[Dic
     from nats to BITS per token (divided by ``ln 2``). A missing baseline, a shape mismatch, or a
     token file whose identity no longer verifies withholds the whole figure (returns ``None``).
     """
-    markers = _successful_markers_by_label(sweep_dir)
+    if admitted_rows is None:
+        markers = _successful_markers_by_label(sweep_dir)
+    else:
+        markers = {}
+        for row in admitted_rows:
+            label = row.get("label")
+            cell_dir = row.get("_cell_dir")
+            if not isinstance(label, str) or not isinstance(cell_dir, str):
+                logger.warning(
+                    "ablation_forest withheld: an admitted row lacks its label or cell directory"
+                )
+                return None
+            markers[label] = dict(row)
     baseline_marker = markers.get(baseline_label)
     if baseline_marker is None:
         logger.warning("ablation_forest withheld: no successful %r baseline cell under %s",

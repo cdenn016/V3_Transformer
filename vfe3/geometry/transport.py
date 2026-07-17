@@ -1398,13 +1398,12 @@ def group_element_inverse(
     *,
     residual_tol: float = 1e-4,
 ) -> 'torch.Tensor | CompactBlockElement':
-    r"""Group-element inverse with a rowwise exact-orthogonality gate.
+    r"""Return the represented element's true inverse, including rounded skew-group frames.
 
-    For a skew-generator group, the transpose is used only when ``U^T U`` equals the identity
-    exactly for that represented row in a bounded float64 check. Every row with any represented
-    orthogonality drift, and every non-skew row, uses a true float64 inverse. ``residual_tol`` is
-    retained for call compatibility and validation; it never widens the exact predicate. The public
-    result is cast back to ``omega.dtype`` so the surrounding float32 path is unchanged.
+    A matrix exponential of a skew generator is orthogonal analytically, but its stored float32
+    representation generally is not exactly orthogonal. Using a transpose for that representation
+    breaks exact cocycle telescoping. ``residual_tol`` remains a validated compatibility argument;
+    inverse selection no longer depends on a practically unreachable exact-equality fast path.
     """
     if not math.isfinite(residual_tol) or residual_tol < 0.0:
         raise ValueError(
@@ -1413,30 +1412,8 @@ def group_element_inverse(
     if isinstance(omega, CompactBlockElement):
         inverse_blocks = _checked_group_inverse(omega.blocks)
         return CompactBlockElement(inverse_blocks, omega.K, tied=omega.tied)
-
-    if not group.skew_symmetric:
-        return _checked_group_inverse(omega)
-
-    with torch.no_grad():
-        if not bool(torch.isfinite(omega).all()):
-            raise FloatingPointError("omega group element contains nonfinite values before inversion")
-
-    K = omega.shape[-1]
-    omega_flat = omega.reshape(-1, K, K)
-    with torch.no_grad(), torch.amp.autocast(omega.device.type, enabled=False):
-        omega_check = omega_flat.detach().double()
-        eye = torch.eye(K, device=omega.device, dtype=torch.float64)
-        gram = omega_check.transpose(-1, -2) @ omega_check
-        exactly_orthogonal = (gram == eye).all(dim=(-2, -1))
-        drifted = ~exactly_orthogonal
-
-    if not bool(drifted.any()):
-        return omega.transpose(-1, -2)
-
-    drifted_inverse = _checked_group_inverse(omega_flat[drifted])
-    inverse = omega_flat.transpose(-1, -2).clone()
-    inverse[drifted] = drifted_inverse
-    return inverse.reshape_as(omega)
+    del group
+    return _checked_group_inverse(omega)
 
 
 def build_transport_from_element(
@@ -1454,9 +1431,8 @@ def build_transport_from_element(
     directly. CompactBlockElement inputs invert their d x d blocks and return
     CompactFactoredTransport, so every contraction remains compact.
 
-    U_j^{-1} uses :func:`group_element_inverse`: non-skew rows and any skew rows with represented
-    orthogonality drift enter a bounded float64 inverse island. Only rows whose float64 Gram matrix
-    is exactly the identity use the transpose fast path. Public inverse factors return to the input dtype. For
+    U_j^{-1} uses :func:`group_element_inverse`: every stored representation enters a bounded float64
+    inverse island, including rounded skew-group frames. Public inverse factors return to the input dtype. For
     equal-block dense groups (block_glk) a FactoredTransport is returned so the per-head fast paths
     run; for a compact equal-block element, CompactFactoredTransport is returned; for a single block
     (glk), the dense {'exp_phi','exp_neg_phi','Omega'} dict is returned (matching

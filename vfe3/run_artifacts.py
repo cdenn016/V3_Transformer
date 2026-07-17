@@ -36,7 +36,6 @@ import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, fields
-from functools import lru_cache
 from numbers import Real
 from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
@@ -46,6 +45,7 @@ import torch
 from vfe3.config import VFE3Config, config_from_serialized
 from vfe3.contracts import DataState, DataStateBuffer
 from vfe3.ema import EMA
+from vfe3.process_utils import run_process_tree
 from vfe3.runtime import deterministic_state
 
 if TYPE_CHECKING:                                        # forward ref only: train imports RunArtifacts
@@ -111,13 +111,13 @@ def _require_identity_sha256(value: object, field: str) -> str:
     return value
 
 
-@lru_cache(maxsize=1)
 def _package_code_identity() -> str:
-    r"""Return one process-cached content identity for every executable ``vfe3/**/*.py`` source.
+    r"""Return the current content identity for every executable ``vfe3/**/*.py`` source.
 
     A run captures this digest once when its artifact owner is constructed. Generated files, tests,
     documentation, Git metadata, and output directories are excluded, so artifact publication cannot
-    change the identity. New Python processes naturally recompute it after a source edit.
+    change the identity. Recomputing at each run boundary is required for long-lived Spyder kernels:
+    editing a source file must not reuse the previous run's identity.
     """
     root = Path(__file__).resolve().parent
     digest = hashlib.sha256()
@@ -424,6 +424,28 @@ def _unique_sibling_temp(final: Path) -> Iterator[Path]:
             pass
 
 
+@contextmanager
+def _unique_sibling_output_temp(final: Path) -> Iterator[Path]:
+    r"""Yield a reserved sibling whose suffix preserves renderer format inference."""
+    final = Path(final)
+    final.parent.mkdir(parents=True, exist_ok=True)
+    suffix = f".tmp{final.suffix}" if final.suffix else ".tmp"
+    fd, raw_path = tempfile.mkstemp(
+        dir=str(final.parent),
+        prefix=f".{final.stem}.",
+        suffix=suffix,
+    )
+    os.close(fd)
+    tmp = Path(raw_path)
+    try:
+        yield tmp
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _write_json_atomic(final: Path, obj: object) -> Path:
     """Serialize JSON through a unique same-directory temporary and atomically publish it."""
     final = Path(final)
@@ -434,31 +456,51 @@ def _write_json_atomic(final: Path, obj: object) -> Path:
 
 
 _CONTROLLED_FIGURE_BANK_TOKENS = 16_384
+_FINAL_FIGURE_TIMEOUT_SECONDS = 2 * 60 * 60
+_ATTENTION_FIGURE_TIMEOUT_SECONDS = 15 * 60
 
 
 def _snapshot_report_batches(
     loader: Iterable,
-    cfg:    VFE3Config,
 ) -> List[object]:
-    """Copy the bounded report input batches to CPU for a fresh plotting process."""
-    tokens_per_batch = max(int(cfg.batch_size) * int(cfg.max_seq_len), 1)
-    n_batches = max(1, -(-_CONTROLLED_FIGURE_BANK_TOKENS // tokens_per_batch))
+    """Copy an actual-shape-bounded report population to CPU for a fresh plotting process."""
     batches: List[object] = []
-    for index, batch in enumerate(loader):
-        if index >= n_batches:
-            break
+    captured_tokens = 0
+    for batch in loader:
         if isinstance(batch, (tuple, list)):
-            copied = tuple(
-                item.detach().cpu() if isinstance(item, torch.Tensor) else item
-                for item in batch
-            )
+            tokens = batch[0]
         elif isinstance(batch, torch.Tensor):
-            copied = batch.detach().cpu()
+            tokens = batch
         else:
             raise TypeError(
                 "figure report loader must yield a tensor or a tuple/list containing tensors"
             )
+        if not isinstance(tokens, torch.Tensor) or tokens.ndim != 2:
+            raise TypeError("figure report token batches must be rank-two tensors")
+        if tokens.shape[0] < 1 or tokens.shape[1] < 1:
+            raise ValueError("figure report token batches must have positive dimensions")
+        remaining = _CONTROLLED_FIGURE_BANK_TOKENS - captured_tokens
+        if remaining <= 0:
+            break
+        batch_rows, sequence_length = tokens.shape
+        if sequence_length > remaining:
+            row_limit, sequence_limit = 1, remaining
+        else:
+            row_limit = min(batch_rows, max(1, remaining // max(sequence_length, 1)))
+            sequence_limit = sequence_length
+
+        def _copy(item: object) -> object:
+            if not isinstance(item, torch.Tensor):
+                return item
+            if item.ndim >= 2 and item.shape[:2] == tokens.shape[:2]:
+                return item[:row_limit, :sequence_limit].detach().cpu().clone()
+            return item.detach().cpu().clone()
+
+        copied = tuple(_copy(item) for item in batch) if isinstance(batch, (tuple, list)) else _copy(batch)
         batches.append(copied)
+        captured_tokens += row_limit * sequence_limit
+        if captured_tokens >= _CONTROLLED_FIGURE_BANK_TOKENS:
+            break
     return batches
 
 
@@ -485,7 +527,7 @@ def _run_figures_isolated(
     model_device = next(model.parameters()).device
     report_batches: Optional[List[object]] = None
     if generate_publication and report_loader is not None:
-        report_batches = _snapshot_report_batches(report_loader, artifacts.cfg)
+        report_batches = _snapshot_report_batches(report_loader)
 
     with _unique_sibling_temp(run_dir / "figure_request.json") as request_path:
         with _unique_sibling_temp(run_dir / "figure_report_batches.pt") as batches_path:
@@ -525,7 +567,7 @@ def _run_figures_isolated(
                     if offloaded:
                         model.to("cpu")
                         torch.cuda.empty_cache()
-                    completed = subprocess.run(
+                    completed = run_process_tree(
                         command,
                         cwd=str(repo_root),
                         env=environment,
@@ -533,9 +575,15 @@ def _run_figures_isolated(
                         text=True,
                         encoding="utf-8",
                         errors="replace",
-                        check=False,
+                        timeout=_FINAL_FIGURE_TIMEOUT_SECONDS,
                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     )
+                except subprocess.TimeoutExpired:
+                    logger.warning(
+                        "isolated figure process exceeded %d seconds; numeric results are saved",
+                        _FINAL_FIGURE_TIMEOUT_SECONDS,
+                    )
+                    return False
                 except (OSError, subprocess.SubprocessError) as exc:
                     logger.warning(
                         "isolated figure process could not start (%s); numeric results are saved", exc
@@ -560,6 +608,89 @@ def _run_figures_isolated(
     return True
 
 
+def _run_attention_maps_isolated(
+    maps:    torch.Tensor,
+    run_dir: Path,
+    logger:  logging.Logger,
+
+    *,
+    channel: str,
+    step:    int,
+) -> Optional[List[Path]]:
+    r"""Render periodic attention maps in a child that may safely suffer a native plotting abort."""
+    try:
+        tensor = maps.detach().cpu() if isinstance(maps, torch.Tensor) else torch.as_tensor(maps)
+        if channel == "beta":
+            if tensor.ndim == 2:
+                tensor = tensor[None, None]
+            elif tensor.ndim == 3:
+                tensor = tensor[None]
+            if tensor.ndim != 4:
+                raise ValueError(
+                    f"attention maps must be (L, H, N, N); got {tuple(tensor.shape)}"
+                )
+            expected = [
+                run_dir / "attention" / f"step_{step}_layer{layer}_head{head}.png"
+                for layer in range(tensor.shape[0])
+                for head in range(tensor.shape[1])
+            ]
+        elif channel == "gamma":
+            if tensor.ndim == 2:
+                tensor = tensor[None]
+            if tensor.ndim != 3:
+                raise ValueError(f"gamma maps must be (H, N, N); got {tuple(tensor.shape)}")
+            expected = [
+                run_dir / "attention" / f"step_{step}_gamma_head{head}.png"
+                for head in range(tensor.shape[0])
+            ]
+        else:
+            raise ValueError(f"unsupported attention channel {channel!r}")
+
+        with _unique_sibling_temp(run_dir / f"attention_{channel}_request.json") as request_path:
+            with _unique_sibling_temp(run_dir / f"attention_{channel}_maps.pt") as maps_path:
+                torch.save(tensor, maps_path)
+                request_path.write_text(json.dumps({
+                    "mode":      "attention",
+                    "run_dir":   str(run_dir.resolve()),
+                    "maps_path": str(maps_path),
+                    "channel":   channel,
+                    "step":      int(step),
+                }), encoding="utf-8")
+                environment = os.environ.copy()
+                environment["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+                environment["VFE3_FIGURE_REQUEST"] = str(request_path)
+                environment["PYTHONUNBUFFERED"] = "1"
+                completed = run_process_tree(
+                    [sys.executable, "-m", "vfe3.viz.figure_worker"],
+                    cwd=str(Path(__file__).resolve().parent.parent),
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=_ATTENTION_FIGURE_TIMEOUT_SECONDS,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or "no stderr"
+            logger.warning(
+                "%s attention-map worker exited with code %d (%s); training continues",
+                channel,
+                completed.returncode,
+                detail[-4000:],
+            )
+            return None
+        return [path for path in expected if path.is_file()]
+    except Exception as exc:
+        logger.warning(
+            "%s attention-map figure at step %d failed (%s); training continues",
+            channel,
+            step,
+            exc,
+        )
+        return None
+
+
 def _selection_semantic_config(
     config: 'VFE3Config | Mapping[str, object]',
 ) -> Dict[str, object]:
@@ -568,7 +699,7 @@ def _selection_semantic_config(
     Model selection depends on architecture, family/transport/decode, optimizer/schedule, and every
     objective weight -- but NOT on resume bookkeeping/policy (``resume_from``,
     ``trust_resume_checkpoint``) or output cadence (``log_interval``, ``checkpoint_interval``,
-    ``generate_figures``). Comparing this projection lets
+    ``generate_figures``, ``force_large_figures``). Comparing this projection lets
     a cross-run resume carry otherwise-identical selected weights even when the resumed run changed
     its resume path or figure/log cadence, while every architecture/objective difference still
     invalidates the bundle.
@@ -599,6 +730,7 @@ def _selection_semantic_config(
         "log_interval",
         "checkpoint_interval",
         "generate_figures",
+        "force_large_figures",
     ):
         normalized.pop(key, None)
     return normalized
@@ -1087,7 +1219,8 @@ class RunArtifacts:
         self.csv_path = self.run_dir / "metrics.csv"
         self.best_path = self.run_dir / "best_model.pt"
         self.cfg = cfg                                       # kept for figure scaling (lambda_beta) + guards
-        self.code_identity_sha256 = _package_code_identity()
+        self.code_identity_sha256 = _verified_process_code_identity()
+        self.run_start_git_identity = dict(_git_code_identity())
         self.selection_data_identity: Optional[Dict[str, object]] = None
 
         self.best_val_ppl: float = float("inf")
@@ -1180,44 +1313,13 @@ class RunArtifacts:
         dependency error is logged and swallowed (never fatal to the run), and each figure is
         closed so ~30 evals do not leak figures. Returns the paths written, or None on failure.
         """
-        try:
-            from vfe3.viz import figures as figs
-        except Exception as exc:                                    # a viz error must never kill training
-            (logger or logging.getLogger(__name__)).warning(
-                "attention-map figure at step %d failed (%s); training continues", step, exc)
-            return None
-        before = set(figs.plt.get_fignums())
-        try:
-            figs.set_publication_style()
-            m = maps.detach().cpu() if hasattr(maps, "detach") else torch.as_tensor(maps)
-            if m.dim() == 2:                                        # (N, N) -> one layer, one head
-                m = m[None, None]
-            elif m.dim() == 3:                                      # (H, N, N) -> one layer
-                m = m[None]
-            if m.dim() != 4:
-                raise ValueError(f"attention maps must be (L, H, N, N); got {tuple(m.shape)}")
-            n_layers, n_heads = m.shape[0], m.shape[1]
-            pos  = m[m > 0]                                         # shared log scale across all panels
-            vmax = float(pos.max()) if pos.numel() else 1.0
-            vmin = float(pos.min()) if pos.numel() else vmax * 1e-3
-            attn_dir = self.run_dir / "attention"
-            attn_dir.mkdir(exist_ok=True)
-            paths = []
-            for li in range(n_layers):
-                for hi in range(n_heads):
-                    path = attn_dir / f"step_{step}_layer{li}_head{hi}.png"
-                    fig = figs.plot_attention_heatmap(
-                        m[li, hi], log=True, vmin=vmin, vmax=vmax,
-                        title=f"Attention (step {step}) - layer {li} head {hi}", path=str(path))
-                    figs.plt.close(fig)
-                    paths.append(path)
-            return paths
-        except Exception as exc:                                    # a viz error must never kill training
-            for number in set(figs.plt.get_fignums()) - before:
-                figs.plt.close(number)
-            (logger or logging.getLogger(__name__)).warning(
-                "attention-map figure at step %d failed (%s); training continues", step, exc)
-            return None
+        return _run_attention_maps_isolated(
+            maps,
+            self.run_dir,
+            logger or logging.getLogger(__name__),
+            channel="beta",
+            step=step,
+        )
 
     def save_gamma_attention_maps(
         self,
@@ -1235,41 +1337,13 @@ class RunArtifacts:
         """
         if maps is None:                                            # model channel inactive -> nothing to plot
             return None
-        try:
-            from vfe3.viz import figures as figs
-        except Exception as exc:                                    # a viz error must never kill training
-            (logger or logging.getLogger(__name__)).warning(
-                "gamma-map figure at step %d failed (%s); training continues", step, exc)
-            return None
-        before = set(figs.plt.get_fignums())
-        try:
-            figs.set_publication_style()
-            m = maps.detach().cpu() if hasattr(maps, "detach") else torch.as_tensor(maps)
-            if m.dim() == 2:                                        # (N, N) -> one head
-                m = m[None]
-            if m.dim() != 3:
-                raise ValueError(f"gamma maps must be (H, N, N); got {tuple(m.shape)}")
-            n_heads = m.shape[0]
-            pos  = m[m > 0]                                         # shared log scale across heads
-            vmax = float(pos.max()) if pos.numel() else 1.0
-            vmin = float(pos.min()) if pos.numel() else vmax * 1e-3
-            attn_dir = self.run_dir / "attention"
-            attn_dir.mkdir(exist_ok=True)
-            paths = []
-            for hi in range(n_heads):
-                path = attn_dir / f"step_{step}_gamma_head{hi}.png"
-                fig = figs.plot_attention_heatmap(
-                    m[hi], log=True, vmin=vmin, vmax=vmax, cmap="viridis", symbol=r"\gamma",
-                    title=f"Model-coupling attention (step {step}) - head {hi}", path=str(path))
-                figs.plt.close(fig)
-                paths.append(path)
-            return paths
-        except Exception as exc:                                    # a viz error must never kill training
-            for number in set(figs.plt.get_fignums()) - before:
-                figs.plt.close(number)
-            (logger or logging.getLogger(__name__)).warning(
-                "gamma-map figure at step %d failed (%s); training continues", step, exc)
-            return None
+        return _run_attention_maps_isolated(
+            maps,
+            self.run_dir,
+            logger or logging.getLogger(__name__),
+            channel="gamma",
+            step=step,
+        )
 
     def save_checkpoint(
         self,
@@ -1716,7 +1790,10 @@ def load_checkpoint(
     if expected_selection_data_identity is None and artifacts is not None:
         expected_selection_data_identity = artifacts.selection_data_identity
     expected_code_identity = (
-        artifacts.code_identity_sha256 if artifacts is not None else _package_code_identity())
+        artifacts.code_identity_sha256
+        if artifacts is not None
+        else _verified_process_code_identity()
+    )
     inherit_selection = _preflight_best_selection(
         ckpt,
         checkpoint_path,
@@ -1874,6 +1951,45 @@ def _git_code_identity(
     return identity
 
 
+def _complete_git_identity(value: Mapping[str, object]) -> bool:
+    """Return whether a Git probe produced a comparable source-tree identity."""
+    git_sha = value.get("git_sha")
+    dirty = value.get("git_dirty")
+    fingerprint = value.get("git_dirty_fingerprint")
+    sha_is_valid = (
+        isinstance(git_sha, str)
+        and len(git_sha) in (40, 64)
+        and all(character in "0123456789abcdefABCDEF" for character in git_sha)
+    )
+    fingerprint_is_valid = (
+        fingerprint is None
+        if dirty is False
+        else (
+            isinstance(fingerprint, str)
+            and len(fingerprint) == 64
+            and all(character in "0123456789abcdefABCDEF" for character in fingerprint)
+        )
+    )
+    return (
+        sha_is_valid
+        and type(dirty) is bool
+        and fingerprint_is_valid
+        and "git_error" not in value
+    )
+
+
+def _git_identity_comparison(
+    run_start: Mapping[str, object],
+    final:     Mapping[str, object],
+) -> Tuple[str, Optional[bool]]:
+    """Classify two bounded Git probes as stable, drifted, or unverifiable."""
+    if not (_complete_git_identity(run_start) and _complete_git_identity(final)):
+        return "unverifiable", None
+    fields = ("git_sha", "git_dirty", "git_dirty_fingerprint")
+    drifted = any(run_start.get(field) != final.get(field) for field in fields)
+    return ("drifted" if drifted else "stable"), drifted
+
+
 def _sha256_file_content(
     path: Path,
 
@@ -1907,6 +2023,109 @@ def _sha256_tensor_content(
     return digest.hexdigest()
 
 
+_PROCESS_PACKAGE_CODE_IDENTITY = _package_code_identity()
+
+
+def _verified_process_code_identity() -> str:
+    r"""Return the import-time identity or fail when disk source drifts in a live process.
+
+    Python keeps imported module objects and bytecode alive after an editor changes their files.
+    Relabeling such a mixed process with the new disk digest would be false provenance. A new run in
+    a long-lived Spyder kernel therefore stops until that kernel restarts and imports one coherent
+    source generation.
+    """
+    current = _package_code_identity()
+    if current != _PROCESS_PACKAGE_CODE_IDENTITY:
+        raise RuntimeError(
+            "vfe3 source changed after this Python process imported the package; restart the "
+            "Spyder kernel before starting another run"
+        )
+    return _PROCESS_PACKAGE_CODE_IDENTITY
+
+
+def _require_token_chunk_in_vocab(
+    chunk:      torch.Tensor,
+    vocab_size: int,
+) -> None:
+    """Reject invalid token IDs before bincount can allocate from an attacker-sized maximum."""
+    if chunk.numel() == 0:
+        return
+    minimum, maximum = torch.aminmax(chunk)
+    if int(minimum) < 0 or int(maximum) >= vocab_size:
+        raise ValueError(
+            f"training token id is outside [0, {vocab_size}); validate the cache first"
+        )
+
+
+def _scan_token_content(
+    tokens: torch.Tensor,
+
+    *,
+    vocab_size:   int,
+    chunk_tokens: int = 128 * 1024,
+) -> Tuple[str, torch.Tensor]:
+    r"""Compute the canonical digest and unigram counts in one bounded corpus pass."""
+    if vocab_size <= 0:
+        raise ValueError("vocab_size must be positive")
+    if chunk_tokens <= 0:
+        raise ValueError("chunk_tokens must be positive")
+    flat = tokens.detach().reshape(-1)
+    digest = hashlib.sha256()
+    counts = torch.zeros(vocab_size, dtype=torch.long, device="cpu")
+    for start in range(0, flat.numel(), chunk_tokens):
+        chunk = flat[start:start + chunk_tokens].to(device="cpu", dtype=torch.long).contiguous()
+        digest.update(chunk.numpy().tobytes())
+        _require_token_chunk_in_vocab(chunk, vocab_size)
+        partial = torch.bincount(chunk, minlength=vocab_size)
+        counts.add_(partial)
+    return digest.hexdigest(), counts
+
+
+def _loader_token_content_summary(
+    loader: Optional[Iterable],
+
+    *,
+    vocab_size: Optional[int] = None,
+) -> 'Tuple[Optional[str], Optional[int], Optional[torch.Tensor]]':
+    r"""Return cached corpus identity and optional counts, scanning both together when needed."""
+    dataset = getattr(loader, "dataset", None)
+    tokens = getattr(dataset, "tokens", None)
+    if tokens is None:
+        return None, None, None
+    cached_sha = getattr(dataset, "_vfe3_token_content_sha256", None)
+    cached_counts = getattr(dataset, "_vfe3_token_content_counts", None)
+    cached_vocab_size = getattr(dataset, "_vfe3_token_content_counts_vocab_size", None)
+    counts_match = (
+        vocab_size is not None
+        and isinstance(cached_counts, torch.Tensor)
+        and cached_counts.device.type == "cpu"
+        and cached_counts.dtype == torch.long
+        and cached_counts.ndim == 1
+        and cached_counts.numel() == vocab_size
+        and cached_vocab_size == vocab_size
+    )
+    if cached_sha is None and vocab_size is not None and not counts_match:
+        cached_sha, cached_counts = _scan_token_content(tokens, vocab_size=vocab_size)
+        setattr(dataset, "_vfe3_token_content_sha256", cached_sha)
+        setattr(dataset, "_vfe3_token_content_counts", cached_counts)
+        setattr(dataset, "_vfe3_token_content_counts_vocab_size", vocab_size)
+        counts_match = True
+    else:
+        if cached_sha is None:
+            cached_sha = _sha256_tensor_content(tokens)
+            setattr(dataset, "_vfe3_token_content_sha256", cached_sha)
+        if vocab_size is not None and not counts_match:
+            cached_counts = _bincount_token_chunks(tokens, vocab_size=vocab_size)
+            setattr(dataset, "_vfe3_token_content_counts", cached_counts)
+            setattr(dataset, "_vfe3_token_content_counts_vocab_size", vocab_size)
+            counts_match = True
+    return (
+        str(cached_sha),
+        int(tokens.numel()),
+        cached_counts if counts_match else None,
+    )
+
+
 def _loader_token_content_identity(
     loader: Optional[Iterable],
 ) -> 'Tuple[Optional[str], Optional[int]]':
@@ -1916,15 +2135,8 @@ def _loader_token_content_identity(
     canonical int64 digest on that dataset after its first bounded hash so every later finalization
     reuses the exact value instead of rereading the unchanged mapped corpus.
     """
-    dataset = getattr(loader, "dataset", None)
-    tokens = getattr(dataset, "tokens", None)
-    if tokens is None:
-        return None, None
-    cached = getattr(dataset, "_vfe3_token_content_sha256", None)
-    if cached is None:
-        cached = _sha256_tensor_content(tokens)
-        setattr(dataset, "_vfe3_token_content_sha256", cached)
-    return str(cached), int(tokens.numel())
+    digest, count, _ = _loader_token_content_summary(loader)
+    return digest, count
 
 
 def _bincount_token_chunks(
@@ -1943,10 +2155,8 @@ def _bincount_token_chunks(
     counts = torch.zeros(vocab_size, dtype=torch.long, device="cpu")
     for start in range(0, flat.numel(), chunk_tokens):
         chunk = flat[start:start + chunk_tokens].to(device="cpu", dtype=torch.long)
+        _require_token_chunk_in_vocab(chunk, vocab_size)
         partial = torch.bincount(chunk, minlength=vocab_size)
-        if partial.numel() != vocab_size:
-            raise ValueError(
-                f"training token id exceeds vocab_size={vocab_size}; validate the cache first")
         counts.add_(partial)
     return counts
 
@@ -1967,6 +2177,34 @@ def _write_provenance(
 ) -> None:
     r"""Write code, environment, per-split data, and data-order provenance best-effort."""
 
+    run_start_git_identity = dict(artifacts.run_start_git_identity)
+    final_git_identity = _git_code_identity()
+    git_identity_status, git_identity_drift = _git_identity_comparison(
+        run_start_git_identity,
+        final_git_identity,
+    )
+    final_code_identity_sha256: Optional[str]
+    final_code_identity_error: Optional[str] = None
+    try:
+        final_code_identity_sha256 = _package_code_identity()
+    except (OSError, RuntimeError) as exc:
+        final_code_identity_sha256 = None
+        final_code_identity_error = repr(exc)
+    code_identity_drift = (
+        None
+        if final_code_identity_sha256 is None
+        else final_code_identity_sha256 != artifacts.code_identity_sha256
+    )
+    if code_identity_drift is True or git_identity_drift is True:
+        source_identity_status = "drifted"
+        source_identity_drift: Optional[bool] = True
+    elif code_identity_drift is False and git_identity_drift is False:
+        source_identity_status = "stable"
+        source_identity_drift = False
+    else:
+        source_identity_status = "unverifiable"
+        source_identity_drift = None
+
     prov: Dict[str, object] = {
         "seed":                cfg.seed,
         "deterministic_state": deterministic_state(),
@@ -1977,8 +2215,22 @@ def _write_provenance(
         "data_seed":           (int(data_seed) if data_seed is not None else None),
         "max_tokens":          (int(max_tokens) if max_tokens is not None else None),
         "tokenizer_tag":       tokenizer_tag,
+        "code_identity_sha256":       artifacts.code_identity_sha256,
+        "final_code_identity_sha256": final_code_identity_sha256,
+        "code_identity_drift":        code_identity_drift,
+        "run_start_git_identity":     run_start_git_identity,
+        "final_git_identity":         final_git_identity,
+        "git_identity_status":        git_identity_status,
+        "git_identity_drift":         git_identity_drift,
+        "source_identity_status":     source_identity_status,
+        "source_identity_drift":      source_identity_drift,
     }
-    prov.update(_git_code_identity())
+    if final_code_identity_error is not None:
+        prov["final_code_identity_error"] = final_code_identity_error
+    # Backward-compatible top-level Git fields now identify the source tree at RUN START, which is
+    # the execution identity consumed by existing multiseed and scaling cohort readers. The final
+    # probe above exists to expose mid-run source drift rather than silently relabeling the run.
+    prov.update(run_start_git_identity)
     for split, loader in (("train", train_loader), ("val", val_loader), ("test", test_loader)):
         sha_key = f"{split}_data_sha256"
         n_key = f"{split}_data_n_tokens"
@@ -1987,7 +2239,13 @@ def _write_provenance(
             # Hash the CONTENT, not the storage: TokenWindows may hold the stream in its native
             # cache dtype (int32 memmap) or int64 (capped load). Normalize to int64 once, then reuse
             # that immutable split digest across every ablation cell sharing the loader.
-            prov[sha_key], prov[n_key] = _loader_token_content_identity(loader)
+            if split == "train":
+                prov[sha_key], prov[n_key], _ = _loader_token_content_summary(
+                    loader,
+                    vocab_size=int(cfg.vocab_size),
+                )
+            else:
+                prov[sha_key], prov[n_key] = _loader_token_content_identity(loader)
         except (AttributeError, RuntimeError, TypeError, ValueError, OSError, MemoryError) as exc:
             # Best-effort provenance, narrowed to the realistic hash-path failures (audit
             # 2026-07-12 N2): exotic loader/dtype/allocation errors must not crash finalize, but
@@ -2000,7 +2258,20 @@ def _write_provenance(
     prov["data_sha256"] = prov["test_data_sha256"]
     prov["data_n_tokens"] = prov["test_data_n_tokens"]
     artifacts.save_json("provenance.json", prov)
-    logger.info("wrote provenance.json (git_sha=%s dirty=%s)", prov.get("git_sha"), prov.get("git_dirty"))
+    if source_identity_status == "drifted":
+        logger.warning(
+            "source identity drifted during the run; provenance records both boundaries"
+        )
+    elif source_identity_status == "unverifiable":
+        logger.warning(
+            "source identity could not be verified at both run boundaries; provenance is marked"
+        )
+    logger.info(
+        "wrote provenance.json (git_sha=%s dirty=%s source_identity=%s)",
+        prov.get("git_sha"),
+        prov.get("git_dirty"),
+        source_identity_status,
+    )
 
 
 @torch.no_grad()
@@ -2144,15 +2415,16 @@ def _write_research_artifacts(
         return
     out: Dict[str, object] = {}
     try:
-        train_dataset = getattr(train_loader, "dataset", None)
-        train_tokens = getattr(train_dataset, "tokens", None)
-        if train_tokens is None:
-            raise ValueError("training loader dataset does not expose corpus tokens")
-        corpus_counts = _bincount_token_chunks(
-            train_tokens,
+        _, _, corpus_counts = _loader_token_content_summary(
+            train_loader,
             vocab_size=int(cfg.vocab_size),
         )
-        out.update(_calibration_and_strata(corpus_counts, model, test_loader, device))
+        if corpus_counts is None:
+            raise ValueError("training loader dataset does not expose corpus tokens")
+        calibration = _calibration_and_strata(corpus_counts, model, test_loader, device)
+        out.update(calibration)
+        if calibration.get("reliability") is not None:
+            out["reliability_split"] = "test"
     except Exception as exc:
         logger.warning("calibration/strata probe failed (%s); skipped", exc)
     try:
@@ -2378,8 +2650,9 @@ def finalize_run(
         except Exception as exc:
             logger.warning("estep final-F probe failed (%s); skipped", exc)
 
+    figures_enabled = bool(getattr(cfg, "generate_figures", True))
     depth_loader = val_loader if val_loader is not None else test_loader
-    if depth_loader is not None:
+    if figures_enabled and depth_loader is not None:
         try:
             _batch = next(iter(depth_loader))
             if not isinstance(_batch, (tuple, list)) or len(_batch) < 2:
@@ -2470,27 +2743,28 @@ def finalize_run(
     except Exception as exc:
         logger.warning("pure-path report failed (%s); skipped", exc)
 
-    # Research artifacts (decode calibration / corpus-frequency-stratified loss / FD gradient check) --
-    # externally-grounded probes that do NOT presuppose the gauge framework. Best-effort, AFTER the
-    # test-eval n_e_steps restore so the model is in its trained state. Run before the figure pass.
-    _write_research_artifacts(model, artifacts, cfg, train_loader, test_loader, device, logger)
+    # Research artifacts feed the expensive publication diagnostics. The figure opt-out is a strict
+    # compute and filesystem boundary: it skips their model replays as well as the renderers.
+    if figures_enabled:
+        _write_research_artifacts(model, artifacts, cfg, train_loader, test_loader, device, logger)
 
     # Plotting is a separate process because Anaconda NumPy/SciPy and PyTorch may initialize
     # incompatible Intel OpenMP copies. A native abort then kills only the disposable worker, not
     # the long-lived Spyder kernel. The worker also drives the model-replay publication set when
     # enabled, using the exact bounded test batches snapshotted from this invocation.
-    try:
-        _run_figures_isolated(
-            model,
-            artifacts,
-            losses,
-            logger,
-            generate_publication=bool(getattr(cfg, "generate_figures", True)),
-            allow_large=bool(getattr(cfg, "force_large_figures", False)),
-            report_loader=test_loader,
-        )
-    except Exception as exc:
-        logger.warning("isolated figure preparation failed (%s); numeric results are saved", exc)
+    if figures_enabled:
+        try:
+            _run_figures_isolated(
+                model,
+                artifacts,
+                losses,
+                logger,
+                generate_publication=True,
+                allow_large=bool(getattr(cfg, "force_large_figures", False)),
+                report_loader=test_loader,
+            )
+        except Exception as exc:
+            logger.warning("isolated figure preparation failed (%s); numeric results are saved", exc)
     return results
 
 
@@ -2773,16 +3047,20 @@ def finalize_validation_run(
             artifacts.save_json("pure_path_report.json", _pure_path_report(cfg, artifacts.history))
         except Exception as exc:
             logger.warning("pure-path report failed (%s); skipped", exc)
-        try:
-            _run_figures_isolated(
-                model,
-                artifacts,
-                losses,
-                logger,
-                generate_publication=False,
-            )
-        except Exception as exc:
-            logger.warning("isolated figure preparation failed (%s); validation results are saved", exc)
+        if bool(getattr(cfg, "generate_figures", True)):
+            try:
+                _run_figures_isolated(
+                    model,
+                    artifacts,
+                    losses,
+                    logger,
+                    generate_publication=False,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "isolated figure preparation failed (%s); validation results are saved",
+                    exc,
+                )
     finally:
         # Strict raw-state reload + RNG restore, on BOTH the success and failure paths: the terminal
         # checkpoint below pairs the RAW model with the raw optimizer moments (never the EMA weights),
@@ -3017,7 +3295,21 @@ def _save_figures(
                 def _isolated(*args: object, **kwargs: object) -> object:
                     before = set(raw_figs.plt.get_fignums())
                     try:
-                        return value(*args, **kwargs)
+                        path_value = kwargs.get("path")
+                        if path_value is None:
+                            return value(*args, **kwargs)
+                        final_path = Path(path_value)
+                        with _unique_sibling_output_temp(final_path) as temporary_path:
+                            isolated_kwargs = dict(kwargs)
+                            isolated_kwargs["path"] = str(temporary_path)
+                            figure = value(*args, **isolated_kwargs)
+                            if (not temporary_path.is_file()
+                                    or temporary_path.stat().st_size == 0):
+                                raise RuntimeError(
+                                    f"figure {name!r} did not write a nonempty temporary output"
+                                )
+                            _atomic_replace(final_path, temporary_path)
+                            return figure
                     except Exception as exc:
                         for number in set(raw_figs.plt.get_fignums()) - before:
                             raw_figs.plt.close(number)

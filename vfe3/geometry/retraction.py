@@ -22,12 +22,38 @@ from vfe3.geometry.lie_ops import (
 
 def _check_sigma_max(sigma_max: Optional[float], eps: float) -> None:
     r"""Reject an eigenvalue ceiling that would violate the SPD/eps invariant."""
+    if not math.isfinite(eps) or eps <= 0.0:
+        raise ValueError(f"eps must be finite and positive; got {eps!r}")
     if sigma_max is None:
         return
-    if not math.isfinite(sigma_max) or sigma_max < eps:
+    if not math.isfinite(sigma_max) or sigma_max <= eps:
         raise ValueError(
-            f"sigma_max must be None or finite and >= eps ({eps}); got {sigma_max!r}"
+            f"sigma_max must be None or finite and > eps ({eps}); got {sigma_max!r}"
         )
+
+
+def _public_spd_bounds(
+    dtype:     torch.dtype,
+    eps:       float,
+    sigma_max: Optional[float],
+) -> Tuple[float, Optional[float]]:
+    """Return strict representable public-dtype bounds or reject an empty interval."""
+    _check_sigma_max(sigma_max, eps)
+    lower_tensor = torch.tensor(float(eps), dtype=dtype)
+    lower_tensor = torch.nextafter(lower_tensor, torch.full_like(lower_tensor, float("inf")))
+    lower = float(lower_tensor)
+    if not math.isfinite(lower) or lower <= float(eps):
+        raise ValueError(f"eps={eps} has no finite representable strict upper neighbor in {dtype}")
+    if sigma_max is None:
+        return lower, None
+    upper_tensor = torch.tensor(float(sigma_max), dtype=dtype)
+    upper_tensor = torch.nextafter(upper_tensor, torch.full_like(upper_tensor, -float("inf")))
+    upper = float(upper_tensor)
+    if not math.isfinite(upper) or upper <= lower:
+        raise ValueError(
+            f"[{eps}, {sigma_max}] has no representable strict interior in {dtype}"
+        )
+    return lower, upper
 
 
 _RETRACTIONS: Dict[str, Callable[..., torch.Tensor]] = {}
@@ -296,6 +322,110 @@ def _frechet_log_spd(
     return 0.5 * (chart_tangent + chart_tangent.transpose(-1, -2))
 
 
+def _certify_public_spd(
+    matrix: torch.Tensor,                  # (..., K, K) projected covariance in its public dtype
+
+    *,
+    eps:       float,
+    sigma_max: Optional[float] = None,
+) -> torch.Tensor:
+    r"""Certify the represented spectrum and repair only rows outside the public interval.
+
+    Cholesky tests of ``Sigma - eps I`` and, when bounded, ``sigma_max I - Sigma`` certify strict
+    represented-value headroom at both ends. The ordinary interior path performs no extra
+    eigendecomposition and is byte-identical. A failing row alone is spectrally rebuilt with
+    public-dtype roundoff clearance; a second certificate has an interior isotropic fallback.
+    """
+    fallback_value, _public_upper = _public_spd_bounds(matrix.dtype, eps, sigma_max)
+    symmetric = 0.5 * (matrix + matrix.transpose(-1, -2))
+    check_dtype = torch.float64 if symmetric.dtype == torch.float64 else torch.float32
+    dimension = symmetric.shape[-1]
+    eye_check = torch.eye(dimension, device=symmetric.device, dtype=check_dtype)
+    flat = symmetric.reshape(-1, dimension, dimension)
+    certificate = flat.to(check_dtype)
+    _, lower_info = torch.linalg.cholesky_ex(
+        certificate - float(eps) * eye_check,
+        check_errors=False,
+    )
+    failed = lower_info.ne(0)
+    if sigma_max is not None:
+        _, upper_info = torch.linalg.cholesky_ex(
+            float(sigma_max) * eye_check - certificate,
+            check_errors=False,
+        )
+        failed = failed | upper_info.ne(0)
+    if not bool(failed.any()):
+        return symmetric
+
+    repair_input = certificate[failed]
+    eigenvalues, eigenvectors = _eigh_damped(repair_input, _rel_gap_eps(repair_input))
+    scale = repair_input.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(1.0)
+    margin = scale * (8.0 * dimension * torch.finfo(symmetric.dtype).eps)
+    margin_scalar = margin.squeeze(-1).squeeze(-1).unsqueeze(-1)
+    if sigma_max is None:
+        lower = torch.full_like(eigenvalues, float(eps)) + margin_scalar
+        repaired_eigenvalues = torch.maximum(eigenvalues, lower)
+        fallback_scale = torch.full_like(margin, fallback_value)
+    else:
+        interval = float(sigma_max) - float(eps)
+        clearance = torch.minimum(
+            margin_scalar,
+            torch.full_like(margin_scalar, interval / 4.0),
+        )
+        lower = torch.full_like(eigenvalues, float(eps)) + clearance
+        upper = torch.full_like(eigenvalues, float(sigma_max)) - clearance
+        repaired_eigenvalues = torch.minimum(torch.maximum(eigenvalues, lower), upper)
+        fallback_scale = torch.full_like(margin, fallback_value)
+    repaired_check = (
+        eigenvectors * repaired_eigenvalues.unsqueeze(-2)
+        @ eigenvectors.transpose(-1, -2)
+    )
+    repaired = repaired_check.to(symmetric.dtype)
+    repaired = 0.5 * (repaired + repaired.transpose(-1, -2))
+    represented = repaired.to(check_dtype)
+    _, repair_lower_info = torch.linalg.cholesky_ex(
+        represented - float(eps) * eye_check,
+        check_errors=False,
+    )
+    repair_failed = repair_lower_info.ne(0)
+    if sigma_max is not None:
+        _, repair_upper_info = torch.linalg.cholesky_ex(
+            float(sigma_max) * eye_check - represented,
+            check_errors=False,
+        )
+        repair_failed = repair_failed | repair_upper_info.ne(0)
+    fallback = fallback_scale.to(symmetric.dtype) * torch.eye(
+        dimension,
+        device=symmetric.device,
+        dtype=symmetric.dtype,
+    )
+    repaired = torch.where(
+        repair_failed.unsqueeze(-1).unsqueeze(-1),
+        fallback,
+        repaired,
+    )
+    final_represented = repaired.to(check_dtype)
+    _, final_lower_info = torch.linalg.cholesky_ex(
+        final_represented - float(eps) * eye_check,
+        check_errors=False,
+    )
+    final_failed = final_lower_info.ne(0)
+    if sigma_max is not None:
+        _, final_upper_info = torch.linalg.cholesky_ex(
+            float(sigma_max) * eye_check - final_represented,
+            check_errors=False,
+        )
+        final_failed = final_failed | final_upper_info.ne(0)
+    if bool(final_failed.any()):
+        raise ValueError(
+            "the requested covariance interval has no certifiable interior fallback "
+            f"in public dtype {symmetric.dtype}"
+        )
+    output = flat.clone()
+    output[failed] = repaired
+    return output.reshape_as(symmetric)
+
+
 def retract_spd_diagonal(
     sigma_diag:   torch.Tensor,             # (..., K) diagonal variances
     delta_sigma:  torch.Tensor,             # (..., K) diagonal tangent
@@ -314,8 +444,8 @@ def retract_spd_diagonal(
     clamped to [eps, sigma_max].
     When sigma_max is None the eigenvalue ceiling is skipped (pure-path: eps floor only).
     """
-    _check_sigma_max(sigma_max, eps)
     orig_dtype = sigma_diag.dtype
+    lower_bound, upper_bound = _public_spd_bounds(orig_dtype, eps, sigma_max)
     with torch.amp.autocast(sigma_diag.device.type, enabled=False):     # tensor-keyed (audit 2026-07-05 m10)
         # float64 stays float64 (audit 2026-07-12 N12, the retract_spd_full F12 policy); half promotes to fp32.
         compute_dtype = torch.float64 if orig_dtype == torch.float64 else torch.float32
@@ -328,7 +458,11 @@ def retract_spd_diagonal(
             exp_arg = exp_arg * torch.clamp(trust_region / (tangent_norm + eps), max=1.0)
         exp_arg = exp_arg.clamp(-50.0, 50.0)
         sigma_new = sigma_safe * torch.exp(exp_arg)
-    sigma_new = sigma_new.clamp(min=eps) if sigma_max is None else sigma_new.clamp(min=eps, max=sigma_max)
+    sigma_new = (
+        sigma_new.clamp(min=lower_bound)
+        if upper_bound is None
+        else sigma_new.clamp(min=lower_bound, max=upper_bound)
+    )
     return sigma_new.to(orig_dtype)
 
 
@@ -355,6 +489,7 @@ def retract_spd_full(
     _check_sigma_max(sigma_max, eps)
     orig_shape = sigma.shape
     orig_dtype = sigma.dtype
+    _public_spd_bounds(orig_dtype, eps, sigma_max)
     if sigma.dim() == 4:
         B, N, K, _ = sigma.shape
         sigma = sigma.reshape(B * N, K, K)
@@ -401,7 +536,11 @@ def retract_spd_full(
             upper=sigma_max,
         )
 
-    sigma_new = sigma_new.to(orig_dtype)
+    sigma_new = _certify_public_spd(
+        sigma_new.to(orig_dtype),
+        eps=eps,
+        sigma_max=sigma_max,
+    )
     if len(orig_shape) == 4:
         sigma_new = sigma_new.reshape(orig_shape)
     return sigma_new
@@ -467,6 +606,7 @@ def retract_logeuclidean_full(
     _check_sigma_max(sigma_max, eps)
     orig_shape = sigma.shape
     orig_dtype = sigma.dtype
+    _public_spd_bounds(orig_dtype, eps, sigma_max)
     if sigma.dim() == 4:
         B, N, K, _ = sigma.shape
         sigma = sigma.reshape(B * N, K, K)
@@ -503,7 +643,11 @@ def retract_logeuclidean_full(
         eig_new = eig_new.clamp(min=eps) if sigma_max is None else eig_new.clamp(min=eps, max=sigma_max)
         sigma_new = vec_new * eig_new.unsqueeze(-2) @ vec_new.transpose(-1, -2)
 
-    sigma_new = sigma_new.to(orig_dtype)
+    sigma_new = _certify_public_spd(
+        sigma_new.to(orig_dtype),
+        eps=eps,
+        sigma_max=sigma_max,
+    )
     if len(orig_shape) == 4:
         sigma_new = sigma_new.reshape(orig_shape)
     return sigma_new
@@ -543,6 +687,7 @@ def retract_log_euclidean(
         )
     # diagonal: Dlog_sigma[delta_sigma] = delta_sigma / sigma
     orig_dtype = sigma.dtype
+    lower_bound, upper_bound = _public_spd_bounds(orig_dtype, eps, sigma_max)
     with torch.amp.autocast(sigma.device.type, enabled=False):          # tensor-keyed (audit 2026-07-05 m10)
         # float64 stays float64 (audit 2026-07-12 N12, matching the full arm above); half promotes to fp32.
         compute_dtype = torch.float64 if orig_dtype == torch.float64 else torch.float32
@@ -552,7 +697,11 @@ def retract_log_euclidean(
             delta_sigma = delta_sigma.clamp(-trust_region, trust_region)
         exp_arg   = (step_size * delta_sigma).clamp(-50.0, 50.0)
         sigma_new = sigma_safe * torch.exp(exp_arg)
-    sigma_new = sigma_new.clamp(min=eps) if sigma_max is None else sigma_new.clamp(min=eps, max=sigma_max)
+    sigma_new = (
+        sigma_new.clamp(min=lower_bound)
+        if upper_bound is None
+        else sigma_new.clamp(min=lower_bound, max=upper_bound)
+    )
     return sigma_new.to(orig_dtype)
 
 

@@ -98,23 +98,23 @@ def test_run_lane_uses_fresh_subprocess_and_junit_path_per_lane(
     monkeypatch: pytest.MonkeyPatch,
     capsys:      pytest.CaptureFixture[str],
 ) -> None:
-    calls: list[tuple[list[str], Mapping[str, str], bool]] = []
+    calls: list[tuple[list[str], Mapping[str, str], float]] = []
     child_environment = run_cpu_tests.build_cpu_environment({"PARENT": "copied"})
 
     def _fake_run(
         command: list[str],
 
         *,
-        env:   Mapping[str, str],
-        check: bool,
+        env:     Mapping[str, str],
+        timeout: float,
     ) -> subprocess.CompletedProcess[str]:
         copied_command = list(command)
-        calls.append((copied_command, env, check))
+        calls.append((copied_command, env, timeout))
         _passing_junit(_junit_path(copied_command), tests=len(calls))
         return subprocess.CompletedProcess(copied_command, 0, stdout="999 passed")
 
     monkeypatch.setattr(run_cpu_tests.os, "cpu_count", _expected_logical_cpu_count)
-    monkeypatch.setattr(run_cpu_tests.subprocess, "run", _fake_run)
+    monkeypatch.setattr(run_cpu_tests, "run_process_tree", _fake_run)
 
     assert run_cpu_tests.run_lane("fast", child_environment, 24) == 0
     assert run_cpu_tests.run_lane("slow", child_environment, 24) == 0
@@ -126,7 +126,10 @@ def test_run_lane_uses_fresh_subprocess_and_junit_path_per_lane(
     assert all(command[:3] == [sys.executable, "-m", "pytest"] for command, _, _ in calls)
     assert all(environment == child_environment for _, environment, _ in calls)
     assert all(environment is not child_environment for _, environment, _ in calls)
-    assert all(check is False for _, _, check in calls)
+    assert [timeout for _, _, timeout in calls] == [
+        run_cpu_tests.LANE_TIMEOUT_SECONDS["fast"],
+        run_cpu_tests.LANE_TIMEOUT_SECONDS["slow"],
+    ]
     assert all(not path.exists() for path in paths)
     output = capsys.readouterr().out
     assert "fast: tests=1 failures=0 errors=0 skipped=0" in output
@@ -192,7 +195,7 @@ def test_main_preflights_all_worker_configurations_before_work(
         "build_cpu_environment",
         _fake_build_cpu_environment,
     )
-    monkeypatch.setattr(run_cpu_tests.subprocess, "run", _unexpected_subprocess)
+    monkeypatch.setattr(run_cpu_tests, "run_process_tree", _unexpected_subprocess)
 
     assert run_cpu_tests.main() != 0
     assert environment_calls == []
@@ -208,16 +211,16 @@ def test_run_lane_cleans_junit_path_when_subprocess_launch_fails(
         command: list[str],
 
         *,
-        env:   Mapping[str, str],
-        check: bool,
+        env:     Mapping[str, str],
+        timeout: float,
     ) -> NoReturn:
         junit_paths.append(_junit_path(list(command)))
         assert env == {"EXACT": "child"}
-        assert check is False
+        assert timeout == run_cpu_tests.LANE_TIMEOUT_SECONDS["fast"]
         raise OSError("cannot launch pytest")
 
     monkeypatch.setattr(run_cpu_tests.os, "cpu_count", _expected_logical_cpu_count)
-    monkeypatch.setattr(run_cpu_tests.subprocess, "run", _raise_oserror)
+    monkeypatch.setattr(run_cpu_tests, "run_process_tree", _raise_oserror)
 
     assert run_cpu_tests.run_lane("fast", {"EXACT": "child"}, 24) == 1
     assert len(junit_paths) == 1
@@ -246,19 +249,34 @@ def test_run_lane_rejects_missing_malformed_failing_or_nonzero_results(
         command: list[str],
 
         *,
-        env:   Mapping[str, str],
-        check: bool,
+        env:     Mapping[str, str],
+        timeout: float,
     ) -> subprocess.CompletedProcess[str]:
         assert env == {"EXACT": "child"}
-        assert check is False
+        assert timeout == run_cpu_tests.LANE_TIMEOUT_SECONDS["fast"]
         junit_paths.append(_junit_path(list(command)))
         if xml_payload is not None:
             junit_paths[-1].write_text(xml_payload, encoding="utf-8")
         return subprocess.CompletedProcess(command, pytest_status)
 
     monkeypatch.setattr(run_cpu_tests.os, "cpu_count", _expected_logical_cpu_count)
-    monkeypatch.setattr(run_cpu_tests.subprocess, "run", _fake_run)
+    monkeypatch.setattr(run_cpu_tests, "run_process_tree", _fake_run)
 
     assert run_cpu_tests.run_lane("fast", {"EXACT": "child"}, 24) != 0
     assert len(junit_paths) == 1
     assert not junit_paths[0].exists()
+
+
+def test_run_lane_times_out_and_cleans_junit_path(monkeypatch, capsys):
+    junit_paths = []
+
+    def _time_out(command, *, env, timeout):
+        junit_paths.append(_junit_path(list(command)))
+        raise subprocess.TimeoutExpired(command, timeout)
+
+    monkeypatch.setattr(run_cpu_tests, "run_process_tree", _time_out)
+
+    assert run_cpu_tests.run_lane("fast", {"EXACT": "child"}, 24) == 1
+    assert len(junit_paths) == 1
+    assert not junit_paths[0].exists()
+    assert "exceeded" in capsys.readouterr().err

@@ -29,6 +29,66 @@ def test_sigma_max_caps_variance_consistently_across_diag_and_full():
     assert eig_le.max().item() <= sigma_max + 1e-4
 
 
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+def test_public_spd_certificate_repairs_reconstruction_boundary(dtype):
+    from vfe3.geometry import retraction as retraction_module
+
+    boundary = torch.tensor([[1.0, 1.0], [1.0, 1.0]], dtype=dtype, requires_grad=True)
+    repaired = retraction_module._certify_public_spd(
+        boundary,
+        eps=1e-6,
+        sigma_max=1.0,
+    )
+
+    assert repaired.dtype == dtype
+    assert torch.linalg.cholesky_ex(repaired.float(), check_errors=False).info.item() == 0
+    assert torch.linalg.eigvalsh(repaired.float()).max().item() <= 1.0
+    repaired.float().sum().backward()
+    assert boundary.grad is not None
+    assert torch.isfinite(boundary.grad).all()
+
+
+def test_public_spd_repair_margin_remains_in_autograd_graph():
+    from vfe3.geometry import retraction as retraction_module
+
+    boundary = torch.diag(torch.tensor([-2.0, 0.0])).requires_grad_(True)
+    repaired = retraction_module._certify_public_spd(
+        boundary,
+        eps=1.0,
+        sigma_max=100.0,
+    )
+    repaired.trace().backward()
+
+    assert boundary.grad is not None
+    assert boundary.grad[0, 0].abs().item() > 0.0
+
+
+def test_public_spd_certificate_rejects_interval_without_representable_interior():
+    from vfe3.geometry import retraction as retraction_module
+
+    boundary = torch.ones(1, 1, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="no representable strict interior"):
+        retraction_module._certify_public_spd(
+            boundary,
+            eps=1.001,
+            sigma_max=1.002,
+        )
+
+
+def test_public_spd_fallback_bound_is_certifiable_after_endpoint_rounding():
+    from vfe3.geometry import retraction as retraction_module
+
+    eps = 1.00000001
+    lower, upper = retraction_module._public_spd_bounds(torch.float32, eps, 2.00000001)
+
+    assert torch.tensor(lower, dtype=torch.float32) - torch.tensor(
+        eps, dtype=torch.float32,
+    ) > 0
+    assert torch.tensor(2.00000001, dtype=torch.float32) - torch.tensor(
+        upper, dtype=torch.float32,
+    ) > 0
+
+
 def test_diagonal_retraction_positive_and_bounded():
     g = torch.Generator().manual_seed(0)
     sigma = torch.rand(4, 6, generator=g) + 0.1
@@ -421,7 +481,7 @@ def test_full_cov_model_first_backward_finite_at_default_init():
 
 
 # --- F2 (audit 2026-07-01): invalid sigma_max must raise, not corrupt Sigma ---
-@pytest.mark.parametrize("bad_sigma_max", [1e-9, -1.0, float("nan")])
+@pytest.mark.parametrize("bad_sigma_max", [1e-9, 1e-6, -1.0, float("nan")])
 @pytest.mark.parametrize("arm", ["diagonal", "full"])
 def test_retract_rejects_invalid_sigma_max(arm, bad_sigma_max):
     """A sub-eps / negative / NaN sigma_max used to flow straight into torch.clamp and silently

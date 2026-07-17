@@ -19,6 +19,7 @@ from uuid import uuid4
 import matplotlib.pyplot as plt
 
 from vfe3.viz.figures import get_figure
+from vfe3.path_utils import portable_path_component_key
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ class FigureSpec:
     name:        str
     output_name: str
     adapter:     Callable[[Mapping[str, object]], Optional[Mapping[str, object]]]
+    postprocess: Optional[Callable[[object, Mapping[str, object]], None]] = None
 
 
 def emit_registered_figures(
@@ -36,8 +38,12 @@ def emit_registered_figures(
     output_dir: Path,
 ) -> List[Path]:
     names = [spec.output_name for spec in specs]
-    if len(names) != len(set(names)):
-        raise ValueError("registered figure output names must be unique")
+    keys = [
+        portable_path_component_key(name, field="registered figure output name")
+        for name in names
+    ]
+    if len(keys) != len(set(keys)):
+        raise ValueError("registered figure output names must be portably unique")
     output_dir.mkdir(parents=True, exist_ok=True)
     written = []
     for spec in specs:
@@ -52,7 +58,17 @@ def emit_registered_figures(
             tmp_target = output_dir / (
                 f".{target.stem}.{uuid4().hex}.tmp{target.suffix}"
             )
-            fig = get_figure(spec.name)(**dict(kwargs), path=str(tmp_target))
+            generator = get_figure(spec.name)
+            if spec.postprocess is None:
+                fig = generator(**dict(kwargs), path=str(tmp_target))
+            else:
+                fig = generator(**dict(kwargs))
+                if fig is None:
+                    raise RuntimeError(
+                        f"figure {spec.name!r} returned no figure for postprocessing"
+                    )
+                spec.postprocess(fig, context)
+                fig.savefig(tmp_target, bbox_inches="tight")
             if not tmp_target.is_file() or tmp_target.stat().st_size == 0:
                 raise RuntimeError(
                     f"figure {spec.name!r} did not write its temporary output"

@@ -72,7 +72,7 @@ def test_pos_extrapolation_figure_renders():
     plt.close(fig)
 
 
-def test_plot_pos_extrapolation_driver(tmp_path):
+def test_plot_pos_extrapolation_driver(tmp_path, monkeypatch):
     sweep = tmp_path / "pos_extrapolation"; figdir = tmp_path / "figures"
     for lab, curve in [("alibi", [{"n": 8, "ce": 3.0}, {"n": 16, "ce": 3.1}]),
                        ("learned", [{"n": 8, "ce": 3.0}, {"n": 16, "ce": 5.0}])]:
@@ -80,5 +80,13 @@ def test_plot_pos_extrapolation_driver(tmp_path):
         (d / "ablation_result.json").write_text(
             json.dumps({"label": lab, "primary_val_ppl": 20.0, "final_val_ppl": 20.0,
                         "status": "success", "error_kind": None, "extrap_ce": curve}))
+    monkeypatch.setattr(
+        ablation,
+        "_collect_sweep_results",
+        lambda _sweep_dir: [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted(sweep.glob("*/ablation_result.json"))
+        ],
+    )
     ablation._plot_pos_extrapolation(sweep, figdir)
     assert (figdir / "pos_extrapolation_extrapolation.png").exists()

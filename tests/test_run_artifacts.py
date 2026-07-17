@@ -50,6 +50,24 @@ def _cfg(**kw):
     return VFE3Config(**base)
 
 
+def test_process_code_identity_fails_closed_after_same_process_source_edit(tmp_path, monkeypatch):
+    package = tmp_path / "vfe3"
+    package.mkdir()
+    entry = package / "run_artifacts.py"
+    source = package / "kernel.py"
+    entry.write_text("# identity root\n", encoding="utf-8")
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.setattr(run_artifacts, "__file__", str(entry))
+
+    before = run_artifacts._package_code_identity()
+    monkeypatch.setattr(run_artifacts, "_PROCESS_PACKAGE_CODE_IDENTITY", before)
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+
+    assert run_artifacts._package_code_identity() != before
+    with pytest.raises(RuntimeError, match="restart the Spyder kernel"):
+        run_artifacts._verified_process_code_identity()
+
+
 @dataclass(frozen=True)
 class TrainedArtifactEvidence:
     relative_files:  frozenset[str]
@@ -489,38 +507,38 @@ def test_save_attention_maps_is_best_effort(tmp_path):
     assert art.save_attention_maps(1, object()) is None         # bad maps -> None, no exception
 
 
-@pytest.mark.parametrize(("writer", "maps"), [
-    ("save_attention_maps", torch.ones(1, 1, 2, 2)),
-    ("save_gamma_attention_maps", torch.ones(1, 2, 2)),
+@pytest.mark.parametrize(("writer", "maps", "channel"), [
+    ("save_attention_maps", torch.ones(1, 1, 2, 2), "beta"),
+    ("save_gamma_attention_maps", torch.ones(1, 2, 2), "gamma"),
 ])
-def test_attention_writer_closes_only_new_figures_on_plot_failure(
+def test_attention_writer_delegates_without_parent_process_plotting(
     tmp_path,
     monkeypatch,
     writer,
     maps,
+    channel,
 ):
     from vfe3.viz import figures as figs
 
     cfg = _cfg()
     art = RunArtifacts(tmp_path / "run", cfg, VFEModel(cfg))
     existing = figs.plt.figure()
-    created = []
+    calls = []
 
-    def _raise_after_creating_figure(*args, **kwargs):
-        fig = figs.plt.figure()
-        created.append(fig.number)
-        raise RuntimeError("plot failed after allocating a figure")
+    def _isolated(value, run_dir, logger, *, channel, step):
+        calls.append((value, run_dir, channel, step))
+        return None
 
-    monkeypatch.setattr(figs, "plot_attention_heatmap", _raise_after_creating_figure)
+    monkeypatch.setattr(run_artifacts, "_run_attention_maps_isolated", _isolated)
     try:
         assert getattr(art, writer)(1, maps) is None
-        open_figures = set(figs.plt.get_fignums())
-        assert existing.number in open_figures
-        assert open_figures.isdisjoint(created)
+        assert len(calls) == 1
+        assert calls[0][0] is maps
+        assert calls[0][1] == art.run_dir
+        assert calls[0][2:] == (channel, 1)
+        assert existing.number in figs.plt.get_fignums()
     finally:
         figs.plt.close(existing)
-        for number in created:
-            figs.plt.close(number)
 
 
 def test_train_without_artifacts_writes_nothing(tmp_path):
@@ -669,6 +687,7 @@ def test_provenance_git_probe_timeout_records_error(tmp_path, monkeypatch):
     model = VFEModel(cfg)
     art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
     timeout = subprocess.TimeoutExpired(["git", "rev-parse", "HEAD"], 5)
+
     def _which(name):
         assert name == "git"
         return "C:/trusted/git.exe"
@@ -697,10 +716,87 @@ def test_provenance_git_probe_timeout_records_error(tmp_path, monkeypatch):
     )
 
     prov = json.loads((tmp_path / "run" / "provenance.json").read_text(encoding="utf-8"))
-    assert prov["git_sha"] is None
-    assert prov["git_dirty"] is None
-    assert prov["git_dirty_fingerprint"] is None
-    assert prov["git_error"] == repr(timeout)
+    assert prov["run_start_git_identity"] == art.run_start_git_identity
+    assert prov["final_git_identity"]["git_sha"] is None
+    assert prov["final_git_identity"]["git_dirty"] is None
+    assert prov["final_git_identity"]["git_dirty_fingerprint"] is None
+    assert prov["final_git_identity"]["git_error"] == repr(timeout)
+    assert prov["git_identity_status"] == "unverifiable"
+    assert prov["git_identity_drift"] is None
+
+
+def test_provenance_persists_execution_identity_and_marks_source_drift(tmp_path, monkeypatch):
+    start_identity = {
+        "git_sha": "a" * 40,
+        "git_dirty": False,
+        "git_dirty_fingerprint": None,
+    }
+    final_identity = {
+        "git_sha": "a" * 40,
+        "git_dirty": True,
+        "git_dirty_fingerprint": "b" * 64,
+    }
+    identities = iter((start_identity, final_identity))
+    monkeypatch.setattr(run_artifacts, "_git_code_identity", lambda: dict(next(identities)))
+
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
+    run_artifacts._write_provenance(
+        art,
+        cfg,
+        model,
+        logging.getLogger("test-provenance-drift"),
+    )
+
+    prov = json.loads((tmp_path / "run" / "provenance.json").read_text(encoding="utf-8"))
+    assert prov["code_identity_sha256"] == art.code_identity_sha256
+    assert prov["run_start_git_identity"] == start_identity
+    assert prov["final_git_identity"] == final_identity
+    assert prov["git_identity_status"] == "drifted"
+    assert prov["git_identity_drift"] is True
+    assert prov["source_identity_status"] == "drifted"
+    assert prov["source_identity_drift"] is True
+    assert {
+        field: prov[field]
+        for field in ("git_sha", "git_dirty", "git_dirty_fingerprint")
+    } == start_identity
+
+
+def test_provenance_marks_package_source_drift(tmp_path, monkeypatch):
+    git_identity = {
+        "git_sha": "a" * 40,
+        "git_dirty": False,
+        "git_dirty_fingerprint": None,
+    }
+    monkeypatch.setattr(run_artifacts, "_git_code_identity", lambda: dict(git_identity))
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
+    final_code_identity = (
+        "0" * 64
+        if art.code_identity_sha256 != "0" * 64
+        else "1" * 64
+    )
+    monkeypatch.setattr(
+        run_artifacts,
+        "_package_code_identity",
+        lambda: final_code_identity,
+    )
+
+    run_artifacts._write_provenance(
+        art,
+        cfg,
+        model,
+        logging.getLogger("test-package-provenance-drift"),
+    )
+
+    prov = json.loads((tmp_path / "run" / "provenance.json").read_text(encoding="utf-8"))
+    assert prov["code_identity_sha256"] == art.code_identity_sha256
+    assert prov["final_code_identity_sha256"] == final_code_identity
+    assert prov["code_identity_drift"] is True
+    assert prov["source_identity_status"] == "drifted"
+    assert prov["source_identity_drift"] is True
 
 
 def test_metrics_csv_includes_gauge_geometry_columns(trained_artifact_evidence):

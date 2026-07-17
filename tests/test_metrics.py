@@ -138,6 +138,13 @@ def test_spd_geodesic_distance_zero_symmetric_diag_full_agree():
     assert torch.allclose(spd_geodesic_distance(A, B), d_ab, atol=1e-4)
 
 
+def test_spd_geodesic_distance_uses_airm_not_half_fisher_scale():
+    sigma_a = torch.ones(1, 1)
+    sigma_b = torch.exp(torch.tensor([[2.0]]))
+
+    assert spd_geodesic_distance(sigma_a, sigma_b).item() == pytest.approx(2.0)
+
+
 def test_belief_spectrum_eigenvalues_and_condition():
     sigma = torch.tensor([[4.0, 1.0, 0.25]])                      # K=3 diagonal
     sp = belief_spectrum(sigma)

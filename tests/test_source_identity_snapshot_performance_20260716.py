@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+from pathlib import Path
 
 import torch
 
@@ -33,21 +34,25 @@ def _source_identities(*splits: str) -> dict[str, dict[str, object]]:
     }
 
 
-def _ablation_success(label: str, sources: object) -> dict[str, object]:
+def _ablation_success(label: str, sources: object, run_dir: Path) -> dict[str, object]:
+    checkpoint = run_dir / "checkpoints" / "terminal.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_bytes(f"checkpoint:{label}".encode("utf-8"))
     return {
         "label": label,
         "error_kind": None,
         "primary_val_ppl": 8.0,
         "final_val_ppl": 9.0,
         "seed": 6,
+        "terminal_checkpoint": str(checkpoint),
         "_loaded_data_sources": copy.deepcopy(sources),
     }
 
 
-def test_ablation_code_identity_preflight_fails_before_output_or_cell_execution(
+def test_ablation_code_identity_preflight_publishes_incomplete_view_without_cell_execution(
     tmp_path, monkeypatch,
 ):
-    output_dir = tmp_path / "must-not-exist"
+    output_dir = tmp_path / "ablation"
     sweep_name = "code_identity_preflight"
     monkeypatch.setitem(ablation.SWEEPS, sweep_name, {"description": "code preflight"})
     monkeypatch.setattr(ablation, "make_run_overrides", lambda _name: [("cell", {})])
@@ -80,7 +85,11 @@ def test_ablation_code_identity_preflight_fails_before_output_or_cell_execution(
 
     assert result == []
     assert executed == []
-    assert not output_dir.exists()
+    sweep_dir = output_dir / sweep_name
+    meta = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8"))
+    assert meta["status"] == "incomplete"
+    assert "code identity" in meta["error"]
+    assert (sweep_dir / "sweep_results.csv").read_text(encoding="utf-8").count("\n") == 1
 
 
 def test_ablation_main_skips_all_analysis_for_incomplete_sweep(
@@ -124,21 +133,51 @@ def test_ablation_main_skips_all_analysis_for_incomplete_sweep(
             name,
             lambda *args, _name=name, **kwargs: called.append(_name),
         )
+    figure_requests = []
+    monkeypatch.setattr(
+        ablation,
+        "_run_ablation_figures_isolated",
+        lambda _output_dir, *, scope, invalidate=False, cohort_identity=None: (
+            figure_requests.append((scope, invalidate, cohort_identity)) or True
+        ),
+    )
 
     ablation.main()
 
     assert called == []
+    assert figure_requests == [
+        ("__sensitivity__", True, None),
+        (sweep_name, True, None),
+    ]
 
 
 def test_ablation_cross_sweep_reports_ignore_incomplete_directories(
     tmp_path, monkeypatch,
 ):
+    contract = ablation._sweep_aggregation_contract(
+        "wikitext-103",
+        {
+            "collect_diagnostics": False,
+            "collect_extrapolation": False,
+            "paired_token_bootstrap": False,
+        },
+        data_seed_override=3,
+        max_tokens=None,
+        max_steps=None,
+        seed_design=[6],
+        source_identities=_source_identities("train", "validation"),
+        code_identity=_CODE_IDENTITY,
+        device="cpu",
+    )
+    cohort = ablation._cross_sweep_cohort_identity(contract)
     for name, status in (("complete", "complete"), ("incomplete", "incomplete")):
         sweep_dir = tmp_path / name
         sweep_dir.mkdir()
         (sweep_dir / "sweep_results.csv").write_text("label,primary_val_ppl\n", encoding="utf-8")
         (sweep_dir / "sweep_meta.json").write_text(
-            json.dumps({"status": status}), encoding="utf-8")
+            json.dumps({"status": status, "aggregation_contract": contract}),
+            encoding="utf-8",
+        )
 
     visited: list[str] = []
     monkeypatch.setattr(
@@ -147,8 +186,12 @@ def test_ablation_cross_sweep_reports_ignore_incomplete_directories(
         lambda sweep_dir: visited.append(sweep_dir.name) or [],
     )
 
-    ablation._plot_sensitivity(tmp_path, tmp_path / "figures")
-    ablation.summarize_sweeps(tmp_path)
+    ablation._plot_sensitivity(
+        tmp_path,
+        tmp_path / "figures",
+        cohort_identity=cohort,
+    )
+    ablation.summarize_sweeps(tmp_path, cohort_identity=cohort)
 
     assert visited == ["complete", "complete"]
 
@@ -182,7 +225,11 @@ def test_ablation_hashes_each_source_once_and_reuses_snapshot_across_cells(
     monkeypatch.setattr(
         ablation,
         "run_single",
-        lambda label, *args, **kwargs: _ablation_success(label, sources),
+        lambda label, _overrides, run_dir, **kwargs: _ablation_success(
+            label,
+            sources,
+            run_dir,
+        ),
     )
 
     ablation.run_sweep(
@@ -227,14 +274,14 @@ def test_ablation_rejects_unavailable_or_mismatched_loaded_source_identity(
     monkeypatch.setattr(ablation, "_git_code_identity", lambda: dict(_CODE_IDENTITY))
     monkeypatch.setattr(ablation, "_cleanup", lambda: None)
 
-    def run_single(label, *args, **kwargs):
-        del args, kwargs
+    def run_single(label, _overrides, run_dir, **kwargs):
+        del kwargs
         loaded = copy.deepcopy(sources)
         if label == "drifted":
             loaded["train"]["sha256"] = "f" * 64
         if label == "missing":
             loaded = None
-        return _ablation_success(label, loaded)
+        return _ablation_success(label, loaded, run_dir)
 
     monkeypatch.setattr(ablation, "run_single", run_single)
 
@@ -288,9 +335,9 @@ def test_ablation_terminal_code_drift_invalidates_every_invocation_cell(
         code_calls.append(snapshot)
         return snapshot
 
-    def run_single(label, *args, **kwargs):
-        del args, kwargs
-        result = _ablation_success(label, sources)
+    def run_single(label, _overrides, run_dir, **kwargs):
+        del kwargs
+        result = _ablation_success(label, sources, run_dir)
         if label == "second":
             state["code"] = after
         return result

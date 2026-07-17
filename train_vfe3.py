@@ -341,11 +341,10 @@ config = dict(
     eval_interval             = 1500,      # periodic validation every N steps (0 = off)
     checkpoint_interval       = 15000,     # save a resumable checkpoint every N steps (0 = off)
 
-    generate_figures          = False,     # OFF: skip the heavy-compute figure set at finalize_run (UMAP
-                                           # belief-category triptych, model/belief UMAP, belief bank, E-step
-                                           # replay, holonomy sampling) + the per-eval attention/gamma heatmaps.
-                                           # True re-enables; make_figures.py re-runs them for a trained run.
-                                           # The cheap dashboards (loss/val-ppl/holonomy/free-energy) still write.
+    generate_figures          = False,     # OFF: strict opt-out for all finalization plots, plot-only
+                                           # probes/model replays, and per-eval attention/gamma heatmaps.
+                                           # True re-enables; make_figures.py later rebuilds the replayable
+                                           # model-report, saved-probe, and persisted-history set.
 
     use_ema                   = False,     # EMA/Polyak averaging of the trained tables (default OFF = pure
                                            # path: model is the last SGD iterate). ON: eval/best-save/final

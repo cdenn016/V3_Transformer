@@ -8,10 +8,16 @@ from collections.abc import Mapping
 from pathlib import Path
 from xml.etree import ElementTree
 
+from vfe3.process_utils import run_process_tree
+
 
 FAST_WORKERS = 12
 SLOW_WORKERS = 3
 RUN_LANES = ("fast", "slow")
+LANE_TIMEOUT_SECONDS = {
+    "fast": 2 * 60 * 60,
+    "slow": 8 * 60 * 60,
+}
 
 CPU_ENVIRONMENT = {
     "VFE3_TEST_DEVICE": "cpu",
@@ -162,11 +168,17 @@ def run_lane(
     try:
         command = build_cpu_lane_command(lane, junit_path, logical_cpu_count)
         try:
-            completed = subprocess.run(
+            completed = run_process_tree(
                 command,
                 env=dict(environment),
-                check=False,
+                timeout=LANE_TIMEOUT_SECONDS[lane],
             )
+        except subprocess.TimeoutExpired as exc:
+            print(
+                f"{lane}: pytest subprocess exceeded {LANE_TIMEOUT_SECONDS[lane]} seconds: {exc}",
+                file=sys.stderr,
+            )
+            return 1
         except OSError as exc:
             print(f"{lane}: pytest subprocess failed: {exc}", file=sys.stderr)
             return 1

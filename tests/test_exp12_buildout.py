@@ -49,7 +49,7 @@ def test_renyi_saturation_figure_renders():
     plt.close(fig)
 
 
-def test_plot_renyi_saturation_driver(tmp_path):
+def test_plot_renyi_saturation_driver(tmp_path, monkeypatch):
     sweep = tmp_path / "renyi_order"; figdir = tmp_path / "figures"
     for a in (0.5, 1.0, 2.0):
         d = sweep / f"renyi_{a}"; d.mkdir(parents=True)
@@ -57,5 +57,13 @@ def test_plot_renyi_saturation_driver(tmp_path):
             {"label": f"renyi_order={a}", "primary_val_ppl": 20.0,
              "final_val_ppl": 20.0, "status": "success", "error_kind": None,
              "attn_entropy": 1.5, "energy_klmax_frac": 0.1 * a}))
+    monkeypatch.setattr(
+        ablation,
+        "_collect_sweep_results",
+        lambda _sweep_dir: [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted(sweep.glob("*/ablation_result.json"))
+        ],
+    )
     ablation._plot_renyi_saturation(sweep, figdir)
     assert (figdir / "renyi_order_renyi_saturation.png").exists()

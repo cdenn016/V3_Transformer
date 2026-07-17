@@ -28,7 +28,11 @@ from vfe3.data.datasets import cache_path, cache_source_identity
 
 DATASET = "wikitext-103"                                      # tokenizer tag "tiktoken" -> *_tiktoken_tokens.*
 FIXED_CODE_IDENTITY = {"git_sha": "a" * 40, "git_dirty": False, "git_dirty_fingerprint": None}
-DIAG_FLAGS = {"collect_diagnostics": False, "collect_extrapolation": False}
+DIAG_FLAGS = {
+    "collect_diagnostics": False,
+    "collect_extrapolation": False,
+    "paired_token_bootstrap": False,
+}
 
 
 def _write_pt_cache(cache_dir: Path, dataset: str, split: str, values) -> Path:
@@ -51,10 +55,18 @@ def _write_bin_cache(cache_dir: Path, dataset: str, split: str, values) -> Path:
 
 def _write_marker(run_dir: Path, **updates) -> None:
     r"""A successful cell headline marker (finite terminal PPL) with optional field overrides."""
+    checkpoint = run_dir / "checkpoints" / "terminal.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    if not checkpoint.exists():
+        checkpoint.write_bytes(b"owned terminal checkpoint")
     marker = {
         "label": "cell", "status": "success", "error_kind": None,
         "primary_val_ppl": 9.0, "final_val_ppl": 10.0, "seed": 6,
+        "terminal_checkpoint": str(checkpoint),
     }
+    identity = ablation._terminal_checkpoint_identity(run_dir, marker)
+    assert identity is not None
+    marker.update(identity)
     marker.update(updates)
     (run_dir / "ablation_result.json").write_text(json.dumps(marker), encoding="utf-8")
 
@@ -93,6 +105,14 @@ def _fake_loaded_sources():
         split: _fake_source_ok(DATASET, split)
         for split in ("train", "validation")
     }
+
+
+def _owned_terminal_checkpoint(run_dir: Path) -> str:
+    """Create the production-required terminal checkpoint for one fake successful cell."""
+    checkpoint = run_dir / "checkpoints" / "terminal.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_bytes(b"owned terminal checkpoint")
+    return str(checkpoint)
 
 
 # =============================================================================
@@ -217,18 +237,20 @@ def test_resumed_stale_cell_rejects_contract_drift_during_recompute(
     monkeypatch.setattr(ablation, "_expected_cell_contract_or_none", rebuild_contract)
     monkeypatch.setattr(ablation, "_cell_is_current", lambda *args, **kwargs: False)
     monkeypatch.setattr(ablation, "_cleanup", lambda: None)
-    monkeypatch.setattr(
-        ablation,
-        "run_single",
-        lambda *args, **kwargs: {
+
+    def fake_run_single(label, overrides, run_dir, **kwargs):
+        del label, overrides, kwargs
+        return {
             "label": "cell",
             "error_kind": None,
             "primary_val_ppl": 8.0,
             "final_val_ppl": 9.0,
             "seed": 6,
+            "terminal_checkpoint": _owned_terminal_checkpoint(run_dir),
             "_loaded_data_sources": _fake_loaded_sources(),
-        },
-    )
+        }
+
+    monkeypatch.setattr(ablation, "run_single", fake_run_single)
 
     run_dir = tmp_path / sweep_name / ablation._sanitize("cell")
     run_dir.mkdir(parents=True)
@@ -252,7 +274,7 @@ def test_resumed_stale_cell_rejects_contract_drift_during_recompute(
     assert len(builds) == 2
     assert marker["status"] == "failed"
     assert marker["cell_contract_fingerprint"] is None
-    assert json.loads((run_dir / "cell_contract.json").read_text(encoding="utf-8")) == stale_contract
+    assert not (run_dir / "cell_contract.json").exists()
     assert result == []
 
 
@@ -280,18 +302,20 @@ def test_recomputation_without_marker_rejects_contract_drift(
 
     monkeypatch.setattr(ablation, "_expected_cell_contract_or_none", rebuild_contract)
     monkeypatch.setattr(ablation, "_cleanup", lambda: None)
-    monkeypatch.setattr(
-        ablation,
-        "run_single",
-        lambda *args, **kwargs: {
+
+    def fake_run_single(label, overrides, run_dir, **kwargs):
+        del label, overrides, kwargs
+        return {
             "label": "cell",
             "error_kind": None,
             "primary_val_ppl": 8.0,
             "final_val_ppl": 9.0,
             "seed": 6,
+            "terminal_checkpoint": _owned_terminal_checkpoint(run_dir),
             "_loaded_data_sources": _fake_loaded_sources(),
-        },
-    )
+        }
+
+    monkeypatch.setattr(ablation, "run_single", fake_run_single)
 
     result = ablation.run_sweep(
         sweep_name,
@@ -365,10 +389,21 @@ def test_missing_requested_diagnostics_output_forbids_contract_publication(tmp_p
     def fake_run_single(label, overrides, run_dir, **kwargs):
         result = {"label": label, "error_kind": None, "primary_val_ppl": 8.0,
                   "final_val_ppl": 9.0, "seed": 6,
+                  "terminal_checkpoint": _owned_terminal_checkpoint(run_dir),
                   "_loaded_data_sources": _fake_loaded_sources()}
         if label == "complete":
-            result["attn_entropy"] = 1.0                    # requested diagnostics output present
-            result["extrap_ce"] = []                        # requested extrapolation output present
+            result.update({                                 # every requested diagnostic is present
+                "attn_entropy": 1.0,
+                "energy_klmax_frac": 0.1,
+                "gauge_resid_in": 1e-7,
+                "gauge_resid_out": 1e-7,
+                "omega_identity_dev": 0.2,
+                "rank_resid": 0.8,
+            })
+            result["extrap_ce"] = [                         # requested extrapolation output present
+                {"n": 16, "ce": 3.0, "ppl": 20.0},
+                {"n": 32, "ce": 3.1, "ppl": 22.2},
+            ]
         return result
 
     monkeypatch.setattr(ablation, "run_single", fake_run_single)
@@ -443,6 +478,7 @@ def test_invalid_config_contract_forbids_reuse_without_aborting_sweep(tmp_path: 
                     "primary_val_ppl": float("inf"), "seed": 6}
         return {"label": label, "error_kind": None, "primary_val_ppl": 8.0,
                 "final_val_ppl": 9.0, "seed": 6,
+                "terminal_checkpoint": _owned_terminal_checkpoint(run_dir),
                 "_loaded_data_sources": _fake_loaded_sources()}
 
     monkeypatch.setattr(ablation, "run_single", fake_run_single)
@@ -477,6 +513,7 @@ def test_missing_or_corrupt_source_contract_forbids_reuse_without_aborting_sweep
     def fake_run_single(label, overrides, run_dir, **kwargs):
         return {"label": label, "error_kind": None, "primary_val_ppl": 8.0,
                 "final_val_ppl": 9.0, "seed": 6,
+                "terminal_checkpoint": _owned_terminal_checkpoint(run_dir),
                 "_loaded_data_sources": (
                     None if label == "race" else _fake_loaded_sources())}
 
@@ -604,14 +641,14 @@ def test_run_single_finalizes_before_writing_success_contract(tmp_path, monkeypa
     monkeypatch.setitem(ablation.SWEEPS, sweep_name, {"description": "terminal checkpoint gate"})
     monkeypatch.setattr(ablation, "make_run_overrides",
                         lambda _n: [("no_ckpt", {}), ("with_ckpt", {})])
-    real_ckpt = tmp_path / "real_step.pt"
-    real_ckpt.write_text("x", encoding="utf-8")
-
     def fake_run_single(label, overrides, run_dir, **kwargs):
         run_dir.mkdir(parents=True, exist_ok=True)
-        tc = str(real_ckpt) if label == "with_ckpt" else str(run_dir / "checkpoints" / "step_2.pt")
+        tc = run_dir / "checkpoints" / "step_2.pt"
+        if label == "with_ckpt":
+            tc.parent.mkdir(parents=True, exist_ok=True)
+            tc.write_text("x", encoding="utf-8")
         return {"label": label, "error_kind": None, "primary_val_ppl": 8.0,
-                "final_val_ppl": 9.0, "seed": 6, "terminal_checkpoint": tc,
+                "final_val_ppl": 9.0, "seed": 6, "terminal_checkpoint": str(tc),
                 "_loaded_data_sources": _fake_loaded_sources()}
 
     monkeypatch.setattr(ablation, "run_single", fake_run_single)

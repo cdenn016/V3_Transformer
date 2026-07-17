@@ -1,6 +1,5 @@
 """Controlled belief-geometry comparison regressions (2026-07-14)."""
 
-from types import SimpleNamespace
 import copy
 import json
 from pathlib import Path
@@ -102,17 +101,20 @@ def test_report_default_requests_same_controlled_token_population(
     batch_size,
     expected_batches,
 ):
-    cfg = SimpleNamespace(max_seq_len=seq_len, batch_size=batch_size)
-
-    max_tokens, max_sequences, n_batches = report._resolve_bank_budget(
-        cfg,
+    max_tokens, max_sequences = report._resolve_bank_budget(
         max_tokens=None,
         max_sequences=None,
+    )
+    batches = [torch.zeros((batch_size, seq_len), dtype=torch.long) for _ in range(3)]
+    collected = report._collect_batches(
+        batches,
+        max_tokens=max_tokens,
+        max_sequences=max_sequences,
     )
 
     assert max_tokens == 16_384
     assert max_sequences is None
-    assert n_batches == expected_batches
+    assert len(collected) == expected_batches
 
 
 def test_cluster_coordinates_use_pca_not_umap_above_ten_dimensions():

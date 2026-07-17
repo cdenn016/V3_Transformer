@@ -23,6 +23,7 @@ experiment to set up). Neither is produced here.
 
 import json
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Mapping, Optional, Sequence
@@ -30,11 +31,23 @@ from typing import Callable, Dict, Iterator, List, Mapping, Optional, Sequence
 import torch
 
 from vfe3 import metrics
-from vfe3.config import VFE3Config, config_from_serialized
-from vfe3.run_artifacts import _selection_semantic_config, semantic_config_fingerprint
+from vfe3.config import VFE3Config
+from vfe3.path_utils import prepare_owned_output_child
+from vfe3.run_artifacts import (
+    _atomic_replace,
+    _unique_sibling_temp,
+    _unique_sibling_output_temp,
+    _write_json_atomic,
+    collect_estep_depth_sensitivity,
+    collect_phi_numerics,
+)
 from vfe3.viz import extract
 from vfe3.viz import embedding_comparison
 from vfe3.viz import figures as figs
+from vfe3.viz.run_loading import (
+    load_best_model_state as _load_best_model_state,
+    load_run_config as _load_config,
+)
 from vfe3.viz.text import supports_english_linguistic_taxonomies
 
 
@@ -104,42 +117,6 @@ class ArtifactPublicationResult:
         yield self.figure_path
 
 
-def _load_config(run_dir: Path) -> 'tuple[VFE3Config, str]':
-    r"""Rebuild ``(cfg, dataset)`` from ``run_dir/config.json`` (the RunArtifacts metadata)."""
-    data = json.loads((run_dir / "config.json").read_text())
-    if not isinstance(data, Mapping) or not isinstance(data.get("config"), Mapping):
-        raise ValueError(f"run metadata {run_dir / 'config.json'} has no config mapping")
-    cfg = config_from_serialized(data["config"], source=str(run_dir / "config.json"))
-    return cfg, data.get("dataset", "")
-
-
-def _load_best_model_state(
-    path: Path,
-    cfg:  VFE3Config,
-
-    *,
-    map_location: object,
-) -> Mapping[str, torch.Tensor]:
-    """Validate and unwrap a self-bound ``best_model.pt`` for strict model loading."""
-    payload = torch.load(path, map_location=map_location, weights_only=True)
-    required = {"model_state", "config", "config_fingerprint"}
-    if not isinstance(payload, Mapping) or not payload or not required.issubset(payload):
-        raise ValueError(f"best checkpoint {path} is not a self-bound model/config bundle")
-    embedded = payload["config"]
-    if not isinstance(embedded, Mapping) or not embedded:
-        raise ValueError(f"best checkpoint {path} has no embedded config mapping")
-    raw_fingerprint = semantic_config_fingerprint(embedded)
-    if payload["config_fingerprint"] != raw_fingerprint:
-        raise ValueError(f"best checkpoint {path} has a config fingerprint mismatch")
-    embedded_cfg = config_from_serialized(embedded, source=f"{path} embedded config")
-    if _selection_semantic_config(embedded_cfg) != _selection_semantic_config(cfg):
-        raise ValueError(f"best checkpoint {path} has a semantic config mismatch with config.json")
-    model_state = payload["model_state"]
-    if not isinstance(model_state, Mapping) or not model_state:
-        raise ValueError(f"best checkpoint {path} must contain a nonempty model_state mapping")
-    return model_state
-
-
 def _build_loader(dataset: str, cfg: VFE3Config, split: str):
     r"""A stable (unshuffled) loader for ``dataset``/``split``. Raises ``FileNotFoundError`` if the
     cache is absent: the figure driver never substitutes synthetic data for a real corpus (that
@@ -159,69 +136,291 @@ def _collect_token_batches(
     del device                                                        # retained private-call compatibility
     out: List[torch.Tensor] = []
     for batch in loader:
-        tokens = batch[0] if isinstance(batch, (tuple, list)) else batch
+        tokens = _report_batch_tokens(batch)
         out.append(tokens.detach().cpu())
         if len(out) >= n_batches:
             break
     return out
 
 
-def _collect_batches(loader, n_batches: int) -> List[object]:
-    r"""Materialize the bounded report population once, retaining targets for shared extraction."""
+def _report_batch_tokens(batch: object) -> torch.Tensor:
+    """Return one report batch's token tensor without trusting configured loader dimensions."""
+    tokens = batch[0] if isinstance(batch, (tuple, list)) else batch
+    if not isinstance(tokens, torch.Tensor):
+        raise TypeError(
+            "report loader batches must be tensors or tuple/list values beginning with a tensor"
+        )
+    return tokens
+
+
+def _collect_batches(
+    loader,
+
+    *,
+    max_tokens:    Optional[int],
+    max_sequences: Optional[int],
+) -> List[object]:
+    r"""Materialize a population bounded by the requested actual token or sequence cap."""
+    extract._validate_bank_caps(max_tokens=max_tokens, max_sequences=max_sequences)
+    if max_tokens is None and max_sequences is None:
+        raise ValueError("one report population cap must be provided")
     out: List[object] = []
+    population = 0
     for batch in loader:
-        out.append(batch)
-        if len(out) >= n_batches:
+        tokens = _report_batch_tokens(batch)
+        if tokens.ndim != 2 or tokens.shape[0] < 1 or tokens.shape[1] < 1:
+            raise ValueError("report loader token batches must be nonempty rank-two tensors")
+        if max_tokens is not None:
+            remaining = int(max_tokens) - population
+            if remaining <= 0:
+                break
+            if tokens.numel() > remaining:
+                batch_rows, sequence_length = tokens.shape
+                if sequence_length > remaining:
+                    row_limit, sequence_limit = 1, remaining
+                else:
+                    row_limit = min(batch_rows, remaining // sequence_length)
+                    sequence_limit = sequence_length
+            else:
+                row_limit, sequence_limit = tokens.shape
+            population += int(row_limit) * int(sequence_limit)
+        else:
+            remaining = int(max_sequences) - population
+            if remaining <= 0:
+                break
+            row_limit = min(int(tokens.shape[0]), remaining)
+            sequence_limit = int(tokens.shape[1])
+            population += row_limit
+
+        if row_limit == tokens.shape[0] and sequence_limit == tokens.shape[1]:
+            retained = batch
+        else:
+            def _slice_aligned(item: object) -> object:
+                if not isinstance(item, torch.Tensor):
+                    return item
+                if item.ndim >= 2 and item.shape[:2] == tokens.shape[:2]:
+                    return item[:row_limit, :sequence_limit].clone()
+                if item.ndim >= 1 and item.shape[0] == tokens.shape[0]:
+                    return item[:row_limit].clone()
+                return item
+
+            if isinstance(batch, tuple):
+                retained = tuple(_slice_aligned(item) for item in batch)
+            elif isinstance(batch, list):
+                retained = [_slice_aligned(item) for item in batch]
+            else:
+                retained = _slice_aligned(batch)
+        out.append(retained)
+        reached_cap = population >= (
+            int(max_tokens) if max_tokens is not None else int(max_sequences)
+        )
+        if reached_cap:
             break
     return out
 
 
 def _resolve_bank_budget(
-    cfg: VFE3Config,
-
     *,
     max_tokens:    Optional[int],
     max_sequences: Optional[int],
-) -> 'tuple[Optional[int], Optional[int], int]':
-    """Resolve the exact bank cap and number of loader batches needed to satisfy it."""
+) -> 'tuple[Optional[int], Optional[int]]':
+    """Resolve the exact bank cap; actual loader shapes determine how many batches are needed."""
     extract._validate_bank_caps(max_tokens=max_tokens, max_sequences=max_sequences)
     if max_tokens is None and max_sequences is None:
         max_tokens = CONTROLLED_BANK_TOKENS
-    if max_tokens is not None:
-        tokens_per_batch = max(int(cfg.batch_size) * int(cfg.max_seq_len), 1)
-        n_batches = max(1, -(-max_tokens // tokens_per_batch))
-    else:
-        n_batches = max(1, -(-int(max_sequences) // max(int(cfg.batch_size), 1)))
-    return max_tokens, max_sequences, n_batches
+    return max_tokens, max_sequences
 
 
-def _estimated_full_vocab_bank_bytes(cfg: VFE3Config, n_batches: int) -> int:
-    r"""Conservatively budget retained logits plus probability workspaces for every bank batch."""
-    if n_batches < 1:
-        raise ValueError(f"n_batches must be positive, got {n_batches}")
-    elements = (
-        int(cfg.vocab_size)
-        * int(cfg.max_seq_len)
-        * int(cfg.batch_size)
-        * int(n_batches)
+def _report_batch_nbytes(value: object) -> int:
+    """Return logical bytes of tensors retained in one materialized loader batch."""
+    if isinstance(value, torch.Tensor):
+        return int(value.numel()) * int(value.element_size())
+    if isinstance(value, (tuple, list)):
+        return sum(_report_batch_nbytes(item) for item in value)
+    if isinstance(value, Mapping):
+        return sum(_report_batch_nbytes(item) for item in value.values())
+    return 0
+
+
+def _estimated_full_vocab_bank_bytes(
+    batches:    Sequence[object],
+    vocab_size: int,
+
+    *,
+    decode_dtype: torch.dtype = torch.float32,
+) -> int:
+    r"""Budget retained loader tensors plus one streamed logits-and-probability workset.
+
+    Full-vocabulary consumers decode one materialized batch at a time. The persistent contribution
+    therefore comes only from the actual loader tensors, with their actual dtypes; the transient
+    contribution is the largest actual token batch times two decode-dtype worksets (logits and
+    softmax probabilities). No configured batch or sequence dimension enters this estimate.
+    """
+    if vocab_size < 1:
+        raise ValueError(f"vocab_size must be positive, got {vocab_size}")
+    retained_bytes = sum(_report_batch_nbytes(batch) for batch in batches)
+    element_size = torch.empty((), dtype=decode_dtype).element_size()
+    streamed_peak = max(
+        (2 * int(_report_batch_tokens(batch).numel()) * vocab_size * element_size
+         for batch in batches),
+        default=0,
     )
-    return 2 * torch.empty((), dtype=torch.float32).element_size() * elements
+    return retained_bytes + streamed_peak
+
+
+def _reliability_from_ce_bank(
+    bank: Optional[Mapping[str, torch.Tensor]],
+
+    *,
+    n_bins: int = 15,
+) -> 'Optional[List[Dict[str, float]]]':
+    r"""Bin confidence and correctness from the report's current split.
+
+    The returned schema matches :func:`vfe3.viz.figures.plot_reliability_diagram` and
+    ``run_artifacts._calibration_and_strata``. Deriving it from the already-decoded CE bank keeps the
+    diagram bound to this invocation's requested split and does not perform another model replay.
+    """
+    if bank is None:
+        return None
+    if type(n_bins) is not int or n_bins < 1:
+        raise ValueError(f"n_bins must be a positive integer, got {n_bins!r}")
+    conf = bank.get("conf")
+    correct = bank.get("correct")
+    if not isinstance(conf, torch.Tensor) or not isinstance(correct, torch.Tensor):
+        raise ValueError("CE bank reliability requires tensor conf and correct fields")
+    conf = conf.detach().reshape(-1)
+    correct = correct.detach().reshape(-1).to(device=conf.device, dtype=conf.dtype)
+    if conf.shape != correct.shape:
+        raise ValueError("CE bank conf and correct fields must have identical shapes")
+    if conf.numel() == 0:
+        return None
+    if not bool(torch.isfinite(conf).all()) or not bool(torch.isfinite(correct).all()):
+        raise ValueError("CE bank reliability fields must be finite")
+    if bool(((conf < 0.0) | (conf > 1.0)).any()):
+        raise ValueError("CE bank confidence must lie in [0, 1]")
+    if bool(((correct < 0.0) | (correct > 1.0)).any()):
+        raise ValueError("CE bank correctness must lie in [0, 1]")
+
+    edges = torch.linspace(0.0, 1.0, n_bins + 1, device=conf.device, dtype=conf.dtype)
+    reliability: List[Dict[str, float]] = []
+    for index in range(n_bins):
+        mask = (conf > edges[index]) & (conf <= edges[index + 1])
+        if bool(mask.any()):
+            reliability.append({
+                "conf": float(conf[mask].mean()),
+                "acc":  float(correct[mask].mean()),
+                "frac": float(mask.to(dtype=conf.dtype).mean()),
+            })
+    return reliability or None
+
+
+def _saved_reliability_for_split(
+    run_dir: Path,
+    split:   str,
+    logger:  logging.Logger,
+) -> 'Optional[List[Dict[str, float]]]':
+    r"""Load saved reliability only when its recorded split matches this report invocation."""
+    path = run_dir / "research.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, Mapping):
+            raise ValueError("top level is not a mapping")
+        saved_split = payload.get("reliability_split")
+        if saved_split != split:
+            logger.info(
+                "saved reliability ignored: research.json split %r does not match requested split %r",
+                saved_split,
+                split,
+            )
+            return None
+        raw = payload.get("reliability")
+        if not isinstance(raw, list):
+            raise ValueError("reliability is not a list")
+        reliability: List[Dict[str, float]] = []
+        for entry in raw:
+            if not isinstance(entry, Mapping):
+                raise ValueError("reliability entry is not a mapping")
+            normalized = {
+                "conf": float(entry["conf"]),
+                "acc":  float(entry["acc"]),
+                "frac": float(entry["frac"]),
+            }
+            if (not all(math.isfinite(value) for value in normalized.values())
+                    or any(value < 0.0 or value > 1.0 for value in normalized.values())):
+                raise ValueError("reliability entry is outside [0, 1] or non-finite")
+            reliability.append(normalized)
+        return reliability or None
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        logger.warning("research.json reliability unreadable (%s); reliability figure skipped", exc)
+        return None
+
+
+def _prepare_missing_saved_probes(
+    model:          torch.nn.Module,
+    report_batches: Sequence[object],
+    run_dir:        Path,
+    device:         torch.device,
+    logger:         logging.Logger,
+) -> None:
+    r"""Persist missing finalization probes from the loaded model and first retained report batch."""
+    depth_path = run_dir / "estep_depth_sensitivity.json"
+    phi_path = run_dir / "phi_numerics.json"
+    if depth_path.is_file() and phi_path.is_file():
+        return
+    if not report_batches:
+        logger.warning("saved probes skipped: report loader supplied no retained batch")
+        return
+
+    batch = report_batches[0]
+    try:
+        tokens = _report_batch_tokens(batch).to(device)
+    except (RuntimeError, TypeError, ValueError) as exc:
+        logger.warning("saved probes skipped: first report batch is unusable (%s)", exc)
+        return
+
+    if not phi_path.is_file():
+        try:
+            _write_json_atomic(phi_path, collect_phi_numerics(model, tokens))
+            logger.info("saved probe -> %s", phi_path)
+        except Exception as exc:
+            logger.warning("phi numerical-reference probe failed (%s); skipped", exc)
+
+    if depth_path.is_file():
+        return
+    targets = batch[1] if isinstance(batch, (tuple, list)) and len(batch) >= 2 else None
+    if not isinstance(targets, torch.Tensor):
+        logger.warning("E-step depth-sensitivity probe skipped: report batch has no tensor targets")
+        return
+    try:
+        record = collect_estep_depth_sensitivity(
+            model,
+            tokens,
+            targets.to(device),
+            depths=(0, 1, 2, 3, 5, 8),
+        )
+        _write_json_atomic(depth_path, record)
+        logger.info("saved probe -> %s", depth_path)
+    except Exception as exc:
+        logger.warning("E-step depth-sensitivity probe failed (%s); skipped", exc)
 
 
 def generate_figures(
-    run_dir:         'str | Path',
+    run_dir:              'str | Path',
 
     *,
-    split:           str                         = "validation",
-    max_tokens:      Optional[int]               = None,
-    max_sequences:   Optional[int]               = None,
-    allow_large:     bool                        = False,
-    checkpoint_path: Optional[Path]              = None,
-    model:           Optional[torch.nn.Module]   = None,   # skip the reload; drive this live model
-    loader:          Optional[object]            = None,   # skip the default loader build
-    device:          Optional[torch.device]      = None,
-    n_e_steps:       Optional[int]               = None,
-    logger:          Optional[logging.Logger]    = None,
+    split:                str                       = "validation",
+    max_tokens:           Optional[int]             = None,
+    max_sequences:        Optional[int]             = None,
+    allow_large:          bool                      = False,
+    prepare_saved_probes: bool                      = False,
+    checkpoint_path:      Optional[Path]            = None,
+    model:                Optional[torch.nn.Module] = None,   # skip reload; drive this live model
+    loader:               Optional[object]          = None,   # skip the default loader build
+    device:               Optional[torch.device]    = None,
+    n_e_steps:            Optional[int]             = None,
+    logger:               Optional[logging.Logger]  = None,
 ) -> List[Path]:
     r"""Drive the model and write the single-run publication figures into ``run_dir/figures/``.
 
@@ -232,15 +431,17 @@ def generate_figures(
     absent; pass ``loader`` to override).
     When both population caps are omitted, the belief/model banks use the controlled default of
     exactly 16,384 tokens. Explicit ``max_sequences`` calls preserve the exploratory compatibility
-    path; the two caps are mutually exclusive. ``allow_large`` opts into the two full-vocabulary
-    extractors when their estimated logits-plus-probabilities peak exceeds 8 GB; lighter inputs and
-    figures still run when they are skipped. ``n_e_steps`` overrides the E-step trace length
-    (default: the trained ``cfg.n_e_steps``). Returns the figure paths actually written
-    (best-effort: a failed figure is logged and omitted).
+    path; the two caps are mutually exclusive. ``allow_large`` opts into the streamed
+    full-vocabulary computation when its actual-batch two-workset estimate exceeds 8 GB; it never
+    enables population-wide logit retention. Lighter inputs and figures still run when the decode is
+    skipped. ``prepare_saved_probes`` persists missing depth-sensitivity and phi-numerics inputs from
+    the already-loaded model and retained report batch so an isolated on-demand worker can render the
+    corresponding finalization figures without a second report replay. ``n_e_steps`` overrides the
+    E-step trace length (default: the trained ``cfg.n_e_steps``). Returns the figure paths actually
+    written (best-effort: a failed figure is logged and omitted).
     """
     run_dir = Path(run_dir)
-    figdir = run_dir / "figures"
-    figdir.mkdir(parents=True, exist_ok=True)
+    figdir = prepare_owned_output_child(run_dir, "figures", role="single-run figure")
     logger = logger or logging.getLogger(__name__)
 
     if model is None:
@@ -269,21 +470,29 @@ def generate_figures(
 
     if loader is None:
         loader = _build_loader(dataset, cfg, split)
-    max_tokens, max_sequences, n_batches = _resolve_bank_budget(
-        cfg,
+    max_tokens, max_sequences = _resolve_bank_budget(
         max_tokens=max_tokens,
         max_sequences=max_sequences,
     )
     controlled_bank = max_tokens is not None
-    report_batches = _collect_batches(loader, n_batches)
+    report_batches = _collect_batches(
+        loader,
+        max_tokens=max_tokens,
+        max_sequences=max_sequences,
+    )
     if not report_batches:
         raise RuntimeError(f"loader for {dataset!r}/{split!r} yielded no batches")
+    n_batches = len(report_batches)
 
-    full_vocab_gb = _estimated_full_vocab_bank_bytes(cfg, n_batches) / 1e9
+    full_vocab_gb = _estimated_full_vocab_bank_bytes(
+        report_batches,
+        int(cfg.vocab_size),
+    ) / 1e9
     skip_full_vocab = full_vocab_gb > 8.0 and not allow_large
     if skip_full_vocab:
         logger.warning(
-            "full-vocab figure inputs skipped: aggregate bank+workspace estimate %.1f GB exceeds "
+            "full-vocab figure inputs skipped: actual streamed two-workset peak estimate "
+            "%.1f GB exceeds "
             "the 8 GB guard; pass allow_large=True to override",
             full_vocab_gb,
         )
@@ -301,7 +510,7 @@ def generate_figures(
         report_batches,
         max_batches=n_batches,
         device=device,
-        return_logits=not skip_full_vocab,
+        return_logits=False,
     ), "inference_bank")
     if inference_bank is not None:
         retained_bank_gb = extract.inference_bank_nbytes(inference_bank) / 1e9
@@ -310,15 +519,6 @@ def generate_figures(
             retained_bank_gb,
             len(inference_bank),
         )
-        if retained_bank_gb > 8.0 and not allow_large and not skip_full_vocab:
-            logger.warning(
-                "full-vocab figure inputs skipped: retained inference bank %.1f GB exceeds the "
-                "8 GB guard; pass allow_large=True to override",
-                retained_bank_gb,
-            )
-            for record in inference_bank:
-                record["logits"] = None
-            skip_full_vocab = True
     token_batches = (
         [record["tokens"] for record in inference_bank]
         if inference_bank is not None
@@ -344,11 +544,34 @@ def generate_figures(
         inference_bank=inference_bank), "belief_bank")
     cstate      = _safe(lambda: extract.converged_state(
         model, tok, snapshot=snapshot), "converged_state")
-    ce_bank     = (None if skip_full_vocab else
-                   _safe(lambda: extract.belief_ce_bank(
-                       model, report_batches, device=device, max_batches=n_batches,
-                       inference_bank=inference_bank),
-                         "belief_ce_bank"))   # B1/EXP-3 Sigma_q<->CE join (calibration figures)
+    decode_stats = (
+        None
+        if skip_full_vocab or inference_bank is None
+        else _safe(
+            lambda: extract.belief_ce_vocab_stats(
+                model,
+                inference_bank,
+                device=device,
+                max_batches=n_batches,
+            ),
+            "belief_ce_vocab_stats",
+        )
+    )
+    ce_bank = (
+        None
+        if skip_full_vocab
+        else (
+            decode_stats[0]
+            if decode_stats is not None
+            else (
+                _safe(lambda: extract.belief_ce_bank(
+                    model, report_batches, device=device, max_batches=n_batches),
+                      "belief_ce_bank")
+                if inference_bank is None
+                else None
+            )
+        )
+    )   # B1/EXP-3 Sigma_q<->CE join (calibration figures)
     amaps       = _safe(lambda: model.attention_maps(tok, snapshot=snapshot), "attention_maps")
     per_layer   = _safe(lambda: model.diagnostics_per_layer(
         tok, snapshot=snapshot), "diagnostics_per_layer")
@@ -366,10 +589,20 @@ def generate_figures(
         model, token_batches, max_tokens=max_tokens, max_sequences=max_sequences,
         inference_bank=inference_bank),
                         "model_channel_bank")
-    vstats      = (None if skip_full_vocab else
-                   _safe(lambda: extract.vocab_prediction_stats(
-                       model, token_batches, inference_bank=inference_bank),
-                         "vocab_prediction_stats"))
+    vstats = (
+        None
+        if skip_full_vocab
+        else (
+            decode_stats[1]
+            if decode_stats is not None
+            else (
+                _safe(lambda: extract.vocab_prediction_stats(model, token_batches),
+                      "vocab_prediction_stats")
+                if inference_bank is None
+                else None
+            )
+        )
+    )
     readout     = _safe(lambda: extract.decode_readout(model), "decode_readout")
     run_label   = f"K{cfg.embed_dim}"
 
@@ -387,15 +620,17 @@ def generate_figures(
             dataset,
         )
 
-    # Decode-calibration reliability bins (conf/acc/frac) the run already wrote to research.json
-    # (run_artifacts._calibration_and_strata); the B1/EXP-3 reliability diagram only plots them.
+    # Decode-calibration reliability bins (conf/acc/frac) come from THIS invocation's already-decoded
+    # CE bank. A saved fallback is accepted only when research.json records the same split; legacy
+    # files with unknown provenance must not silently mix finalization/test with on-demand/validation.
     reliability = None
-    rj = run_dir / "research.json"
-    if rj.exists():
+    if ce_bank is not None:
         try:
-            reliability = json.loads(rj.read_text()).get("reliability")
-        except Exception as exc:                                  # best-effort, like every figure input
-            logger.warning("research.json reliability unreadable (%s); reliability figure skipped", exc)
+            reliability = _reliability_from_ce_bank(ce_bank)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            logger.warning("current-split reliability reduction failed (%s); trying saved input", exc)
+    if reliability is None:
+        reliability = _saved_reliability_for_split(run_dir, split, logger)
 
     model_channels = (("mu", "sigma", "phi")
                       if mc_bank is not None and "phi" in mc_bank else ("mu", "sigma"))
@@ -450,8 +685,12 @@ def generate_figures(
         _before = set(figs.plt.get_fignums())            # registry snapshot for the leak sweep below
         try:
             path = figdir / f"{name}.png"
-            fig = thunk(str(path))
-            outcomes = getattr(fig, "_vfe3_publication_outcomes", None)
+            with _unique_sibling_output_temp(path) as temporary_path:
+                fig = thunk(str(temporary_path))
+                outcomes = getattr(fig, "_vfe3_publication_outcomes", None)
+                if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
+                    raise RuntimeError(f"figure {name!r} did not write a nonempty temporary output")
+                _atomic_replace(path, temporary_path)
             figs.plt.close(fig)
             written.append(path)
             logger.info("figure -> %s", path)
@@ -608,14 +847,19 @@ def generate_figures(
             keys = list(per_layer)
             n_layers = len(per_layer[keys[0]]) if keys else 0
             csv_path = run_dir / "metrics_per_layer.csv"
-            with open(csv_path, "w", newline="", encoding="utf-8") as fh:
-                w = csv.writer(fh)
-                w.writerow(["layer", *keys])
-                for li in range(n_layers):
-                    w.writerow([li, *(float(per_layer[k][li]) for k in keys)])
+            with _unique_sibling_temp(csv_path) as temporary_path:
+                with temporary_path.open("w", newline="", encoding="utf-8") as fh:
+                    w = csv.writer(fh)
+                    w.writerow(["layer", *keys])
+                    for li in range(n_layers):
+                        w.writerow([li, *(float(per_layer[k][li]) for k in keys)])
+                _atomic_replace(csv_path, temporary_path)
             logger.info("wrote per-layer metrics -> %s", csv_path)
         except Exception as exc:
             logger.warning("metrics_per_layer.csv failed (%s); continuing", exc)
+
+    if prepare_saved_probes:
+        _prepare_missing_saved_probes(model, report_batches, run_dir, device, logger)
 
     logger.info("wrote %d single-run figures to %s", len(written), figdir)
     return written
@@ -655,10 +899,14 @@ def compare_belief_umap_sidecars(
     published_figure: Optional[Path] = None
     published_json: Optional[Path] = None
     try:
-        figure = figs.plot_controlled_embedding_comparison(
-            summary,
-            path=str(output_figure),
-        )
+        with _unique_sibling_output_temp(output_figure) as temporary_path:
+            figure = figs.plot_controlled_embedding_comparison(
+                summary,
+                path=str(temporary_path),
+            )
+            if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
+                raise RuntimeError("controlled embedding comparison figure was not written")
+            _atomic_replace(output_figure, temporary_path)
         outcomes["figure"]["published"] = True
         published_figure = output_figure
     except Exception as exc:
@@ -765,7 +1013,11 @@ def vocab_comparison_figures(
         try:
             path = out / f"{name}.png"
             fig = thunk()
-            figs._save(fig, str(path))
+            with _unique_sibling_output_temp(path) as temporary_path:
+                figs._save(fig, str(temporary_path))
+                if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
+                    raise RuntimeError(f"comparison figure {name!r} was not written")
+                _atomic_replace(path, temporary_path)
             written.append(path)
             logger.info("figure -> %s", path)
         except Exception as exc:

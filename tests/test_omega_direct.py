@@ -657,7 +657,7 @@ def test_appended_belief_step_omega_direct_uses_stored_frame():
     assert not torch.allclose(out1.mu, out2.mu, atol=1e-6)         # the stored frame must feed the rebuild
 
 
-def test_group_element_inverse_mixed_skew_rows_matches_reference_and_gradient():
+def test_group_element_inverse_skew_rows_match_true_inverse_and_gradient():
     group = get_group("so_k")(K=3)
     clean_0 = torch.eye(3)
     clean_1 = torch.tensor([
@@ -677,24 +677,19 @@ def test_group_element_inverse_mixed_skew_rows_matches_reference_and_gradient():
     ])
     omega = torch.stack([clean_0, drifted_0, drifted_1, clean_1]).reshape(2, 2, 3, 3)
     omega = omega.requires_grad_(True)
-    drifted = torch.tensor([[False, True], [True, False]], device=omega.device)
-
     got = group_element_inverse(omega, group, residual_tol=1e-4)
-    transpose = omega.transpose(-1, -2)
     true_inverse = torch.linalg.inv(omega.double()).to(omega.dtype)
 
     assert got.shape == omega.shape
     assert got.dtype == omega.dtype
     assert got.device == omega.device
-    assert torch.equal(got[~drifted], transpose[~drifted])
-    assert torch.allclose(got[drifted], true_inverse[drifted], atol=1e-7, rtol=1e-6)
+    assert torch.allclose(got, true_inverse, atol=1e-7, rtol=1e-6)
 
     weights = torch.arange(got.numel(), device=got.device, dtype=got.dtype).reshape_as(got) / got.numel()
     grad = torch.autograd.grad((got * weights).sum(), omega)[0]
 
     omega_ref = omega.detach().clone().requires_grad_(True)
-    reference = omega_ref.transpose(-1, -2).clone()
-    reference[drifted] = torch.linalg.inv(omega_ref[drifted].double()).to(omega_ref.dtype)
+    reference = torch.linalg.inv(omega_ref.double()).to(omega_ref.dtype)
     grad_reference = torch.autograd.grad((reference * weights).sum(), omega_ref)[0]
 
     assert torch.isfinite(grad).all()

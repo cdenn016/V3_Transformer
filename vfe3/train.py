@@ -1128,8 +1128,11 @@ def _loader_data_identity(
             raise RuntimeError(
                 "loader data identity model vocabulary does not match the active config")
     else:
-        from vfe3.run_artifacts import _loader_token_content_identity
-        digest, n_tokens = _loader_token_content_identity(loader)
+        from vfe3.run_artifacts import _loader_token_content_summary
+        digest, n_tokens, _counts = _loader_token_content_summary(
+            loader,
+            vocab_size=int(vocab_size),
+        )
         assert digest is not None and n_tokens is not None
         normalized = {
             "schema_version":       2,
@@ -1336,11 +1339,14 @@ def train(
     if cfg.decode_unigram_prior:
         _tok = getattr(getattr(loader, "dataset", None), "tokens", None)
         if _tok is not None:
-            from vfe3.run_artifacts import _bincount_token_chunks
-            _counts = _bincount_token_chunks(
-                _tok,
+            from vfe3.run_artifacts import _loader_token_content_summary
+            _digest, _n_tokens, _counts = _loader_token_content_summary(
+                loader,
                 vocab_size=cfg.vocab_size,
-            ).to(torch.float32)
+            )
+            if _counts is None:
+                raise RuntimeError("training token counts are unavailable for unigram decode")
+            _counts = _counts.to(torch.float32)
             model.prior_bank.set_unigram_log_prior(_counts.to(device))
         else:
             import warnings

@@ -690,7 +690,7 @@ class VFE3Config:
     ema_decay:                 float = 0.999
 
     eval_max_batches:          Optional[int] = None # cap the PERIODIC eval pass (None = full split; pure path)
-    generate_figures:          bool          = True         # auto-run the single-run publication figures at finalize_run (off the hot path)
+    generate_figures:          bool          = True         # run finalize-time publication probes and figures; False skips both
 
     # Memory-guard override for full-vocabulary reporting inputs (audit 2026-07-01 F9): the two
     # extractors that materialize full (B, N, V) logits/probabilities are skipped above the guard,
@@ -866,9 +866,10 @@ class VFE3Config:
         # sigma_max caps the covariance in the SPD retractions (clamp max=sigma_max); a nonfinite
         # or sub-eps cap would push the clamped covariance below eps / negative / NaN (audit
         # 2026-07-01 F2). None stays permissive (no cap).
-        if self.sigma_max is not None and not (math.isfinite(self.sigma_max) and self.sigma_max >= self.eps):
+        if self.sigma_max is not None and not (
+                math.isfinite(self.sigma_max) and self.sigma_max > self.eps):
             raise ValueError(
-                f"sigma_max must be None or finite and >= eps ({self.eps}), got {self.sigma_max}"
+                f"sigma_max must be None or finite and > eps ({self.eps}), got {self.sigma_max}"
             )
         if not (math.isfinite(self.e_sigma_q_trust) and self.e_sigma_q_trust > 0.0):
             raise ValueError(

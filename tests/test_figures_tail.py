@@ -138,34 +138,44 @@ def _write_cell(sweep_dir, label, result):
     (d / "ablation_result.json").write_text(json.dumps(marker))
 
 
-def test_plot_gauge_transport_driver(tmp_path):
+def _raw_fixture_rows(sweep_dir):
+    return [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(sweep_dir.glob("*/ablation_result.json"))
+    ]
+
+
+def test_plot_gauge_transport_driver(tmp_path, monkeypatch):
     sweep = tmp_path / "gauge_transport"; figdir = tmp_path / "figures"
     for lab, ppl, dev in [("on_L1", 30.0, 0.4), ("off_L1", 33.0, 1e-7), ("frozen_L1", 31.0, 0.4),
                           ("on_L2", 28.0, 0.4), ("off_L2", 32.0, 1e-7), ("frozen_L2", 30.0, 0.4)]:
         _write_cell(sweep, lab, {"primary_val_ppl": ppl, "omega_identity_dev": dev})
+    monkeypatch.setattr(ablation, "_collect_sweep_results", _raw_fixture_rows)
     ablation._plot_gauge_transport(sweep, figdir)
     assert (figdir / "gauge_transport_gauge_bars.png").exists()
 
 
-def test_plot_kappa_dispersion_driver(tmp_path):
+def test_plot_kappa_dispersion_driver(tmp_path, monkeypatch):
     sweep = tmp_path / "kappa_beta_per_head"; figdir = tmp_path / "figures"
     for lab, kb, ppl in [("uniform_1.0", [1.0, 1.0], 30.0), ("split_0.6_1.4", [0.6, 1.4], 30.8),
                          ("geomean_0.6_1.4", [0.91652, 0.91652], 30.2)]:
         _write_cell(sweep, lab, {"primary_val_ppl": ppl, "overrides": {"kappa_beta": kb}})
+    monkeypatch.setattr(ablation, "_collect_sweep_results", _raw_fixture_rows)
     ablation._plot_kappa_dispersion(sweep, figdir)
     assert (figdir / "kappa_beta_per_head_kappa_dispersion.png").exists()
 
 
-def test_plot_cg_coupling_driver(tmp_path):
+def test_plot_cg_coupling_driver(tmp_path, monkeypatch):
     sweep = tmp_path / "cg_coupling"; figdir = tmp_path / "figures"
     for lab, ppl in [("cg_off", 31.0), ("cg_on", 29.5)]:
         _write_cell(sweep, lab, {"primary_val_ppl": ppl, "gauge_resid_in": 1e-7,
                                  "overrides": {"use_cg_coupling": lab == "cg_on"}})
+    monkeypatch.setattr(ablation, "_collect_sweep_results", _raw_fixture_rows)
     ablation._plot_cg_coupling(sweep, figdir)
     assert (figdir / "cg_coupling_ppl_equiv.png").exists()
 
 
-def test_plot_gauge_residual_drift_driver(tmp_path):
+def test_plot_gauge_residual_drift_driver(tmp_path, monkeypatch):
     sweep = tmp_path / "gauge_equivariance"; figdir = tmp_path / "figures"
     for lab, climb in [("tied_block_glk", 1e-7), ("untied_block_glk", 1e-2)]:
         d = sweep / lab; d.mkdir(parents=True)
@@ -174,6 +184,11 @@ def test_plot_gauge_residual_drift_driver(tmp_path):
             w.writeheader()
             for st, r in [(10, 1e-7), (20, climb)]:
                 w.writerow({"step": st, "val_builder_resid": r})
+    monkeypatch.setattr(
+        ablation,
+        "_compatible_cell_dirs",
+        lambda _sweep_dir: sorted(path for path in sweep.iterdir() if path.is_dir()),
+    )
     ablation._plot_gauge_residual_drift(sweep, figdir)
     assert (figdir / "gauge_equivariance_residual_drift.png").exists()
 

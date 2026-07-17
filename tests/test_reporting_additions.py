@@ -1014,6 +1014,7 @@ def _stub_registered_figure(name, cap):
     def _fn(*, path=None, **kwargs):
         cap[name] = kwargs
         fig = plt.figure()
+        cap[f"{name}__figure"] = fig
         if path is not None:
             fig.savefig(path)
         return fig
@@ -1066,7 +1067,7 @@ def _fake_ablation_source_ok(dataset, split, *, cache_dir=None):
             "sha256": "0" * 64 + split, "meta": None, "meta_sha256": None}
 
 
-def test_ablation_main_dispatches_registered_figures_by_name_and_keeps_legacy_outputs(
+def test_ablation_renderer_dispatches_registered_figures_by_name_and_keeps_legacy_outputs(
     tmp_path, monkeypatch,
 ):
     # Stub the contract-building identity seams exactly as the existing PB-07 ablation-report
@@ -1081,8 +1082,12 @@ def test_ablation_main_dispatches_registered_figures_by_name_and_keeps_legacy_ou
 
     def fake_run_single(label, overrides, run_dir, **kwargs):
         run_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint = run_dir / "checkpoints" / "terminal.pt"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_bytes(f"checkpoint:{label}".encode("utf-8"))
         result = {"label": label, "error_kind": None, "seed": 6,
                   "overrides": ablation._jsonable(overrides),
+                  "terminal_checkpoint": str(checkpoint),
                   "_loaded_data_sources": {
                       split: _fake_ablation_source_ok("wikitext-103", split)
                       for split in ("train", "validation")
@@ -1114,25 +1119,27 @@ def test_ablation_main_dispatches_registered_figures_by_name_and_keeps_legacy_ou
     monkeypatch.setitem(figs._FIGURES, "ablation_forest", _stub_registered_figure("ablation_forest", cap))
     monkeypatch.setitem(figs._FIGURES, "lr_grid_heatmap", _stub_registered_figure("lr_grid_heatmap", cap))
 
-    monkeypatch.setitem(ablation.CONFIG, "output_dir", str(tmp_path))
-    monkeypatch.setitem(ablation.CONFIG, "device", "cpu")
-    monkeypatch.setitem(ablation.CONFIG, "dataset", "wikitext-103")
-    monkeypatch.setitem(ablation.CONFIG, "resume", False)
-    monkeypatch.setitem(ablation.CONFIG, "seed", 6)
-    monkeypatch.setitem(ablation.CONFIG, "max_tokens", None)
-    monkeypatch.setitem(ablation.CONFIG, "max_steps", None)
-    monkeypatch.setitem(ablation.CONFIG, "list_only", False)
-
-    # Two production main() calls, one per opt-in report sweep (both out of SWEEP_ORDER, so each
-    # must be named explicitly); both write into the same output_dir/figures.
-    monkeypatch.setitem(ablation.CONFIG, "sweep", "component_ablation_forest")
-    ablation.main()
-    monkeypatch.setitem(ablation.CONFIG, "sweep", "e_q_mu_sigma_lr_grid")
-    ablation.main()
-
     fig_dir = tmp_path / "figures"
-    assert (fig_dir / "ablation_forest.png").exists() and (fig_dir / "ablation_forest.png").stat().st_size > 0
-    assert (fig_dir / "lr_grid_heatmap.png").exists() and (fig_dir / "lr_grid_heatmap.png").stat().st_size > 0
+    for name in ("component_ablation_forest", "e_q_mu_sigma_lr_grid"):
+        ablation.run_sweep(
+            name,
+            tmp_path,
+            dataset="wikitext-103",
+            device=DEVICE,
+            seed=6,
+            resume=False,
+        )
+        ablation._render_sweep_figures(tmp_path / name, fig_dir)
+
+    forest_path = fig_dir / "component_ablation_forest_ablation_forest.png"
+    grid_path = fig_dir / "e_q_mu_sigma_lr_grid_lr_grid_heatmap.png"
+    assert forest_path.exists() and forest_path.stat().st_size > 0
+    assert grid_path.exists() and grid_path.stat().st_size > 0
+    for figure_name in ("ablation_forest", "lr_grid_heatmap"):
+        assert any(
+            "Gauge classification" in text.get_text()
+            for text in cap[f"{figure_name}__figure"].texts
+        )
     assert {r["label"] for r in cap["ablation_forest"]["rows"]} == set(forest_offsets)
     grid = cap["lr_grid_heatmap"]["grid"]
     assert grid["z"].shape == (len(ablation._GRID_SIGMA_LRS), len(ablation._GRID_MU_LRS))

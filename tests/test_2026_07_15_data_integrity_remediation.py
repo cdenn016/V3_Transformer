@@ -23,6 +23,7 @@ import scaling
 import scaling_analysis
 import vfe3.data.datasets as datasets_mod
 import vfe3.run_artifacts as artifacts_mod
+import vfe3.viz.extract as extract_mod
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows, cache_path, cached_token_count, load_cached_tokens
 from vfe3.model.model import VFEModel
@@ -642,6 +643,12 @@ def test_training_unigram_count_uses_bounded_native_width_chunks(
 class _ArtifactSink:
     def __init__(self) -> None:
         self.saved: List[Dict[str, object]] = []
+        self.code_identity_sha256 = "c" * 64
+        self.run_start_git_identity = {
+            "git_sha": "0" * 40,
+            "git_dirty": False,
+            "git_dirty_fingerprint": None,
+        }
 
     def save_json(self, name: str, value: Dict[str, object]) -> None:
         assert name == "provenance.json"
@@ -656,14 +663,20 @@ def test_provenance_reuses_one_immutable_split_digest_across_finalizations(
     model = torch.nn.Linear(1, 1)
     cfg = VFE3Config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1)
     calls = 0
-    real_hash = artifacts_mod._sha256_tensor_content
+    real_scan = artifacts_mod._scan_token_content
 
-    def counted_hash(value: torch.Tensor, *, chunk_tokens: int = 128 * 1024) -> str:
+    def counted_scan(
+        value: torch.Tensor,
+
+        *,
+        vocab_size: int,
+        chunk_tokens: int = 128 * 1024,
+    ) -> tuple[str, torch.Tensor]:
         nonlocal calls
         calls += 1
-        return real_hash(value, chunk_tokens=chunk_tokens)
+        return real_scan(value, vocab_size=vocab_size, chunk_tokens=chunk_tokens)
 
-    monkeypatch.setattr(artifacts_mod, "_sha256_tensor_content", counted_hash)
+    monkeypatch.setattr(artifacts_mod, "_scan_token_content", counted_scan)
     monkeypatch.setattr(
         artifacts_mod,
         "_git_code_identity",
@@ -676,6 +689,78 @@ def test_provenance_reuses_one_immutable_split_digest_across_finalizations(
     artifacts_mod._write_provenance(sink_b, cfg, model, logger, train_loader=loader)
     assert calls == 1
     assert sink_a.saved[0]["train_data_sha256"] == sink_b.saved[0]["train_data_sha256"]
+
+
+def test_train_provenance_and_research_counts_share_one_corpus_scan(monkeypatch) -> None:
+    tokens = torch.arange(20, dtype=torch.int32)
+    loader = DataLoader(TokenWindows(tokens, seq_len=4), batch_size=2)
+    cfg = VFE3Config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1)
+    calls = 0
+    real_scan = artifacts_mod._scan_token_content
+
+    def counted_scan(value, *, vocab_size, chunk_tokens=128 * 1024):
+        nonlocal calls
+        calls += 1
+        return real_scan(value, vocab_size=vocab_size, chunk_tokens=chunk_tokens)
+
+    monkeypatch.setattr(artifacts_mod, "_scan_token_content", counted_scan)
+    monkeypatch.setattr(
+        artifacts_mod,
+        "_git_code_identity",
+        lambda: {"git_sha": "0" * 40, "git_dirty": False, "git_dirty_fingerprint": None},
+    )
+    monkeypatch.setattr(
+        artifacts_mod,
+        "_calibration_and_strata",
+        lambda *_args, **_kwargs: {
+            "calibration_probe": 1.0,
+            "reliability": [{"conf": 0.5, "acc": 1.0, "frac": 1.0}],
+        },
+    )
+    monkeypatch.setattr(artifacts_mod, "_fd_gradient_check", lambda *_args: 0.0)
+    monkeypatch.setattr(
+        extract_mod,
+        "belief_ce_bank",
+        lambda *_args, **_kwargs: {
+            "tr_sigma": torch.empty(0),
+            "ce": torch.empty(0),
+        },
+    )
+
+    class _NamedSink:
+        def __init__(self) -> None:
+            self.saved: Dict[str, Dict[str, object]] = {}
+            self.code_identity_sha256 = "c" * 64
+            self.run_start_git_identity = {
+                "git_sha": "0" * 40,
+                "git_dirty": False,
+                "git_dirty_fingerprint": None,
+            }
+
+        def save_json(self, name: str, value: Dict[str, object]) -> None:
+            self.saved[name] = value
+
+    sink = _NamedSink()
+    logger = artifacts_mod.logging.getLogger(__name__)
+    model = torch.nn.Linear(1, 1)
+    _loader_data_identity(loader, cfg.vocab_size)
+    artifacts_mod._write_provenance(
+        sink, cfg, model, logger, train_loader=loader,
+    )
+    artifacts_mod._write_research_artifacts(
+        model,
+        sink,
+        cfg,
+        loader,
+        loader,
+        torch.device("cpu"),
+        logger,
+    )
+
+    assert calls == 1
+    assert sink.saved["provenance.json"]["train_data_n_tokens"] == tokens.numel()
+    assert sink.saved["research.json"]["calibration_probe"] == 1.0
+    assert sink.saved["research.json"]["reliability_split"] == "test"
 
 
 def _checkpoint_cfg() -> VFE3Config:

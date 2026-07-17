@@ -767,11 +767,13 @@ def spd_geodesic_distance(
     diagonal: Optional[bool] = None,
     eps:      float = 1e-12,
 ) -> torch.Tensor:                       # (...) affine-invariant SPD distance d_AI(Sigma_a, Sigma_b)
-    r"""Affine-invariant (Rao/Fisher) geodesic distance on the SPD cone.
+    r"""Affine-invariant Riemannian geodesic distance on the SPD cone.
 
     d_AI(Sigma_a, Sigma_b) = ||log(Sigma_a^{-1/2} Sigma_b Sigma_a^{-1/2})||_F
                            = sqrt(sum_k (log lambda_k)^2),
-    where lambda_k are the generalized eigenvalues of (Sigma_b, Sigma_a). For diagonal beliefs
+    where lambda_k are the generalized eigenvalues of (Sigma_b, Sigma_a). This is the standard
+    affine-invariant SPD metric without the Gaussian covariance Fisher block's factor of one half;
+    it must therefore not be labeled as the Fisher-Rao distance. For diagonal beliefs
     this reduces to sqrt(sum_k log^2(sigma_b,k / sigma_a,k)). This is the metric the SPD
     retraction itself uses, so belief-trajectory / E-step-residual lengths are measured in the
     geometry the inference actually moves in. Symmetric, zero iff Sigma_a == Sigma_b.

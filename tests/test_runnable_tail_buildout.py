@@ -43,7 +43,7 @@ def test_holonomy_trainability_figure_renders():
     plt.close(fig)
 
 
-def test_plot_holonomy_trainability_driver(tmp_path):
+def test_plot_holonomy_trainability_driver(tmp_path, monkeypatch):
     sweep = tmp_path / "regime_ii"; figdir = tmp_path / "figures"
     d = sweep / "regime_ii"; d.mkdir(parents=True)
     with open(d / "metrics.csv", "w", newline="", encoding="utf-8") as fh:
@@ -56,5 +56,10 @@ def test_plot_holonomy_trainability_driver(tmp_path):
         w = _csv.DictWriter(fh, fieldnames=["step", "holonomy_deviation"])
         w.writeheader()
         w.writerow({"step": 10, "holonomy_deviation": 0.0})
+    monkeypatch.setattr(
+        ablation,
+        "_compatible_cell_dirs",
+        lambda _sweep_dir: [d, d2],
+    )
     ablation._plot_holonomy_trainability(sweep, figdir)            # must not crash on the flat cell
     assert (figdir / "regime_ii_holonomy_trainability.png").exists()

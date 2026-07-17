@@ -283,6 +283,11 @@ def test_scaling_requires_nonempty_unique_cell_labels(
         "NUL",
         "CONIN$",
         "CONOUT$",
+        "CLOCK$",
+        "x" * 256,
+        "🙂" * 100,
+        "COM¹",
+        "LPT³.txt",
     ),
 )
 def test_scaling_rejects_unsafe_path_components_before_output_creation(
@@ -302,6 +307,11 @@ def test_scaling_rejects_unsafe_path_components_before_output_creation(
         scaling.main()
 
     assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("bad_component", ("CONIN$", "CONOUT$", "CLOCK$", "COM¹", "LPT³.txt"))
+def test_scaling_analysis_portably_rejects_windows_devices(bad_component):
+    assert not scaling_analysis._safe_manifest_component(bad_component)
 
 
 @pytest.mark.parametrize("component_kind", ("route", "label"))

@@ -612,8 +612,10 @@ def test_shared_report_inference_bank_serves_all_population_consumers_once(
     ])
 
     inference_calls = 0
+    decode_calls = 0
     cpu_transfer_ids: set[int] = set()
     real_forward_beliefs = model.forward_beliefs
+    real_decode = model.prior_bank.decode
     real_cpu = torch.Tensor.cpu
 
     def _forward_spy(*args: object, **kwargs: object) -> object:
@@ -625,13 +627,19 @@ def test_shared_report_inference_bank_serves_all_population_consumers_once(
         cpu_transfer_ids.add(id(value))
         return real_cpu(value, *args, **kwargs)
 
+    def _decode_spy(*args: object, **kwargs: object) -> torch.Tensor:
+        nonlocal decode_calls
+        decode_calls += 1
+        return real_decode(*args, **kwargs)
+
     monkeypatch.setattr(model, "forward_beliefs", _forward_spy)
+    monkeypatch.setattr(model.prior_bank, "decode", _decode_spy)
     monkeypatch.setattr(torch.Tensor, "cpu", _cpu_spy)
     inference_bank = extract.collect_inference_bank(
         model,
         loader,
         max_batches=len(loader),
-        return_logits=True,
+        return_logits=False,
     )
     retained_tensors = [
         tensor
@@ -639,6 +647,8 @@ def test_shared_report_inference_bank_serves_all_population_consumers_once(
         for tensor in _record_tensors(record)
     ]
     assert len(inference_bank) == len(loader)
+    assert all(record["logits"] is None for record in inference_bank)
+    assert all(record["belief"] is not None for record in inference_bank)
     assert retained_tensors
     assert all(tensor.device.type == "cpu" for tensor in retained_tensors)
     assert all(id(tensor) in cpu_transfer_ids for tensor in retained_tensors)
@@ -656,23 +666,18 @@ def test_shared_report_inference_bank_serves_all_population_consumers_once(
         token_batches,
         inference_bank=inference_bank,
     )
-    actual_ce = extract.belief_ce_bank(
+    actual_ce, actual_vocab = extract.belief_ce_vocab_stats(
         model,
-        loader,
-        inference_bank=inference_bank,
+        inference_bank,
     )
     actual_model = extract.model_channel_bank(
         model,
         token_batches,
         inference_bank=inference_bank,
     )
-    actual_vocab = extract.vocab_prediction_stats(
-        model,
-        token_batches,
-        inference_bank=inference_bank,
-    )
-
     assert inference_calls == len(loader)
+    assert decode_calls == len(loader)
+    assert actual_vocab is not None
     _assert_mapping_close(actual_belief, expected_belief)
     _assert_mapping_close(actual_ce, expected_ce)
     assert actual_model is not None and expected_model is not None
@@ -706,7 +711,7 @@ def test_shared_population_consumers_drop_padding_and_keep_aligned_targets() -> 
     inference_bank = extract.collect_inference_bank(
         model,
         loader,
-        return_logits=True,
+        return_logits=False,
     )
 
     belief = extract.belief_bank(model, [], inference_bank=inference_bank)
@@ -721,8 +726,8 @@ def test_shared_population_consumers_drop_padding_and_keep_aligned_targets() -> 
         assert bank["pos_idx"].tolist() == [0, 1, 2, 3, 0]
 
     valid_logits = torch.cat([
-        record["logits"][record["targets"] != -100]
-        for record in inference_bank
+        model(tokens)[targets != -100]
+        for tokens, targets in loader
     ])
     expected_mean = valid_logits.float().softmax(dim=-1).mean(dim=0)
     torch.testing.assert_close(vocab["mean_pred_prob"], expected_mean)
@@ -731,6 +736,58 @@ def test_shared_population_consumers_drop_padding_and_keep_aligned_targets() -> 
     assert vocab["disp_context_ids"].tolist() == [0, 1, 2, 3]
     assert vocab["disp_target_ids"].tolist() == [1, 2, 3, 4]
     assert vocab["unigram"].nonzero().flatten().tolist() == [1, 2, 3, 4, 9]
+
+
+def test_report_batch_budget_uses_materialized_shapes_and_dtypes() -> None:
+    first = (
+        torch.zeros((2, 3), dtype=torch.long),
+        torch.zeros((2, 3), dtype=torch.int32),
+    )
+    second = torch.zeros((1, 5), dtype=torch.long)
+    third = torch.zeros((4, 1), dtype=torch.long)
+
+    by_tokens = report._collect_batches(
+        [first, second, third],
+        max_tokens=10,
+        max_sequences=None,
+    )
+    by_sequences = report._collect_batches(
+        [first, second, third],
+        max_tokens=None,
+        max_sequences=3,
+    )
+
+    assert by_tokens[0] is first
+    assert by_tokens[1].shape == (1, 4)
+    assert by_tokens[1].numel() + first[0].numel() == 10
+    assert by_sequences == [first, second]
+    retained_bytes = (
+        first[0].numel() * first[0].element_size()
+        + first[1].numel() * first[1].element_size()
+        + by_tokens[1].numel() * by_tokens[1].element_size()
+    )
+    largest_full_vocab_workset = (
+        2
+        * first[0].numel()
+        * 11
+        * torch.tensor([], dtype=torch.float32).element_size()
+    )
+    assert report._estimated_full_vocab_bank_bytes(by_tokens, 11) == (
+        retained_bytes + largest_full_vocab_workset
+    )
+
+    oversized_tokens = torch.zeros((64, 1024), dtype=torch.long)
+    oversized_targets = torch.ones_like(oversized_tokens)
+    bounded = report._collect_batches(
+        [(oversized_tokens, oversized_targets)],
+        max_tokens=10,
+        max_sequences=None,
+    )
+    assert bounded[0][0].shape == bounded[0][1].shape == (1, 10)
+    assert (
+        bounded[0][0].untyped_storage().data_ptr()
+        != oversized_tokens.untyped_storage().data_ptr()
+    )
 
 
 def test_shared_belief_ce_honors_requested_device_and_releases_each_record(
@@ -1070,13 +1127,17 @@ def test_report_token_fallback_keeps_all_collected_batches_off_device(
     assert all(tokens.device.type == "cpu" for tokens in actual)
 
 
-def test_full_vocab_memory_guard_scales_with_all_retained_batches() -> None:
-    cfg = _tiny_config(vocab_size=101, max_seq_len=7, batch_size=3)
-    one_batch = report._estimated_full_vocab_bank_bytes(cfg, 1)
-    four_batches = report._estimated_full_vocab_bank_bytes(cfg, 4)
+def test_full_vocab_memory_guard_streams_largest_batch_instead_of_aggregating_logits() -> None:
+    vocab_size = 101
+    batch = torch.zeros((3, 7), dtype=torch.long)
+    batch_bytes = batch.numel() * batch.element_size()
+    streamed_workset = 8 * vocab_size * batch.numel()
 
-    assert one_batch == 8 * cfg.vocab_size * cfg.max_seq_len * cfg.batch_size
-    assert four_batches == 4 * one_batch
+    one_batch = report._estimated_full_vocab_bank_bytes([batch], vocab_size)
+    four_batches = report._estimated_full_vocab_bank_bytes([batch] * 4, vocab_size)
+
+    assert one_batch == batch_bytes + streamed_workset
+    assert four_batches == 4 * batch_bytes + streamed_workset
 
 
 def test_eval_only_step_runs_sparse_omega_determinant_validation(

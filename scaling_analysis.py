@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
+from vfe3.path_utils import portable_path_component_key
 from vfe3.viz.sweep_adapters import aggregate_validation_points, capacity_scaling_kwargs, pareto_frontier_kwargs
 from vfe3.run_artifacts import _write_json_atomic
 
@@ -253,17 +254,11 @@ def _structural_signature(row: Mapping[str, Any]) -> tuple:
 
 def _safe_manifest_component(value: object) -> bool:
     """Whether a manifest route or label is one regular Windows path component."""
-    return (
-        type(value) is str
-        and bool(value)
-        and value == value.strip()
-        and value not in {".", ".."}
-        and "/" not in value
-        and "\\" not in value
-        and not value.endswith((".", " "))
-        and not os.path.isabs(value)
-        and not os.path.isreserved(value)
-    )
+    try:
+        portable_path_component_key(value, field="manifest path component")
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _exact_join_key(row: Mapping[str, Any]) -> Optional[Tuple[str, str, int]]:

@@ -67,7 +67,7 @@ def test_mu_precond_figure_renders():
     plt.close(fig)
 
 
-def test_plot_mu_precond_driver(tmp_path):
+def test_plot_mu_precond_driver(tmp_path, monkeypatch):
     sweep = tmp_path / "fisher_mu_precond"; figdir = tmp_path / "figures"
     for p in ("fisher", "raw"):
         for t in (1, 3):
@@ -75,6 +75,14 @@ def test_plot_mu_precond_driver(tmp_path):
             (d / "ablation_result.json").write_text(json.dumps(
                 {"label": f"{p}_T{t}", "primary_val_ppl": 30.0 + (2.0 if p == "raw" else 0.0),
                  "final_val_ppl": 30.0 + (2.0 if p == "raw" else 0.0),
-                 "status": "success", "error_kind": None}))
+                  "status": "success", "error_kind": None}))
+    monkeypatch.setattr(
+        ablation,
+        "_collect_sweep_results",
+        lambda _sweep_dir: [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted(sweep.glob("*/ablation_result.json"))
+        ],
+    )
     ablation._plot_mu_precond(sweep, figdir)
     assert (figdir / "fisher_mu_precond_mu_precond.png").exists()

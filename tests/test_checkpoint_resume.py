@@ -1302,11 +1302,16 @@ def test_selection_projection_migrates_missing_defaults_and_rejects_unknown_fiel
         _selection_semantic_config(newer)
 
 
-def test_selection_projection_excludes_checkpoint_trust_policy() -> None:
+def test_selection_projection_excludes_checkpoint_and_figure_policy() -> None:
     from vfe3.run_artifacts import _selection_semantic_config
 
     assert _selection_semantic_config(_cfg(trust_resume_checkpoint=False)) == (
         _selection_semantic_config(_cfg(trust_resume_checkpoint=True))
+    )
+    assert _selection_semantic_config(
+        _cfg(generate_figures=False, force_large_figures=False)
+    ) == _selection_semantic_config(
+        _cfg(generate_figures=True, force_large_figures=True)
     )
 
 
