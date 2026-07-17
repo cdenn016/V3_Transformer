@@ -1113,9 +1113,11 @@ def stable_matrix_exp_pair(
     exp_dim:                 Optional[int]       = None,     # dimension for the float64-island decision (None -> d)
     validity_max_norm:       Optional[float]     = None,     # opt-in fail-closed pre-clamp chart bound
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    r"""exp(M) and optionally exp(-M) with Frobenius-norm clamp + float64 upcast.
+    r"""Represented exp(M) and optionally its float64-computed inverse.
 
     Frobenius-norm clamp + float64 upcast keep matrix_exp stable for large ||M||.
+    The paired negative factor is the inverse of the represented forward factor, not a separately
+    rounded evaluation of exp(-M), so the stored pair shares one finite-precision group element.
 
     SAFEGUARD, NOT THE EXACT OPERATOR: when ``||M||_F > max_norm`` the matrix is rescaled to
     ``max_norm``, so the returned factor is ``exp(max_norm * M/||M||_F)``, NOT ``exp(M)`` -- the
@@ -1235,19 +1237,15 @@ def stable_matrix_exp_pair(
             exp_pos = _blockwise_matrix_exp(matrix_up, block_dims).to(orig_dtype)
             if only_forward:
                 exp_neg = None
-            elif skew_symmetric:
-                exp_neg = exp_pos.transpose(-1, -2)
             else:
-                exp_neg = _blockwise_matrix_exp(-matrix_up, block_dims).to(orig_dtype)
+                exp_neg = _blockwise_group_inverse(exp_pos, block_dims)
             return exp_pos, exp_neg
 
         exp_pos = torch.linalg.matrix_exp(matrix_up).to(orig_dtype)
         if only_forward:
             exp_neg = None
-        elif skew_symmetric:
-            exp_neg = exp_pos.transpose(-1, -2)
         else:
-            exp_neg = torch.linalg.matrix_exp(-matrix_up).to(orig_dtype)
+            exp_neg = _checked_group_inverse(exp_pos)
     return exp_pos, exp_neg
 
 
@@ -1290,6 +1288,35 @@ def _blockwise_matrix_exp(
         end = start + dim
         blk = matrix[..., start:end, start:end].contiguous()
         out[..., start:end, start:end] = torch.linalg.matrix_exp(blk)
+        start = end
+    return out
+
+
+def _blockwise_group_inverse(
+    matrix:     torch.Tensor,             # (..., d, d) represented block-diagonal group element
+    block_dims: List[int],                # block sizes; sum == d
+) -> torch.Tensor:                        # (..., d, d) inverse with structural off-block zeros
+    r"""Invert represented diagonal blocks in float64 without materializing a full dense solve."""
+    out = torch.zeros_like(matrix)
+    if len(set(block_dims)) == 1 and len(block_dims) > 1:
+        H, d = len(block_dims), block_dims[0]
+        batch = matrix.shape[:-2]
+        matrix_view = matrix.reshape(*batch, H, d, H, d)
+        blocks = torch.diagonal(
+            matrix_view,
+            dim1=-4,
+            dim2=-2,
+        ).movedim(-1, -3).contiguous()
+        inverses = _checked_group_inverse(blocks)
+        out_view = out.reshape(*batch, H, d, H, d)
+        torch.diagonal(out_view, dim1=-4, dim2=-2).copy_(inverses.movedim(-3, -1))
+        return out
+
+    start = 0
+    for dim in block_dims:
+        end = start + dim
+        block = matrix[..., start:end, start:end].contiguous()
+        out[..., start:end, start:end] = _checked_group_inverse(block)
         start = end
     return out
 
@@ -1465,7 +1492,7 @@ def _stable_compact_glk_exp_pair(
     clamp_monitor:           bool            = False,
     validity_max_norm:       Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Exponentiate packed equal blocks with the dense path's global clamp and dtype rules."""
+    r"""Exponentiate packed blocks once and invert their represented values in float64."""
     if validity_max_norm is not None and (
         not math.isfinite(validity_max_norm) or validity_max_norm <= 0.0
     ):
@@ -1512,7 +1539,7 @@ def _stable_compact_glk_exp_pair(
     with torch.amp.autocast(blocks.device.type, enabled=False):
         blocks_up = blocks.to(up_dtype).contiguous()
         exp_pos = torch.linalg.matrix_exp(blocks_up).to(orig_dtype)
-        exp_neg = torch.linalg.matrix_exp(-blocks_up).to(orig_dtype)
+        exp_neg = _checked_group_inverse(exp_pos)
     return exp_pos, exp_neg
 
 

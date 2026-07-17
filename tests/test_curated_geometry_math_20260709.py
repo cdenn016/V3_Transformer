@@ -594,9 +594,10 @@ def test_large_skew_dim_mode_matches_float64_matrix_exp() -> None:
         exp_fp64_norm_threshold=5.0,
     )
     reference = torch.linalg.matrix_exp(matrix.double()).float()
+    represented_inverse = torch.linalg.inv(reference.double()).float()
 
     assert torch.equal(exp_pos, reference)
-    assert torch.equal(exp_neg, reference.transpose(-1, -2))
+    assert torch.equal(exp_neg, represented_inverse)
 
 
 def test_small_skew_dim_mode_keeps_float32_identity() -> None:
@@ -610,9 +611,10 @@ def test_small_skew_dim_mode_keeps_float32_identity() -> None:
         exp_fp64_norm_threshold=5.0,
     )
     reference = torch.linalg.matrix_exp(matrix)
+    represented_inverse = torch.linalg.inv(reference.double()).float()
 
     assert torch.equal(exp_pos, reference)
-    assert torch.equal(exp_neg, reference.transpose(-1, -2))
+    assert torch.equal(exp_neg, represented_inverse)
 
 
 def test_laplace_renyi_large_separation_has_finite_gradients() -> None:

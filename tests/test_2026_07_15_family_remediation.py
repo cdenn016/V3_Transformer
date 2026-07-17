@@ -62,7 +62,7 @@ def test_gaussian_public_statistical_paths_keep_current_values() -> None:
     with torch.no_grad():
         mixer.mixer_delta.copy_(torch.tensor([[0.0, 1.0], [0.0, 0.0]]))
     _, mixed = mixer(torch.zeros_like(variance), variance)
-    assert torch.equal(mixed, torch.tensor([[5.0, 1.0]]))
+    assert torch.allclose(mixed, torch.tensor([[5.0, 1.0]]))
 
     indefinite = torch.diag(torch.tensor([-1e-6, 1.0]))
     spectrum = metrics.belief_spectrum(
@@ -452,4 +452,4 @@ def test_grad_forward_invalidates_identity_shortcut_before_versionless_write() -
         mixed_mean, _ = mixer(mean, variance)
 
     assert mixed_mean is not mean
-    assert torch.equal(mixed_mean, torch.tensor([[2.75, 3.0]]))
+    assert torch.allclose(mixed_mean, torch.tensor([[2.75, 3.0]]))

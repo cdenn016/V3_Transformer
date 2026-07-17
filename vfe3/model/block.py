@@ -88,6 +88,7 @@ def vfe_block(
     rope:            Optional[torch.Tensor]    = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
     rope_on_cov:     bool                      = False,  # full-gauge: rotate covariance too
     rope_on_value:   bool                      = True,   # False -> value aggregation uses the un-rotated base
+    training:        bool                      = False,  # explicit module mode for inner-loop controls
     tau:             'Optional[float | torch.Tensor]' = None,  # softmax temperature (precomputed by vfe_stack; None -> compute here)
 
     capture:         Optional[MStepCapture]        = None,   # out-param: stashes the CONVERGED (pre-transform) belief under 'converged'
@@ -135,6 +136,7 @@ def vfe_block(
         transport_chart_max_norm=cfg.transport_chart_max_norm,
         transport_status=transport_status,
         randomize_e_steps=cfg.randomize_e_steps,
+        training=training,
         e_steps_min=cfg.e_steps_min, e_steps_max=cfg.e_steps_max,
         e_steps_backprop_last=cfg.e_steps_backprop_last,
         e_step_halt_tol=cfg.e_step_halt_tol,

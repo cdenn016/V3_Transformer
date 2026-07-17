@@ -338,7 +338,7 @@ def _certify_public_spd(
     """
     fallback_value, _public_upper = _public_spd_bounds(matrix.dtype, eps, sigma_max)
     symmetric = 0.5 * (matrix + matrix.transpose(-1, -2))
-    check_dtype = torch.float64 if symmetric.dtype == torch.float64 else torch.float32
+    check_dtype = torch.float64
     dimension = symmetric.shape[-1]
     eye_check = torch.eye(dimension, device=symmetric.device, dtype=check_dtype)
     flat = symmetric.reshape(-1, dimension, dimension)

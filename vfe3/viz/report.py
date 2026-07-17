@@ -52,6 +52,8 @@ from vfe3.viz.text import supports_english_linguistic_taxonomies
 
 
 CONTROLLED_BANK_TOKENS = 16_384
+_FULL_PAIR_MATRIX_WORKSETS = 8
+_COORDINATE_WORKSETS = 12
 
 _SINGLE_RUN_FIGURE_INVENTORY = (
     "estep_convergence.png",
@@ -247,17 +249,43 @@ def _estimated_full_vocab_bank_bytes(
     vocab_size: int,
 
     *,
-    decode_dtype: torch.dtype = torch.float32,
+    decode_dtype:                    torch.dtype   = torch.float32,
+    full_pair_matrix_dim:            Optional[int] = None,
+    coordinate_workspace_dim:        Optional[int] = None,
+    coordinate_workspace_vocab_size: Optional[int] = None,
 ) -> int:
-    r"""Budget retained loader tensors plus one streamed logits-and-probability workset.
+    r"""Budget retained loader tensors plus the configured dense decode workspace.
 
     Full-vocabulary consumers decode one materialized batch at a time. The persistent contribution
     therefore comes only from the actual loader tensors, with their actual dtypes; the transient
     contribution is the largest actual token batch times two decode-dtype worksets (logits and
-    softmax probabilities). No configured batch or sequence dimension enters this estimate.
+    softmax probabilities). A dense full-covariance functional additionally creates pairwise
+    ``(B, N, V, K, K)`` matrices during factorization and solves. Eight such worksets provide a
+    conservative allocation guard. Generic diagonal-family and expected-likelihood kernels instead
+    create coordinate worksets shaped ``(B, N, V_or_chunk, K)``. Twelve float32-equivalent worksets
+    cover the reachable near-KL family branch that retains float32 inputs alongside float64
+    intermediates; the represented dimension and actual vocabulary width are budgeted separately.
+    Optimized kernels leave both workspace forms unset. No configured batch or sequence dimension
+    enters this estimate.
     """
     if vocab_size < 1:
         raise ValueError(f"vocab_size must be positive, got {vocab_size}")
+    if (full_pair_matrix_dim is not None
+            and (type(full_pair_matrix_dim) is not int or full_pair_matrix_dim < 1)):
+        raise ValueError(
+            f"full_pair_matrix_dim must be a positive integer or None, got "
+            f"{full_pair_matrix_dim!r}"
+        )
+    coordinate_values = (coordinate_workspace_dim, coordinate_workspace_vocab_size)
+    if (coordinate_workspace_dim is None) != (coordinate_workspace_vocab_size is None):
+        raise ValueError(
+            "coordinate workspace dimension and vocabulary size must be provided together"
+        )
+    if any(type(value) is not int or value < 1 for value in coordinate_values if value is not None):
+        raise ValueError("coordinate workspace dimension and vocabulary size must be positive integers")
+    if (coordinate_workspace_vocab_size is not None
+            and coordinate_workspace_vocab_size > vocab_size):
+        raise ValueError("coordinate workspace vocabulary size cannot exceed the full vocabulary")
     retained_bytes = sum(_report_batch_nbytes(batch) for batch in batches)
     element_size = torch.empty((), dtype=decode_dtype).element_size()
     streamed_peak = max(
@@ -265,7 +293,45 @@ def _estimated_full_vocab_bank_bytes(
          for batch in batches),
         default=0,
     )
+    if full_pair_matrix_dim is not None:
+        streamed_peak += max(
+            (_FULL_PAIR_MATRIX_WORKSETS
+             * int(_report_batch_tokens(batch).numel())
+             * vocab_size
+             * full_pair_matrix_dim
+             * full_pair_matrix_dim
+             * element_size
+             for batch in batches),
+            default=0,
+        )
+    if coordinate_workspace_dim is not None and coordinate_workspace_vocab_size is not None:
+        streamed_peak += max(
+            (_COORDINATE_WORKSETS
+             * int(_report_batch_tokens(batch).numel())
+             * coordinate_workspace_vocab_size
+             * coordinate_workspace_dim
+             * element_size
+             for batch in batches),
+            default=0,
+        )
     return retained_bytes + streamed_peak
+
+
+def _decode_workspace_requirements(
+    cfg:                VFE3Config,
+    active_decode_mode: str,
+) -> 'tuple[Optional[int], Optional[int], Optional[int]]':
+    r"""Return dense-matrix dimension, coordinate dimension, and coordinate vocabulary width."""
+    width = int(cfg.embed_dim)
+    vocab_size = int(cfg.vocab_size)
+    if (not cfg.diagonal_covariance
+            and active_decode_mode in {"full", "family", "family_chunked"}):
+        return width, None, None
+    if cfg.diagonal_covariance and active_decode_mode in {"family", "family_chunked"}:
+        return None, width, vocab_size
+    if active_decode_mode == "expected_likelihood_chunked":
+        return None, width, min(vocab_size, int(cfg.decode_chunk_size))
+    return None, None, None
 
 
 def _reliability_from_ce_bank(
@@ -432,9 +498,9 @@ def generate_figures(
     When both population caps are omitted, the belief/model banks use the controlled default of
     exactly 16,384 tokens. Explicit ``max_sequences`` calls preserve the exploratory compatibility
     path; the two caps are mutually exclusive. ``allow_large`` opts into the streamed
-    full-vocabulary computation when its actual-batch two-workset estimate exceeds 8 GB; it never
-    enables population-wide logit retention. Lighter inputs and figures still run when the decode is
-    skipped. ``prepare_saved_probes`` persists missing depth-sensitivity and phi-numerics inputs from
+    full-vocabulary computation when its actual-batch, decode-aware workspace estimate exceeds 8 GB;
+    it never enables population-wide logit retention. Lighter inputs and figures still run when the
+    decode is skipped. ``prepare_saved_probes`` persists missing depth-sensitivity and phi-numerics inputs from
     the already-loaded model and retained report batch so an isolated on-demand worker can render the
     corresponding finalization figures without a second report replay. ``n_e_steps`` overrides the
     E-step trace length (default: the trained ``cfg.n_e_steps``). Returns the figure paths actually
@@ -484,14 +550,24 @@ def generate_figures(
         raise RuntimeError(f"loader for {dataset!r}/{split!r} yielded no batches")
     n_batches = len(report_batches)
 
+    active_decode_mode = cfg.decode_mode if cfg.use_prior_bank else "linear"
+    (full_pair_matrix_dim,
+     coordinate_workspace_dim,
+     coordinate_workspace_vocab_size) = _decode_workspace_requirements(
+        cfg,
+        active_decode_mode,
+    )
     full_vocab_gb = _estimated_full_vocab_bank_bytes(
         report_batches,
         int(cfg.vocab_size),
+        full_pair_matrix_dim=full_pair_matrix_dim,
+        coordinate_workspace_dim=coordinate_workspace_dim,
+        coordinate_workspace_vocab_size=coordinate_workspace_vocab_size,
     ) / 1e9
     skip_full_vocab = full_vocab_gb > 8.0 and not allow_large
     if skip_full_vocab:
         logger.warning(
-            "full-vocab figure inputs skipped: actual streamed two-workset peak estimate "
+            "full-vocab figure inputs skipped: actual streamed decode-workspace peak estimate "
             "%.1f GB exceeds "
             "the 8 GB guard; pass allow_large=True to override",
             full_vocab_gb,

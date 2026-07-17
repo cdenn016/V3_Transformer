@@ -384,7 +384,20 @@ class FullGaussian(BeliefParams):
             device=dispersion.device,
             dtype=dispersion.dtype,
         )
-        return torch.linalg.inv(symmetric + eps * eye)
+        factor, ok = safe_cholesky(symmetric, eps=eps, rounds=5)
+        safe_factor = torch.where(
+            ok.unsqueeze(-1).unsqueeze(-1),
+            factor,
+            eye.expand_as(factor),
+        )
+        precision = torch.cholesky_inverse(safe_factor)
+        if not bool(ok.all()):
+            precision = torch.where(
+                ok.unsqueeze(-1).unsqueeze(-1),
+                precision,
+                torch.linalg.pinv(symmetric),
+            )
+        return 0.5 * (precision + precision.transpose(-1, -2))
 
     @classmethod
     def trust_region_scale(

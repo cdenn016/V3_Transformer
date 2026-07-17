@@ -105,7 +105,7 @@ def test_generate_decodes_only_last_position(monkeypatch):
             decode_last=decode_last,
             **kwargs,
         )
-        calls.append((return_logits, decode_last, tuple(logits.shape)))
+        calls.append((return_logits, decode_last, kwargs.get("training"), tuple(logits.shape)))
         return belief, logits
 
     monkeypatch.setattr(model, "forward_beliefs", tracked_forward_beliefs)
@@ -113,8 +113,8 @@ def test_generate_decodes_only_last_position(monkeypatch):
 
     assert out.shape == (2, 5)
     assert calls == [
-        (True, True, (2, 1, V)),
-        (True, True, (2, 1, V)),
+        (True, True, False, (2, 1, V)),
+        (True, True, False, (2, 1, V)),
     ]
 
 

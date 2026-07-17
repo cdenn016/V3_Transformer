@@ -247,6 +247,32 @@ def test_val_diagnostics_columns_rectangular_and_finite() -> None:
     assert {"cocycle_residual", "transport_asymmetry", "weight_norm_mu"} <= cols
 
 
+def test_val_diagnostics_passes_explicit_diagonal_covariance_for_square_trace(monkeypatch) -> None:
+    from vfe3 import metrics as metrics_module
+    from vfe3.train import _val_diagnostics
+
+    cfg = _cfg(embed_dim=4, max_seq_len=4, family="gaussian_diagonal")
+    model = VFEModel(cfg).to(DEVICE)
+    loader = _loader(cfg)
+    observed: list[bool | None] = []
+    real_estep_residuals = metrics_module.estep_residuals
+
+    def _record_diagonal(mu_traj, sigma_traj, phi_traj, *, diagonal=None, eps=1e-12):
+        observed.append(diagonal)
+        return real_estep_residuals(
+            mu_traj,
+            sigma_traj,
+            phi_traj,
+            diagonal=diagonal,
+            eps=eps,
+        )
+
+    monkeypatch.setattr(metrics_module, "estep_residuals", _record_diagonal)
+    _val_diagnostics(model, loader, DEVICE)
+
+    assert observed == [True]
+
+
 def test_diagnostics_has_renyi_band_frac() -> None:
     torch.manual_seed(0)
     model = VFEModel(_cfg()).to(DEVICE)

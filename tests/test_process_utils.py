@@ -29,6 +29,21 @@ class _InterruptingProcess(_FakeProcess):
         return "stdout", "stderr"
 
 
+class _NeverReapingProcess(_FakeProcess):
+    def __init__(self) -> None:
+        super().__init__()
+        self.timeouts = []
+        self.kills = 0
+
+    def communicate(self, timeout=None):
+        self.calls += 1
+        self.timeouts.append(timeout)
+        raise subprocess.TimeoutExpired(["worker"], timeout)
+
+    def kill(self):
+        self.kills += 1
+
+
 class _Gate:
     def __init__(self) -> None:
         self.value = None
@@ -42,6 +57,11 @@ class _Gate:
 
     def close(self):
         self.closed = True
+
+
+class _FailingGate(_Gate):
+    def flush(self):
+        raise OSError("gate broke")
 
 
 def test_run_process_tree_uses_fresh_posix_group_and_reaps_descendants(monkeypatch):
@@ -105,6 +125,23 @@ def test_run_process_tree_terminates_and_reaps_after_base_exception(monkeypatch)
     assert process.calls == 2
 
 
+def test_timeout_cleanup_never_uses_an_unbounded_reap(monkeypatch):
+    process = _NeverReapingProcess()
+    monkeypatch.setattr(process_utils.os, "name", "posix")
+    monkeypatch.setattr(process_utils.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(process_utils, "_kill_process_tree", lambda *_args: None)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        process_utils.run_process_tree(["worker"], timeout=1.0)
+
+    assert process.timeouts == [
+        1.0,
+        process_utils._PROCESS_REAP_TIMEOUT_SECONDS,
+        process_utils._PROCESS_REAP_TIMEOUT_SECONDS,
+    ]
+    assert process.kills == 1
+
+
 def test_owned_output_child_rejects_reparse_point_before_use(tmp_path, monkeypatch):
     redirected = tmp_path / "figures"
     redirected.mkdir()
@@ -153,3 +190,58 @@ def test_windows_workload_is_released_only_after_job_assignment(monkeypatch):
     assert events[-1] == ("closed", None)
     assert gate.value == "1" and gate.closed is True
     assert completed.returncode == 0
+
+
+def test_windows_assignment_failure_uses_bounded_cleanup(monkeypatch):
+    process = _FakeProcess()
+    process.stdin = _Gate()
+    cleaned = []
+
+    class _Job:
+        def assign(self, _child):
+            raise OSError("assignment failed")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(process_utils.os, "name", "nt")
+    monkeypatch.setattr(process_utils.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(process_utils, "_WindowsJob", _Job)
+    monkeypatch.setattr(
+        process_utils,
+        "_terminate_and_reap_after_interruption",
+        lambda child, job: cleaned.append((child, job)),
+    )
+
+    with pytest.raises(OSError, match="contain the child"):
+        process_utils.run_process_tree(["worker"])
+
+    assert cleaned == [(process, None)]
+
+
+def test_windows_gate_failure_uses_bounded_cleanup(monkeypatch):
+    process = _FakeProcess()
+    process.stdin = _FailingGate()
+    cleaned = []
+
+    class _Job:
+        def assign(self, _child):
+            return None
+
+        def close(self):
+            return None
+
+    job = _Job()
+    monkeypatch.setattr(process_utils.os, "name", "nt")
+    monkeypatch.setattr(process_utils.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(process_utils, "_WindowsJob", lambda: job)
+    monkeypatch.setattr(
+        process_utils,
+        "_terminate_and_reap_after_interruption",
+        lambda child, owner: cleaned.append((child, owner)),
+    )
+
+    with pytest.raises(OSError, match="gate broke"):
+        process_utils.run_process_tree(["worker"])
+
+    assert cleaned == [(process, job)]

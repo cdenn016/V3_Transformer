@@ -44,6 +44,10 @@ def _complete_scaling_summary():
 def test_scaling_recompute_removes_owned_stale_artifacts_but_preserves_user_notes(tmp_path):
     run_dir = tmp_path / "cell"
     (run_dir / "figures").mkdir(parents=True)
+    (run_dir / scaling._SCALING_OWNER_FILENAME).write_text(
+        json.dumps(scaling._scaling_owner_payload("grow_K", "K20", 0)),
+        encoding="utf-8",
+    )
     (run_dir / "checkpoints").mkdir()
     (run_dir / "attention").mkdir()
     for path in (
@@ -60,7 +64,12 @@ def test_scaling_recompute_removes_owned_stale_artifacts_but_preserves_user_note
     user_plot = run_dir / "user_plot.png"
     user_plot.write_bytes(b"preserve me too")
 
-    scaling._reset_stale_scaling_artifacts(run_dir)
+    scaling._reset_stale_scaling_artifacts(
+        run_dir,
+        route="grow_K",
+        label="K20",
+        seed=0,
+    )
 
     assert note.read_text(encoding="utf-8") == "preserve me"
     assert user_plot.read_bytes() == b"preserve me too"
@@ -70,6 +79,49 @@ def test_scaling_recompute_removes_owned_stale_artifacts_but_preserves_user_note
     assert not (run_dir / "loss_curve.png").exists()
     assert not (run_dir / "summary.json").exists()
     assert not (run_dir / "best_model.pt").exists()
+
+
+def test_scaling_recompute_rejects_and_preserves_an_unowned_collision(tmp_path):
+    run_dir = tmp_path / "cell"
+    run_dir.mkdir()
+    note = run_dir / "user_notes.txt"
+    note.write_text("preserve me", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="ownership|promotable"):
+        scaling._reset_stale_scaling_artifacts(
+            run_dir,
+            route="grow_K",
+            label="K20",
+            seed=0,
+        )
+
+    assert note.read_text(encoding="utf-8") == "preserve me"
+    assert sorted(path.name for path in run_dir.iterdir()) == ["user_notes.txt"]
+
+
+def test_scaling_recompute_promotes_one_exact_legacy_cell_marker(tmp_path):
+    run_dir = tmp_path / "cell"
+    run_dir.mkdir()
+    (run_dir / "scaling_cell.json").write_text(
+        json.dumps({"route": "grow_K", "label": "K20", "seed": 0}),
+        encoding="utf-8",
+    )
+    stale = run_dir / "summary.json"
+    stale.write_text("{}", encoding="utf-8")
+
+    scaling._reset_stale_scaling_artifacts(
+        run_dir,
+        route="grow_K",
+        label="K20",
+        seed=0,
+    )
+
+    owner = json.loads(
+        (run_dir / scaling._SCALING_OWNER_FILENAME).read_text(encoding="utf-8")
+    )
+    assert owner == scaling._scaling_owner_payload("grow_K", "K20", 0)
+    assert not (run_dir / "scaling_cell.json").exists()
+    assert not stale.exists()
 
 
 def test_scaling_cell_path_rejects_reparse_ancestor_and_traversal(tmp_path, monkeypatch):

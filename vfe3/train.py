@@ -883,7 +883,7 @@ def evaluate(
 # pos_loss_* needs targets and seq_len >= 4) stay NaN on runs where they do not apply.
 _VAL_DIAG_KEYS = (
     "val_self_coupling", "val_self_divergence", "val_belief_coupling", "val_attention_entropy",
-    "val_free_energy_total",
+    "val_inner_alignment_energy_total", "val_free_energy_total",
     "val_attn_entropy", "val_effective_rank", "val_belief_cond_median", "val_attn_entropy_min",
     "val_attn_entropy_min_all", "val_attn_collapsed_heads", "val_future_leakage", "val_row_sum_error",
     "val_pos_content_r2", "val_prev_token_mass", "val_period_match_mass", "val_head_redundancy_js",
@@ -936,7 +936,8 @@ def _val_diagnostics(
     out["val_self_divergence"]    = vd["self_divergence"]   / vn
     out["val_belief_coupling"]    = vd["belief_coupling"]   / vn
     out["val_attention_entropy"]  = vd["attention_entropy"] / vn
-    out["val_free_energy_total"]  = vd["total"]             / vn
+    out["val_inner_alignment_energy_total"] = vd["total"]   / vn
+    out["val_free_energy_total"] = out["val_inner_alignment_energy_total"]  # legacy CSV alias
     out["val_attn_entropy"]       = vd["attn_entropy"]
     out["val_effective_rank"]     = vd["effective_rank"]
     out["val_belief_cond_median"] = vd["belief_cond_median"]
@@ -996,7 +997,8 @@ def _val_diagnostics(
     # a descent-quality readout, not a convergence-FAILURE flag.
     out["estep_f_nondecreasing_frac"] = (
         float((f[1:] > f[:-1] + 1e-9).float().mean()) if f.numel() > 1 else 0.0)
-    res = M.estep_residuals(tr["mu"], tr["sigma"], tr["phi"])   # last-iter belief change (SPD metric for sigma)
+    res = M.estep_residuals(                                      # last-iter belief change (SPD metric for sigma)
+        tr["mu"], tr["sigma"], tr["phi"], diagonal=model.cfg.diagonal_covariance)
     for _nm, _key in (("r_mu", "estep_r_mu_last"), ("r_sigma", "estep_r_sigma_last"),
                       ("r_phi", "estep_r_phi_last")):
         out[_key] = float(res[_nm][-1].mean()) if res[_nm].numel() else 0.0
@@ -1515,7 +1517,7 @@ def train(
                 else " | BPC unavailable"
             )
             logger.info(
-                "    F: self %.4f | belief %.4f | entropy %.4f | total %.4f | eff_rank %.2f | BPT %.4f%s",
+                "    Inner alignment energy: self %.4f | belief %.4f | entropy %.4f | total %.4f | eff_rank %.2f | BPT %.4f%s",
                 d["self_coupling"], d["belief_coupling"], d["attention_entropy"],
                 d["total"], d["effective_rank"], bits_per_token, bpc_text,
             )
@@ -1629,7 +1631,8 @@ def train(
                 "self_divergence":    d["self_divergence"]   / n_tok,   # raw sum_i D(q_i||p_i) drift; == self_coupling only at lambda_alpha_mode='constant'
                 "belief_coupling":    d["belief_coupling"]   / n_tok,
                 "attention_entropy":  d["attention_entropy"] / n_tok,
-                "free_energy_total":  d["total"]             / n_tok,
+                "inner_alignment_energy_total": d["total"]  / n_tok,
+                "free_energy_total":  d["total"]             / n_tok,  # legacy CSV alias
                 "effective_rank":     d["effective_rank"],
                 "holonomy_deviation": d["holonomy_deviation"],
                 "gauge_trace_spread": d["gauge_trace_spread"],
@@ -1670,7 +1673,7 @@ def train(
             # the standard convention). The train side is seq-0 (diagnostics runs on seq 0) while val is
             # the token-weighted val-set mean, so read it as a TREND, not an absolute. Eval-cadence like
             # val_ce above: written only on an eval row, blank (NaN) on the log-interval rows in between.
-            # (The complexity-vs-fit comparison is free_energy_total vs
+            # (The complexity-vs-fit comparison is inner_alignment_energy_total vs
             # val_ce, both already columns; a separate "elbo_ce_gap" would subtract a CE from a
             # complexity-only F -- d["total"] carries no -E_q[log p] data term -- so it is NOT emitted.)
             row["generalization_gap"] = (last_val["ce"] - ce) if do_eval else float("nan")
@@ -1762,7 +1765,7 @@ def train(
             # Model-channel F blocks (per-token, like the belief blocks above): present iff the
             # s-channel tables exist (diagnostics gates them on STATIC config -- lambda_h / gamma /
             # prior_source / s_e_step), so the column set is fixed per run and the CSV stays
-            # rectangular. free_energy_total above already carries their WEIGHTED contribution
+            # rectangular. inner_alignment_energy_total above already carries their WEIGHTED contribution
             # (diagnostics folds it into d["total"] at the same per-sequence-sum scale, so the
             # uniform /n_tok normalizes every block consistently -- audit obs 18497). The raw blocks
             # are stored for the model_channel_terms figure; hyper_prior_weighted is the EXACT weighted

@@ -97,7 +97,7 @@ def test_rope_cache_key_tracks_mutated_rope_base():
 
     assert not torch.equal(first, second)
     assert torch.equal(second, fresh)
-    assert len(model._rope_cache) == 2
+    assert len(model._rope_cache) == 1
 
 
 def test_rope_cache_key_tracks_mutated_pos_rotation():
@@ -124,9 +124,21 @@ def test_rope_cache_key_tracks_mutated_pos_rotation():
         second = model._rope_rotation(8, device)
 
         assert torch.equal(second, -first)
-        assert len(model._rope_cache) == 2
+        assert len(model._rope_cache) == 1
     finally:
         rope_module._POS_ROTATIONS.pop(name, None)
+
+
+def test_runtime_length_caches_retain_only_the_latest_shape():
+    model = VFEModel(_rope_cfg(pos_rotation="rope", n_heads=1))
+    device = model.prior_bank.mu_embed.device
+
+    for length in range(1, model.cfg.max_seq_len + 1):
+        model._attention_log_prior(length, device)
+        model._rope_rotation(length, device)
+
+    assert len(model._log_prior_cache) == 1
+    assert len(model._rope_cache) == 1
 
 
 def test_rope_changes_logits_vs_no_rope():

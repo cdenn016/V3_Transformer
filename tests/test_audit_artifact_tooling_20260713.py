@@ -178,6 +178,8 @@ def test_filesystem_slug_is_shared_allowlist_policy():
     assert filesystem_slug("a b") != filesystem_slug("a:b")
     assert "/" not in filesystem_slug("", fallback="../fallback")
     assert len(filesystem_slug("x" * 500)) <= 130
+    assert filesystem_slug("CON.txt").startswith("_CON.txt__")
+    assert filesystem_slug("lpt1.log").startswith("_lpt1.log__")
 
 
 def test_make_figures_inherits_trained_large_figure_opt_in(tmp_path, monkeypatch):

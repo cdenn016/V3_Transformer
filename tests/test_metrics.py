@@ -1,5 +1,6 @@
 import math
 
+import pytest
 import torch
 
 import vfe3.metrics as metrics_module
@@ -143,6 +144,22 @@ def test_spd_geodesic_distance_uses_airm_not_half_fisher_scale():
     sigma_b = torch.exp(torch.tensor([[2.0]]))
 
     assert spd_geodesic_distance(sigma_a, sigma_b).item() == pytest.approx(2.0)
+
+
+def test_spd_geodesic_distance_full_uses_cholesky_generalized_eigenvalues(monkeypatch):
+    transform = torch.tensor([[2.0, 0.5], [0.0, 0.25]], dtype=torch.float32)
+    log_eigenvalues = torch.tensor([1.0, -2.0], dtype=torch.float32)
+    sigma_a = transform @ transform.transpose(-1, -2)
+    sigma_b = transform @ torch.diag(torch.exp(log_eigenvalues)) @ transform.transpose(-1, -2)
+
+    def _forbid_explicit_eigh(*args, **kwargs):
+        raise AssertionError("full SPD distance explicitly eigendecomposed Sigma_a")
+
+    monkeypatch.setattr(torch.linalg, "eigh", _forbid_explicit_eigh)
+    distance = spd_geodesic_distance(sigma_a, sigma_b, diagonal=False)
+
+    assert distance.dtype == sigma_a.dtype
+    assert torch.allclose(distance, log_eigenvalues.square().sum().sqrt(), atol=2e-5)
 
 
 def test_belief_spectrum_eigenvalues_and_condition():

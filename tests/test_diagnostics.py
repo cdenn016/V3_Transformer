@@ -86,18 +86,22 @@ def test_eval_diagnostics_builds_one_snapshot(monkeypatch) -> None:
     tokens = _tokens()
     targets = torch.roll(tokens, shifts=-1, dims=1)
     calls = 0
+    training_modes = []
     real_forward_beliefs = model.forward_beliefs
 
     def counted_forward_beliefs(*args, **kwargs):
         nonlocal calls
         calls += 1
+        training_modes.append(kwargs.get("training"))
         return real_forward_beliefs(*args, **kwargs)
 
     monkeypatch.setattr(model, "forward_beliefs", counted_forward_beliefs)
     diagnostics = _val_diagnostics(model, [(tokens, targets)], torch.device("cpu"))
 
     assert calls == 1
-    assert math.isfinite(diagnostics["val_free_energy_total"])
+    assert training_modes == [False]
+    assert math.isfinite(diagnostics["val_inner_alignment_energy_total"])
+    assert diagnostics["val_free_energy_total"] == diagnostics["val_inner_alignment_energy_total"]
     assert math.isfinite(diagnostics["estep_f_drop"])
     assert math.isfinite(diagnostics["pos_loss_ratio"])
 

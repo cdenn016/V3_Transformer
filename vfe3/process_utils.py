@@ -13,6 +13,8 @@ from typing import Mapping, Optional, Sequence
 
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_PROCESS_REAP_TIMEOUT_SECONDS = 10.0
+_TASKKILL_TIMEOUT_SECONDS = 10.0
 _WINDOWS_GATED_LAUNCHER = (
     "import subprocess,sys; "
     "gate=sys.stdin.buffer.read(1); "
@@ -102,8 +104,8 @@ class _WindowsJob:
             raise ctypes.WinError(ctypes.get_last_error())
 
     def terminate(self, exit_code: int = 1) -> None:
-        if self._handle:
-            self._kernel32.TerminateJobObject(self._handle, exit_code)
+        if self._handle and not self._kernel32.TerminateJobObject(self._handle, exit_code):
+            raise ctypes.WinError(ctypes.get_last_error())
 
     def close(self) -> None:
         if self._handle:
@@ -118,14 +120,28 @@ def _kill_process_tree(
     """Terminate a child and every descendant without trusting the child to cooperate."""
     if os.name == "nt":
         if job is not None:
-            job.terminate()
-            return
-        subprocess.Popen(
+            try:
+                job.terminate()
+                return
+            except OSError:
+                pass
+        taskkill = subprocess.Popen(
             ["taskkill", "/PID", str(process.pid), "/T", "/F"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        ).wait()
+        )
+        try:
+            returncode = taskkill.wait(timeout=_TASKKILL_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            try:
+                taskkill.kill()
+                taskkill.wait(timeout=_PROCESS_REAP_TIMEOUT_SECONDS)
+            except BaseException:
+                pass
+            raise TimeoutError("taskkill did not finish within its bounded timeout") from exc
+        if returncode != 0 and process.poll() is None:
+            raise OSError(f"taskkill failed with exit code {returncode}")
         return
     try:
         os.killpg(process.pid, signal.SIGKILL)
@@ -146,7 +162,13 @@ def _terminate_and_reap_after_interruption(
         except BaseException:
             pass
     try:
-        process.communicate()
+        process.communicate(timeout=_PROCESS_REAP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+            process.communicate(timeout=_PROCESS_REAP_TIMEOUT_SECONDS)
+        except BaseException:
+            pass
     except BaseException:
         pass
 
@@ -215,31 +237,60 @@ def run_process_tree(
                 if job is not None:
                     job.close()
                 job = None
-                _kill_process_tree(process, None)
-                process.communicate()
+                _terminate_and_reap_after_interruption(process, None)
                 raise OSError(
                     "could not contain the child in a Windows Job Object"
                 ) from exc
             gate = process.stdin
             if gate is None:
-                _kill_process_tree(process, job)
-                process.communicate()
+                _terminate_and_reap_after_interruption(process, job)
                 raise OSError("Windows process gate was not created")
-            gate.write("1" if text else b"1")
-            gate.flush()
-            gate.close()
+            try:
+                gate.write("1" if text else b"1")
+                gate.flush()
+                gate.close()
+            except BaseException:
+                _terminate_and_reap_after_interruption(process, job)
+                raise
             process.stdin = None
         try:
             output, error = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
-            _kill_process_tree(process, job)
+            cleanup_errors = []
             try:
-                output, error = process.communicate()
-            except BaseException:
-                _terminate_and_reap_after_interruption(process, job)
-                raise
+                _kill_process_tree(process, job)
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(cleanup_exc)
+                if job is not None:
+                    try:
+                        job.close()
+                    except BaseException as close_exc:
+                        cleanup_errors.append(close_exc)
+                    job = None
+            try:
+                output, error = process.communicate(timeout=_PROCESS_REAP_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired as reap_exc:
+                cleanup_errors.append(reap_exc)
+                try:
+                    process.kill()
+                    output, error = process.communicate(
+                        timeout=_PROCESS_REAP_TIMEOUT_SECONDS,
+                    )
+                except BaseException as kill_exc:
+                    cleanup_errors.append(kill_exc)
+                    output = error = None
+            except BaseException as reap_exc:
+                cleanup_errors.append(reap_exc)
+                output = error = None
             exc.output = output
             exc.stderr = error
+            add_note = getattr(exc, "add_note", None)
+            if callable(add_note):
+                for cleanup_error in cleanup_errors:
+                    add_note(
+                        "process-tree cleanup diagnostic: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
             raise
         except BaseException:
             _terminate_and_reap_after_interruption(process, job)

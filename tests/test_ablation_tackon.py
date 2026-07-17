@@ -381,6 +381,10 @@ def _write_marker(
     gauge_fields = ablation._gauge_reporting_fields(cfg)
     cell = sweep_dir / ablation._sanitize(label)
     cell.mkdir(parents=True, exist_ok=True)
+    (cell / "ablation_cell_owner.json").write_text(
+        json.dumps(ablation._ablation_cell_owner_payload(sweep_dir.name, label, seed)),
+        encoding="utf-8",
+    )
     checkpoint = cell / "checkpoints" / "terminal.pt"
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
     checkpoint.write_bytes(f"checkpoint:{label}:{seed}".encode("utf-8"))
@@ -481,6 +485,19 @@ def test_collect_sweep_results_rejects_malformed_failed_and_nonfinite_markers(tm
 
     union = ablation._collect_sweep_results(sweep_dir)
     assert [marker["label"] for marker in union] == ["valid"]
+
+
+def test_collect_sweep_results_rejects_a_mismatched_owner(tmp_path: Path) -> None:
+    sweep_dir = tmp_path / "kappa"
+    sweep_dir.mkdir()
+    _write_marker(sweep_dir, "valid-looking", ppl=11.0, seed=6)
+    run_dir = sweep_dir / ablation._sanitize("valid-looking")
+    (run_dir / "ablation_cell_owner.json").write_text(
+        json.dumps(ablation._ablation_cell_owner_payload(sweep_dir.name, "valid-looking", 7)),
+        encoding="utf-8",
+    )
+
+    assert ablation._collect_sweep_results(sweep_dir) == []
 
 
 def test_collect_sweep_results_accepts_only_current_compatible_contract_cohort(
@@ -678,6 +695,42 @@ def test_sensitivity_invalidation_retires_pre_manifest_summary(tmp_path: Path) -
     }, output_dir)
 
     assert not stale.exists()
+
+
+def test_figure_worker_rejects_manifest_filename_outside_scope_inventory(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "ablation"
+    figure_dir = output_dir / "figures"
+    figure_dir.mkdir(parents=True)
+    foreign = figure_dir / "foreign.txt"
+    foreign.write_text("preserve me", encoding="utf-8")
+    (figure_dir / "ablation_figure_manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "scopes": {"gauge_transport": {"files": [foreign.name]}},
+    }), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unowned filename"):
+        figure_worker._render_ablation_request({
+            "scope": "gauge_transport",
+            "invalidate": True,
+        }, output_dir)
+
+    assert foreign.read_text(encoding="utf-8") == "preserve me"
+
+
+def test_figure_worker_rejects_malformed_existing_manifest(tmp_path: Path) -> None:
+    output_dir = tmp_path / "ablation"
+    figure_dir = output_dir / "figures"
+    figure_dir.mkdir(parents=True)
+    manifest = figure_dir / "ablation_figure_manifest.json"
+    manifest.write_text("not json", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unreadable"):
+        figure_worker._render_ablation_request({
+            "scope": "gauge_transport",
+            "invalidate": True,
+        }, output_dir)
 
 
 def test_get_loader_threads_split_aware_shuffle_drop_last(monkeypatch) -> None:
@@ -911,6 +964,28 @@ def test_recompute_owns_a_clean_cell_generation_and_cached_resume_preserves_it(
     assert cached_sentinel.read_text(encoding="utf-8") == "keep on valid resume"
     assert outside.read_text(encoding="utf-8") == "preserve"
 
+    owner_path = run_dir / "ablation_cell_owner.json"
+    owner_path.write_text(
+        json.dumps(ablation._ablation_cell_owner_payload(sweep_name, "cell", 7)),
+        encoding="utf-8",
+    )
+    rejected = ablation.run_sweep(
+        sweep_name,
+        tmp_path,
+        dataset="wikitext-103",
+        device=None,
+        seed=6,
+        resume=True,
+    )
+
+    assert rejected == []
+    assert json.loads(owner_path.read_text(encoding="utf-8"))["seed"] == 7
+    assert json.loads(
+        (run_dir / "ablation_result.json").read_text(encoding="utf-8")
+    )["status"] == "success"
+    assert cached_sentinel.read_text(encoding="utf-8") == "keep on valid resume"
+    assert outside.read_text(encoding="utf-8") == "preserve"
+
 
 def test_expand_range_sign_mismatch_raises() -> None:
     r"""A sign-mismatched [start, stop, step] must raise, not silently expand to zero cells."""
@@ -925,6 +1000,108 @@ def test_expand_range_valid_directions_unchanged() -> None:
     assert ablation._expand_range([0, 4, 2]) == [0, 2, 4]
     assert ablation._expand_range([5, 0, -1]) == [5, 4, 3, 2, 1, 0]
     assert ablation._expand_range([2, 2, 1]) == [2]
+
+
+def test_main_records_global_figure_invalidation_failure_and_returns_nonzero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sweep_name = "status_probe"
+    monkeypatch.setitem(ablation.SWEEPS, sweep_name, {"description": "status probe"})
+    for key, value in {
+        "list_only":  False,
+        "output_dir": str(tmp_path),
+        "device":     "cpu",
+        "sweep":      sweep_name,
+        "dataset":    "wikitext-103",
+        "seed":       6,
+        "resume":     False,
+        "max_tokens": None,
+        "max_steps":  None,
+    }.items():
+        monkeypatch.setitem(ablation.CONFIG, key, value)
+    monkeypatch.setattr(ablation, "validate_sweeps", lambda _names: None)
+    monkeypatch.setattr(
+        ablation,
+        "_run_ablation_figures_isolated",
+        lambda *_args, **kwargs: not (
+            kwargs.get("scope") == "__sensitivity__" and kwargs.get("invalidate") is True
+        ),
+    )
+    monkeypatch.setattr(
+        ablation,
+        "run_sweep",
+        lambda *_args, **_kwargs: pytest.fail("sweep ran after global invalidation failure"),
+    )
+
+    assert ablation.main() == 1
+    status = json.loads((tmp_path / "ablation_run_status.json").read_text(encoding="utf-8"))
+    assert status["status"] == "incomplete"
+    assert status["requested_sweeps"] == [sweep_name]
+    assert status["incomplete_sweeps"] == [sweep_name]
+    assert status["failed_figure_scopes"] == ["__sensitivity__:invalidate"]
+
+
+def test_main_records_requested_render_failure_and_returns_nonzero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sweep_name = "render_status_probe"
+    monkeypatch.setitem(ablation.SWEEPS, sweep_name, {"description": "render status probe"})
+    for key, value in {
+        "list_only":  False,
+        "output_dir": str(tmp_path),
+        "device":     "cpu",
+        "sweep":      sweep_name,
+        "dataset":    "wikitext-103",
+        "seed":       6,
+        "resume":     False,
+        "max_tokens": None,
+        "max_steps":  None,
+    }.items():
+        monkeypatch.setitem(ablation.CONFIG, key, value)
+    monkeypatch.setattr(ablation, "validate_sweeps", lambda _names: None)
+    monkeypatch.setattr(
+        ablation,
+        "_cross_sweep_cohort_identity",
+        lambda _contract: {"cohort": "one"},
+    )
+    monkeypatch.setattr(ablation, "analyze_sweep", lambda _path: None)
+    monkeypatch.setattr(ablation, "summarize_sweeps", lambda *_args, **_kwargs: None)
+
+    def fake_run_sweep(
+        name:       str,
+        output_dir: Path,
+
+        **_kwargs: object,
+    ) -> list:
+        sweep_dir = output_dir / name
+        sweep_dir.mkdir(parents=True, exist_ok=True)
+        ablation._write_json_atomic(sweep_dir / "sweep_meta.json", {
+            "status":               "complete",
+            "aggregation_contract": {"fixture": True},
+        })
+        return []
+
+    def fake_figures(
+        _output_dir: Path,
+
+        *,
+        scope:           str,
+        invalidate:      bool          = False,
+        cohort_identity: object | None = None,
+    ) -> bool:
+        del cohort_identity
+        return not (scope == sweep_name and not invalidate)
+
+    monkeypatch.setattr(ablation, "run_sweep", fake_run_sweep)
+    monkeypatch.setattr(ablation, "_run_ablation_figures_isolated", fake_figures)
+
+    assert ablation.main() == 1
+    status = json.loads((tmp_path / "ablation_run_status.json").read_text(encoding="utf-8"))
+    assert status["status"] == "incomplete"
+    assert status["incomplete_sweeps"] == []
+    assert status["failed_figure_scopes"] == [f"{sweep_name}:render"]
 
 
 def test_sanitize_distinct_labels_do_not_collide() -> None:

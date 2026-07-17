@@ -1140,6 +1140,105 @@ def test_full_vocab_memory_guard_streams_largest_batch_instead_of_aggregating_lo
     assert four_batches == 4 * batch_bytes + streamed_workset
 
 
+def test_full_vocab_memory_guard_counts_dense_full_covariance_pair_workspaces() -> None:
+    vocab_size = 101
+    matrix_dim = 20
+    batch = torch.zeros((3, 7), dtype=torch.long)
+    base = report._estimated_full_vocab_bank_bytes([batch], vocab_size)
+    pair_workspaces = (
+        report._FULL_PAIR_MATRIX_WORKSETS
+        * batch.numel()
+        * vocab_size
+        * matrix_dim
+        * matrix_dim
+        * torch.tensor([], dtype=torch.float32).element_size()
+    )
+
+    guarded = report._estimated_full_vocab_bank_bytes(
+        [batch],
+        vocab_size,
+        full_pair_matrix_dim=matrix_dim,
+    )
+
+    assert guarded == base + pair_workspaces
+
+
+def test_full_vocab_memory_guard_counts_coordinate_workspaces() -> None:
+    vocab_size = 101
+    coordinate_width = 17
+    coordinate_dim = 20
+    batch = torch.zeros((3, 7), dtype=torch.long)
+    base = report._estimated_full_vocab_bank_bytes([batch], vocab_size)
+    coordinate_workspaces = (
+        report._COORDINATE_WORKSETS
+        * batch.numel()
+        * coordinate_width
+        * coordinate_dim
+        * torch.tensor([], dtype=torch.float32).element_size()
+    )
+
+    guarded = report._estimated_full_vocab_bank_bytes(
+        [batch],
+        vocab_size,
+        coordinate_workspace_dim=coordinate_dim,
+        coordinate_workspace_vocab_size=coordinate_width,
+    )
+
+    assert guarded == base + coordinate_workspaces
+
+
+def test_full_vocab_memory_guard_covers_near_kl_fp64_coordinate_peak() -> None:
+    vocab_size = 101
+    coordinate_dim = 20
+    batch = torch.zeros((3, 7), dtype=torch.long)
+    base = report._estimated_full_vocab_bank_bytes([batch], vocab_size)
+    minimum_near_kl_workspaces = (
+        12
+        * batch.numel()
+        * vocab_size
+        * coordinate_dim
+        * torch.tensor([], dtype=torch.float32).element_size()
+    )
+
+    guarded = report._estimated_full_vocab_bank_bytes(
+        [batch],
+        vocab_size,
+        coordinate_workspace_dim=coordinate_dim,
+        coordinate_workspace_vocab_size=vocab_size,
+    )
+
+    assert guarded >= base + minimum_near_kl_workspaces
+
+
+@pytest.mark.parametrize(
+    ("diagonal", "mode", "chunk", "expected"),
+    [
+        (True, "diagonal_chunked", 17, (None, None, None)),
+        (True, "family", 17, (None, 20, 101)),
+        (True, "family_chunked", 17, (None, 20, 101)),
+        (True, "expected_likelihood_chunked", 17, (None, 20, 17)),
+        (False, "full", 17, (20, None, None)),
+        (False, "full_chunked", 17, (None, None, None)),
+        (False, "family", 17, (20, None, None)),
+        (False, "family_chunked", 17, (20, None, None)),
+    ],
+)
+def test_decode_mode_wires_the_required_report_workspace(
+    diagonal: bool,
+    mode:     str,
+    chunk:    int,
+    expected: tuple,
+) -> None:
+    cfg = SimpleNamespace(
+        diagonal_covariance=diagonal,
+        decode_chunk_size=chunk,
+        embed_dim=20,
+        vocab_size=101,
+    )
+
+    assert report._decode_workspace_requirements(cfg, mode) == expected
+
+
 def test_eval_only_step_runs_sparse_omega_determinant_validation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

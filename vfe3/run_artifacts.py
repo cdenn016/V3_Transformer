@@ -112,7 +112,7 @@ def _require_identity_sha256(value: object, field: str) -> str:
 
 
 def _package_code_identity() -> str:
-    r"""Return the current content identity for every executable ``vfe3/**/*.py`` source.
+    r"""Return the current content identity for the package and supported root execution drivers.
 
     A run captures this digest once when its artifact owner is constructed. Generated files, tests,
     documentation, Git metadata, and output directories are excluded, so artifact publication cannot
@@ -120,15 +120,31 @@ def _package_code_identity() -> str:
     editing a source file must not reuse the previous run's identity.
     """
     root = Path(__file__).resolve().parent
+    repository = root.parent
     digest = hashlib.sha256()
-    sources = sorted(
+    package_sources = {
         path for path in root.rglob("*.py")
         if "__pycache__" not in path.parts
-    )
+    }
+    root_drivers = {
+        repository / name
+        for name in (
+            "ablation.py",
+            "compare_vocab_figures.py",
+            "make_figures.py",
+            "multiseed_analysis.py",
+            "scaling.py",
+            "scaling_analysis.py",
+            "sigma_gate_measure.py",
+            "train_vfe3.py",
+        )
+        if (repository / name).is_file()
+    }
+    sources = sorted(package_sources | root_drivers)
     if not sources:
-        raise RuntimeError("training code identity found no vfe3 Python sources")
+        raise RuntimeError("training code identity found no executable Python sources")
     for path in sources:
-        relative = path.relative_to(root.parent).as_posix().encode("utf-8")
+        relative = path.relative_to(repository).as_posix().encode("utf-8")
         try:
             content = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
         except OSError as exc:
@@ -247,6 +263,38 @@ def _normalized_data_identity(
             "data_state data_identity tokenizer_tag must agree with source tokenizer_tag")
     size_bytes = _require_identity_positive_int(source.get("size_bytes"), "source size_bytes")
     _require_identity_sha256(source.get("sha256"), "source sha256")
+
+    tokenizer_provenance_status = source.get("tokenizer_provenance_status")
+    tokenizer_provenance = source.get("tokenizer_provenance")
+    tokenizer_provenance_sha256 = source.get("tokenizer_provenance_sha256")
+    if tokenizer_provenance_status is not None:
+        if tokenizer_provenance_status not in {
+                "manifest_verified", "filename_inferred_unverified"}:
+            raise ValueError(
+                "data_state source tokenizer_provenance_status is unsupported")
+        if tokenizer_provenance_status == "filename_inferred_unverified":
+            if tokenizer_provenance is not None or tokenizer_provenance_sha256 is not None:
+                raise ValueError(
+                    "unverified tokenizer provenance must not carry a manifest identity")
+        else:
+            if not isinstance(tokenizer_provenance, dict):
+                raise ValueError("verified tokenizer provenance requires a manifest mapping")
+            _require_identity_sha256(
+                tokenizer_provenance_sha256,
+                "source tokenizer_provenance_sha256",
+            )
+            expected_manifest = {
+                "schema_version": 1,
+                "dataset": normalized["dataset"],
+                "split": normalized["split"],
+                "tokenizer_tag": tokenizer_tag,
+                "tokenizer_encoding": tokenizer_encoding,
+                "tokenizer_vocab_size": tokenizer_vocab_size,
+                "payload_sha256": source["sha256"],
+            }
+            if tokenizer_provenance != expected_manifest:
+                raise ValueError(
+                    "verified tokenizer provenance disagrees with the data identity")
 
     meta = source.get("meta")
     meta_sha256 = source.get("meta_sha256")
@@ -372,22 +420,31 @@ def _atomic_replace(
 ) -> None:
     r"""Atomically publish ``tmp`` over ``final`` via ``os.replace`` (same-volume rename).
 
-    Same-directory temp + ``os.replace`` makes the publish an atomic rename on one volume, so a
-    crash or power loss mid-write can never leave a truncated JSON or corrupt ``.pt`` at the final
-    name (audit 2026-07-01 C11). Retries with backoff on ``PermissionError`` -- Windows can hold a
+    Same-directory temp + ``os.replace`` makes the name switch atomic on one volume. The temporary
+    file is flushed with ``fsync`` before publication; on POSIX the containing directory is also
+    flushed after the rename. Windows has no portable directory-fsync primitive, so it provides the
+    flushed-file atomic replacement guarantee but not a claim of directory-entry durability across
+    sudden power loss. Retries with backoff on ``PermissionError`` -- Windows can hold a
     transient open-handle lock on the destination (this host has hit it on ``best_model.pt``) --
     and re-raises any other error (and the last ``PermissionError``) so a real failure is never
-    swallowed. On the raising paths the orphaned ``tmp`` is best-effort deleted first (audit
-    2026-07-01 round-3); between retries it must survive (it is the source of the next replace)."""
+    swallowed. On pre-publication raising paths the orphaned ``tmp`` is best-effort deleted first;
+    between retries it must survive because it is the source of the next replace. A post-rename
+    POSIX directory-flush error propagates after publication and cannot re-enter that retry loop."""
     def _cleanup_tmp() -> None:
         try:                                             # cleanup failure must not mask the original error
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
+    try:
+        with tmp.open("r+b") as handle:
+            os.fsync(handle.fileno())
+    except Exception:
+        _cleanup_tmp()
+        raise
     for i in range(retries):
         try:
             os.replace(tmp, final)
-            return
+            break
         except PermissionError:
             if i == retries - 1:
                 _cleanup_tmp()
@@ -396,6 +453,13 @@ def _atomic_replace(
         except Exception:
             _cleanup_tmp()
             raise
+    if os.name != "nt":
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(final.parent, flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 @contextmanager
@@ -1198,8 +1262,8 @@ class RunArtifacts:
     r"""Owns a run directory and the incremental writes (CSV rows, checkpoints, best model).
 
     Contract (m25): each instance owns a FRESH run_dir. ``__init__`` (re)writes config.json and the
-    first ``log_metrics`` opens metrics.csv with ``"w"`` (truncate), so aiming a new instance at a
-    populated dir would clobber it -- but no path does: resume builds a new timestamped run_dir and
+    first ``log_metrics`` publishes a newly written metrics.csv, so aiming a new instance at a
+    populated dir would replace it -- but no path does: resume builds a new timestamped run_dir and
     restores state from a checkpoint FILE via ``load_checkpoint``, never reusing a dir in place."""
 
     def __init__(
@@ -1258,7 +1322,7 @@ class RunArtifacts:
         return _write_json_atomic(self.run_dir / name, obj)
 
     def log_metrics(self, row: Dict[str, float]) -> None:
-        r"""Append one metrics row to ``metrics.csv`` (header written on the first call).
+        r"""Atomically publish ``metrics.csv`` with one additional rectangular row.
 
         The column set is fixed by the first row; later rows must share those keys so the CSV
         stays rectangular (the training loop emits a homogeneous row each periodic eval).
@@ -1268,14 +1332,26 @@ class RunArtifacts:
         between evals -- shows an empty cell rather than a repeated value or a literal "nan".
         The IN-MEMORY ``self.history`` keeps the raw NaN float so
         the figure pass (which filters on ``math.isfinite``) is unaffected."""
-        self.history.append(dict(row))                          # raw floats (incl. NaN) for the figure pass
-        if self._fieldnames is None:
-            self._fieldnames = list(row.keys())
-            with open(self.csv_path, "w", newline="") as fh:
-                csv.DictWriter(fh, fieldnames=self._fieldnames).writeheader()
-        csv_row = {k: ("" if isinstance(v, float) and math.isnan(v) else v) for k, v in row.items()}
-        with open(self.csv_path, "a", newline="") as fh:
-            csv.DictWriter(fh, fieldnames=self._fieldnames).writerow(csv_row)
+        fieldnames = list(row) if self._fieldnames is None else list(self._fieldnames)
+        if set(row) != set(fieldnames):
+            missing = sorted(set(fieldnames) - set(row))
+            extra = sorted(set(row) - set(fieldnames))
+            raise ValueError(
+                f"metrics row field set changed (missing={missing}, extra={extra})"
+            )
+        candidate_history = [*self.history, dict(row)]
+        with _unique_sibling_temp(self.csv_path) as tmp:
+            with tmp.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                for history_row in candidate_history:
+                    writer.writerow({
+                        key: ("" if isinstance(value, float) and math.isnan(value) else value)
+                        for key, value in history_row.items()
+                    })
+            _atomic_replace(self.csv_path, tmp)
+        self._fieldnames = fieldnames
+        self.history.append(dict(row))                          # update only after durable publication
 
     def maybe_save_best(self, step: int, model: torch.nn.Module, val_ppl: float) -> bool:
         r"""Save weights bound to their semantic config iff ``val_ppl`` is a new minimum.
@@ -1431,6 +1507,7 @@ class RunArtifacts:
                                           if metropolis_generator is not None else None),
                 "config":          asdict(cfg),
                 "code_identity_sha256": self.code_identity_sha256,
+                "git_identity":    _git_code_identity(),
                 "selection_data_identity": self.selection_data_identity,
                 "scaler_state":    (scaler.state_dict()
                                     if scaler is not None and scaler.is_enabled() else None),
@@ -1806,8 +1883,11 @@ def load_checkpoint(
     )
     saved_config = None
     config_drift: List[str] = []
-    if cfg is not None:
-        saved_config, config_drift = _preflight_resume_config(ckpt.get("config"), cfg)
+    resume_cfg = cfg if cfg is not None else (artifacts.cfg if artifacts is not None else None)
+    if resume_cfg is not None:
+        saved_config, config_drift = _preflight_resume_config(
+            ckpt.get("config"), resume_cfg,
+        )
 
     model.load_state_dict(saved_model_state)
     if optimizer is not None:
@@ -1844,7 +1924,7 @@ def load_checkpoint(
         _restore_best_selection(
             ckpt, checkpoint_path, artifacts, model.state_dict(), map_location,
             inherit_selection)
-    if cfg is not None:
+    if resume_cfg is not None:
         if config_drift:
             import warnings
             warnings.warn(
@@ -1874,6 +1954,47 @@ def load_checkpoint(
                 "epoch":                       saved_epoch,
                 "data_identity":               saved_data_identity,
             })
+    if artifacts is not None:
+        saved_code_identity = ckpt.get("code_identity_sha256")
+        code_identity_match = (
+            saved_code_identity == expected_code_identity
+            if isinstance(saved_code_identity, str)
+            else None
+        )
+        saved_git_identity = ckpt.get("git_identity")
+        current_git_identity = dict(artifacts.run_start_git_identity)
+        if isinstance(saved_git_identity, Mapping):
+            git_identity_status, git_identity_drift = _git_identity_comparison(
+                saved_git_identity,
+                current_git_identity,
+            )
+            saved_git_record: Optional[Dict[str, object]] = dict(saved_git_identity)
+        else:
+            git_identity_status, git_identity_drift = "unverifiable", None
+            saved_git_record = None
+        artifacts.save_json("resume_provenance.json", {
+            "schema_version":                  1,
+            "resume_mode":                     "raw_state_resume",
+            "checkpoint_path":                 str(checkpoint_path.resolve()),
+            "saved_step":                      saved_step,
+            "config_restore_policy":           "current_config_authoritative",
+            "config_drift_fields":             list(config_drift),
+            "saved_config_fingerprint":        (
+                semantic_config_fingerprint(saved_config)
+                if isinstance(saved_config, Mapping) else None
+            ),
+            "current_config_fingerprint":      (
+                semantic_config_fingerprint(asdict(resume_cfg))
+                if resume_cfg is not None else None
+            ),
+            "saved_code_identity_sha256":      saved_code_identity,
+            "current_code_identity_sha256":    expected_code_identity,
+            "code_identity_match":             code_identity_match,
+            "saved_git_identity":              saved_git_record,
+            "current_git_identity":            current_git_identity,
+            "git_identity_status":             git_identity_status,
+            "git_identity_drift":              git_identity_drift,
+        })
     return saved_step
 
 

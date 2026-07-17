@@ -13,6 +13,7 @@ thing that can make their final weights differ is a missing restore leg -- model
 optimizer momentum (exp_avg/exp_avg_sq), or the scheduler's ``last_epoch``.
 """
 
+import json
 import math
 from dataclasses import asdict
 from enum import IntEnum
@@ -23,6 +24,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from vfe3.config import VFE3Config
+from vfe3 import run_artifacts
 from vfe3.data.datasets import TokenWindows
 from vfe3.ema import EMA
 from vfe3.model.model import VFEModel
@@ -84,6 +86,42 @@ def test_load_checkpoint_restores_model_and_returns_step(tmp_path):
     assert step == 4
     for restored, original in zip(_params(fresh), saved):
         assert torch.equal(restored, original)                 # exact model-state restore
+
+
+def test_resume_persists_saved_and_current_source_identity(tmp_path, monkeypatch):
+    identity = {
+        "git_sha": "a" * 40,
+        "git_dirty": False,
+        "git_dirty_fingerprint": None,
+    }
+    monkeypatch.setattr(run_artifacts, "_git_code_identity", lambda: dict(identity))
+    cfg = _cfg()
+    source = VFEModel(cfg)
+    source_artifacts = RunArtifacts(tmp_path / "source", cfg, source)
+    checkpoint = source_artifacts.save_checkpoint(
+        0, source, build_optimizer(source, cfg), cfg,
+    )
+
+    restored = VFEModel(cfg)
+    restored_artifacts = RunArtifacts(tmp_path / "restored", cfg, restored)
+    load_checkpoint(
+        checkpoint,
+        restored,
+        build_optimizer(restored, cfg),
+        cfg=cfg,
+        artifacts=restored_artifacts,
+    )
+
+    provenance = json.loads(
+        (restored_artifacts.run_dir / "resume_provenance.json").read_text(encoding="utf-8")
+    )
+    assert provenance["resume_mode"] == "raw_state_resume"
+    assert provenance["config_restore_policy"] == "current_config_authoritative"
+    assert provenance["config_drift_fields"] == []
+    assert provenance["code_identity_match"] is True
+    assert provenance["saved_git_identity"] == identity
+    assert provenance["current_git_identity"] == identity
+    assert provenance["git_identity_status"] == "stable"
 
 
 @pytest.mark.parametrize("bad_step", (True, -1, 1.5, "1", _StepEnum.ONE))

@@ -26,9 +26,51 @@ import csv
 import hashlib
 import json
 import math
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
+
+
+_CHILD_SENTINEL = "_VFE3_MULTISEED_ANALYSIS_CHILD"
+
+
+def _run_isolated_child() -> int:
+    r"""Run this click-to-run driver in a disposable interpreter and return its status."""
+    script = Path(__file__).resolve()
+    environment = os.environ.copy()
+    environment[_CHILD_SENTINEL] = "1"
+    environment["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    environment["PYTHONUNBUFFERED"] = "1"
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(script.parent),
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"isolated multi-seed analysis worker could not start: {exc}", file=sys.stderr)
+        return 1
+    if completed.stdout:
+        print(completed.stdout, end="")
+    if completed.stderr:
+        print(completed.stderr, end="", file=sys.stderr)
+    return int(completed.returncode)
+
+
+if __name__ == "__main__" and os.environ.get(_CHILD_SENTINEL) != "1":
+    raise SystemExit(_run_isolated_child())
+
+if os.environ.get(_CHILD_SENTINEL) == "1":
+    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import numpy as np
 
@@ -541,6 +583,9 @@ def _read_csv_columns(path: Path) -> Dict[str, List[Optional[float]]]:
         for row in reader:
             for c in cols:
                 data[c].append(_as_finite_float(row.get(c)))
+    if ("inner_alignment_energy_total" not in data
+            and "free_energy_total" in data):
+        data["inner_alignment_energy_total"] = list(data["free_energy_total"])
     return data
 
 
@@ -722,7 +767,7 @@ CURVE_SPECS: List[tuple] = [
     ("val_ppl",            False),
     ("val_bits_per_token", False),
     ("val_bpc",            False),
-    ("free_energy_total",  False),
+    ("inner_alignment_energy_total", False),
     ("self_coupling",      False),
     ("belief_coupling",    False),
     ("attention_entropy",  False),
@@ -740,7 +785,7 @@ CURVE_SPECS: List[tuple] = [
 ]
 
 GRID_COLS: List[str] = [                                          # overview-grid subset
-    "train_ce", "val_ppl", "free_energy_total", "grad_norm", "holonomy_deviation",
+    "train_ce", "val_ppl", "inner_alignment_energy_total", "grad_norm", "holonomy_deviation",
     "gauge_trace_spread", "effective_rank", "attn_entropy", "belief_cond_median",
 ]
 _LOGY_COLS = {c for c, logy in CURVE_SPECS if logy}
@@ -890,13 +935,13 @@ def _emit_figures(root: Path, scalars, curves, per_layer) -> None:
     print(f"  figures -> {fig_dir}  ({made} written)")
 
 
-def main() -> None:
+def main() -> int:
     root = _resolve_run_root(CONFIG["run_root"])
     seed_dirs = _seed_dirs(root)
     if not seed_dirs and not (root / "multiseed_request.json").is_file():
         print(f"no per-seed run dirs under {str(root)!r} "
               f"(looked for summary.json / provenance.json / config.json)")
-        return
+        return 1
     seeds = [_seed_for(d) for d in seed_dirs]
     request_design = _requested_seed_design(root)
     print(f"\n=== Multi-seed digest: {root}  ({len(seed_dirs)} seeds: {seeds}) ===\n")
@@ -999,7 +1044,8 @@ def main() -> None:
 
     if publication_complete:
         _emit_figures(root, scalars, curves, per_layer)
+    return 0 if publication_complete else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -683,7 +683,10 @@ def test_val_diagnostics_failure_resets_to_nan(tmp_path, monkeypatch):
     def _flaky(*a, **k):
         calls["n"] += 1
         if calls["n"] == 1:
-            return {"val_free_energy_total": 1.23}              # eval 1: a fresh probe value
+            return {
+                "val_inner_alignment_energy_total": 1.23,
+                "val_free_energy_total": 1.23,
+            }                                                    # eval 1: a fresh probe value
         raise RuntimeError("diagnostics boom")                  # eval 2: replay failure
 
     monkeypatch.setattr(vt, "_val_diagnostics", _flaky)
@@ -693,6 +696,8 @@ def test_val_diagnostics_failure_resets_to_nan(tmp_path, monkeypatch):
     with open(tmp_path / "run" / "metrics.csv", newline="", encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
     assert calls["n"] == 2                                      # both evals hit the probe
+    assert rows[0]["val_inner_alignment_energy_total"] == "1.23"
+    assert rows[1]["val_inner_alignment_energy_total"] == ""
     assert rows[0]["val_free_energy_total"] == "1.23"           # eval 1 wrote the fresh value
     assert rows[1]["val_free_energy_total"] == ""               # eval 2 failed -> NaN -> blank, NOT stale 1.23
 

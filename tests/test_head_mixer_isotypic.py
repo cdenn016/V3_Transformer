@@ -1,5 +1,7 @@
 r"""Isotypic (label-grouped) HeadMixer: the full linear commutant of a mixed irrep tower."""
 
+import math
+
 import pytest
 import torch
 
@@ -59,10 +61,10 @@ def test_mults_one_tower_gives_scalar_gains():
     m = HeadMixer([1, 3, 5, 7], irrep_labels=["l0", "l1", "l2", "l3"])
     assert all(tuple(d.shape) == (1, 1) for d in m.mixer_deltas)
     with torch.no_grad():
-        m.mixer_deltas[2].fill_(0.5)            # gain 1.5 on the l2 head
+        m.mixer_deltas[2].fill_(0.5)            # gain exp(0.5) on the l2 head
     mu = torch.randn(3, 16)
     mu2, _ = m(mu, torch.ones(3, 16))
-    assert torch.allclose(mu2[:, 4:9], 1.5 * mu[:, 4:9])
+    assert torch.allclose(mu2[:, 4:9], math.exp(0.5) * mu[:, 4:9])
     assert torch.equal(mu2[:, :4], mu[:, :4])   # other heads untouched
 
 

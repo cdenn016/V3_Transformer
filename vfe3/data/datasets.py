@@ -41,6 +41,7 @@ def _tokenizer_tag(dataset: str) -> str:
 
 _TOKENIZER_VOCAB_SIZE = {"tiktoken": 50257, "tiktoken_cl100k": 100277}
 _TIKTOKEN_ENCODING_NAME = {"tiktoken": "gpt2", "tiktoken_cl100k": "cl100k_base"}
+_CACHE_PROVENANCE_SCHEMA_VERSION = 1
 
 
 def tiktoken_encoding_name(dataset: str) -> str:
@@ -133,6 +134,63 @@ def _binary_cache_metadata(
     return canonical_meta, dtype
 
 
+def _cache_tokenizer_provenance(
+    path:           Path,
+    dataset:       str,
+    split:         str,
+    payload_sha256: str,
+) -> Dict[str, object]:
+    r"""Validate an optional exact tokenizer-provenance manifest for one cache payload.
+
+    Legacy caches remain readable, but their tokenizer identity is labeled as filename-inferred and
+    unverified. A present ``<cache>.provenance.json`` must bind the exact payload digest, dataset,
+    split, tokenizer tag, encoding, and vocabulary size; malformed or mismatched manifests fail closed.
+    """
+    manifest_path = Path(str(path) + ".provenance.json")
+    if not manifest_path.exists():
+        return {
+            "tokenizer_provenance_status": "filename_inferred_unverified",
+            "tokenizer_provenance": None,
+            "tokenizer_provenance_sha256": None,
+        }
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError(f"token cache provenance manifest must be a regular file: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"token cache provenance manifest is unreadable: {manifest_path}") from exc
+    required = {
+        "schema_version",
+        "dataset",
+        "split",
+        "tokenizer_tag",
+        "tokenizer_encoding",
+        "tokenizer_vocab_size",
+        "payload_sha256",
+    }
+    if not isinstance(manifest, dict) or set(manifest) != required:
+        raise ValueError(f"token cache provenance manifest has an unsupported schema: {manifest_path}")
+    expected = {
+        "schema_version": _CACHE_PROVENANCE_SCHEMA_VERSION,
+        "dataset": dataset,
+        "split": split,
+        "tokenizer_tag": _tokenizer_tag(dataset),
+        "tokenizer_encoding": tiktoken_encoding_name(dataset),
+        "tokenizer_vocab_size": tokenizer_vocab_size(dataset),
+        "payload_sha256": payload_sha256,
+    }
+    differing = sorted(key for key in required if manifest.get(key) != expected[key])
+    if differing:
+        raise ValueError(
+            f"token cache provenance manifest disagrees with the cache for field(s) {differing}"
+        )
+    return {
+        "tokenizer_provenance_status": "manifest_verified",
+        "tokenizer_provenance": dict(manifest),
+        "tokenizer_provenance_sha256": _sha256_file(manifest_path),
+    }
+
+
 def cache_source_identity(
     dataset:   str,
     split:     str = "validation",
@@ -160,14 +218,18 @@ def cache_source_identity(
     if pt.exists():
         resolved = pt.resolve()
         stat = resolved.stat()
+        payload_sha256 = _sha256_file(resolved)
         identity: Dict[str, object] = {
             "format":        "pt",
             "tokenizer_tag": tokenizer_tag,
             "size_bytes":    int(stat.st_size),
-            "sha256":        _sha256_file(resolved),
+            "sha256":        payload_sha256,
             "meta":          None,
             "meta_sha256":   None,
         }
+        identity.update(_cache_tokenizer_provenance(
+            resolved, dataset, split, payload_sha256,
+        ))
         return identity
 
     binp = cache_path(dataset, split, suffix="bin", cache_dir=cache_dir)
@@ -176,14 +238,18 @@ def cache_source_identity(
         meta, _ = _binary_cache_metadata(resolved)
         stat = resolved.stat()
         meta_path = Path(str(binp) + ".meta.json")
+        payload_sha256 = _sha256_file(resolved)
         identity = {
             "format":        "bin",
             "tokenizer_tag": tokenizer_tag,
             "size_bytes":    int(stat.st_size),
-            "sha256":        _sha256_file(resolved),
+            "sha256":        payload_sha256,
             "meta":          meta,
             "meta_sha256":   _sha256_file(meta_path),
         }
+        identity.update(_cache_tokenizer_provenance(
+            resolved, dataset, split, payload_sha256,
+        ))
         return identity
 
     raise FileNotFoundError(

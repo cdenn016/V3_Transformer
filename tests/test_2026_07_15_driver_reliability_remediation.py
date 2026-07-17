@@ -881,7 +881,7 @@ def test_multiseed_withholds_curves_layers_and_main_publication_for_bad_requeste
     monkeypatch.setattr(multiseed_analysis, "SCALAR_KEYS", ["test_ppl"])
     monkeypatch.setattr(multiseed_analysis, "_emit_figures", lambda *args: emitted.append(args))
 
-    multiseed_analysis.main()
+    assert multiseed_analysis.main() != 0
 
     summary = json.loads((tmp_path / "multiseed_summary.json").read_text(encoding="utf-8"))
     assert summary["design"]["complete"] is False
@@ -895,6 +895,12 @@ def test_multiseed_withholds_curves_layers_and_main_publication_for_bad_requeste
         "figures": True,
     }
     assert emitted == []
+
+
+def test_multiseed_main_returns_nonzero_for_empty_unrequested_design(tmp_path, monkeypatch):
+    monkeypatch.setitem(multiseed_analysis.CONFIG, "run_root", str(tmp_path))
+
+    assert multiseed_analysis.main() != 0
 
 
 def _controlled_bank() -> dict[str, torch.Tensor]:

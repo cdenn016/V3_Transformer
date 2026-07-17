@@ -1,7 +1,7 @@
 r"""Schur-commutant head mixer (use_head_mixer, opt-in).
 
 Mixes the equal-size gauge-irrep blocks (under block_glk: the n_heads heads) with a learned
-per-type matrix A = I + delta embedded as kron(A, I_d), applied symmetrically to mu (M mu) and
+per-type matrix A = exp(delta) embedded as kron(A, I_d), applied symmetrically to mu (M mu) and
 Sigma (M Sigma M^T; diagonal closed form sigma'[m] = sum_n A[m,n]^2 sigma[n]). Identity init
 (delta=0) makes a mixer-on model bitwise-identical to mixer-off at step 0. Under block_glk's
 UNTIED per-block gauge the mixer breaks strict gauge equivariance (exact at init, deviates as A
@@ -50,19 +50,32 @@ def test_diagonal_sigma_closed_form_is_A_squared():
     assert torch.allclose(sigma2, torch.tensor([[[5.0, 3.0]]]))
 
 
-def test_laplace_zero_mixer_row_uses_finite_zero_norm_subgradient():
+def test_exponential_parameterization_prevents_singular_covariance():
+    mix = HeadMixer([1, 1])
+    with torch.no_grad():
+        mix.mixer_delta.copy_(-torch.eye(2))
+
+    mu = torch.tensor([[[1.0, 2.0]]])
+    sigma = torch.tensor([[[2.0, 3.0]]])
+    _, sigma_diag = mix(mu, sigma)
+    _, sigma_full = mix(mu, torch.diag_embed(sigma))
+
+    assert (sigma_diag > 0.0).all()
+    assert (torch.linalg.eigvalsh(sigma_full) > 0.0).all()
+
+
+def test_laplace_exponential_mixer_has_positive_scale_and_finite_gradients():
     mix = HeadMixer([1, 1], family="laplace_diagonal")
     with torch.no_grad():
-        mix.mixer_delta.copy_(torch.tensor([[-1.0, 0.0], [0.0, 0.0]]))
+        mix.mixer_delta.copy_(-torch.eye(2))
     dispersion = torch.tensor([[[2.0, 3.0]]], requires_grad=True)
 
     mu_out, dispersion_out = mix(torch.tensor([[[1.0, 2.0]]]), dispersion)
     (mu_out.sum() + dispersion_out.sum()).backward()
 
-    assert torch.equal(mu_out, torch.tensor([[[0.0, 2.0]]]))
-    assert torch.equal(dispersion_out, torch.tensor([[[0.0, 3.0]]]))
-    assert torch.equal(mix.mixer_delta.grad, torch.tensor([[1.0, 2.0], [1.0, 5.0]]))
-    assert torch.equal(dispersion.grad, torch.tensor([[[0.0, 1.0]]]))
+    assert (dispersion_out > 0.0).all()
+    assert torch.isfinite(mix.mixer_delta.grad).all()
+    assert torch.isfinite(dispersion.grad).all()
 
 
 def test_full_cov_sandwich_matches_explicit_kron():
@@ -71,7 +84,7 @@ def test_full_cov_sandwich_matches_explicit_kron():
     mix = HeadMixer([d, d])
     with torch.no_grad():
         mix.mixer_delta.normal_(0.0, 0.3)
-    A = torch.eye(n) + mix.mixer_delta
+    A = torch.linalg.matrix_exp(mix.mixer_delta)
     M = torch.kron(A, torch.eye(d))
     base = torch.randn(n * d, n * d)
     S = (base.t() @ base).reshape(1, 1, n * d, n * d)        # SPD full covariance
@@ -130,7 +143,7 @@ def test_head_mixer_equivariant_under_tied_gauge_full_cov():
     K = n * d
     mix = HeadMixer([d, d])
     with torch.no_grad():
-        mix.mixer_delta.normal_(0.0, 0.4)                    # A = I + Delta, nontrivial
+        mix.mixer_delta.normal_(0.0, 0.4)                    # A = exp(Delta), nontrivial
     h = torch.eye(d) + 0.3 * torch.randn(d, d)               # h in GL(d) (near I, invertible)
     Omega = torch.kron(torch.eye(n), h)                      # (K, K) tied gauge: same h in every head
     mu = torch.randn(1, 1, K)

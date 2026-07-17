@@ -773,10 +773,10 @@ def _belief_channel_features(bank: Dict, channel: str):
     raise ValueError(f"unknown belief channel {channel!r} (expected mu / sigma / phi)")
 
 
-# Canonical key -> (legend label, multi-line bar name) for the complexity-F components, in the
+# Canonical key -> (legend label, multi-line bar name) for the inner alignment-energy components, in the
 # order they stack. Belief channel always present; the model channel (hyper-prior, model-coupling)
-# only when those columns are logged. The data term (CE) is NOT a component of F -- it is co-plotted
-# as a held-out reference, never summed in.
+# only when those columns are logged. The data term (CE) is separate and is co-plotted as a held-out
+# reference, never summed into this inner diagnostic.
 _FE_LABELS = {
     "self":              ("self-coupling",     "self-coupling\n$\\mathrm{KL}(q\\|p)$"),
     "belief":            ("belief coupling",   "belief-coupling\n$\\lambda_\\beta\\sum\\mathrm{KL}(q\\|\\Omega q)$"),
@@ -790,16 +790,16 @@ def _fe_terms(history: Dict, lambda_beta, *, lambda_gamma=0.0, include_attention
     r"""Per-eval complexity free-energy components shared by the decomposition/co-descent figures.
 
     Returns ``(step, components, total, ce)`` where ``components`` is an ordered list of
-    ``(canonical_key, array)`` pairs whose sum is ``total`` -- the per-token COMPLEXITY / inference free
-    energy that the E-step descends. ``total`` does NOT include the data/likelihood term: there is no
-    observation channel in the LM, so the cross-entropy is a held-out readout, returned separately as
-    ``ce`` for co-plotting, never summed into F. The belief blocks carry the (scalar or per-row)
+    ``(canonical_key, array)`` pairs whose sum is ``total`` -- the per-token inner alignment energy
+    that the E-step descends. ``total`` does not include a data/likelihood term, so it is not the
+    canonical full variational free energy. Cross-entropy is returned separately as ``ce`` for
+    co-plotting and is never summed into this diagnostic. The belief blocks carry the (scalar or per-row)
     ``lambda_beta`` weight; the attention-entropy block is included only when
     ``include_attention_entropy`` (matching ``free_energy_terms``' gate on ``total``). The model channel
     is added only when its columns are present: ``hyper_prior_weighted`` is the EXACT weighted hyper-prior
     folded into the runtime total (so state_dependent/learnable lambda_h need no reconstruction), and the
     gamma blocks are scaled by ``lambda_gamma``. The logged diagnostics are already per token, so every
-    component is commensurate and ``total`` matches the ``free_energy_total`` column.
+    component is commensurate and ``total`` matches the ``inner_alignment_energy_total`` column.
     """
     step = _np(history["step"]).astype(float)
     lb   = _np(lambda_beta).astype(float)
@@ -829,16 +829,16 @@ def plot_free_energy_codescent(
     include_attention_entropy: bool  = True,
     path:                      Optional[str] = None,
 ):
-    r"""F-vs-CE co-descent: the per-token complexity free energy and the held-out loss fall together.
+    r"""Inner-energy-vs-CE co-descent for the per-token alignment terms and held-out loss.
 
-    Twin y-axes over the real training step -- the complexity / inference free energy F (self-coupling +
+    Twin y-axes over the real training step -- the inner alignment energy (self-coupling +
     the lambda_beta-scaled belief-coupling and attention-entropy + the weighted hyper-prior and gamma
     model-coupling when the model channel is live, left, solid) and the held-out validation CE (right,
-    dashed) -- each a faint raw line under a rolling-mean trend. F is the quantity the E-step minimizes;
-    the CE is NOT part of F (there is no observation channel in the LM), it is the held-out readout the
-    descent is meant to track. The final values are tagged and the Pearson correlation of the two curves
-    is in the title; a high positive r is the co-descent signature, the evidence that minimizing the
-    inference F lowers held-out loss.
+    dashed) -- each a faint raw line under a rolling-mean trend. This energy contains no observation
+    likelihood and is therefore not the canonical full variational free energy; the CE is a separate
+    held-out readout. The final values are tagged and the Pearson association of the two curves is in
+    the title; it summarizes co-movement and does not establish that changing either quantity causes
+    the other to change.
     """
     step, _comps, total, ce = _fe_terms(history, lambda_beta, lambda_gamma=lambda_gamma,
                                         include_attention_entropy=include_attention_entropy)
@@ -848,10 +848,10 @@ def plot_free_energy_codescent(
     fig, ax = plt.subplots(figsize=(6.6, 3.9))
     ax.plot(step, total, lw=0.7, color=_CB[0], alpha=0.25)
     # Final values fold into the legend labels; standalone right-edge annotations otherwise land on top
-    # of the opposite (twin) axis tick labels -- the left-axis F tag overlaps the right CE ticks.
-    flab = f"F total (left) = {total[-1]:.1f}" if step.size else "F total (left)"
+    # of the opposite (twin) axis tick labels -- the left energy tag overlaps the right CE ticks.
+    flab = f"inner energy (left) = {total[-1]:.1f}" if step.size else "inner energy (left)"
     ln1, = ax.plot(step, _rolling_mean(total, w), lw=2.0, color=_CB[0], label=flab)
-    ax.set(xlabel="training step", ylabel="free energy F (nats/token)")
+    ax.set(xlabel="training step", ylabel="inner alignment energy (nats/token)")
     ax.yaxis.label.set_color(_CB[0]); ax.tick_params(axis="y", colors=_CB[0])
     if step.size and _set_finite_xlim(ax, step):
         _step_xaxis(ax)
@@ -863,9 +863,9 @@ def plot_free_energy_codescent(
     ax2.set_ylabel("validation CE (nats/token)", color=_CB[1]); ax2.tick_params(axis="y", colors=_CB[1])
     if total.size > 2:
         r = float(np.corrcoef(total, ce)[0, 1])
-        ax.set_title(rf"Free-energy / data-term co-descent (Pearson $r={r:+.2f}$)")
+        ax.set_title(rf"Inner-energy / CE co-descent (Pearson $r={r:+.2f}$)")
     else:
-        ax.set_title("Free-energy / data-term co-descent")
+        ax.set_title("Inner-energy / CE co-descent")
     ax.legend([ln1, ln2], [ln1.get_label(), ln2.get_label()], loc="upper right", fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
@@ -881,17 +881,17 @@ def plot_free_energy_decomposition(
     include_attention_entropy: bool  = True,
     path:                      Optional[str] = None,
 ):
-    r"""The per-token complexity free-energy budget at convergence and how its terms move over training.
+    r"""The per-token inner alignment-energy budget and how its terms move over training.
 
     Panel A: the F-contributions at the LAST eval on a LOG x-axis with the value past each bar, so the
     dominant self-coupling and the order-of-magnitude-smaller terms are all legible (a linear bar
     collapses the small ones to slivers, the failure mode of the old single bar). Panel B: the same terms
     at the early/mid/late thirds of training on a log y-axis -- self-coupling sits flat near its value
     while the belief-coupling, attention-entropy, and model-channel terms carry the descent. The bars are
-    the complexity / inference F (the quantity the E-step minimizes): self-coupling, the lambda_beta-scaled
+    the inner alignment energy (the quantity the E-step minimizes): self-coupling, the lambda_beta-scaled
     belief-coupling and attention-entropy, and -- when the model channel is live -- the weighted hyper-prior
-    and gamma model-coupling. The data/likelihood term (CE) is NOT shown: it is not part of F (no
-    observation channel in the LM); see the co-descent figure for F vs the held-out CE.
+    and gamma model-coupling. The data/likelihood term (CE) is not shown, so this diagnostic must not
+    be read as the canonical full variational free energy; see the co-descent figure for the separate CE.
     """
     step, comps, _total, _ce = _fe_terms(history, lambda_beta, lambda_gamma=lambda_gamma,
                                          include_attention_entropy=include_attention_entropy)
@@ -910,7 +910,7 @@ def plot_free_energy_decomposition(
         axes[0].annotate(f"{val:.1f}", xy=(val, yi), xytext=(4, 0), textcoords="offset points",
                          va="center", ha="left", fontsize=9)
     axes[0].set_xlim(float(last.min()) * 0.5, float(last.max()) * 3.0)
-    axes[0].set(xlabel="free-energy contribution (nats/token, log scale)",
+    axes[0].set(xlabel="inner-energy contribution (nats/token, log scale)",
                 title=f"Budget at step {int(step[-1]):,}")
     # Panel B -- early/mid/late medians, log y so the flat dominant term and the moving terms coexist.
     thirds  = np.array_split(np.arange(step.size), 3)
@@ -924,7 +924,7 @@ def plot_free_energy_decomposition(
     axes[1].set_yscale("log")
     axes[1].set_ylim(top=axes[1].get_ylim()[1] * 2.2)            # headroom for the legend above the bars
     axes[1].set_xticks(centers); axes[1].set_xticklabels(["early", "mid", "late"])
-    axes[1].set(xlabel="training third", ylabel="F term (median, nats/token, log scale)",
+    axes[1].set(xlabel="training third", ylabel="inner term (median, nats/token, log scale)",
                 title="Self-coupling flat; other terms descend")
     axes[1].legend(fontsize=7.5, frameon=False, ncol=2, loc="upper right")
     fig.tight_layout()
@@ -4121,7 +4121,8 @@ PUB_LABELS: Dict[str, str] = {
     "self_divergence":    r"$\sum_i \mathrm{KL}(q_i\|p_i)$",
     "belief_coupling":    r"$\sum_{ij}\beta_{ij}\,\mathrm{KL}(q_i\|\Omega_{ij}q_j)$",
     "attention_entropy":  r"$\tau\sum_{ij}\beta_{ij}\log(\beta_{ij}/\pi_{ij})$",
-    "free_energy_total":  r"free energy $F$ (nats/token)",
+    "inner_alignment_energy_total": r"inner alignment energy (nats/token)",
+    "free_energy_total":  r"inner alignment energy (legacy column alias)",
     # -- model-channel (s) free-energy blocks (r = model-fiber prior centroid; manuscript symbol) --
     "hyper_prior":        r"$\mathrm{KL}(s_i\|r)$",
     "hyper_prior_weighted": r"$\lambda_h\,\mathrm{KL}(s_i\|r)$",

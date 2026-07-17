@@ -177,6 +177,7 @@ def test_public_e_step_keyword_signature_follows_repository_order():
         "e_step_gradient", "exp_fp64_mode",
         "return_trajectory", "oracle_unroll_grad", "randomize_e_steps",
         "transport_mean_per_head", "compact_phi_block_transport", "rope_on_cov", "rope_on_value",
+        "training",
         "e_step_halt_tol", "grad_record", "state_record", "rope", "log_prior",
         "transport_chart_max_norm", "transport_status", "prebuilt_transport",
         "kwargs",

@@ -87,6 +87,7 @@ def test_shared_prebuilt_transport_respects_truncation_boundary() -> None:
         n_iter=3,
         e_phi_lr=0.0,
         e_steps_backprop_last=1,
+        training=True,
         prebuilt_transport=prebuilt_transport,
     )
     loss = out.mu.square().sum()
@@ -111,6 +112,7 @@ def test_oracle_last_k_restores_prior_gradient() -> None:
         n_iter=3,
         e_phi_lr=0.0,
         e_steps_backprop_last=1,
+        training=True,
         renyi_order=0.5,
         oracle_unroll_grad=True,
     )
@@ -139,6 +141,7 @@ def test_backprop_last_equal_total_matches_full_unroll() -> None:
             n_iter=3,
             e_phi_lr=0.0,
             e_steps_backprop_last=backprop_last,
+            training=True,
             renyi_order=0.5,
             oracle_unroll_grad=True,
         )
@@ -254,6 +257,7 @@ def test_refine_s_forwards_global_estep_controls(
     assert captured["e_step_update"] == "mm_exact"
     assert captured["mm_damping"] == 0.4
     assert captured["randomize_e_steps"] is True
+    assert captured["training"] is False
     assert captured["e_steps_min"] == 2
     assert captured["e_steps_max"] == 4
     assert captured["e_steps_backprop_last"] == 1
@@ -322,7 +326,7 @@ def test_q_and_s_randomized_depth_draw_independently(
     for _ in range(2):
         start = len(draws)
         torch.manual_seed(0)
-        model.forward_beliefs(token_ids)
+        model.forward_beliefs(token_ids, training=True)
         runs.append(draws[start:])
 
     assert runs[0] == runs[1]

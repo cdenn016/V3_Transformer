@@ -1,9 +1,9 @@
 r"""Schur-commutant head mixer for VFE_3.0 (opt-in).
 
 Without labels (the legacy equal-dims form) mixes ``n`` equal-size gauge-irrep blocks with one
-learned matrix :math:`A = I + \Delta \in \mathbb{R}^{n \times n}` embedded as
+learned invertible matrix :math:`A = \exp(\Delta) \in \mathrm{GL}(n)` embedded as
 :math:`\mathrm{kron}(A, I_d)`, where :math:`n` is the number of blocks and :math:`d` the
-(shared) block dimension. With ``irrep_labels`` the class builds one :math:`A_t = I + \Delta_t`
+(shared) block dimension. With ``irrep_labels`` the class builds one :math:`A_t = \exp(\Delta_t)`
 per maximal run of equal-labeled blocks -- the full linear commutant of a mixed-irrep tower for
 real-type irreps -- so unequal block dimensions no longer raise a dim-collision hazard provided
 they carry different labels. Under ``block_glk`` the blocks are the ``n_heads`` heads, so the
@@ -23,9 +23,9 @@ throughout V3 when ``diagonal_covariance=True``)
 applied block-by-block for each component :math:`t`. Factorized Laplace instead uses the
 moment-matched scale :math:`b'[m,c] = \sqrt{\sum_n A_t[m,n]^2 b[n,c]^2}`.
 
-Initialization is exactly the identity (:math:`\Delta_t = 0`, stored as the delta-from-identity
-so the init is bit-exact), so a model with the mixer enabled is bitwise indistinguishable from
-the mixer-disabled path at step 0.
+Initialization is exactly the identity (:math:`\Delta_t = 0`, stored as a matrix-log coordinate
+with an exact no-grad passthrough), so a model with the mixer enabled is bitwise indistinguishable
+from the mixer-disabled path at step 0.
 
 Gauge equivariance: :math:`\mathrm{kron}(A, I_d)` commutes with a block-diagonal gauge
 :math:`\mathrm{diag}(h_1, \ldots, h_n)` ONLY when the gauge is TIED (:math:`h_k = h_0` for all
@@ -55,7 +55,7 @@ from vfe3.families.base import get_family
 
 
 class HeadMixer(nn.Module):
-    r"""Isotypic per-component mixer: one :math:`A_t = I + \Delta_t` per maximal run of
+    r"""Isotypic per-component mixer: one :math:`A_t = \exp(\Delta_t)` per maximal run of
     equal-labeled blocks, embedded as :math:`\mathrm{blockdiag}_t(A_t \otimes I_{d_t})` --
     the full linear commutant of the tower for real-type irreps. Without labels the whole
     group must be one equal-dims component (the legacy behavior, byte-identical)."""
@@ -153,8 +153,7 @@ class HeadMixer(nn.Module):
         return self.mixer_deltas[0]
 
     def _A(self, t: int) -> torch.Tensor:
-        d = self.mixer_deltas[t]
-        return torch.eye(d.shape[0], device=d.device, dtype=d.dtype) + d
+        return torch.linalg.matrix_exp(self.mixer_deltas[t])
 
     def is_identity(self) -> bool:
         r"""Exact diagnostic predicate; forward uses the synchronization-free version cache."""
@@ -176,8 +175,8 @@ class HeadMixer(nn.Module):
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         r"""Remap the pre-isotypic key ``mixer_delta`` -> ``mixer_deltas.0`` so strict
-        checkpoint resume of single-component mixers written before the ParameterList
-        refactor keeps working."""
+        state-dict key loading for single-component mixers written before the ParameterList
+        refactor continues to work."""
         old = prefix + "mixer_delta"
         if old in state_dict and len(self.mixer_deltas) == 1:
             state_dict[prefix + "mixer_deltas.0"] = state_dict.pop(old)

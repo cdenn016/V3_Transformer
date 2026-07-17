@@ -129,4 +129,10 @@ def filesystem_slug(
     prefix = re.sub(r"[^A-Za-z0-9._-]", "_", value).strip("._") or safe_fallback
     prefix = prefix[:120]
     suffix = hashlib.sha1(value.encode("utf-8")).hexdigest()[:8]
-    return f"{prefix}__{suffix}"
+    slug = f"{prefix}__{suffix}"
+    try:
+        portable_path_component_key(slug, field="filesystem slug")
+    except ValueError:
+        slug = f"_{prefix[:119]}__{suffix}"
+        portable_path_component_key(slug, field="filesystem slug")
+    return slug

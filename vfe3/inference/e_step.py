@@ -1184,6 +1184,7 @@ def e_step(
     compact_phi_block_transport: bool = False,    # packed canonical flat block_glk phi factors
     rope_on_cov:                 bool = False,
     rope_on_value:               bool = True,
+    training:                    bool = False,    # explicit module mode; independent of autograd context
 
     e_step_halt_tol:             Optional[float]               = None,   # eval halting: break when mean KL(q^t||q^{t-1}) < tol
     grad_record:                 Optional[EStepGradientRecord] = None,   # diag out-param: LAST iteration's belief-grad norms
@@ -1210,10 +1211,11 @@ def e_step(
     'unroll' here (no_grad already severs every gradient).
 
     Tier-1 loop control (all default OFF): ``randomize_e_steps`` samples the depth
-    T ~ Uniform{e_steps_min..e_steps_max} on grad-enabled (training) forwards, from the GLOBAL
+    T ~ Uniform{e_steps_min..e_steps_max} on explicit training forwards, from the GLOBAL
     torch RNG; ``e_steps_backprop_last=k`` runs all but the last k iterations under no_grad and
     detaches the belief at the boundary (truncated backprop); ``e_step_halt_tol`` breaks the eval
-    (no_grad) loop when the mean configured-family KL(q^t || q^{t-1}) drops below tol."""
+    loop when the mean configured-family KL(q^t || q^{t-1}) drops below tol. The explicit
+    ``training`` flag keeps detached training under ``torch.no_grad`` distinct from evaluation."""
     traj: List[float] = []
 
     # Hoist the flat transport when phi is frozen across iterations (e_phi_lr==0).  On the flat
@@ -1325,12 +1327,12 @@ def e_step(
             state_record["free_energy"].append(_f_diag(b, record_sequence_index))
 
     # Tier-1 loop control (all default OFF -> the pure fixed-depth loop below, byte-identical).
-    # grad-enabled == a TRAINING forward (the eval/generate paths run under no_grad): the
-    # discriminator for both the randomized depth and the truncated-backprop prefix, while the
-    # halting rule is the eval-side complement.
+    # Module mode, not ambient autograd state, selects randomized training depth versus deterministic
+    # evaluation halting. Detached training deliberately runs under no_grad and must still follow the
+    # training loop policy. Truncated backprop additionally requires a live autograd context.
     grad_on = torch.is_grad_enabled()
     n_total = n_iter
-    if randomize_e_steps and grad_on:
+    if randomize_e_steps and training:
         # Sample T ~ Uniform{e_steps_min..e_steps_max} from the GLOBAL torch RNG (this toggle
         # consumes global RNG state); eval keeps the deterministic n_iter.
         n_total = int(torch.randint(e_steps_min, e_steps_max + 1, (1,)).item())
@@ -1338,7 +1340,7 @@ def e_step(
     # no_grad and the belief is detached at the boundary; the last k iterations keep the
     # configured e_step_gradient behavior. 0 = OFF (full path).
     no_grad_prefix = 0
-    if e_steps_backprop_last > 0 and grad_on:
+    if e_steps_backprop_last > 0 and training and grad_on:
         no_grad_prefix = max(n_total - e_steps_backprop_last, 0)
     halt_eps: float = kwargs.get("eps", 1e-6)
     halt_family = get_family(kwargs.get("family", "gaussian_diagonal")) if e_step_halt_tol is not None else None
@@ -1346,7 +1348,7 @@ def e_step(
     if return_trajectory or state_record is not None:
         _record_diagnostic_state(belief)
     for t in range(n_total):
-        if e_step_halt_tol is not None and not grad_on:
+        if e_step_halt_tol is not None and not training:
             prev_mu, prev_sigma = belief.mu, belief.sigma
         if t < no_grad_prefix:
             with torch.no_grad():
@@ -1417,7 +1419,7 @@ def e_step(
             )
         if return_trajectory or state_record is not None:
             _record_diagnostic_state(belief)
-        if e_step_halt_tol is not None and not grad_on and t + 1 < n_total:
+        if e_step_halt_tol is not None and not training and t + 1 < n_total:
             # Eval-time halting: mean over tokens of the configured-family KL(q^t || q^{t-1})
             # (the per-iteration belief move); break when < tol. The guard on t+1 < n_total skips
             # a wasted check after the final iteration.

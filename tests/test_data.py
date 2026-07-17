@@ -1,5 +1,6 @@
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -9,6 +10,7 @@ import torch
 from vfe3.data.datasets import (
     TokenWindows,
     _tokenizer_tag,
+    cache_source_identity,
     cache_path,
     default_cache_dir,
     get_tiktoken_decoder,
@@ -105,6 +107,51 @@ def test_load_synthetic_pt_cache(tmp_path):
     out = load_cached_tokens("wikitext-103", "train", cache_dir=tmp_path)
     assert out.dtype == torch.long and out.shape == (500,)
     assert torch.equal(out, toks)
+
+
+def test_legacy_cache_tokenizer_provenance_is_explicitly_unverified(tmp_path):
+    path = cache_path("wikitext-103", "train", suffix="pt", cache_dir=tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(torch.arange(8, dtype=torch.int64), path)
+
+    identity = cache_source_identity("wikitext-103", "train", cache_dir=tmp_path)
+
+    assert identity["tokenizer_provenance_status"] == "filename_inferred_unverified"
+    assert identity["tokenizer_provenance"] is None
+    assert identity["tokenizer_provenance_sha256"] is None
+
+
+def test_cache_tokenizer_provenance_manifest_binds_exact_payload(tmp_path):
+    dataset, split = "wikitext-103", "train"
+    path = cache_path(dataset, split, suffix="pt", cache_dir=tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(torch.arange(8, dtype=torch.int64), path)
+    legacy = cache_source_identity(dataset, split, cache_dir=tmp_path)
+    manifest = {
+        "schema_version": 1,
+        "dataset": dataset,
+        "split": split,
+        "tokenizer_tag": _tokenizer_tag(dataset),
+        "tokenizer_encoding": tiktoken_encoding_name(dataset),
+        "tokenizer_vocab_size": tokenizer_vocab_size(dataset),
+        "payload_sha256": legacy["sha256"],
+    }
+    Path(str(path) + ".provenance.json").write_text(
+        json.dumps(manifest), encoding="utf-8",
+    )
+
+    verified = cache_source_identity(dataset, split, cache_dir=tmp_path)
+
+    assert verified["tokenizer_provenance_status"] == "manifest_verified"
+    assert verified["tokenizer_provenance"] == manifest
+    assert isinstance(verified["tokenizer_provenance_sha256"], str)
+
+    manifest["payload_sha256"] = "0" * 64
+    Path(str(path) + ".provenance.json").write_text(
+        json.dumps(manifest), encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="payload_sha256"):
+        cache_source_identity(dataset, split, cache_dir=tmp_path)
 
 
 def test_load_synthetic_bin_cache(tmp_path):

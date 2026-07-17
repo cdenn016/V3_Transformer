@@ -777,17 +777,27 @@ def spd_geodesic_distance(
     this reduces to sqrt(sum_k log^2(sigma_b,k / sigma_a,k)). This is the metric the SPD
     retraction itself uses, so belief-trajectory / E-step-residual lengths are measured in the
     geometry the inference actually moves in. Symmetric, zero iff Sigma_a == Sigma_b.
+
+    The full-covariance reduction factors Sigma_a = L L^T in float64 and obtains the generalized
+    eigenvalues from the symmetric matrix L^{-1} Sigma_b L^{-T} using triangular solves. It never
+    materializes Sigma_a^{-1/2}.
     """
     if not _is_full_cov(sigma_a, diagonal):
         ratio = sigma_b.clamp(min=eps) / sigma_a.clamp(min=eps)
         return torch.sqrt((torch.log(ratio) ** 2).sum(dim=-1).clamp(min=0.0))
-    a = 0.5 * (sigma_a + sigma_a.transpose(-1, -2))
-    b = 0.5 * (sigma_b + sigma_b.transpose(-1, -2))
-    wa, qa = torch.linalg.eigh(a)
-    inv_sqrt = (qa * wa.clamp(min=eps).rsqrt().unsqueeze(-2)) @ qa.transpose(-1, -2)
-    whitened = inv_sqrt @ b @ inv_sqrt
-    lam = torch.linalg.eigvalsh(0.5 * (whitened + whitened.transpose(-1, -2))).clamp(min=eps)
-    return torch.sqrt((torch.log(lam) ** 2).sum(dim=-1).clamp(min=0.0))
+    output_dtype = torch.promote_types(sigma_a.dtype, sigma_b.dtype)
+    a = sigma_a.to(torch.float64)
+    b = sigma_b.to(torch.float64)
+    a = 0.5 * (a + a.transpose(-1, -2))
+    b = 0.5 * (b + b.transpose(-1, -2))
+    chol_a = torch.linalg.cholesky(a)
+    left = torch.linalg.solve_triangular(chol_a, b, upper=False)
+    generalized = torch.linalg.solve_triangular(
+        chol_a, left.transpose(-1, -2), upper=False).transpose(-1, -2)
+    generalized = 0.5 * (generalized + generalized.transpose(-1, -2))
+    lam = torch.linalg.eigvalsh(generalized).clamp(min=eps)
+    distance = torch.sqrt((torch.log(lam) ** 2).sum(dim=-1).clamp(min=0.0))
+    return distance.to(dtype=output_dtype)
 
 
 def attention_entropy_rows(

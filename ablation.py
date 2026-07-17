@@ -3015,6 +3015,11 @@ def _collect_sweep_results(
                 or result.get("sweep") != sweep_dir.name
                 or run_dir.name != _sanitize(label)):
             continue
+        seed = result.get("seed")
+        if (type(seed) is not int
+                or not _ablation_cell_owner_is_exact(
+                    run_dir, sweep_dir.name, label, seed)):
+            continue
         if result.get("status") != "success" or result.get("error_kind") is not None:
             continue
         try:
@@ -3142,6 +3147,31 @@ def _read_regular_json_mapping(path: Path, *, role: str) -> Dict[str, object]:
     return dict(value)
 
 
+def _ablation_cell_owner_is_exact(
+    run_dir:    Path,
+    sweep_name: str,
+    label:      str,
+    seed:       int,
+) -> bool:
+    """Return true only when the regular ownership sentinel has the exact requested identity."""
+    try:
+        expected = _ablation_cell_owner_payload(sweep_name, label, seed)
+        owner = _read_regular_json_mapping(
+            run_dir / _ABLATION_CELL_OWNER_FILENAME,
+            role="ablation cell ownership sentinel",
+        )
+    except ValueError:
+        return False
+    return bool(
+        set(owner) == set(expected)
+        and type(owner.get("schema_version")) is int
+        and type(owner.get("sweep")) is str
+        and type(owner.get("label")) is str
+        and type(owner.get("seed")) is int
+        and owner == expected
+    )
+
+
 def _authorize_ablation_cell_cleanup(
     run_dir:    Path,
     sweep_name: str,
@@ -3168,19 +3198,7 @@ def _authorize_ablation_cell_cleanup(
         or _path_is_junction(owner_path)
     )
     if owner_present:
-        owner = _read_regular_json_mapping(
-            owner_path,
-            role="ablation cell ownership sentinel",
-        )
-        exact_owner = (
-            set(owner) == set(expected)
-            and type(owner.get("schema_version")) is int
-            and type(owner.get("sweep")) is str
-            and type(owner.get("label")) is str
-            and type(owner.get("seed")) is int
-            and owner == expected
-        )
-        if not exact_owner:
+        if not _ablation_cell_owner_is_exact(run_dir, sweep_name, label, seed):
             raise ValueError(
                 "ablation cell ownership sentinel does not match the requested sweep, label, and seed"
             )
@@ -3461,6 +3479,8 @@ def run_sweep(
             # separate post-contract validator binds the requested artifact's exact bytes/schema, so a
             # missing or drifted val_token_nats.pt forbids reuse even when the contract still matches.
             if (_cell_dir_is_owned(sweep_dir, run_dir)
+                    and _ablation_cell_owner_is_exact(
+                        run_dir, sweep_name, label, cell_seed)
                     and expected_contract is not None
                     and _cell_is_current(run_dir, expected_contract)
                     and _paired_token_artifact_is_current(run_dir, required=paired_token_bootstrap)):
@@ -3487,17 +3507,24 @@ def run_sweep(
                 label=label,
                 seed=cell_seed,
             )
-            generation_started = True
-            result = run_single(label, overrides, run_dir, dataset=dataset, device=device,
-                                 seed=cell_seed, collect_diagnostics=collect_diagnostics,
-                                 collect_extrapolation=collect_extrapolation,
-                                 paired_token_bootstrap=paired_token_bootstrap,
-                                 max_tokens=max_tokens, max_steps=max_steps)
-        except Exception as exc:                             # a training crash must not kill the sweep
-            logger.exception("sweep %s / %s crashed", sweep_name, label)
-            result = {"label": label, "error_kind": "train", "error": str(exc),
+        except Exception as exc:
+            logger.exception("sweep %s / %s setup failed", sweep_name, label)
+            result = {"label": label, "error_kind": "setup", "error": str(exc),
                       "primary_val_ppl": float("inf"), "seed": int(cell_seed),
                       "overrides": _jsonable(overrides)}
+        else:
+            generation_started = True
+            try:
+                result = run_single(label, overrides, run_dir, dataset=dataset, device=device,
+                                    seed=cell_seed, collect_diagnostics=collect_diagnostics,
+                                    collect_extrapolation=collect_extrapolation,
+                                    paired_token_bootstrap=paired_token_bootstrap,
+                                    max_tokens=max_tokens, max_steps=max_steps)
+            except Exception as exc:                         # one training crash must not kill the sweep
+                logger.exception("sweep %s / %s training crashed", sweep_name, label)
+                result = {"label": label, "error_kind": "train", "error": str(exc),
+                          "primary_val_ppl": float("inf"), "seed": int(cell_seed),
+                          "overrides": _jsonable(overrides)}
         finally:
             _cleanup()
 
@@ -4647,7 +4674,27 @@ def _run_ablation_figures_isolated(
 # MAIN  (click-to-run; edit CONFIG above)
 # =============================================================================
 
-def main() -> None:
+def _write_ablation_run_status(
+    output_dir: Path,
+
+    *,
+    status:                str,
+    requested_sweeps:      List[str],
+    incomplete_sweeps:     List[str],
+    failed_figure_scopes:  List[str],
+) -> None:
+    """Atomically publish the terminal completeness of one click-to-run invocation."""
+    _write_json_atomic(output_dir / "ablation_run_status.json", {
+        "schema_version":       1,
+        "status":               status,
+        "requested_sweeps":     list(requested_sweeps),
+        "incomplete_sweeps":    list(dict.fromkeys(incomplete_sweeps)),
+        "failed_figure_scopes": list(dict.fromkeys(failed_figure_scopes)),
+        "timestamp":            time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+
+
+def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     output_dir = Path(CONFIG["output_dir"])
 
@@ -4665,7 +4712,7 @@ def main() -> None:
             print(f"{mark} {name:<28}{sweep_n_runs(s):>5}  {s['description']}")
         print(f"\n{len(SWEEPS)} sweeps registered; SWEEP_ORDER runs {len(SWEEP_ORDER)} "
               f"({sum(sweep_n_runs(SWEEPS[n]) for n in SWEEP_ORDER)} runs).")
-        return
+        return 0
 
     # ---- contiguous run: per sweep { train -> analyze table -> PPL figure }, then comparison ----
     if CONFIG["device"] == "auto":
@@ -4686,18 +4733,39 @@ def main() -> None:
 
     current_cohort: Optional[Dict[str, object]] = None
     incomplete_sweeps: List[str] = []
+    failed_figure_scopes: List[str] = []
+    _write_ablation_run_status(
+        output_dir,
+        status="running",
+        requested_sweeps=list(sweep_names),
+        incomplete_sweeps=incomplete_sweeps,
+        failed_figure_scopes=failed_figure_scopes,
+    )
     if not _run_ablation_figures_isolated(
             output_dir,
             scope="__sensitivity__",
             invalidate=True):
-        raise RuntimeError(
+        failed_figure_scopes.append("__sensitivity__:invalidate")
+        incomplete_sweeps.extend(sweep_names)
+        logger.error(
             "could not invalidate prior sensitivity figures; refusing to publish a mixed generation"
         )
+        _write_ablation_run_status(
+            output_dir,
+            status="incomplete",
+            requested_sweeps=list(sweep_names),
+            incomplete_sweeps=incomplete_sweeps,
+            failed_figure_scopes=failed_figure_scopes,
+        )
+        return 1
     for name in sweep_names:
         if not _run_ablation_figures_isolated(output_dir, scope=name, invalidate=True):
-            raise RuntimeError(
-                f"could not invalidate prior {name!r} figures; refusing to run beside stale output"
+            failed_figure_scopes.append(f"{name}:invalidate")
+            incomplete_sweeps.append(name)
+            logger.error(
+                "could not invalidate prior %r figures; refusing to run beside stale output", name
             )
+            continue
         run_sweep(name, output_dir, dataset=CONFIG["dataset"], device=device,
                   seed=CONFIG["seed"], resume=CONFIG["resume"],
                   max_tokens=CONFIG["max_tokens"], max_steps=CONFIG["max_steps"])
@@ -4727,22 +4795,37 @@ def main() -> None:
             incomplete_sweeps.append(name)
             continue
         analyze_sweep(sweep_dir)                            # this sweep's numeric table (accumulated)
-        _run_ablation_figures_isolated(output_dir, scope=name)
+        if not _run_ablation_figures_isolated(output_dir, scope=name):
+            failed_figure_scopes.append(f"{name}:render")
 
     # ---- after all sweeps: the cross-sweep comparison ----
     if current_cohort is not None:
-        _run_ablation_figures_isolated(
-            output_dir,
-            scope="__sensitivity__",
-            cohort_identity=current_cohort,
-        )
+        if not _run_ablation_figures_isolated(
+                output_dir,
+                scope="__sensitivity__",
+                cohort_identity=current_cohort):
+            failed_figure_scopes.append("__sensitivity__:render")
         summarize_sweeps(output_dir, cohort_identity=current_cohort)
     if incomplete_sweeps:
         logger.error(
             "incomplete sweeps withheld from analysis: %s",
             ", ".join(incomplete_sweeps),
         )
+    status = "complete" if not incomplete_sweeps and not failed_figure_scopes else "incomplete"
+    _write_ablation_run_status(
+        output_dir,
+        status=status,
+        requested_sweeps=list(sweep_names),
+        incomplete_sweeps=incomplete_sweeps,
+        failed_figure_scopes=failed_figure_scopes,
+    )
+    if failed_figure_scopes:
+        logger.error(
+            "requested figure scopes failed: %s",
+            ", ".join(failed_figure_scopes),
+        )
+    return 0 if status == "complete" else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

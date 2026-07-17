@@ -641,6 +641,7 @@ class VFEModel(nn.Module):
             # guard above pins n_heads == 1 for that case, so shape[0] == 1 here.
             if cached.dim() == 3 and len(self.group.irrep_dims) == 1:
                 cached = cached.squeeze(0)
+            self._log_prior_cache.clear()
             self._log_prior_cache[key] = cached
         return cached
 
@@ -659,6 +660,7 @@ class VFEModel(nn.Module):
             cached = get_pos_rotation(self.cfg.pos_rotation)(
                 torch.arange(n, device=device), self.group.irrep_dims,
                 base=self.cfg.rope_base, device=device, dtype=dtype)
+            self._rope_cache.clear()
             self._rope_cache[key] = cached
         return cached
 
@@ -804,6 +806,7 @@ class VFEModel(nn.Module):
 
         *,
         e_step_gradient:    str                    = "unroll",
+        training:           bool                   = False,
         rope:               Optional[torch.Tensor] = None,      # (N, K, K) gauge-RoPE rotation (None -> off)
         prebuilt_transport: 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport | None' = None,
     ) -> 'tuple[torch.Tensor, torch.Tensor]':
@@ -901,6 +904,7 @@ class VFEModel(nn.Module):
             e_step_update=cfg.e_step_update,
             mm_damping=cfg.mm_damping,
             randomize_e_steps=cfg.randomize_e_steps,
+            training=training,
             e_steps_min=cfg.e_steps_min,
             e_steps_max=cfg.e_steps_max,
             e_steps_backprop_last=cfg.e_steps_backprop_last,
@@ -932,7 +936,9 @@ class VFEModel(nn.Module):
         belief_phi = self._apply_pos_phi(enc.phi[0]).unsqueeze(0)    # (1, N, n_gen) belief frame
         phi0 = self._resolve_model_frame(token_ids[:1], belief_phi) # (1, N, n_gen) model frame
         rope = self._rope_rotation(token_ids.shape[1], token_ids.device)
-        return self._refine_s(token_ids[:1], phi0, rope=rope)        # (1, N, K) x2
+        return self._refine_s(
+            token_ids[:1], phi0, training=False, rope=rope,
+        )                                                            # (1, N, K) x2
 
     def forward_beliefs(
         self,
@@ -941,6 +947,7 @@ class VFEModel(nn.Module):
         *,
         return_logits:  bool           = False,          # also decode logits; else logits is None
         decode_last:    bool           = False,          # decode only the last position as (B, 1, V)
+        training:       bool           = False,          # explicit inner-loop policy; evaluation APIs keep False
         capture:        Optional[MStepCapture]       = None,   # out-param: M-step intermediates (q*, final-block prior, raw out)
         estep_grad_out: Optional[EStepGradientOutput] = None,   # diag out-param: E-step belief-grad norms (forwarded)
     ) -> 'Tuple[BeliefState, Optional[torch.Tensor]]':
@@ -966,7 +973,9 @@ class VFEModel(nn.Module):
         that block), both written by ``vfe_stack``. ``capture['prior']`` retains the encode-time prior
         (post s-refine), and ``capture['out']`` retains the raw stack output (pre final_norm).
 
-        Grad-transparent: it carries the SAME internal ``run = no_grad() if e_step_gradient=='detach'
+        ``training`` explicitly selects randomized-depth and evaluation-halting policy; it is not
+        inferred from ambient autograd state. Grad-transparent: this seam carries the same internal
+        ``run = no_grad() if e_step_gradient=='detach'
         else nullcontext()`` and ``amp`` contexts forward establishes, so a grad-enabled training caller
         and a no-grad inference caller both get the identical forward value. The no-grad property used by
         the policy layer comes from the caller's ``@torch.no_grad`` scope (``generate``,
@@ -1063,6 +1072,7 @@ class VFEModel(nn.Module):
                 # self-couples to its prior every iteration, so s reaches mu_final even at n_e_steps=1.
                 s_mu1, s_sigma1 = self._refine_s(
                     token_ids, model_phi, e_step_gradient=e_step_gradient,
+                    training=training,
                     rope=rope, prebuilt_transport=shared_omega)
                 s_belief = (s_mu1, s_sigma1)
                 beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
@@ -1108,7 +1118,7 @@ class VFEModel(nn.Module):
                 connection_L=connection_L,
                 e_step_gradient=e_step_gradient,
                 rope=rope, rope_on_cov=self.cfg.rope_full_gauge,
-                rope_on_value=self.cfg.rope_on_value,
+                rope_on_value=self.cfg.rope_on_value, training=training,
                 capture=capture, grad_record=grad_rec,
                 transport_status=self._transport_status,
                 prebuilt_transport=shared_omega,
@@ -1196,7 +1206,9 @@ class VFEModel(nn.Module):
         mode = mode or self._reflection_metropolis_mode()
         with torch.no_grad():
             cap: Dict = {}
-            belief, _ = self.forward_beliefs(token_ids, capture=cap)
+            belief, _ = self.forward_beliefs(
+                token_ids, training=self.training, capture=cap,
+            )
             conv      = cap.get("converged")
             if mode == "omega":
                 belief_f = conv if (conv is not None and conv.omega is not None) else belief
@@ -1490,7 +1502,7 @@ class VFEModel(nn.Module):
         ``decode_last=True`` preserves the complete belief and decodes only terminal ``(B, 1, V)`` logits.
         """
         return self.forward_beliefs(
-            token_ids, return_logits=return_logits, decode_last=decode_last)
+            token_ids, return_logits=return_logits, decode_last=decode_last, training=False)
 
     def forward(
         self,
@@ -1513,7 +1525,12 @@ class VFEModel(nn.Module):
         if targets is None:
             # Inference: logits via the shared belief seam. estep_grad_out is forwarded so the
             # diagnostic still fills on this path (byte-identical to the pre-refactor return).
-            return self.forward_beliefs(token_ids, return_logits=True, estep_grad_out=estep_grad_out)[1]
+            return self.forward_beliefs(
+                token_ids,
+                return_logits=True,
+                training=self.training,
+                estep_grad_out=estep_grad_out,
+            )[1]
         # Training path: produce the converged belief q* (no (B,N,V) logits) via the shared seam, then
         # run the existing decode + cross-entropy + M-step assembly reading belief.mu / sigma / phi.
         # cap (non-None only when the M-step self-coupling term is on) is filled by forward_beliefs
@@ -1529,8 +1546,13 @@ class VFEModel(nn.Module):
             # appends to (or stacks) a CG list (PB-13).
             cap["cg_moment_energy_rows"] = []
             cap["cg_pre_moments"] = []
-        belief, _ = self.forward_beliefs(token_ids, return_logits=False,
-                                         capture=cap, estep_grad_out=estep_grad_out)
+        belief, _ = self.forward_beliefs(
+            token_ids,
+            return_logits=False,
+            training=self.training,
+            capture=cap,
+            estep_grad_out=estep_grad_out,
+        )
         mu_final, sigma_final = belief.mu, belief.sigma          # (B, N, K) post final_norm; sigma = out.sigma
 
         # Decode + cross-entropy fp32 island. The decode matmul (_decode_diagonal) reconstructs the
@@ -2263,7 +2285,7 @@ class VFEModel(nn.Module):
             if self.cfg.policy_mode == "none":
                 context = seq[:, -self.cfg.max_seq_len:]                 # (B, <=max_seq_len)
                 _belief, decoded = self.forward_beliefs(
-                    context, return_logits=True, decode_last=True)
+                    context, return_logits=True, decode_last=True, training=False)
                 logits = decoded[:, 0, :]                                # (B, V) last position
                 invalid_row = torch.isnan(logits).any(dim=-1) | torch.isposinf(logits).any(dim=-1)
                 if bool(invalid_row.any()):
@@ -2363,7 +2385,9 @@ class VFEModel(nn.Module):
         # get_policy('efe_rollout') (spec Section 3.5), not here.
         horizon = self.cfg.policy_horizon if self.cfg.policy_mode == "efe_rollout" else 1
         _validate_policy_context(context, horizon, self.cfg.max_seq_len)
-        _belief, decoded = self.forward_beliefs(context, return_logits=True, decode_last=True)
+        _belief, decoded = self.forward_beliefs(
+            context, return_logits=True, decode_last=True, training=False,
+        )
         base_logits = decoded[:, 0, :]                               # (B, V) base last-position logits
         invalid_row = torch.isnan(base_logits).any(dim=-1) | torch.isposinf(base_logits).any(dim=-1)
         if bool(invalid_row.any()):
@@ -2695,7 +2719,7 @@ class VFEModel(nn.Module):
         diagnostic: dict = {}
         capture = {"diagnostic": diagnostic}
         final_belief, logits = self.forward_beliefs(
-            token_ids, return_logits=True, capture=capture)
+            token_ids, return_logits=True, training=False, capture=capture)
         if logits is None:
             raise RuntimeError("diagnostic snapshot requested logits but the decoder returned None")
 

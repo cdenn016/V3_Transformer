@@ -466,8 +466,8 @@ def test_scored_outer_loss_matches_pre_change_assembly(include_entropy, n_heads)
 # Cholesky (K*(K-1)//2) alongside the log-variance diagonal, so encode_s/r_parameters return
 # a full (..., K, K) covariance; diagonal and Laplace channels create NO packed keys and stay
 # byte-identical. _hyper_prior_kl dispatches KL(s||r) through the configured family, and
-# barycenter_r_ moment-matches full Gaussians. Vocabulary-prior and decode variance tables stay
-# diagonal in every family.
+# barycenter_r_ moment-matches full Gaussians. Token and decode variance tables stay diagonal, while
+# a full model-channel prior preserves its packed covariance on the s-to-p encode route.
 # ===========================================================================
 
 from vfe3.families.covariance_tables import (                    # noqa: E402
@@ -599,6 +599,24 @@ def test_full_encode_s_covariance_is_spd_with_offdiagonal():
     assert (eigs > 0).all()                                     # SPD everywhere
     off = s_sigma - torch.diag_embed(torch.diagonal(s_sigma, dim1=-2, dim2=-1))
     assert float(off.abs().max()) > 0.0                        # genuinely off-diagonal
+
+
+def test_full_model_channel_encode_preserves_packed_prior_covariance():
+    m = _pb11_model(**_full_kw(prior_source="model_channel"))
+    pb = m.prior_bank
+    with torch.no_grad():
+        pb.s_sigma_lower_embed.normal_(0.0, 0.4)
+    tok = torch.arange(4, dtype=torch.long).reshape(1, 4)
+
+    encoded = pb.encode(tok)
+    s_mu, s_sigma = pb.encode_s(tok)
+
+    assert torch.equal(encoded.mu, s_mu)
+    assert torch.equal(encoded.sigma, s_sigma)
+    off = encoded.sigma - torch.diag_embed(
+        torch.diagonal(encoded.sigma, dim1=-2, dim2=-1)
+    )
+    assert torch.count_nonzero(off) > 0
 
 
 # --- vocabulary / decode tables stay diagonal in every family -------------------------------

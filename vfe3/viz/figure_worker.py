@@ -19,7 +19,11 @@ from typing import Dict, List, Mapping
 import torch
 
 from vfe3.config import VFE3Config, config_from_serialized
-from vfe3.path_utils import prepare_owned_output_child
+from vfe3.path_utils import (
+    path_is_reparse_point,
+    portable_path_component_key,
+    prepare_owned_output_child,
+)
 from vfe3.run_artifacts import (
     _atomic_replace,
     _save_figures,
@@ -208,11 +212,50 @@ def _legacy_ablation_scope_files(scope: str) -> set[str]:
     )
 
 
+def _validated_ablation_manifest(path: Path) -> Dict[str, Dict[str, object]]:
+    """Load one manifest whose entries can authorize only known ablation figure names."""
+    if not path.exists():
+        return {}
+    if path_is_reparse_point(path) or not path.is_file():
+        raise ValueError("ablation figure manifest must be a regular file")
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("ablation figure manifest is unreadable") from exc
+    if (not isinstance(manifest, dict)
+            or type(manifest.get("schema_version")) is not int
+            or manifest.get("schema_version") != 1
+            or not isinstance(manifest.get("scopes"), dict)):
+        raise ValueError("ablation figure manifest has an unsupported schema")
+
+    validated: Dict[str, Dict[str, object]] = {}
+    for stored_scope, entry in manifest["scopes"].items():
+        if not isinstance(stored_scope, str):
+            raise ValueError("ablation figure manifest scope names must be strings")
+        portable_path_component_key(stored_scope, field="ablation figure manifest scope")
+        if not isinstance(entry, dict) or not isinstance(entry.get("files"), list):
+            raise ValueError(f"ablation figure manifest scope {stored_scope!r} is malformed")
+        allowed = _legacy_ablation_scope_files(stored_scope)
+        files = entry["files"]
+        if (any(not isinstance(name, str) or name not in allowed for name in files)
+                or len(files) != len(set(files))):
+            raise ValueError(
+                f"ablation figure manifest scope {stored_scope!r} contains an unowned filename"
+            )
+        validated[stored_scope] = {
+            "files": list(files),
+            **({"updated_at": entry["updated_at"]}
+               if isinstance(entry.get("updated_at"), str) else {}),
+        }
+    return validated
+
+
 def _render_ablation_request(request: Mapping[str, object], output_dir: Path) -> None:
     r"""Render and stage one ablation scope before replacing its manifest-owned outputs."""
     scope = request.get("scope")
     if not isinstance(scope, str) or not scope or Path(scope).name != scope:
         raise ValueError(f"invalid ablation figure scope {scope!r}")
+    portable_path_component_key(scope, field="ablation figure scope")
     invalidate = request.get("invalidate", False)
     if type(invalidate) is not bool:
         raise ValueError("ablation figure invalidate must be an exact boolean")
@@ -249,36 +292,28 @@ def _render_ablation_request(request: Mapping[str, object], output_dir: Path) ->
                 for path in stage.iterdir()
                 if path.is_file() and path.suffix.lower() == ".png"
             )
+        allowed_current = _legacy_ablation_scope_files(scope)
+        if any(name not in allowed_current for name in produced):
+            raise ValueError(
+                f"ablation renderer produced a filename not owned by scope {scope!r}"
+            )
         manifest_path = figure_dir / "ablation_figure_manifest.json"
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            manifest = {}
-        if not isinstance(manifest, dict) or not isinstance(manifest.get("scopes", {}), dict):
-            manifest = {}
-        scopes = dict(manifest.get("scopes", {}))
+        scopes = _validated_ablation_manifest(manifest_path)
         prior_entry = scopes.get(scope, {})
-        prior_files = set(
-            prior_entry.get("files", [])
-            if isinstance(prior_entry, dict) and isinstance(prior_entry.get("files", []), list)
-            else []
-        )
+        prior_files = set(prior_entry.get("files", []))
         # The first manifest-backed render/invalidation must also retire every deterministic output
         # name from pre-manifest releases, including specialized figures and sensitivity summaries.
         prior_files.update(_legacy_ablation_scope_files(scope))
         other_owned = set()
         for other_scope, entry in scopes.items():
-            if other_scope == scope or not isinstance(entry, dict):
+            if other_scope == scope:
                 continue
-            names = entry.get("files", [])
-            if isinstance(names, list):
-                other_owned.update(name for name in names if isinstance(name, str))
+            other_owned.update(entry["files"])
 
         for name in produced:
             os.replace(stage / name, figure_dir / name)
         for name in prior_files - set(produced) - other_owned:
-            if isinstance(name, str) and Path(name).name == name:
-                (figure_dir / name).unlink(missing_ok=True)
+            (figure_dir / name).unlink(missing_ok=True)
         scopes[scope] = {
             "files": produced,
             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),

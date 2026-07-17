@@ -24,6 +24,17 @@ def test_full_covariance_config_derives_diagonal_covariance_flag():
         VFE3Config(family="gaussian_full", diagonal_covariance=True)    # no longer a settable field
 
 
+def test_full_gaussian_fisher_precision_has_no_ridge_on_valid_spd_input():
+    from vfe3.families.gaussian import FullGaussian
+
+    sigma = torch.tensor([[2.0, 0.25], [0.25, 1.0]], dtype=torch.float64)
+    small_eps = FullGaussian.mean_fisher_precision(sigma, eps=1e-12)
+    large_eps = FullGaussian.mean_fisher_precision(sigma, eps=1e-2)
+
+    assert torch.equal(small_eps, large_eps)
+    torch.testing.assert_close(small_eps @ sigma, torch.eye(2, dtype=sigma.dtype))
+
+
 def test_full_covariance_model_runs_end_to_end():
     """The full-covariance pure path runs encode -> E-step -> full decode -> CE, forward+backward."""
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,

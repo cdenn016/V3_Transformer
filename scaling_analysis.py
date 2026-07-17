@@ -21,17 +21,55 @@ collapses seeds keyed on the persisted ``best_val_ppl`` (never a test metric) in
 ``bpc_mean`` carry above.
 """
 
-import os
-if os.environ.get("VFE3_ALLOW_DUPLICATE_OPENMP") == "1":
-    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-
 import csv
 import hashlib
 import json
 import logging
 import math
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple
+
+
+_CHILD_SENTINEL = "_VFE3_SCALING_ANALYSIS_CHILD"
+
+
+def _run_isolated_child() -> int:
+    r"""Run this click-to-run driver in a disposable interpreter and return its status."""
+    script = Path(__file__).resolve()
+    environment = os.environ.copy()
+    environment[_CHILD_SENTINEL] = "1"
+    environment["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    environment["PYTHONUNBUFFERED"] = "1"
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(script)],
+            cwd=str(script.parent),
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"isolated scaling-analysis worker could not start: {exc}", file=sys.stderr)
+        return 1
+    if completed.stdout:
+        print(completed.stdout, end="")
+    if completed.stderr:
+        print(completed.stderr, end="", file=sys.stderr)
+    return int(completed.returncode)
+
+
+if __name__ == "__main__" and os.environ.get(_CHILD_SENTINEL) != "1":
+    raise SystemExit(_run_isolated_child())
+
+if os.environ.get(_CHILD_SENTINEL) == "1":
+    os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import numpy as np
 
@@ -1271,5 +1309,10 @@ def _make_figures(
                     path=str(fig_dir / "estep_capacity.png")))
 
 
-if __name__ == "__main__":
+def main() -> int:
     analyze()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

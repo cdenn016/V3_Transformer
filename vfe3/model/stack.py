@@ -47,6 +47,7 @@ def vfe_stack(
     rope:            Optional[torch.Tensor]    = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
     rope_on_cov:     bool                      = False,  # full-gauge: rotate covariance too
     rope_on_value:   bool                      = True,   # False -> value aggregation uses the un-rotated base
+    training:        bool                      = False,  # explicit module mode for inner-loop controls
 
     capture:         Optional[MStepCapture]        = None,   # out-param: LAST block's converged belief + live prior
     grad_record:     Optional[EStepGradientRecord] = None,   # diag out-param: LAST block's E-step belief-grad norms (None -> no capture)
@@ -124,7 +125,7 @@ def vfe_stack(
                            connection_W=connection_W, connection_M=connection_M,
                            connection_L=connection_L,
                            e_step_gradient=e_step_gradient, rope=rope, rope_on_cov=rope_on_cov,
-                           rope_on_value=rope_on_value, tau=tau_b,
+                           rope_on_value=rope_on_value, training=training, tau=tau_b,
                            capture=capture, grad_record=grad_record,   # each block overwrites; last wins
                            transport_status=transport_status,
                            state_record=(diagnostic_capture.setdefault(

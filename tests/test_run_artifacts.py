@@ -166,6 +166,107 @@ def test_log_metrics_writes_csv_with_header(tmp_path):
     assert len(lines) == 3                                     # header + 2 rows
 
 
+def test_log_metrics_publication_failure_preserves_csv_and_history(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+    art.log_metrics({"step": 1, "val_ppl": 3.0})
+    before_bytes = art.csv_path.read_bytes()
+    before_history = list(art.history)
+
+    def _fail_publish(*args, **kwargs):
+        del args, kwargs
+        raise OSError("publish failed")
+
+    monkeypatch.setattr(run_artifacts, "_atomic_replace", _fail_publish)
+    with pytest.raises(OSError, match="publish failed"):
+        art.log_metrics({"step": 2, "val_ppl": 2.5})
+
+    assert art.csv_path.read_bytes() == before_bytes
+    assert art.history == before_history
+
+
+def test_log_metrics_rejects_a_changed_field_set(tmp_path):
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    art = RunArtifacts(tmp_path / "r", cfg, model)
+    art.log_metrics({"step": 1, "val_ppl": 3.0})
+
+    with pytest.raises(ValueError, match="field set changed"):
+        art.log_metrics({"step": 2, "val_ce": 1.0})
+
+
+def test_atomic_replace_cleans_temp_when_file_fsync_fails(tmp_path, monkeypatch):
+    final = tmp_path / "artifact.json"
+    temporary = tmp_path / ".artifact.json.tmp"
+    temporary.write_text("pending", encoding="utf-8")
+    monkeypatch.setattr(
+        run_artifacts.os,
+        "fsync",
+        lambda _fd: (_ for _ in ()).throw(OSError("fsync failed")),
+    )
+
+    with pytest.raises(OSError, match="fsync failed"):
+        run_artifacts._atomic_replace(final, temporary)
+
+    assert not final.exists()
+    assert not temporary.exists()
+
+
+def test_atomic_replace_fsyncs_through_a_write_capable_handle(tmp_path, monkeypatch):
+    final = tmp_path / "artifact.json"
+    temporary = tmp_path / ".artifact.json.tmp"
+    temporary.write_text("pending", encoding="utf-8")
+    observed_modes = []
+    original_open = run_artifacts.Path.open
+
+    def _track_open(path, mode="r", *args, **kwargs):
+        if path == temporary:
+            observed_modes.append(mode)
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(run_artifacts.Path, "open", _track_open)
+    run_artifacts._atomic_replace(final, temporary)
+
+    assert observed_modes == ["r+b"]
+    assert final.read_text(encoding="utf-8") == "pending"
+
+
+def test_atomic_replace_does_not_retry_after_a_directory_fsync_failure(
+    tmp_path,
+    monkeypatch,
+):
+    final = tmp_path / "artifact.json"
+    temporary = tmp_path / ".artifact.json.tmp"
+    temporary.write_text("pending", encoding="utf-8")
+    replacements = []
+    original_replace = run_artifacts.os.replace
+
+    def _record_replace(source, destination):
+        replacements.append((source, destination))
+        original_replace(source, destination)
+
+    monkeypatch.setattr(run_artifacts.os, "name", "posix")
+    monkeypatch.setattr(run_artifacts.os, "replace", _record_replace)
+    monkeypatch.setattr(
+        run_artifacts.os,
+        "open",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PermissionError("directory fsync denied")
+        ),
+    )
+
+    with pytest.raises(PermissionError, match="directory fsync denied"):
+        run_artifacts._atomic_replace(final, temporary)
+
+    assert replacements == [(temporary, final)]
+    assert final.read_text(encoding="utf-8") == "pending"
+    assert not temporary.exists()
+
+
 def test_history_figures_run_in_disposable_process_without_mutating_parent_openmp_env(
     tmp_path,
     monkeypatch,

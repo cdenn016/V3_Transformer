@@ -64,6 +64,8 @@ logger = logging.getLogger("scaling")
 
 _SCALING_CELL_SCHEMA_VERSION = 2
 _SCALING_REUSE_DIGEST_FIELD = "reuse_contract_sha256"
+_SCALING_OWNER_SCHEMA_VERSION = 1
+_SCALING_OWNER_FILENAME = "scaling_cell_owner.json"
 _SCALING_SUMMARY_DIGEST_FIELD = "scaling_reuse_contract_sha256"
 
 
@@ -926,6 +928,7 @@ def _trusted_scaling_run_dir(
     seed:       int,
 ) -> Path:
     """Return one real direct-child cell tree contained by ``output_dir``."""
+    seed = _require_scaling_seed(seed)
     root = _trusted_scaling_output_dir(output_dir)
     components = (route, label, f"s{seed}")
     current = root
@@ -943,10 +946,108 @@ def _trusted_scaling_run_dir(
         current.relative_to(root)
     except ValueError as exc:
         raise ValueError("scaling cell escaped its owned output tree") from exc
+    _authorize_scaling_cell(current, route, label, seed)
     return current
 
 
-def _reset_stale_scaling_artifacts(run_dir: Path) -> None:
+def _scaling_owner_payload(route: str, label: str, seed: int) -> Dict[str, object]:
+    """Return the exact identity that authorizes destructive scaling-cell cleanup."""
+    portable_path_component_key(route, field="scaling owner route")
+    portable_path_component_key(label, field="scaling owner label")
+    return {
+        "schema_version": _SCALING_OWNER_SCHEMA_VERSION,
+        "route":          route,
+        "label":          label,
+        "seed":           _require_scaling_seed(seed),
+    }
+
+
+def _scaling_owner_is_exact(
+    value:    Mapping[str, object],
+    expected: Mapping[str, object],
+) -> bool:
+    """Whether a decoded owner has exactly the versioned identity schema and Python types."""
+    return bool(
+        set(value) == set(expected)
+        and type(value.get("schema_version")) is int
+        and type(value.get("route")) is str
+        and type(value.get("label")) is str
+        and type(value.get("seed")) is int
+        and value == expected
+    )
+
+
+def _read_regular_scaling_json(path: Path, *, role: str) -> Dict[str, object]:
+    """Read a direct regular, non-reparse JSON object without following a redirect."""
+    if path.is_symlink() or _path_is_reparse_point(path) or not path.is_file():
+        raise ValueError(f"{role} must be a regular non-reparse file")
+    try:
+        if path.resolve(strict=True).parent != path.parent.resolve(strict=True):
+            raise ValueError(f"{role} resolves outside its scaling cell")
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{role} is unreadable") from exc
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{role} must contain a JSON object")
+    return dict(value)
+
+
+def _authorize_scaling_cell(run_dir: Path, route: str, label: str, seed: int) -> Path:
+    r"""Validate exact ownership or promote one exact regular legacy cell marker once."""
+    expected = _scaling_owner_payload(route, label, seed)
+    owner_path = run_dir / _SCALING_OWNER_FILENAME
+    children = list(run_dir.iterdir())
+    if not children:
+        _write_json_atomic(owner_path, expected)
+        return owner_path
+
+    owner_present = (
+        owner_path.exists()
+        or owner_path.is_symlink()
+        or _path_is_reparse_point(owner_path)
+    )
+    if owner_present:
+        owner = _read_regular_scaling_json(
+            owner_path,
+            role="scaling cell ownership sentinel",
+        )
+        if not _scaling_owner_is_exact(owner, expected):
+            raise ValueError(
+                "scaling cell ownership sentinel does not match route, label, and seed"
+            )
+        return owner_path
+
+    legacy_path = run_dir / "scaling_cell.json"
+    try:
+        legacy = _read_regular_scaling_json(
+            legacy_path,
+            role="legacy scaling cell ownership marker",
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "nonempty scaling cell has no valid ownership sentinel or promotable legacy marker"
+        ) from exc
+    if (
+        legacy.get("route") != route
+        or legacy.get("label") != label
+        or type(legacy.get("seed")) is not int
+        or legacy.get("seed") != seed
+    ):
+        raise ValueError(
+            "legacy scaling cell ownership marker does not match route, label, and seed"
+        )
+    _write_json_atomic(owner_path, expected)
+    return owner_path
+
+
+def _reset_stale_scaling_artifacts(
+    run_dir: Path,
+
+    *,
+    route: str,
+    label: str,
+    seed:  int,
+) -> None:
     r"""Remove only runner-owned artifacts before recomputing one deterministic scaling cell."""
     if not run_dir.exists():
         return
@@ -955,6 +1056,7 @@ def _reset_stale_scaling_artifacts(run_dir: Path) -> None:
         raise ValueError("scaling cell directory may not be a symlink or junction")
     if not run_dir.is_dir():
         raise ValueError("scaling cell path exists but is not a directory")
+    _authorize_scaling_cell(run_dir, route, label, seed)
     owned_directories = ("attention", "checkpoints", "figures")
     owned_files = {
         "best_model.pt",
@@ -1052,7 +1154,12 @@ def run_cell(
     try:
         cfg = VFE3Config(**cfg_dict)
     except (ValueError, NotImplementedError, TypeError) as exc:
-        _reset_stale_scaling_artifacts(run_dir)
+        _reset_stale_scaling_artifacts(
+            run_dir,
+            route=cell["route"],
+            label=label,
+            seed=seed,
+        )
         logger.warning("  [config rejected] %s: %s", label, exc)
         return {"label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
                 "error_kind": "config", "error": str(exc), "seed": seed,
@@ -1071,7 +1178,12 @@ def run_cell(
                 "error_kind": None, "seed": seed, "cached": True,
                 **metrics}
 
-    _reset_stale_scaling_artifacts(run_dir)
+    _reset_stale_scaling_artifacts(
+        run_dir,
+        route=cell["route"],
+        label=label,
+        seed=seed,
+    )
 
     pred_n, n_gen = predict_n_params(cfg)
     seed_everything(cfg.seed, deterministic=cfg.deterministic)

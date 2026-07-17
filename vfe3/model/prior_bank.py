@@ -401,9 +401,9 @@ class PriorBank(nn.Module):
         # and the pure path is param-free. s drawn BEFORE r preserves the existing lambda_h>0 RNG order
         # (byte-identical to the hyper-prior-only build). s init mirrors the belief tables (small mu,
         # sigma matching sigma_init); r init: mu=0, sigma matching sigma_init -- so s != r at init
-        # (KL(s||r) > 0, the channel has a gradient). NOTE: s_i is NOT coupled to the belief q on
-        # either path (the gamma transport is tied+detached); the s->q coupling and the s-channel
-        # E-step update are DEFERRED.
+        # (KL(s||r) > 0, the channel has a gradient). When prior_source='model_channel', these same
+        # tables supply the belief prior p, including their packed full covariance; s_e_step may
+        # additionally refine that prior before the belief-channel E-step.
         if lambda_h > 0.0 or lambda_gamma > 0.0 or prior_source == "model_channel" or s_e_step:
             self.s_mu_embed        = nn.Parameter(mu_init_std * torch.randn(vocab_size, K))
             self.s_sigma_log_embed = nn.Parameter(torch.full((vocab_size, K), sigma_log_init))
@@ -575,10 +575,9 @@ class PriorBank(nn.Module):
         strict-lower Cholesky into the full SPD covariance L L^T as (B, N, K, K). Available on the
         active-model-channel path (lambda_h>0, lambda_gamma>0, prior_source='model_channel', or
         s_e_step, where the s tables are created); consumed as ``get_family(cfg.family)(s_mu,
-        s_sigma)`` by the hyper-prior term lambda_h*KL(s_i||r). Through this consumer s_i is NOT
-        coupled into the belief q, so it stays predictively inert. The s->q coupling is a SEPARATE
-        path: prior_source=='model_channel' routes the belief prior to the SAME s tables via
-        _prior_mu_table/_prior_sigma_log_table (which read the DIAGONAL log-variance table).
+        s_sigma)`` by the hyper-prior term lambda_h*KL(s_i||r). The s->q coupling is a separate
+        path: ``prior_source='model_channel'`` routes the belief prior to these same s tables,
+        including the packed full covariance when the configured family is ``gaussian_full``.
         """
         s_mu = self.s_mu_embed[token_ids]                                       # (B, N, K)
         if self._s_cov_kind == "full":
@@ -1391,6 +1390,23 @@ class LinearFusedCECallable(Protocol):
 FusedCECallable = GeometricFusedCECallable | LinearFusedCECallable
 
 
+def _encode_prior_sigma(
+    pb:        PriorBank,
+    token_ids: torch.Tensor,             # (B, N) integer token ids
+) -> torch.Tensor:
+    """Look up the configured belief prior covariance without discarding model-channel rank."""
+    log_diag = pb._prior_sigma_log_table()[token_ids]                    # (B, N, K)
+    if pb.diagonal_covariance:
+        return bounded_variance_from_log(log_diag, eps=pb.eps)
+    if pb.prior_source == "model_channel":
+        return covariance_from_packed(
+            log_diag,
+            pb.s_sigma_lower_embed[token_ids],
+            eps=pb.eps,
+        )                                                                # (B, N, K, K)
+    return torch.diag_embed(bounded_variance_from_log(log_diag, eps=pb.eps))
+
+
 @register_encode("per_token")
 def _encode_per_token(
     pb:        PriorBank,
@@ -1398,19 +1414,15 @@ def _encode_per_token(
 ) -> BeliefState:
     r"""Per-token table lookup: token_ids -> (mu_v, sigma_v, phi_v) as the belief q = p.
 
-    Diagonal family: sigma is the (B, N, K) variance vector. Full family
-    (``diagonal_covariance=False``): the same per-token variances are embedded as a
-    DIAGONAL full covariance (B, N, K, K) -- the SPD starting point the full-covariance
-    E-step (full sandwich transport + affine-invariant SPD retraction) then evolves
-    off-diagonal mass into. The mean / gauge tables are shared across families.
+    Diagonal family: sigma is the (B, N, K) variance vector. A full token-table prior promotes its
+    diagonal variances to (B, N, K, K). A full ``model_channel`` prior reconstructs the complete
+    packed s covariance, so the s-to-p route preserves learned correlations. The mean and gauge
+    tables are shared across families.
     """
     mu = pb._prior_mu_table()[token_ids]                                     # (B, N, K) prior (s if model_channel)
-    sigma_diag = bounded_variance_from_log(
-        pb._prior_sigma_log_table()[token_ids], eps=pb.eps,
-    )                                                                                 # (B, N, K), sigma > 0
+    sigma = _encode_prior_sigma(pb, token_ids)                               # (B,N,K) or (B,N,K,K)
     phi = pb.phi_embed[token_ids]                                            # (B, N, n_gen)
     omega = pb._omega_lookup(token_ids) if getattr(pb, "gauge_parameterization", "phi") == "omega_direct" else None
-    sigma = sigma_diag if pb.diagonal_covariance else torch.diag_embed(sigma_diag)
     return BeliefState(mu=mu, sigma=sigma, phi=phi, omega=omega)
 
 
@@ -1430,13 +1442,10 @@ def _encode_per_token_additive(
     equivariant; use with ``transport_mode='flat'`` and ``pos_phi='none'`` so no other channel transports.
     """
     mu = pb._prior_mu_table()[token_ids]                                     # (B, N, K) prior (s if model_channel)
-    sigma_diag = bounded_variance_from_log(
-        pb._prior_sigma_log_table()[token_ids], eps=pb.eps,
-    )                                                                                 # (B, N, K)
+    sigma = _encode_prior_sigma(pb, token_ids)                               # (B,N,K) or (B,N,K,K)
     phi_code = pb.phi_embed[token_ids]                                       # (B, N, n_gen) learned table
     mu = mu + phi_code @ pb.additive_R.t()                                   # (B, N, K) structure-free shift
     phi = torch.zeros_like(phi_code)                                         # Omega = I: no gl(g) transport
-    sigma = sigma_diag if pb.diagonal_covariance else torch.diag_embed(sigma_diag)
     return BeliefState(mu=mu, sigma=sigma, phi=phi)
 
 

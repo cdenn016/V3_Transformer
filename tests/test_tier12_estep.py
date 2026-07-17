@@ -193,11 +193,12 @@ def test_randomize_off_loop_count_unchanged(device):
     assert len(traj) == 4                              # initial F + one per iteration
 
 
-def test_randomized_depth_samples_t_when_grad_enabled(device):
+def test_randomized_depth_samples_t_when_training(device):
     b0, mu_p, sigma_p, grp = _belief_and_prior(device)
     assert torch.is_grad_enabled()                     # the training-forward discriminator
     _, traj = e_step(b0, mu_p, sigma_p, grp, n_iter=5, tau=1.5, e_phi_lr=0.0,
                      randomize_e_steps=True, e_steps_min=2, e_steps_max=2,
+                     training=True,
                      return_trajectory=True)
     assert len(traj) == 3                              # T == 2, not n_iter == 5
 
@@ -209,6 +210,18 @@ def test_randomized_depth_inert_at_eval(device):
                          randomize_e_steps=True, e_steps_min=1, e_steps_max=1,
                          return_trajectory=True)
     assert len(traj) == 4                              # eval keeps the deterministic n_iter
+
+
+def test_detached_training_still_randomizes_depth(device):
+    b0, mu_p, sigma_p, grp = _belief_and_prior(device)
+    with torch.no_grad():
+        _, traj = e_step(
+            b0, mu_p, sigma_p, grp,
+            n_iter=5, tau=1.5, e_phi_lr=0.0,
+            randomize_e_steps=True, e_steps_min=2, e_steps_max=2,
+            training=True, return_trajectory=True,
+        )
+    assert len(traj) == 3
 
 
 def test_halt_tol_exits_after_one_iteration_at_eval(device):
@@ -223,7 +236,7 @@ def test_backprop_last_truncates_but_signal_flows(device):
     b0, mu_p, sigma_p, grp = _belief_and_prior(device)
     mu_p = mu_p.clone().requires_grad_(True)
     out = e_step(b0, mu_p, sigma_p, grp, n_iter=3, tau=1.5, e_phi_lr=0.0,
-                 e_steps_backprop_last=1)
+                 e_steps_backprop_last=1, training=True)
     out.mu.sum().backward()
     assert mu_p.grad is not None and torch.isfinite(mu_p.grad).all()
     assert mu_p.grad.abs().sum() > 0                   # the last-k window still reaches the prior
@@ -237,7 +250,7 @@ def test_backprop_last_truncates_transport_gradient_to_phi(device):
     phi_leaf = b0.phi.detach().clone().requires_grad_(True)
     belief = b0._replace(phi=phi_leaf)
     out = e_step(belief, mu_p, sigma_p, grp, n_iter=3, tau=1.5, e_phi_lr=0.0,
-                 e_steps_backprop_last=1)
+                 e_steps_backprop_last=1, training=True)
     out.mu.sum().backward()
     assert mu_p.grad is not None and mu_p.grad.abs().sum() > 0              # the last-k window still reaches the prior
     assert phi_leaf.grad is None or float(phi_leaf.grad.abs().sum()) == 0.0   # transport leak through the hoist severed
