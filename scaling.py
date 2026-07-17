@@ -334,7 +334,7 @@ config = dict(
     m_p_sigma_lr              = 0.01,
     m_phi_lr                  = 0.01,
 
-    m_s_phi_lr                = 0.016,         # M-step LR for independent model-channel frame (phi_tilde)
+    m_s_phi_lr                = 0.007,         # M-step LR for independent model-channel frame (phi_tilde)
     
     weight_decay              = 0.02,   #0.03
     phi_weight_decay          = 0.03, #0.03
@@ -351,8 +351,8 @@ config = dict(
     norm_type_block           = "none",             # "none" | "mahalanobis"
     norm_type_final           = "none",              # "none" | "mahalanobis"
     
-    prior_handoff_rho         = 0,                 # 1.0 = full flow; 0.0 = priors frozen
-    prior_handoff_sigma       = 0,                 # sigma damping in [0,1] (0.0 = frozen at embedding)
+    prior_handoff_rho         = 1,                 # 1.0 = full flow; 0.0 = priors frozen
+    prior_handoff_sigma       = 0.1,                 # sigma damping in [0,1] (0.0 = frozen at embedding)
     
     #################################
     #        Numerical Safety

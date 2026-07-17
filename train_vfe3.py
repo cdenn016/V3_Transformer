@@ -84,8 +84,8 @@ config = dict(
     
     max_seq_len               = 128,                 # N, context length
     
-    batch_size                = 64,
-    max_steps                 = 15000,
+    batch_size                = 256,
+    max_steps                 = 105000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
