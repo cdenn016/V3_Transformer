@@ -307,12 +307,6 @@ def test_pullback_group_bch_backtracks_and_certifies_right_product_order(
         torch.linalg.matrix_norm(exp_candidate - reversed_product)
         / torch.linalg.matrix_norm(reversed_product)
     )
-    committed_phi = candidate.candidate_phi.to(dtype=torch.float32)
-    committed_exp = torch.linalg.matrix_exp(embedded(committed_phi.double()))
-    committed_residual = (
-        torch.linalg.matrix_norm(committed_exp - right)
-        / torch.linalg.matrix_norm(right)
-    )
     assert torch.linalg.matrix_norm(embedded(phi)).item() == pytest.approx(chart_norm, abs=1e-12)
     assert candidate.backtracking_reductions.item() == reductions
     assert candidate.group_product_residual.item() == pytest.approx(right_residual, rel=2e-6)
@@ -321,8 +315,126 @@ def test_pullback_group_bch_backtracks_and_certifies_right_product_order(
     assert actual_reversed.item() == pytest.approx(reversed_residual, rel=5e-4)
     record_property("current_chart_norm", chart_norm)
     record_property("float64_staging_residual", float(actual_right))
-    record_property("float32_committed_residual", float(committed_residual))
-    assert committed_residual.item() <= 5.0e-6
+
+
+_REAL_COMMIT_CASES = {
+    3.0: {
+        "phi": [
+            0.4461370124222645,
+            -0.37866876575372294,
+            1.1203006449654396,
+            -2.7207532407183694,
+        ],
+        "delta": [
+            0.0075751275839514645,
+            -0.002453059541722277,
+            -0.003516904099976695,
+            -0.002529014357447788,
+        ],
+    },
+    5.0: {
+        "phi": [
+            0.19176642751290957,
+            -1.411275433700944,
+            3.477796870171524,
+            -3.297947273280199,
+        ],
+        "delta": [
+            0.008133453045635446,
+            0.0015903479064029997,
+            -0.0025065446684178387,
+            -0.001781968201968022,
+        ],
+    },
+}
+
+
+def _real_optimizer_commit_case(monkeypatch, chart_norm):
+    import vfe3.gauge_optim as gauge_optim
+
+    case = _REAL_COMMIT_CASES[chart_norm]
+    group = get_group("glk")(K=2, dtype=torch.float32)
+    initial = torch.zeros(2, 4, dtype=torch.float32)
+    initial[0] = torch.tensor(case["phi"], dtype=torch.float32)
+    parameter = nn.Parameter(initial.clone())
+    inactive_before = parameter.detach()[1].clone()
+    delta = torch.tensor([case["delta"]], dtype=torch.float64)
+    monkeypatch.setattr(
+        gauge_optim,
+        "pullback_group_direction",
+        lambda *args, **kwargs: _fixed_direction(-delta),
+    )
+    staged = []
+    original_stage = gauge_optim.stage_pullback_group_candidate
+
+    def _stage_spy(*args, **kwargs):
+        candidate = original_stage(*args, **kwargs)
+        staged.append(candidate)
+        return candidate
+
+    monkeypatch.setattr(gauge_optim, "stage_pullback_group_candidate", _stage_spy)
+    optimizer = _make_optimizer(
+        [{"params": [parameter], "lr": 1.0, "pullback_group": True, "weight_decay": 0.0}],
+        group,
+        trust_radius=1.0,
+        chart_max_norm=6.0,
+    )
+    parameter.grad = torch.zeros_like(parameter)
+    parameter.grad[0] = 1.0
+    optimizer.step()
+
+    assert len(staged) == 1
+    candidate = staged[0]
+    assert candidate.candidate_phi.dtype == torch.float64
+    stored = parameter.detach()[0]
+    staged_cast = candidate.candidate_phi[0].to(dtype=parameter.dtype)
+    initial_active64 = initial[0].double().unsqueeze(0)
+    factor_scale = candidate.trust_scale / torch.pow(
+        torch.tensor(2.0, dtype=torch.float64),
+        candidate.backtracking_reductions,
+    )
+    right_coordinates = (
+        -candidate.direction.xi * factor_scale.unsqueeze(-1)
+    )
+    generators64 = group.generators.double()
+    embedded = lambda value: torch.einsum("...a,aij->...ij", value, generators64)
+    stored_exp = torch.linalg.matrix_exp(embedded(stored.double().unsqueeze(0)))
+    initial_exp = torch.linalg.matrix_exp(embedded(initial_active64))
+    right_factor_exp = torch.linalg.matrix_exp(embedded(right_coordinates))
+    right_product = initial_exp @ right_factor_exp
+    reversed_product = right_factor_exp @ initial_exp
+    right_residual = (
+        torch.linalg.matrix_norm(stored_exp - right_product)
+        / torch.linalg.matrix_norm(right_product)
+    )
+    reversed_residual = (
+        torch.linalg.matrix_norm(stored_exp - reversed_product)
+        / torch.linalg.matrix_norm(reversed_product)
+    )
+    return {
+        "stored_matches_staged_cast": torch.equal(stored, staged_cast),
+        "inactive_unchanged": torch.equal(parameter.detach()[1], inactive_before),
+        "right_residual": float(right_residual),
+        "reversed_residual": float(reversed_residual),
+        "observed_chart_norm": float(torch.linalg.vector_norm(initial[0].double())),
+    }
+
+
+@pytest.mark.parametrize("chart_norm", [3.0, 5.0])
+def test_optimizer_commit_is_single_float32_cast_with_certified_right_product(
+    monkeypatch,
+    record_property,
+    chart_norm,
+):
+    committed = _real_optimizer_commit_case(monkeypatch, chart_norm)
+    record_property("current_chart_norm", committed["observed_chart_norm"])
+    record_property("float32_committed_residual", committed["right_residual"])
+    record_property("float32_committed_reversed_residual", committed["reversed_residual"])
+    assert committed["observed_chart_norm"] == pytest.approx(chart_norm, abs=2.0e-7)
+    assert committed["stored_matches_staged_cast"]
+    assert committed["inactive_unchanged"]
+    assert committed["right_residual"] <= 5.0e-6
+    assert committed["reversed_residual"] >= 5.0e-5
 
 
 def test_pullback_group_candidate_rejects_chart_bound(monkeypatch):

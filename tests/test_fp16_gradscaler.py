@@ -118,8 +118,10 @@ def test_fp16_with_pullback_group_steps_the_k10_two_gl5_frame(monkeypatch):
 def test_fp16_pullback_overflow_preserves_all_phi_factors_and_clock(monkeypatch):
     cfg = _tiny_cfg(
         amp_dtype="fp16",
+        embed_dim=10,
         gauge_group="block_glk",
         m_phi_update_mode="pullback_group",
+        n_heads=2,
         phi_precond_mode="pullback_per_block",
         transport_chart_max_norm=6.0,
         pos_phi="learned",
@@ -130,6 +132,7 @@ def test_fp16_pullback_overflow_preserves_all_phi_factors_and_clock(monkeypatch)
     )
     torch.manual_seed(0)
     model = VFEModel(cfg)
+    assert model.group.irrep_dims == [5, 5]
     optimizer = build_optimizer(model, cfg)
     scheduler = _sched(optimizer)
     scaler = torch.amp.GradScaler(device="cpu", enabled=True, init_scale=128.0)

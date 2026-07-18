@@ -5,6 +5,7 @@ import types
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from vfe3.config import VFE3Config
 import vfe3.gauge_optim as gauge_optim
@@ -156,6 +157,122 @@ def test_completed_outer_loss_not_reconstructed_ce_supplies_phi_covector(record_
     assert float((loss_fd - ce_fd).abs()) >= 0.5 * float(autograd_directional.abs())
 
 
+def _processed_regularized_phi_covector(
+    model:    VFEModel,
+    tokens:   torch.Tensor,
+    targets:  torch.Tensor,
+    objective: str,
+    clip:      float,
+) -> tuple[torch.Tensor, float]:
+    optimizer = build_optimizer(model, model.cfg)
+    scaler = torch.amp.GradScaler(device="cpu", enabled=True, init_scale=128.0)
+    optimizer.zero_grad(set_to_none=True)
+    torch.manual_seed(0)
+    logits, completed_loss, returned_ce = model(tokens, targets)
+    if objective == "completed_loss":
+        selected = completed_loss
+    else:
+        assert objective == "reconstructed_ce"
+        assert logits is not None
+        flat_logits = logits.reshape(-1, model.cfg.vocab_size).float()
+        flat_targets = targets.reshape(-1)
+        n_valid = (flat_targets != -100).sum().clamp_min(1)
+        selected = F.cross_entropy(
+            flat_logits,
+            flat_targets,
+            ignore_index=-100,
+            reduction="sum",
+        ) / n_valid
+        torch.testing.assert_close(selected.detach(), returned_ce, rtol=0.0, atol=0.0)
+    scaler.scale(selected).backward()
+    scaler.unscale_(optimizer)
+    pre_clip_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), clip))
+    gradient = model.prior_bank.phi_embed.grad.detach().clone()
+    active = gradient.abs().sum(dim=-1) > 0
+    return gradient[active].double(), pre_clip_norm
+
+
+def _production_regularized_covectors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+    cfg = _pullback_cfg(
+        mass_phi=3.0,
+        use_prior_bank=True,
+        decode_mode="diagonal",
+        randomize_e_steps=True,
+        e_steps_min=1,
+        e_steps_max=2,
+        amp_dtype="fp16",
+    )
+    torch.manual_seed(53)
+    template = VFEModel(cfg)
+    tokens, targets = _fixed_batch()
+    direction = _seeded_active_direction(template.prior_bank.phi_embed, tokens)
+    with torch.no_grad():
+        active_rows = torch.unique(tokens)
+        template.prior_bank.phi_embed[active_rows].add_(0.08 * direction[active_rows])
+    completed_model = copy.deepcopy(template)
+    ce_model = copy.deepcopy(template)
+    actual_model = copy.deepcopy(template)
+    clip = 0.01
+    completed, completed_pre_clip = _processed_regularized_phi_covector(
+        completed_model,
+        tokens,
+        targets,
+        "completed_loss",
+        clip,
+    )
+    reconstructed_ce, ce_pre_clip = _processed_regularized_phi_covector(
+        ce_model,
+        tokens,
+        targets,
+        "reconstructed_ce",
+        clip,
+    )
+
+    received: list[torch.Tensor] = []
+    original_direction = gauge_optim.pullback_group_direction
+
+    def _direction_spy(grad_phi, *args, **kwargs):
+        received.append(grad_phi.detach().clone())
+        return original_direction(grad_phi, *args, **kwargs)
+
+    monkeypatch.setattr(gauge_optim, "pullback_group_direction", _direction_spy)
+    actual_optimizer = build_optimizer(actual_model, actual_model.cfg)
+    actual_scaler = torch.amp.GradScaler(device="cpu", enabled=True, init_scale=128.0)
+    torch.manual_seed(0)
+    train_step(
+        actual_model,
+        actual_optimizer,
+        _scheduler(actual_optimizer),
+        tokens,
+        targets,
+        grad_clip=clip,
+        scaler=actual_scaler,
+    )
+    assert len(received) == 1
+    return received[0], completed, reconstructed_ce, completed_pre_clip, ce_pre_clip
+
+
+def test_train_step_consumes_completed_regularized_loss_covector_at_geometry_seam(
+    monkeypatch: pytest.MonkeyPatch,
+    record_property,
+) -> None:
+    received, completed, reconstructed_ce, completed_pre_clip, ce_pre_clip = (
+        _production_regularized_covectors(monkeypatch)
+    )
+    torch.testing.assert_close(received, completed, rtol=0.0, atol=0.0)
+    separation = torch.linalg.vector_norm(received - reconstructed_ce)
+    record_property("regularized_received_covector_norm", float(torch.linalg.vector_norm(received)))
+    record_property("regularized_ce_covector_norm", float(torch.linalg.vector_norm(reconstructed_ce)))
+    record_property("regularized_covector_separation", float(separation))
+    record_property("regularized_completed_pre_clip_norm", completed_pre_clip)
+    record_property("regularized_ce_pre_clip_norm", ce_pre_clip)
+    assert separation >= (
+        0.1 * torch.linalg.vector_norm(received)
+    )
+
+
 def _pullback_cfg(**overrides: object) -> VFE3Config:
     values: dict[str, object] = {
         "m_phi_update_mode": "pullback_group",
@@ -185,7 +302,8 @@ def test_geometry_receives_exact_post_unscale_post_clip_covector(
     reference_loss = reference(tokens, targets)[1]
     reference_scaler.scale(reference_loss).backward()
     reference_scaler.unscale_(reference_optimizer)
-    torch.nn.utils.clip_grad_norm_(reference.parameters(), clip)
+    pre_clip_norm = float(torch.nn.utils.clip_grad_norm_(reference.parameters(), clip))
+    assert pre_clip_norm > clip
     expected_full = reference.prior_bank.phi_embed.grad.detach().clone()
     active = expected_full.abs().sum(dim=-1) > 0
     expected = expected_full[active].double()
@@ -212,6 +330,7 @@ def test_geometry_receives_exact_post_unscale_post_clip_covector(
 
     assert len(received) == 1
     torch.testing.assert_close(received[0], expected, rtol=0.0, atol=0.0)
+    record_property("pre_clip_global_norm", pre_clip_norm)
     record_property("processed_phi_covector_norm", float(torch.linalg.vector_norm(expected)))
     assert not torch.isclose(torch.linalg.vector_norm(received[0]), torch.tensor(1.0, dtype=torch.float64))
 
