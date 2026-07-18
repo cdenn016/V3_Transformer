@@ -39,11 +39,11 @@ def e_step_shared_kwargs(
     extractors dropped ``e_step_update`` / ``mm_damping`` / ``lambda_twohop`` /
     ``skip_belief_sigma_update``, which the committed baselines set off-default). Runtime objects
     (tau, lambda_beta, log_prior, rope, connections, gauge_parameterization) stay per-call-site;
-    the Tier-1 transport-numerics toggles (exp_fp64_*, transport_mean_per_head) stay explicit
-    ``e_step`` parameters, deliberately off this bag (the diagnostic F keeps default transport
-    numerics). ``free_energy_value`` declares every iteration-only key here as an explicit
-    accept-and-ignore parameter, so one bag serves both consumers and a misspelled knob still
-    raises ``TypeError``.
+    The per-head mean contraction stays an explicit internal ``e_step`` parameter because the
+    diagnostic F does not consume it. ``reuse_pairwise_kl_stats`` is a mandatory shared argument,
+    so both production iteration and its diagnostic F request the same pairwise-statistics reuse.
+    ``free_energy_value`` declares every iteration-only key here as an explicit accept-and-ignore
+    parameter, so one bag serves both consumers and a misspelled knob still raises ``TypeError``.
     """
     return dict(
         renyi_order=cfg.renyi_order, value=cfg.lambda_alpha,
@@ -64,7 +64,7 @@ def e_step_shared_kwargs(
         lambda_twohop=cfg.lambda_twohop,
         skip_belief_sigma_update=cfg.skip_belief_sigma_update,
         compile_pair_kernel=cfg.compile_pair_kernel,
-        reuse_pairwise_kl_stats=cfg.reuse_pairwise_kl_stats,
+        reuse_pairwise_kl_stats=True,
     )
 
 
@@ -113,8 +113,7 @@ def vfe_block(
     if tau is None:
         tau = attention_tau(_as_coeff(cfg.kappa_beta, belief.mu.device), group.irrep_dims)
     compact_phi_blocks = (
-        cfg.compact_phi_block_transport
-        and gauge_parameterization == "phi"
+        gauge_parameterization == "phi"
         and cfg.transport_mode == "flat"
         and cfg.phi_reflection == "off"
         and group.phi_coordinate_layout == "block_head_row_major"
@@ -129,7 +128,7 @@ def vfe_block(
         grad_record=grad_record, state_record=state_record,
         log_prior=log_prior,
         rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
-        transport_mean_per_head=cfg.transport_mean_per_head,
+        transport_mean_per_head=True,
         compact_phi_block_transport=compact_phi_blocks,
         exp_fp64_mode=cfg.exp_fp64_mode,
         exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,

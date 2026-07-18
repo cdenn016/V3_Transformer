@@ -2026,7 +2026,7 @@ def _factored_per_head_mean(
     mu:       torch.Tensor,               # (..., N, K) source (key, index j) means
 ) -> torch.Tensor:                        # (..., N, N, K) transported means
     r"""Per-head mean transport from the factored exps (the mean twin of
-    ``_factored_diagonal_covariance``; cfg.transport_mean_per_head, Tier-1 perf toggle).
+    ``_factored_diagonal_covariance``; active production transport numerics).
 
     For each head h on coordinates [start:end] the block Omega^(h)_ij = exp(phi_i)^(h) exp(-phi_j)^(h)
     is the only nonzero part of Omega on head h's rows (the off-block entries are exactly 0.0), so

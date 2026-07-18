@@ -712,11 +712,10 @@ class VFEModel(nn.Module):
         return torch.autocast(device_type=device.type, enabled=False)
 
     def _compact_phi_blocks_enabled(self) -> bool:
-        r"""Whether this model is on the canonical route supported by the packed phi fast path."""
+        r"""Whether this model is on the canonical route supported by packed phi transport."""
         cfg = self.cfg
         return (
-            cfg.compact_phi_block_transport
-            and cfg.gauge_parameterization == "phi"
+            cfg.gauge_parameterization == "phi"
             and cfg.transport_mode == "flat"
             and cfg.phi_reflection == "off"
             and self.group.phi_coordinate_layout == "block_head_row_major"
@@ -899,11 +898,11 @@ class VFEModel(nn.Module):
             **self._model_channel_connection_kwargs(),
             e_step_gradient=e_step_gradient,
             oracle_unroll_grad=cfg.oracle_unroll_grad,
-            # Tier-1 transport perf toggles: the s-channel E-step shares the flat transport
-            # numerics with the belief channel (all default OFF/byte-identical).
-            transport_mean_per_head=cfg.transport_mean_per_head,
+            # The s-channel E-step shares the active per-head transport numerics with the belief
+            # channel; packed transport remains gated to the eligible canonical phi route.
+            transport_mean_per_head=True,
             compact_phi_block_transport=self._compact_phi_blocks_enabled(),
-            reuse_pairwise_kl_stats=cfg.reuse_pairwise_kl_stats,
+            reuse_pairwise_kl_stats=True,
             exp_fp64_mode=cfg.exp_fp64_mode,
             exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
             transport_chart_max_norm=cfg.transport_chart_max_norm,
@@ -1062,9 +1061,9 @@ class VFEModel(nn.Module):
                     right_phi=beliefs.right_phi,
                     reflection=beliefs.reflection if beliefs.reflection is not None else None,   # phi-path reflection fold (None -> byte-identical)
                     clamp_monitor=self.cfg.transport_clamp_monitor,
-                    # Tier-1 transport perf toggles: the shared build must carry the same island
-                    # keying / per-head mean flag the per-e_step hoists would have used.
-                    transport_mean_per_head=self.cfg.transport_mean_per_head,
+                    # The shared build carries the same active per-head mean contraction as the
+                    # per-E-step transport hoists.
+                    transport_mean_per_head=True,
                     compact_phi_block_transport=self._compact_phi_blocks_enabled(),
                     exp_fp64_mode=self.cfg.exp_fp64_mode,
                     exp_fp64_norm_threshold=self.cfg.exp_fp64_norm_threshold,
@@ -1243,8 +1242,8 @@ class VFEModel(nn.Module):
         only the tied-gamma fold varies with the proposed frame -- then evaluates ``free_energy_value``
         with the FIXED captured tau (``context.tau``, the final block's entry-derived query-adaptive
         temperature), the FIXED handoff-adjusted prior moments (``context.mu_p``/``context.sigma_p``),
-        the honored ``lambda_twohop``, and the ACTIVE transport/RoPE/numerics controls
-        (``transport_mode``, ``connection_W``/``M``/``L``, cocycle/link/clamp, ``transport_mean_per_head``,
+        the honored ``lambda_twohop``, and the active transport/RoPE numerics
+        (``transport_mode``, ``connection_W``/``M``/``L``, cocycle/link/clamp, the per-head mean contraction,
         ``context.rope`` + ``rope_on_cov``/``rope_on_value``, ``exp_fp64_mode``/``exp_fp64_norm_threshold``).
         Current and trial thus differ ONLY in the proposed frame/reflection, so the Metropolis DeltaF is
         the exact change in the joint F under the block move.
@@ -1284,7 +1283,7 @@ class VFEModel(nn.Module):
                 cocycle_relaxation=cfg.cocycle_relaxation,
                 link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
                 clamp_monitor=cfg.transport_clamp_monitor,
-                transport_mean_per_head=cfg.transport_mean_per_head,
+                transport_mean_per_head=True,
                 rope=context.rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
                 exp_fp64_mode=cfg.exp_fp64_mode, exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
                 transport_chart_max_norm=cfg.transport_chart_max_norm,
@@ -1876,7 +1875,7 @@ class VFEModel(nn.Module):
                                        right_phi=self._pos_phi_right(phi),
                                        mu=(s_mu if tm in _TRANSPORT_NEEDS_MU else None),
                                        sigma=(s_sigma if tm in _TRANSPORT_NEEDS_SIGMA else None),
-                                       transport_mean_per_head=cfg.transport_mean_per_head,
+                                       transport_mean_per_head=True,
                                        compact_phi_block_transport=self._compact_phi_blocks_enabled(),
                                        rope=self._rope_rotation(n_pos, token_ids.device),
                                        rope_on_cov=cfg.rope_full_gauge,
@@ -2485,7 +2484,7 @@ class VFEModel(nn.Module):
                 belief.phi,
                 self.group,
                 compact_phi_block_transport=True,
-                transport_mean_per_head=cfg.transport_mean_per_head,
+                transport_mean_per_head=True,
                 exp_fp64_mode=cfg.exp_fp64_mode,
                 exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
                 **kwargs,

@@ -300,7 +300,7 @@ def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -
     (``e_step_shared_kwargs``, audit 2026-07-12 N5 -- previously a hand-rolled copy that silently
     dropped ``e_step_update``/``mm_damping``/``lambda_twohop``/``skip_belief_sigma_update``) plus
     the runtime extras ``vfe_block``/``e_step`` bind per call (tau, step sizes, connections,
-    transport toggles, log_prior, rope)."""
+    active per-head transport contraction, log_prior, rope)."""
     cfg = model.cfg
     kw = e_step_shared_kwargs(cfg, _model_device(model))
     kw.update(
@@ -312,7 +312,7 @@ def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -
         connection_M=getattr(model, "connection_M", None),
         connection_L=getattr(model, "connection_L", None),
         compact_phi_block_transport=model._compact_phi_blocks_enabled(),
-        transport_mean_per_head=cfg.transport_mean_per_head,
+        transport_mean_per_head=True,
         exp_fp64_mode=cfg.exp_fp64_mode,
         exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
         transport_chart_max_norm=cfg.transport_chart_max_norm,
