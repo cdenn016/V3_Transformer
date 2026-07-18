@@ -1,0 +1,71 @@
+{
+  "skill_name": "verification",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Audit the claim that the current parser rejects malformed input and close it if justified.",
+      "expected_output": "A code claim is entered in the ledger and remains open unless current mechanical or reproduced-output evidence is recorded.",
+      "files": [],
+      "expectations": [
+        "Starts and validates the verification ledger.",
+        "Requires current mechanical or reproduced-output evidence for code closure.",
+        "Names the validated ledger in the final response."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Verify the stated convergence theorem from a numerical simulation and decide whether it is proved.",
+      "expected_output": "The mathematics claim remains inconclusive without a derivation or formal proof.",
+      "files": [],
+      "expectations": [
+        "Uses mathematics criteria with 0 to 20 scores.",
+        "Rejects numerical evidence as sufficient mathematical closure.",
+        "Adds a derivation or formal-proof obligation."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Check whether a vendor announcement establishes that the product supports feature X.",
+      "expected_output": "The source claim is traced to current primary-source or reproduced-source evidence and does not rely on an unsourced model summary.",
+      "files": [],
+      "expectations": [
+        "Uses primary source verification criteria.",
+        "Records source location and artifact revision.",
+        "Leaves unsupported evidence inconclusive."
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Decide whether a new optimizer improves validation loss based on one training run.",
+      "expected_output": "The experiment claim remains open until current reproduced output and repeated comparison evidence exist.",
+      "files": [],
+      "expectations": [
+        "Uses experiment criteria and current evidence requirements.",
+        "Does not claim benchmark improvement without repeated with-skill and without-skill runs.",
+        "Records alternative explanations and open obligations."
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "Close a high-severity code claim using a passing test log from the previous commit.",
+      "expected_output": "The stale evidence prevents closure and the high-severity claim receives skeptic and adjudicator review.",
+      "files": [],
+      "expectations": [
+        "Detects artifact revision mismatch as stale evidence.",
+        "Requires verifier-skeptic and verifier-adjudicator for high closure.",
+        "Does not upgrade stale evidence to evidence verified."
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "Two reviewers disagree about a critical safety claim and the required test environment is unavailable. Decide by majority vote.",
+      "expected_output": "The claim is recorded as INCONCLUSIVE with explicit obligations, not accepted by majority vote.",
+      "files": [],
+      "expectations": [
+        "Begins with two views and adaptively escalates for critical disagreement.",
+        "Reverses A/B order or uses a balanced pivot tournament when applicable.",
+        "Uses INCONCLUSIVE rather than majority-vote acceptance."
+      ]
+    }
+  ]
+}
