@@ -14,7 +14,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "domain", "statement", "severity", "state", "artifact_revision", "criteria", "views", "evidence", "counterevidence", "verifiers", "open_obligations", "evidence_invalidated"],
+        "required": ["id", "domain", "statement", "severity", "state", "artifact_revision", "criteria", "escalation_triggers", "views", "evidence", "counterevidence", "verifiers", "open_obligations", "evidence_invalidated"],
         "properties": {
           "id": {"type": "string", "minLength": 1},
           "domain": {"enum": ["code", "experiment", "mathematics", "evidence", "research", "source", "general"]},
@@ -23,6 +23,7 @@
           "state": {"enum": ["CANDIDATE", "LLM_SUPPORTED", "EVIDENCE_VERIFIED", "REFUTED", "INCONCLUSIVE"]},
           "artifact_revision": {"type": "string", "minLength": 1},
           "criteria": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["name", "score"], "properties": {"name": {"type": "string", "minLength": 1}, "score": {"type": "number", "minimum": 0, "maximum": 20}}}},
+          "escalation_triggers": {"type": "array", "uniqueItems": true, "items": {"enum": ["small_margin", "high_dispersion", "criterion_disagreement", "high_severity"]}},
           "views": {
             "type": "object",
             "additionalProperties": false,

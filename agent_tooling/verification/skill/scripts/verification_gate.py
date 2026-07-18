@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ CLAIM_STATES = frozenset({"CANDIDATE", "LLM_SUPPORTED", "EVIDENCE_VERIFIED", "RE
 MODES = frozenset({"triage", "closure"})
 DOMAINS = frozenset({"code", "experiment", "mathematics", "evidence", "research", "source", "general"})
 SEVERITIES = frozenset({"low", "medium", "high", "critical"})
+ESCALATION_TRIGGERS = frozenset({"small_margin", "high_dispersion", "criterion_disagreement", "high_severity"})
 EVIDENCE_KINDS = frozenset(
     {
         "llm_judgment",
@@ -37,6 +39,7 @@ _CLAIM_FIELDS = frozenset(
         "state",
         "artifact_revision",
         "criteria",
+        "escalation_triggers",
         "views",
         "evidence",
         "counterevidence",
@@ -65,7 +68,16 @@ def _nonempty_string(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
-def render_skill_markdown(skill_root: Path) -> str:
+def _posix_path(path: Path) -> str:
+    """Return a Git-Bash-compatible representation of a local path."""
+
+    text = str(path.resolve()).replace("\\", "/")
+    if len(text) >= 3 and text[1:3] == ":/":
+        return f"/{text[0].lower()}{text[2:]}"
+    return text
+
+
+def render_skill_markdown(skill_root: Path, shell: str = "powershell") -> str:
     """Render the source skill template for an installed skill directory.
 
     Task 3 copies the skill before calling this seam, so the gate command names
@@ -80,7 +92,13 @@ def render_skill_markdown(skill_root: Path) -> str:
         raise ValueError("skill template has no verification gate command token")
     if not gate_path.is_file():
         raise FileNotFoundError(gate_path)
-    command = f'& "{Path(sys.executable).resolve()}" "{gate_path}"'
+    python_path = Path(sys.executable).resolve()
+    if shell == "powershell":
+        command = f'& "{python_path}" "{gate_path}"'
+    elif shell == "posix":
+        command = f"{shlex.quote(_posix_path(python_path))} {shlex.quote(_posix_path(gate_path))}"
+    else:
+        raise ValueError("shell must be powershell or posix")
     return template.replace(GATE_COMMAND_TOKEN, command)
 
 
@@ -118,6 +136,7 @@ def _validate_views(
     value:               object,
     aggregate_criteria:  dict[str, float],
     severity:            object,
+    escalation_required: bool,
 ) -> tuple[list[str], bool]:
     """Validate auditable independent views and their criterion aggregation."""
 
@@ -188,30 +207,43 @@ def _validate_views(
                     errors.append(f"{item_prefix}: left and right must be nonempty strings")
                     continue
                 match_items.append(match)
+        ordered_matches: set[tuple[str, str]] = set()
+        valid_matches: set[tuple[str, str]] = set()
+        for index, match in enumerate(match_items):
+            left = str(match["left"])
+            right = str(match["right"])
+            item_prefix = f"{prefix}: views comparison matches[{index}]"
+            if left not in candidate_set or right not in candidate_set or left == right:
+                errors.append(f"{item_prefix}: match must use distinct known candidate IDs")
+                continue
+            ordered = (left, right)
+            if ordered in ordered_matches:
+                errors.append(f"{item_prefix}: duplicate ordered match")
+                continue
+            ordered_matches.add(ordered)
+            valid_matches.add(ordered)
+        if method == "pairwise":
+            if not valid_matches:
+                errors.append(f"{prefix}: pairwise comparison requires at least one explicit match")
+            for left, right in valid_matches:
+                if (right, left) not in valid_matches:
+                    errors.append(f"{prefix}: each pairwise comparison requires both ordered orientations")
+                    break
         if method == "pivot_tournament":
             if not pivot_set or not pivot_set < candidate_set:
                 errors.append(f"{prefix}: pivot_tournament requires pivot_ids as a nonempty proper subset of candidate_ids")
-            left_orientations: set[tuple[str, str]] = set()
-            right_orientations: set[tuple[str, str]] = set()
-            for index, match in enumerate(match_items):
-                left = str(match["left"])
-                right = str(match["right"])
-                item_prefix = f"{prefix}: views comparison matches[{index}]"
-                if left not in candidate_set or right not in candidate_set or left == right:
-                    errors.append(f"{item_prefix}: match must use distinct known candidate IDs")
-                    continue
+            for index, (left, right) in enumerate(valid_matches):
                 pivots_in_match = int(left in pivot_set) + int(right in pivot_set)
                 if pivots_in_match != 1:
-                    errors.append(f"{item_prefix}: match must contain exactly one pivot ID")
-                    continue
-                if left in pivot_set:
-                    left_orientations.add((right, left))
-                else:
-                    right_orientations.add((left, right))
-            for nonpivot in candidate_set - pivot_set:
-                if not any(candidate == nonpivot for candidate, _ in left_orientations) or not any(candidate == nonpivot for candidate, _ in right_orientations):
-                    errors.append(f"{prefix}: every nonpivot requires both left and right orientations against a pivot")
-                    break
+                    errors.append(f"{prefix}: views comparison matches[{index}] must contain exactly one pivot ID")
+            expected_matches = {
+                (pivot, nonpivot)
+                for pivot in pivot_set
+                for nonpivot in candidate_set - pivot_set
+            }
+            expected_matches.update((nonpivot, pivot) for pivot in pivot_set for nonpivot in candidate_set - pivot_set)
+            if valid_matches != expected_matches:
+                errors.append(f"{prefix}: pivot_tournament requires a complete nonpivot-by-pivot grid in both left and right orientations")
 
     score_records = views.get("scores")
     per_view_criteria: list[dict[str, float]] = []
@@ -259,8 +291,8 @@ def _validate_views(
             per_view_criteria.append(current)
     if len(view_ids) != len(set(view_ids)):
         errors.append(f"{prefix}: views must contain unique view IDs")
-    if severity in {"high", "critical"} and len(set(view_ids)) < 4:
-        errors.append(f"{prefix}: {severity} claims require at least four unique views")
+    if (severity in {"high", "critical"} or unresolved is True or escalation_required) and len(set(view_ids)) < 4:
+        errors.append(f"{prefix}: escalation, unresolved disagreement, high, and critical claims require at least four unique views")
     if not aggregate_criteria:
         errors.append(f"{prefix}: criteria must contain at least one aggregate criterion")
     for name, aggregate_score in aggregate_criteria.items():
@@ -302,9 +334,15 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
         errors.append("ledger: claims must contain at least one claim")
 
     claim_items: list[tuple[str, int, object]] = []
+    claim_ids: set[str] = set()
     for index, claim in enumerate(claims_value):
         claim_dict = _as_dict(claim)
         claim_id = claim_dict.get("id") if claim_dict is not None else None
+        if _nonempty_string(claim_id):
+            claim_id_text = str(claim_id)
+            if claim_id_text in claim_ids:
+                errors.append(f"ledger: duplicate claim ID '{claim_id_text}'")
+            claim_ids.add(claim_id_text)
         sort_id = claim_id if _nonempty_string(claim_id) else f"~{index:08d}"
         claim_items.append((str(sort_id), index, claim))
 
@@ -327,6 +365,16 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
         severity = claim.get("severity")
         if severity not in SEVERITIES:
             errors.append(f"{prefix}: severity must be one of {', '.join(sorted(SEVERITIES))}")
+        escalation_triggers = claim.get("escalation_triggers")
+        escalation_required = False
+        if not isinstance(escalation_triggers, list):
+            errors.append(f"{prefix}: escalation_triggers must be a list")
+        elif any(trigger not in ESCALATION_TRIGGERS for trigger in escalation_triggers):
+            errors.append(f"{prefix}: escalation_triggers must use only {', '.join(sorted(ESCALATION_TRIGGERS))}")
+        elif len(set(escalation_triggers)) != len(escalation_triggers):
+            errors.append(f"{prefix}: escalation_triggers must be unique")
+        else:
+            escalation_required = bool(escalation_triggers)
         state = claim.get("state")
         if state not in CLAIM_STATES:
             errors.append(f"{prefix}: state must be one of {', '.join(sorted(CLAIM_STATES))}")
@@ -362,7 +410,13 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                     else:
                         aggregate_criteria[name] = float(score)
 
-        view_errors, unresolved_disagreement = _validate_views(prefix, claim.get("views"), aggregate_criteria, severity)
+        view_errors, unresolved_disagreement = _validate_views(
+            prefix,
+            claim.get("views"),
+            aggregate_criteria,
+            severity,
+            escalation_required,
+        )
         errors.extend(view_errors)
 
         evidence_kinds: set[str] = set()

@@ -18,6 +18,7 @@ def valid_code_claim() -> dict[str, object]:
         "state": "EVIDENCE_VERIFIED",
         "artifact_revision": "abc123",
         "criteria": [{"name": "reachability", "score": 20}],
+        "escalation_triggers": [],
         "views": {
             "calibration_kind": "independent_0_20",
             "unresolved_disagreement": False,
@@ -27,7 +28,7 @@ def valid_code_claim() -> dict[str, object]:
                 "candidate_ids": ["A", "B"],
                 "pivot_ids": [],
                 "orders": ["AB", "BA"],
-                "matches": [],
+                "matches": [{"left": "A", "right": "B"}, {"left": "B", "right": "A"}],
             },
             "scores": [
                 {"view_id": "code-a", "criteria": [{"name": "reachability", "score": 20}]},
@@ -375,6 +376,109 @@ def test_balanced_pivot_tournament_validates() -> None:
     assert validate_ledger(ledger) == []
 
 
+def test_pairwise_comparisons_require_nonempty_balanced_unique_matches() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    views = claim["views"]
+    assert isinstance(views, dict)
+    comparison = views["comparison"]
+    assert isinstance(comparison, dict)
+    comparison["matches"] = [{"left": "A", "right": "B"}, {"left": "A", "right": "B"}]
+
+    errors = validate_ledger(ledger)
+
+    assert any("CODE-001" in error and "duplicate ordered match" in error for error in errors)
+    assert any("CODE-001" in error and "both ordered orientations" in error for error in errors)
+
+
+def test_pairwise_matches_reject_unknown_or_identical_candidate_ids() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    views = claim["views"]
+    assert isinstance(views, dict)
+    comparison = views["comparison"]
+    assert isinstance(comparison, dict)
+    comparison["matches"] = [{"left": "A", "right": "C"}]
+
+    assert any("CODE-001" in error and "distinct known candidate IDs" in error for error in validate_ledger(ledger))
+
+
+def test_pivot_tournament_requires_every_pivot_for_every_nonpivot_in_both_orientations() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    views = claim["views"]
+    assert isinstance(views, dict)
+    views["comparison"] = valid_pivot_tournament()
+    comparison = views["comparison"]
+    assert isinstance(comparison, dict)
+    comparison["pivot_ids"] = ["A", "B"]
+    comparison["matches"] = [
+        {"left": "A", "right": "C"}, {"left": "C", "right": "A"},
+        {"left": "A", "right": "D"}, {"left": "D", "right": "A"},
+        {"left": "A", "right": "E"}, {"left": "E", "right": "A"},
+    ]
+
+    assert any("CODE-001" in error and "complete nonpivot-by-pivot grid" in error for error in validate_ledger(ledger))
+
+
+def test_pivot_tournament_rejects_duplicate_ordered_matches() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    views = claim["views"]
+    assert isinstance(views, dict)
+    views["comparison"] = valid_pivot_tournament()
+    comparison = views["comparison"]
+    assert isinstance(comparison, dict)
+    matches = comparison["matches"]
+    assert isinstance(matches, list)
+    matches.append({"left": "A", "right": "B"})
+
+    assert any("CODE-001" in error and "duplicate ordered match" in error for error in validate_ledger(ledger))
+
+
+def test_escalation_triggers_require_four_views_for_low_severity_claims() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["escalation_triggers"] = ["small_margin"]
+
+    assert any("CODE-001" in error and "four unique views" in error for error in validate_ledger(ledger))
+
+
+def test_unresolved_low_severity_disagreement_requires_four_views() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["state"] = "INCONCLUSIVE"
+    claim["open_obligations"] = ["Resolve reviewer disagreement."]
+    views = claim["views"]
+    assert isinstance(views, dict)
+    views["unresolved_disagreement"] = True
+
+    assert any("CODE-001" in error and "four unique views" in error for error in validate_ledger(ledger))
+
+
+def test_four_views_satisfy_escalation_trigger_requirement() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["escalation_triggers"] = ["criterion_disagreement"]
+    views = claim["views"]
+    assert isinstance(views, dict)
+    scores = views["scores"]
+    assert isinstance(scores, list)
+    scores.extend([
+        {"view_id": "code-c", "criteria": [{"name": "reachability", "score": 20}]},
+        {"view_id": "code-d", "criteria": [{"name": "reachability", "score": 20}]},
+    ])
+
+    assert validate_ledger(ledger) == []
+
+
 def test_errors_are_reported_in_claim_id_order() -> None:
     ledger = valid_ledger()
     first = copy.deepcopy(ledger["claims"][0])
@@ -391,6 +495,13 @@ def test_errors_are_reported_in_claim_id_order() -> None:
 
     assert errors[0].startswith("A-001:")
     assert errors[-1].startswith("Z-001:")
+
+
+def test_duplicate_claim_ids_are_rejected() -> None:
+    ledger = valid_ledger()
+    ledger["claims"].append(copy.deepcopy(ledger["claims"][0]))
+
+    assert any("ledger: duplicate claim ID 'CODE-001'" == error for error in validate_ledger(ledger))
 
 
 def activate(tmp_path: Path, ledger: dict[str, object], ledger_name: str = "ledger.json") -> Path:

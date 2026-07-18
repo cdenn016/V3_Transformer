@@ -41,7 +41,7 @@ def test_skill_activates_the_gate_and_validates_the_named_ledger() -> None:
 def test_copied_skill_renders_an_absolute_gate_command_for_an_unrelated_cwd(tmp_path: Path) -> None:
     installed_skill = tmp_path / "installed skill with spaces" / "verification"
     shutil.copytree(SKILL_ROOT, installed_skill)
-    rendered = render_skill_markdown(installed_skill)
+    rendered = render_skill_markdown(installed_skill, shell="powershell")
     (installed_skill / "SKILL.md").write_text(rendered, encoding="utf-8")
 
     assert "{{VERIFICATION_GATE_COMMAND}}" not in rendered
@@ -64,10 +64,10 @@ def test_copied_skill_renders_an_absolute_gate_command_for_an_unrelated_cwd(tmp_
     ledger["claims"] = [
         {
             "id": "RENDER-001", "domain": "code", "statement": "The installed gate executes.", "severity": "low",
-            "state": "EVIDENCE_VERIFIED", "artifact_revision": "rendered", "criteria": [{"name": "execution", "score": 20}],
+            "state": "EVIDENCE_VERIFIED", "artifact_revision": "rendered", "criteria": [{"name": "execution", "score": 20}], "escalation_triggers": [],
             "views": {
                 "calibration_kind": "independent_0_20", "unresolved_disagreement": False,
-                "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["A", "B"], "pivot_ids": [], "orders": ["AB", "BA"], "matches": []},
+                "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["A", "B"], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "A", "right": "B"}, {"left": "B", "right": "A"}]},
                 "scores": [{"view_id": "render-a", "criteria": [{"name": "execution", "score": 20}]}, {"view_id": "render-b", "criteria": [{"name": "execution", "score": 20}]}],
             },
             "evidence": [{"kind": "mechanical", "location": "render-test", "artifact_revision": "rendered"}],
@@ -77,6 +77,37 @@ def test_copied_skill_renders_an_absolute_gate_command_for_an_unrelated_cwd(tmp_
     ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
     validate_result = subprocess.run(["powershell", "-NoProfile", "-Command", validate_command], cwd=unrelated_cwd, check=False, capture_output=True, text=True)
     assert validate_result.returncode == 0, validate_result.stdout
+
+
+def test_copied_skill_renders_a_posix_command_for_git_bash(tmp_path: Path) -> None:
+    installed_skill = tmp_path / "installed skill with spaces" / "verification"
+    shutil.copytree(SKILL_ROOT, installed_skill)
+    rendered = render_skill_markdown(installed_skill, shell="posix")
+    git_bash = Path("C:/Program Files/Git/bin/bash.exe")
+    assert git_bash.is_file()
+    start_command = next(line.strip() for line in rendered.splitlines() if line.strip().endswith("--mode closure"))
+    validate_command = next(line.strip() for line in rendered.splitlines() if line.strip().endswith(".verification/ledger.json"))
+    assert not start_command.startswith("& ")
+
+    unrelated_cwd = tmp_path / "unrelated posix cwd"
+    unrelated_cwd.mkdir()
+    start_result = subprocess.run([str(git_bash), "-lc", start_command], cwd=unrelated_cwd, check=False, capture_output=True, text=True)
+    assert start_result.returncode == 0, start_result.stderr
+    ledger_path = unrelated_cwd / ".verification" / "ledger.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    ledger["artifact_revision"] = "rendered"
+    ledger["claims"] = [{
+        "id": "POSIX-001", "domain": "code", "statement": "The POSIX command executes.", "severity": "low",
+        "state": "EVIDENCE_VERIFIED", "artifact_revision": "rendered", "criteria": [{"name": "execution", "score": 20}], "escalation_triggers": [],
+        "views": {"calibration_kind": "independent_0_20", "unresolved_disagreement": False,
+                  "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["A", "B"], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "A", "right": "B"}, {"left": "B", "right": "A"}]},
+                  "scores": [{"view_id": "posix-a", "criteria": [{"name": "execution", "score": 20}]}, {"view_id": "posix-b", "criteria": [{"name": "execution", "score": 20}]}]},
+        "evidence": [{"kind": "mechanical", "location": "render-test", "artifact_revision": "rendered"}],
+        "counterevidence": [], "verifiers": [{"role": "verifier-code"}], "open_obligations": [], "evidence_invalidated": False,
+    }]
+    ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+    validate_result = subprocess.run([str(git_bash), "-lc", validate_command], cwd=unrelated_cwd, check=False, capture_output=True, text=True)
+    assert validate_result.returncode == 0, validate_result.stderr
 
 
 def test_skill_requires_audits_proofs_and_current_domain_correctness_evidence() -> None:
