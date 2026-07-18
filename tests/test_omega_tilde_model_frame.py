@@ -383,11 +383,12 @@ def test_phi_tilde_optimizer_uses_its_own_lr_and_exact_coverage() -> None:
     assert {parameter for parameter in model.parameters() if parameter.requires_grad} == set(grouped)
 
 
-def test_phi_tilde_natural_gradient_group_is_geometric_and_decay_free() -> None:
+def test_phi_tilde_pullback_group_is_geometric_and_decay_free() -> None:
     model = _model(
         s_frame_mode="phi_tilde",
-        m_phi_natural_grad=True,
+        m_phi_update_mode="pullback_group",
         phi_precond_mode="pullback_per_block",
+        transport_chart_max_norm=6.0,
         m_s_phi_lr=0.006,
         phi_weight_decay=0.2,
     )
@@ -395,9 +396,45 @@ def test_phi_tilde_natural_gradient_group_is_geometric_and_decay_free() -> None:
     group = _optimizer_group_for(optimizer, model.prior_bank.s_phi_embed)
 
     assert group is _optimizer_group_for(optimizer, model.s_pos_phi_free)
-    assert group["gauge"] is True
+    assert group["pullback_group"] is True
     assert group["weight_decay"] == 0.0
     assert group["lr"] == 0.006
+
+
+def test_pullback_group_steps_each_stored_factor_only_on_current_active_rows() -> None:
+    model = _model(
+        s_frame_mode="phi_tilde",
+        m_phi_update_mode="pullback_group",
+        phi_precond_mode="pullback_per_block",
+        transport_chart_max_norm=6.0,
+        m_phi_lr=0.01,
+        m_s_phi_lr=0.008,
+    )
+    optimizer = build_optimizer(model, model.cfg)
+    factors = (
+        model.prior_bank.phi_embed,
+        model.pos_phi_free,
+        model.prior_bank.s_phi_embed,
+        model.s_pos_phi_free,
+    )
+    active_rows = (1, 2, 3, 4)
+    before = [parameter.detach().clone() for parameter in factors]
+    for parameter, active_row in zip(factors, active_rows):
+        parameter.grad = torch.zeros_like(parameter)
+        parameter.grad.reshape(-1, parameter.shape[-1])[active_row, 0] = 0.2
+
+    optimizer.step()
+
+    for parameter, expected, active_row in zip(factors, before, active_rows):
+        flat_parameter = parameter.detach().reshape(-1, parameter.shape[-1])
+        flat_expected = expected.reshape_as(flat_parameter)
+        inactive = torch.ones(flat_parameter.shape[0], dtype=torch.bool)
+        inactive[active_row] = False
+        assert not torch.equal(flat_parameter[active_row], flat_expected[active_row])
+        assert torch.equal(flat_parameter[inactive], flat_expected[inactive])
+        assert parameter.dtype == torch.float32
+        assert parameter.grad is None
+        assert parameter not in optimizer.state
 
 
 @pytest.mark.parametrize("e_step_update", ["gradient", "mm_exact"])

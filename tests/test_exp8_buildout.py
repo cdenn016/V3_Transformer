@@ -1,7 +1,6 @@
-r"""Tests for the 2026-06-22 EXP-8 build-out (pullback nat-grad gauge M-step + LR, D1):
+r"""Tests for the 2026-06-22 EXP-8 pullback gauge M-step diagnostics.
 
-  * GaugeManifoldAdamW stashes the GATED training-time diagnostics -- cos(nat,grad) (=1 for the
-    conformal killing rescale, a valid cosine for pullback) and the pullback metric condition number.
+  * GaugeManifoldAdamW stashes the gated direction cosine and pullback condition diagnostics.
   * the diagnostics are silent (no compute, empty _gauge_diag) unless _collect_gauge_diag is set.
   * train() writes the cumulative wall_clock_s column into metrics.csv.
   * the wall-clock convergence figure renders.
@@ -26,11 +25,12 @@ from vfe3.viz import figures as figs
 DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 
-def _natgrad_opt_with_grads(precond_mode: str) -> GaugeManifoldAdamW:
+def _pullback_opt_with_grads() -> GaugeManifoldAdamW:
     r"""A GaugeManifoldAdamW with phi_embed.grad populated by one backward pass."""
     cfg = VFE3Config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8,
-                     gauge_group="block_glk", m_phi_natural_grad=True,
-                     phi_precond_mode=precond_mode, m_phi_lr=0.01, e_phi_lr=0.0)
+                     gauge_group="block_glk", m_phi_update_mode="pullback_group",
+                     phi_precond_mode="pullback_per_block", transport_chart_max_norm=6.0,
+                     m_phi_lr=0.01, e_phi_lr=0.0)
     torch.manual_seed(0)
     model = VFEModel(cfg).to(DEVICE)
     opt = build_optimizer(model, cfg)
@@ -42,7 +42,7 @@ def _natgrad_opt_with_grads(precond_mode: str) -> GaugeManifoldAdamW:
 
 
 def test_gauge_diag_pullback_collects_cos_and_cond():
-    opt = _natgrad_opt_with_grads("pullback_per_block")
+    opt = _pullback_opt_with_grads()
     assert isinstance(opt, GaugeManifoldAdamW)
     opt._collect_gauge_diag = True
     opt.step()
@@ -53,34 +53,28 @@ def test_gauge_diag_pullback_collects_cos_and_cond():
     assert gd["pullback_cond_max"] >= gd["pullback_cond_median"] - 1e-6
 
 
-def test_gauge_diag_declares_pullback_metric_as_full(monkeypatch):
-    from vfe3 import numerics
-
-    kinds = []
-
-    def _condition_number(matrix, *, eps=1e-12, kind="auto"):
-        kinds.append(kind)
-        return torch.ones(matrix.shape[:-2], device=matrix.device, dtype=matrix.dtype)
-
-    monkeypatch.setattr(numerics, "condition_number", _condition_number)
-    opt = _natgrad_opt_with_grads("pullback_per_block")
+def test_gauge_diag_reports_finite_damped_pullback_condition():
+    opt = _pullback_opt_with_grads()
     opt._collect_gauge_diag = True
     opt.step()
+    assert torch.isfinite(torch.tensor(opt._gauge_diag["pullback_cond_median"]))
+    assert opt._gauge_diag["pullback_cond_median"] >= 1.0 - 1e-6
 
-    assert kinds and set(kinds) == {"full"}
 
-
-def test_gauge_diag_killing_cos_is_one_and_no_cond():
-    opt = _natgrad_opt_with_grads("killing_per_block")
+def test_gauge_diag_attempt_does_not_create_phi_optimizer_state():
+    opt = _pullback_opt_with_grads()
     opt._collect_gauge_diag = True
     opt.step()
-    gd = opt._gauge_diag
-    assert abs(gd["cos_nat_phi"] - 1.0) < 1e-4                      # conformal: direction-preserving
-    assert "pullback_cond_median" not in gd                        # cond only on the pullback modes
+    pullback_parameters = [
+        parameter
+        for group in opt.param_groups if group.get("pullback_group", False)
+        for parameter in group["params"]
+    ]
+    assert all(parameter not in opt.state for parameter in pullback_parameters)
 
 
 def test_gauge_diag_silent_when_flag_off():
-    opt = _natgrad_opt_with_grads("pullback_per_block")
+    opt = _pullback_opt_with_grads()
     opt.step()                                                      # _collect_gauge_diag defaults False
     assert opt._gauge_diag == {}
 
@@ -102,13 +96,14 @@ def test_wall_clock_column_in_metrics(tmp_path):
 
 
 def test_gauge_diag_columns_rectangular_through_train(tmp_path):
-    r"""End-to-end: a natural-grad pullback gauge run writes cos_nat_phi + pullback_cond_* into
+    r"""End-to-end: a pullback-group run writes cos_nat_phi + pullback_cond_* into
     metrics.csv, present in EVERY row (the fixed-key-set / NaN-default contract; log_metrics locks
     fieldnames on row 0, so a key first appearing later would break the CSV)."""
     torch.manual_seed(0)
     cfg = VFE3Config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8, max_steps=4,
                      log_interval=2, eval_interval=2, batch_size=2, gauge_group="block_glk",
-                     m_phi_natural_grad=True, phi_precond_mode="pullback_per_block",
+                     m_phi_update_mode="pullback_group", phi_precond_mode="pullback_per_block",
+                     transport_chart_max_norm=6.0,
                      m_phi_lr=0.01, e_phi_lr=0.0)
     model = VFEModel(cfg).to(DEVICE)
     batches = [(torch.randint(0, 32, (2, 8), device=DEVICE),

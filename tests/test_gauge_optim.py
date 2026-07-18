@@ -243,9 +243,10 @@ def test_pullback_group_trust_scales_the_learning_rate_weighted_right_factor(mon
 
 
 @pytest.mark.parametrize(
-    ("phi_values", "delta_values", "reductions", "right_residual", "reversed_residual"),
+    ("chart_norm", "phi_values", "delta_values", "reductions", "right_residual", "reversed_residual"),
     [
         (
+            3.0,
             [0.4461370124222645, -0.37866876575372294, 1.1203006449654396, -2.7207532407183694],
             [0.0075751275839514645, -0.002453059541722277, -0.003516904099976695, -0.002529014357447788],
             6,
@@ -253,6 +254,7 @@ def test_pullback_group_trust_scales_the_learning_rate_weighted_right_factor(mon
             1.083e-4,
         ),
         (
+            5.0,
             [0.19176642751290957, -1.411275433700944, 3.477796870171524, -3.297947273280199],
             [0.008133453045635446, 0.0015903479064029997, -0.0025065446684178387, -0.001781968201968022],
             7,
@@ -263,6 +265,8 @@ def test_pullback_group_trust_scales_the_learning_rate_weighted_right_factor(mon
 )
 def test_pullback_group_bch_backtracks_and_certifies_right_product_order(
     monkeypatch,
+    record_property,
+    chart_norm,
     phi_values,
     delta_values,
     reductions,
@@ -303,10 +307,22 @@ def test_pullback_group_bch_backtracks_and_certifies_right_product_order(
         torch.linalg.matrix_norm(exp_candidate - reversed_product)
         / torch.linalg.matrix_norm(reversed_product)
     )
+    committed_phi = candidate.candidate_phi.to(dtype=torch.float32)
+    committed_exp = torch.linalg.matrix_exp(embedded(committed_phi.double()))
+    committed_residual = (
+        torch.linalg.matrix_norm(committed_exp - right)
+        / torch.linalg.matrix_norm(right)
+    )
+    assert torch.linalg.matrix_norm(embedded(phi)).item() == pytest.approx(chart_norm, abs=1e-12)
     assert candidate.backtracking_reductions.item() == reductions
     assert candidate.group_product_residual.item() == pytest.approx(right_residual, rel=2e-6)
+    assert candidate.group_product_residual.item() <= 1.0e-6
     assert actual_right.item() == pytest.approx(right_residual, rel=2e-6)
     assert actual_reversed.item() == pytest.approx(reversed_residual, rel=5e-4)
+    record_property("current_chart_norm", chart_norm)
+    record_property("float64_staging_residual", float(actual_right))
+    record_property("float32_committed_residual", float(committed_residual))
+    assert committed_residual.item() <= 5.0e-6
 
 
 def test_pullback_group_candidate_rejects_chart_bound(monkeypatch):

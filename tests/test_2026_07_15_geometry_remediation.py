@@ -10,6 +10,7 @@ from vfe3.geometry.groups import get_group
 from vfe3.geometry.lie_ops import compose_phi, embed_phi, retract_omega
 from vfe3.geometry.retraction import _eigh_damped, _rel_gap_eps, retract_spd_full
 from vfe3.geometry.transport import (
+    TRANSPORT_CLAMP_MAX_NORM,
     _stable_compact_glk_exp_pair,
     gauge_invariant_edge_features,
     get_transport,
@@ -169,6 +170,51 @@ def test_configured_transport_chart_bound_reaches_flat_model_vertex_exponential(
 
     with pytest.raises(ValueError, match="transport chart validity bound"):
         model.forward_beliefs(torch.tensor([[0, 1]]))
+
+
+def test_composed_token_position_chart_is_unclamped_in_bound_and_rejected_out_of_bound() -> None:
+    cfg = VFE3Config(
+        vocab_size=5,
+        embed_dim=4,
+        n_heads=2,
+        max_seq_len=2,
+        n_layers=1,
+        n_e_steps=1,
+        e_phi_lr=0.0,
+        gauge_group="block_glk",
+        pos_phi="learned",
+        pos_phi_compose="bch",
+        m_phi_update_mode="pullback_group",
+        phi_precond_mode="pullback_per_block",
+        transport_chart_max_norm=6.0,
+    )
+    model = VFEModel(cfg)
+    tokens = torch.tensor([[0, 1]])
+    with torch.no_grad():
+        model.prior_bank.phi_embed.zero_()
+        model.pos_phi_free.zero_()
+        model.prior_bank.phi_embed[tokens.unique(), 0] = 3.0
+        model.pos_phi_free[:, 0] = 2.0
+
+    stored = model.prior_bank.phi_embed[tokens]
+    effective = model._apply_pos_phi(stored)
+    effective_matrix = embed_phi(effective, model.group.generators)
+    effective_norm = torch.linalg.matrix_norm(effective_matrix, ord="fro", dim=(-2, -1))
+    hard_clamp_scale = (
+        TRANSPORT_CLAMP_MAX_NORM / effective_norm.clamp_min(cfg.eps)
+    ).clamp(max=1.0)
+    assert bool((effective_norm < cfg.transport_chart_max_norm).all())
+    assert torch.equal(hard_clamp_scale, torch.ones_like(hard_clamp_scale))
+    belief, _ = model.forward_beliefs(tokens)
+    assert torch.isfinite(belief.phi).all()
+
+    with torch.no_grad():
+        model.prior_bank.phi_embed[tokens.unique(), 0] = 4.0
+        model.pos_phi_free[:, 0] = 3.0
+    assert float(torch.linalg.vector_norm(model.prior_bank.phi_embed[0].detach())) < 5.0
+    assert float(torch.linalg.vector_norm(model.pos_phi_free[0].detach())) < 5.0
+    with pytest.raises(ValueError, match="transport chart validity bound exceeded before matrix-exponential clamp"):
+        model.forward_beliefs(tokens)
 
 
 def test_configured_transport_chart_bound_reaches_covariant_connection_exponential() -> None:

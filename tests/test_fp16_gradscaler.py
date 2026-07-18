@@ -7,6 +7,7 @@ import torch
 
 from vfe3.config import VFE3Config
 from vfe3.ema import EMA
+import vfe3.gauge_optim as gauge_optim
 from vfe3.model.model import VFEModel
 from vfe3.train import build_optimizer, train, train_step
 
@@ -80,18 +81,97 @@ def test_fp16_scaler_scales_and_updates_params():
     assert moved, "no parameter moved under the enabled fp16 scaler (gradients underflowed?)"
 
 
-def test_fp16_with_gauge_natural_grad_steps_the_frame():
-    # Option A: fp16 + m_phi_natural_grad (custom GaugeManifoldAdamW) must compose with the
-    # scaler -- the gauge-frame table must move under a scaled step (not silently no-op).
-    cfg = _tiny_cfg(amp_dtype="fp16", m_phi_natural_grad=True, pos_phi="learned")
+def test_fp16_with_pullback_group_steps_the_k10_two_gl5_frame(monkeypatch):
+    cfg = _tiny_cfg(
+        amp_dtype="fp16",
+        embed_dim=10,
+        n_heads=2,
+        gauge_group="block_glk",
+        m_phi_update_mode="pullback_group",
+        phi_precond_mode="pullback_per_block",
+        transport_chart_max_norm=6.0,
+        pos_phi="learned",
+    )
     torch.manual_seed(0)
     m = VFEModel(cfg)
     opt = build_optimizer(m, cfg); sch = _sched(opt)
     scaler = torch.amp.GradScaler(device="cpu", enabled=True)
     phi0 = m.prior_bank.phi_embed.detach().clone()
+    staged_dtypes = []
+    original_stage = gauge_optim.stage_pullback_group_candidate
+
+    def _stage_spy(*args, **kwargs):
+        candidate = original_stage(*args, **kwargs)
+        staged_dtypes.append(candidate.candidate_phi.dtype)
+        return candidate
+
+    monkeypatch.setattr(gauge_optim, "stage_pullback_group_candidate", _stage_spy)
     tok, tgt = _batch(cfg)
     train_step(m, opt, sch, tok, tgt, grad_clip=1.0, scaler=scaler)
+    assert m.group.irrep_dims == [5, 5]
+    assert staged_dtypes and set(staged_dtypes) == {torch.float64}
+    assert m.prior_bank.phi_embed.dtype == torch.float32
+    assert m.pos_phi_free.dtype == torch.float32
     assert not torch.equal(phi0, m.prior_bank.phi_embed), "gauge frame did not move under fp16 scaler"
+
+
+def test_fp16_pullback_overflow_preserves_all_phi_factors_and_clock(monkeypatch):
+    cfg = _tiny_cfg(
+        amp_dtype="fp16",
+        gauge_group="block_glk",
+        m_phi_update_mode="pullback_group",
+        phi_precond_mode="pullback_per_block",
+        transport_chart_max_norm=6.0,
+        pos_phi="learned",
+        s_frame_mode="phi_tilde",
+        s_e_step=True,
+        prior_source="model_channel",
+        lambda_gamma=0.5,
+    )
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    optimizer = build_optimizer(model, cfg)
+    scheduler = _sched(optimizer)
+    scaler = torch.amp.GradScaler(device="cpu", enabled=True, init_scale=128.0)
+    model.prior_bank.output_proj_weight.register_hook(
+        lambda gradient: torch.full_like(gradient, float("inf"))
+    )
+    factors = (
+        model.prior_bank.phi_embed,
+        model.pos_phi_free,
+        model.prior_bank.s_phi_embed,
+        model.s_pos_phi_free,
+    )
+    before = [parameter.detach().clone() for parameter in factors]
+    scale_before = float(scaler.get_scale())
+    scheduler_epoch = scheduler.last_epoch
+    staging_calls = []
+    original_stage = gauge_optim.stage_pullback_group_candidate
+
+    def _stage_spy(*args, **kwargs):
+        staging_calls.append(1)
+        return original_stage(*args, **kwargs)
+
+    monkeypatch.setattr(gauge_optim, "stage_pullback_group_candidate", _stage_spy)
+    status = {}
+    tok, tgt = _batch(cfg)
+    train_step(
+        model,
+        optimizer,
+        scheduler,
+        tok,
+        tgt,
+        grad_clip=1.0,
+        scaler=scaler,
+        status_out=status,
+    )
+
+    assert status == {"did_step": False}
+    assert float(scaler.get_scale()) < scale_before
+    assert scheduler.last_epoch == scheduler_epoch
+    assert staging_calls == []
+    for parameter, expected in zip(factors, before):
+        assert torch.equal(parameter, expected)
 
 
 def test_ema_does_not_advance_on_gradscaler_overflow(monkeypatch, device):

@@ -275,15 +275,17 @@ def test_learnable_r_centroid_has_no_weight_decay():
     assert all(g["weight_decay"] == 0.0 for g in r_groups)
 
 
-def test_learnable_r_grouped_under_natural_grad_optimizer():
-    # The other authorized optimizer path: m_phi_natural_grad=True returns GaugeManifoldAdamW; a
+def test_learnable_r_grouped_under_pullback_group_optimizer():
+    # The pullback-group route returns GaugeManifoldAdamW; a
     # trainable r must still be grouped (in a plain non-gauge group, mean@m_p_mu_lr / log-scale@m_p_sigma_lr).
     from vfe3.train import build_optimizer
     from vfe3.gauge_optim import GaugeManifoldAdamW
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=1, use_prior_bank=True, lambda_h=0.5, prior_source="model_channel",
-                     learnable_r=True, m_phi_natural_grad=True,
-                     phi_precond_mode="pullback_per_block", seed=0)
+                     learnable_r=True, gauge_group="block_glk",
+                     m_phi_update_mode="pullback_group",
+                     phi_precond_mode="pullback_per_block",
+                     transport_chart_max_norm=6.0, seed=0)
     torch.manual_seed(0)
     m = VFEModel(cfg)
     opt = build_optimizer(m, cfg)

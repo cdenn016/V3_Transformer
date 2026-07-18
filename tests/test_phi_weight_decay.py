@@ -5,8 +5,8 @@ Decoupled AdamW decay on phi sets an LR-invariant ceiling on the frame norm
 (|phi*| ~ E[normalized-grad]/wd), pulling the gauge transport exp(phi.G) toward the identity
 independently of the M-step LRs. The gauge frames are protected at weight_decay=0; this field
 makes that protection a first-class, sweepable knob (set phi_weight_decay=0 for full protection)
-without changing the generic weight_decay on the belief tables. Under m_phi_natural_grad=True phi is
-natural-gradient stepped on the gauge group, so its AdamW decay stays 0 regardless of the field.
+without changing the generic weight_decay on the belief tables. Under pullback-group descent phi is
+stepped by a local group retraction, so its AdamW decay stays 0 regardless of the field.
 """
 
 import torch
@@ -38,6 +38,9 @@ def test_phi_decay_distinct_from_generic_by_default():
     opt = build_optimizer(model, cfg)
     assert _wd(_group_of(opt, model.prior_bank.phi_embed), opt) == 0.065   # phi: own decay
     assert _wd(_group_of(opt, model.prior_bank.mu_embed), opt) == 0.05     # belief tables: generic
+    model.prior_bank.phi_embed.grad = torch.ones_like(model.prior_bank.phi_embed)
+    opt.step()
+    assert set(opt.state[model.prior_bank.phi_embed]) == {"step", "exp_avg", "exp_avg_sq"}
 
 
 def test_phi_weight_decay_override_protects_phi_only():
@@ -55,9 +58,16 @@ def test_pos_phi_free_uses_phi_weight_decay():
     assert _wd(_group_of(opt, model.pos_phi_free), opt) == 0.0             # pos frame is a gauge frame too
 
 
-def test_natural_grad_forces_phi_decay_zero_regardless_of_field():
-    cfg = VFE3Config(**BASE, gauge_group="block_glk", m_phi_natural_grad=True,
-                     phi_precond_mode="pullback_per_block", phi_weight_decay=0.065)
+def test_pullback_group_forces_phi_decay_zero_regardless_of_field():
+    cfg = VFE3Config(**BASE, gauge_group="block_glk", m_phi_update_mode="pullback_group",
+                     phi_precond_mode="pullback_per_block", transport_chart_max_norm=6.0,
+                     phi_weight_decay=0.065)
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
-    assert _wd(_group_of(opt, model.prior_bank.phi_embed), opt) == 0.0     # natural-grad path: still 0
+    group = _group_of(opt, model.prior_bank.phi_embed)
+    assert _wd(group, opt) == 0.0
+    assert group["pullback_group"] is True
+    model.prior_bank.phi_embed.grad = torch.zeros_like(model.prior_bank.phi_embed)
+    model.prior_bank.phi_embed.grad[0, 0] = 1.0
+    opt.step()
+    assert model.prior_bank.phi_embed not in opt.state
