@@ -10,14 +10,15 @@ denied because the GitHub destination was not verified as trusted or private.
 Do not remove the separate investigation worktree at
 `C:\tmp\vfe3-mphi-ng-investigation-20260717`.
 
-Tasks 1 through 4 are complete and independently approved. The Task 1 restart
+Tasks 1 through 5 are complete and independently approved. The Task 1 restart
 checkpoint `b0bf9cb` was completed by fix commit `843b45c`. Task 2 is recorded
 by runtime commit `71e5481` and atomic nonfinite-covector review fix `085777f`.
 Task 3 is recorded by migration commit `43ed6d3` and live-topology slot-schema
 review fix `045a245`. Task 4 is recorded by integration-test commit `574602f`
 and real-training-seam review fix `6ad1cdc`. No Critical or Important findings
-remain in these tasks. Resume at Task 5 rather than dispatching or reviewing
-Tasks 1 through 4 again.
+remain in these tasks. Task 5 is recorded by cleanup commit `2ae3ce2` and
+review-fix commit `023686f`. Resume at Task 6 rather than dispatching or
+reviewing Tasks 1 through 5 again.
 
 ## Verification captured before restart
 
@@ -55,11 +56,20 @@ Task 4 evidence is at `C:\tmp\vfe3-phi-task4-review-red-20260717.xml`,
 eight-file artifact records 162 tests, zero failures, zero errors, and zero
 skips.
 
+Task 5 evidence is at `C:\tmp\vfe3-phi-cleanup-contract-red-20260717.xml`,
+`C:\tmp\vfe3-phi-cleanup-green-20260717.xml`,
+`C:\tmp\vfe3-phi-task5-review-fix-matrix-20260717.xml`, and
+`C:\tmp\vfe3-phi-task5-rereview-focused-20260717.xml`. The exact cleanup
+artifact records 214 tests, zero failures, zero errors, and one skip. The
+expanded artifact records 500 tests, one accepted baseline failure, zero
+errors, and one skip.
+
 ## Resume sequence
 
-1. Read `.superpowers/sdd/progress.md`, this handoff, and the Task 5 section of
+1. Read `.superpowers/sdd/progress.md`, this handoff, and the Task 6 section of
    the approved implementation plan.
 2. Preserve commits `b0bf9cb`, `843b45c`, `71e5481`, `085777f`, `43ed6d3`, and
-   `045a245`, `574602f`, and `6ad1cdc`; do not re-dispatch Tasks 1 through 4.
-3. Proceed sequentially from Task 5 using the approved strict geometry,
+   `045a245`, `574602f`, `6ad1cdc`, `2ae3ce2`, and `023686f`; do not re-dispatch
+   Tasks 1 through 5.
+3. Proceed sequentially from Task 6 using the approved strict geometry,
    stateless runtime, and serialized migration interfaces.
