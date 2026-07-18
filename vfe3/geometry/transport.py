@@ -1834,7 +1834,7 @@ def transport_covariance(
             rotated = CompactFactoredTransport(
                 exp_blocks, inv_blocks, omega.base.K,
                 mean_per_head=omega.base.mean_per_head,
-                same_frame_flat_cocycle=omega.same_frame_flat_cocycle)
+                same_frame_flat_cocycle=_certifies_same_frame_flat_cocycle(omega))
             return transport_covariance(rotated, sigma, diagonal_out=diagonal_out)
         # Other full-gauge bases use the established rotated dense operator.
         out = transport_covariance(_rope_dense_omega(omega.base, omega.rope), sigma,

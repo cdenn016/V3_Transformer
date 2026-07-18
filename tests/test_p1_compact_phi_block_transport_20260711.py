@@ -426,6 +426,34 @@ def test_direct_rope_wrapper_fails_closed_for_untrusted_rotation(rope_kind: str)
         assert torch.equal(covariance[:, self_links, self_links], expected_self)
 
 
+def test_certified_rope_over_uncertified_compact_base_keeps_raw_full_self_transport() -> None:
+    N, H, d, K = 3, 2, 2, 4
+    exp_blocks = 2.0 * torch.eye(d).expand(1, N, H, d, d).clone()
+    inv_blocks = 3.0 * torch.eye(d).expand(1, N, H, d, d).clone()
+    base = CompactFactoredTransport(exp_blocks, inv_blocks, K)
+    rope = torch.eye(K).expand(1, N, K, K).clone()
+    wrapped = RopeTransport(
+        base=base,
+        rope=rope,
+        on_cov=True,
+        same_frame_flat_cocycle=True,
+    )
+    mu = torch.arange(N * K, dtype=torch.float32).reshape(1, N, K) + 1.0
+    sigma = torch.eye(K).expand(1, N, K, K).clone()
+    self_links = torch.arange(N)
+
+    assert not base.same_frame_flat_cocycle
+    assert wrapped.same_frame_flat_cocycle
+    assert torch.equal(
+        transport_mean(wrapped, mu)[:, self_links, self_links],
+        6.0 * mu,
+    )
+    assert torch.equal(
+        transport_covariance(wrapped, sigma, diagonal_out=False)[:, self_links, self_links],
+        36.0 * sigma,
+    )
+
+
 def test_self_link_certificates_reject_non_boolean_values() -> None:
     dense = torch.eye(4).expand(1, 3, 4, 4).clone()
     blocks = torch.eye(2).expand(1, 3, 2, 2, 2).clone()
