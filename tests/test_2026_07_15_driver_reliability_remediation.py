@@ -1242,7 +1242,7 @@ def test_generation_checkpoint_digest_binds_the_exact_loaded_snapshot(tmp_path):
         checkpoint_snapshot=snapshot,
     )
 
-    assert config == original["config"]
+    assert config == vars(VFE3Config(**original["config"]))
     assert torch.equal(state["weight"], original["model_state"]["weight"])
     assert digest == hashlib.sha256(snapshot).hexdigest()
     assert not torch.equal(state["weight"], replacement["model_state"]["weight"])

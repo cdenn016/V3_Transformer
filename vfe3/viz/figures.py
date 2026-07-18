@@ -3850,7 +3850,7 @@ def plot_cov_gap_vs_kappa(
 
 
 # ===========================================================================
-# D1 / EXP-8  --  pullback natural-gradient gauge M-step convergence
+# D1 / EXP-8  --  pullback-group gauge M-step convergence
 # ===========================================================================
 
 @register_figure("wallclock_convergence")

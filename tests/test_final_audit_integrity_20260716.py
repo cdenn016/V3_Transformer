@@ -583,6 +583,13 @@ def test_retired_phi_optimizer_core_is_confined_to_migration_fixtures() -> None:
     )
     assert retired_moment.search(production) is None
 
+    retired_mstep_claim = re.compile(
+        r"natural[-_ ]*gradient.{0,80}m[-_ ]*step"
+        r"|m[-_ ]*step.{0,80}natural[-_ ]*gradient",
+        re.IGNORECASE,
+    )
+    assert all(retired_mstep_claim.search(text) is None for text in source.values())
+
     retired_fields = (
         "m_phi_" + "natural_grad",
         "m_gauge_" + "momentum",
