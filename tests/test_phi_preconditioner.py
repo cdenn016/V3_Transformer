@@ -23,6 +23,119 @@ def test_pullback_group_registry_is_separate_from_estep_registry():
     assert _PHI_GROUP_DIRECTIONS is not _PRECOND
 
 
+def _remove_test_phi_group_direction(name: str) -> None:
+    _PHI_GROUP_DIRECTIONS.pop(name, None)
+    for support_name in (
+        "_PHI_GROUP_DIRECTION_ACCEPTS_COORDINATE_LAYOUT",
+        "_PHI_GROUP_DIRECTION_REQUIRES_SOURCE_BASIS",
+    ):
+        support = getattr(phi_preconditioner, support_name, None)
+        if support is not None:
+            support.pop(name, None)
+
+
+def test_pullback_group_dispatch_preserves_legacy_registered_callable_without_layout_keyword():
+    name = "test_legacy_without_coordinate_layout"
+    seen = {}
+
+    @phi_preconditioner.register_phi_group_direction(name)
+    def legacy_direction(grad_phi, phi, generators, *, irrep_dims=None):
+        seen["irrep_dims"] = irrep_dims
+        return phi_preconditioner._pullback_group_direction(
+            grad_phi,
+            phi,
+            generators,
+            irrep_dims=irrep_dims,
+        )
+
+    try:
+        result = pullback_group_direction(
+            torch.ones(4),
+            torch.zeros(4),
+            generate_glk(2),
+            mode=name,
+            coordinate_layout="block_head_row_major",
+            irrep_dims=[2],
+        )
+    finally:
+        _remove_test_phi_group_direction(name)
+
+    assert seen["irrep_dims"] == [2]
+    assert torch.isfinite(result.v_phi).all()
+
+
+def test_pullback_group_dispatch_forwards_layout_to_kwargs_callable_and_override():
+    name = "test_kwargs_coordinate_layout"
+    seen = []
+
+    @phi_preconditioner.register_phi_group_direction(name)
+    def initial_direction(grad_phi, phi, generators, *, irrep_dims=None):
+        raise AssertionError("override did not replace initial registered direction")
+
+    @phi_preconditioner.register_phi_group_direction(name, override=True)
+    def kwargs_direction(grad_phi, phi, generators, *, irrep_dims=None, **kwargs):
+        seen.append(kwargs.get("coordinate_layout"))
+        return phi_preconditioner._pullback_group_direction(
+            grad_phi,
+            phi,
+            generators,
+            irrep_dims=irrep_dims,
+        )
+
+    try:
+        result = pullback_group_direction(
+            torch.ones(4),
+            torch.zeros(4),
+            generate_glk(2),
+            mode=name,
+            coordinate_layout="block_head_row_major",
+            irrep_dims=[2],
+        )
+    finally:
+        _remove_test_phi_group_direction(name)
+
+    assert seen == ["block_head_row_major"]
+    assert torch.isfinite(result.v_phi).all()
+
+
+def test_pullback_group_dispatch_does_not_keyword_call_positional_only_layout():
+    name = "test_positional_only_coordinate_layout"
+    seen = []
+
+    @phi_preconditioner.register_phi_group_direction(name)
+    def positional_layout_direction(
+        grad_phi,
+        phi,
+        generators,
+        coordinate_layout=None,
+        /,
+        *,
+        irrep_dims=None,
+    ):
+        seen.append(coordinate_layout)
+        return phi_preconditioner._pullback_group_direction(
+            grad_phi,
+            phi,
+            generators,
+            irrep_dims=irrep_dims,
+        )
+
+    try:
+        result = pullback_group_direction(
+            torch.ones(4),
+            torch.zeros(4),
+            generate_glk(2),
+            mode=name,
+            coordinate_layout="block_head_row_major",
+            irrep_dims=[2],
+        )
+    finally:
+        _remove_test_phi_group_direction(name)
+
+    assert seen == [None]
+    assert torch.isfinite(result.v_phi).all()
+
+
 def test_pullback_group_direction_returns_float64_gram_relative_zero_chart_solution():
     generators = generate_glk(2)
     generators = generators * torch.tensor([0.5, 1.0, 2.0, 3.0]).view(-1, 1, 1)
@@ -454,6 +567,525 @@ def test_pullback_group_direction_disables_autocast_in_strict_float64_island(mon
         )
     assert autocast_states == [False]
     assert result.v_phi.dtype == torch.float64
+
+
+def _two_recurrence_differential_oracle(
+    ad: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Frozen pre-optimization right/left differential recurrence."""
+    n_gen = ad.shape[-1]
+    eye = torch.eye(n_gen, dtype=ad.dtype, device=ad.device).expand_as(ad).clone()
+    psi_right = eye.clone()
+    psi_left = eye.clone()
+    term_right = eye.clone()
+    term_left = eye.clone()
+    norm_one = torch.linalg.matrix_norm(ad, ord=1, dim=(-2, -1))
+    norm_inf = torch.linalg.matrix_norm(ad, ord=float("inf"), dim=(-2, -1))
+    use_one = norm_one <= norm_inf
+    alpha = torch.where(use_one, norm_one, norm_inf)
+    bound_k = torch.ones_like(alpha)
+    for k in range(1, phi_preconditioner._PHI_GROUP_MAX_SERIES_ORDER):
+        term_right = torch.matmul(term_right, ad) / float(k + 1)
+        term_left = -torch.matmul(term_left, ad) / float(k + 1)
+        psi_right = psi_right + term_right
+        psi_left = psi_left + term_left
+        bound_k = bound_k * alpha / float(k + 1)
+        order = k + 1
+        if order < phi_preconditioner._PHI_GROUP_MIN_SERIES_ORDER or (
+            order % phi_preconditioner._PHI_GROUP_SERIES_ORDER_STEP
+        ):
+            continue
+        first_omitted = bound_k * alpha / float(order + 1)
+        ratio = alpha / float(order + 2)
+        tail = torch.where(
+            ratio < 1.0,
+            first_omitted / (1.0 - ratio),
+            torch.full_like(ratio, torch.inf),
+        )
+        right_one = torch.linalg.matrix_norm(psi_right, ord=1, dim=(-2, -1))
+        right_inf = torch.linalg.matrix_norm(psi_right, ord=float("inf"), dim=(-2, -1))
+        left_one = torch.linalg.matrix_norm(psi_left, ord=1, dim=(-2, -1))
+        left_inf = torch.linalg.matrix_norm(psi_left, ord=float("inf"), dim=(-2, -1))
+        right_norm = torch.where(use_one, right_one, right_inf)
+        left_norm = torch.where(use_one, left_one, left_inf)
+        right_ok = tail <= phi_preconditioner._PHI_GROUP_TAIL_TOL * torch.maximum(
+            torch.ones_like(tail), right_norm
+        )
+        left_ok = tail <= phi_preconditioner._PHI_GROUP_TAIL_TOL * torch.maximum(
+            torch.ones_like(tail), left_norm
+        )
+        if bool((right_ok & left_ok & torch.isfinite(tail)).all()):
+            return psi_right, psi_left, order
+    raise AssertionError("oracle series did not converge")
+
+
+def test_pullback_group_differentials_reuse_one_positive_power_recurrence(monkeypatch, device):
+    phi, generators = _gl_chart_fixture("random_nonnormal", 3.0)
+    phi = phi.to(device)
+    generators = generators.to(device)
+    structure, _ = phi_preconditioner._strict_structure_constants(generators)
+    ad = torch.einsum("a,abc->cb", phi, structure)
+    expected_right, expected_left, expected_order = _two_recurrence_differential_oracle(ad)
+    original = torch.matmul
+    matmul_calls = 0
+
+    def count_matmul(*args, **kwargs):
+        nonlocal matmul_calls
+        matmul_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "matmul", count_matmul)
+    actual_right, actual_left, actual_order = phi_preconditioner._adaptive_phi_differentials(ad)
+
+    assert actual_order == expected_order
+    assert torch.equal(actual_right, expected_right)
+    assert torch.equal(actual_left, expected_left)
+    assert matmul_calls == actual_order - 1
+
+
+@pytest.mark.parametrize("orthonormal", (True, False))
+def test_pullback_group_solve_scale_reuses_eigenvalue_only_for_identity_gram(
+    monkeypatch,
+    orthonormal,
+    device,
+):
+    phi_preconditioner._STRICT_PULLBACK_PREP_CACHE.clear()
+    generators = generate_glk(2, device=device).double()
+    if not orthonormal:
+        generators = generators * torch.tensor(
+            [0.5, 1.0, 1.5, 2.0],
+            device=device,
+        ).view(-1, 1, 1)
+    grad = torch.tensor([0.7, -0.3, 0.2, 0.9], dtype=torch.float64, device=device)
+    phi = torch.tensor([0.1, -0.2, 0.15, -0.05], dtype=torch.float64, device=device)
+    original = torch.linalg.matrix_norm
+    original_solve = torch.cholesky_solve
+    spectral_calls = 0
+    solve_calls = 0
+
+    def count_spectral(*args, **kwargs):
+        nonlocal spectral_calls
+        if kwargs.get("ord") == 2:
+            spectral_calls += 1
+        return original(*args, **kwargs)
+
+    def perturb_direction_solve(*args, **kwargs):
+        nonlocal solve_calls
+        solve_calls += 1
+        result = original_solve(*args, **kwargs)
+        if solve_calls == 2:
+            perturbation = torch.linspace(
+                1.0,
+                2.0,
+                result.numel(),
+                dtype=result.dtype,
+                device=result.device,
+            ).reshape_as(result)
+            result = result + 1e-12 * perturbation
+        return result
+
+    monkeypatch.setattr(torch.linalg, "matrix_norm", count_spectral)
+    monkeypatch.setattr(torch, "cholesky_solve", perturb_direction_solve)
+    result = pullback_group_direction(grad, phi, generators, mode="pullback")
+
+    _, metric = _strict_series_pullback(phi, generators)
+    gram = torch.einsum("aij,bij->ab", generators, generators)
+    damped = 0.5 * (metric + metric.transpose(-1, -2)) + 1e-6 * gram
+    residual = torch.linalg.vector_norm(damped @ result.v_phi - grad)
+    expected_scale = (
+        original(damped, ord=2)
+        * torch.linalg.vector_norm(result.v_phi)
+        + torch.linalg.vector_norm(grad)
+    )
+    expected = residual / expected_scale
+    assert torch.allclose(result.scaled_solve_residual, expected, rtol=1e-12, atol=1e-18)
+    assert spectral_calls == (0 if orthonormal else 1)
+
+
+def test_pullback_group_strict_preparation_cache_hits_and_invalidates_on_mutation(monkeypatch):
+    phi_preconditioner._STRICT_PULLBACK_PREP_CACHE.clear()
+    generators = generate_glk(2)
+    original = phi_preconditioner._strict_structure_constants
+    calls = 0
+
+    def count_builds(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(phi_preconditioner, "_strict_structure_constants", count_builds)
+    grad = torch.ones(4)
+    phi = torch.zeros(4)
+    pullback_group_direction(grad, phi, generators, mode="pullback")
+    pullback_group_direction(grad, phi, generators, mode="pullback")
+    generators.add_(0.0)
+    pullback_group_direction(grad, phi, generators, mode="pullback")
+
+    assert calls == 2
+
+
+def test_pullback_group_strict_preparation_cache_is_bounded_and_weak():
+    phi_preconditioner._STRICT_PULLBACK_PREP_CACHE.clear()
+    generators_live = [
+        generate_glk(1)
+        for _ in range(phi_preconditioner._STRICT_PULLBACK_PREP_CACHE_MAXSIZE + 3)
+    ]
+    for generators in generators_live:
+        pullback_group_direction(
+            torch.ones(1),
+            torch.zeros(1),
+            generators,
+            mode="pullback",
+        )
+    assert len(phi_preconditioner._STRICT_PULLBACK_PREP_CACHE) == (
+        phi_preconditioner._STRICT_PULLBACK_PREP_CACHE_MAXSIZE
+    )
+    cached_sources = [
+        generators_ref()
+        for generators_ref, _ in phi_preconditioner._STRICT_PULLBACK_PREP_CACHE.values()
+    ]
+    assert all(source is not generators_live[0] for source in cached_sources)
+    assert any(source is generators_live[-1] for source in cached_sources)
+    generators_refs = [weakref.ref(source) for source in generators_live]
+    del cached_sources
+    del generators
+    generators_live.clear()
+    gc.collect()
+    assert all(generators_ref() is None for generators_ref in generators_refs)
+    assert not phi_preconditioner._STRICT_PULLBACK_PREP_CACHE
+
+
+def test_pullback_group_strict_preparation_cache_bypasses_requires_grad(monkeypatch):
+    phi_preconditioner._STRICT_PULLBACK_PREP_CACHE.clear()
+    generators = generate_glk(2).requires_grad_()
+    original = phi_preconditioner._strict_structure_constants
+    calls = 0
+
+    def count_builds(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(phi_preconditioner, "_strict_structure_constants", count_builds)
+    for _ in range(2):
+        result = pullback_group_direction(
+            torch.ones(4),
+            torch.tensor([0.1, -0.2, 0.15, -0.05]),
+            generators,
+            mode="pullback",
+        )
+    assert calls == 2
+    assert not phi_preconditioner._STRICT_PULLBACK_PREP_CACHE
+    objective = result.v_phi.square().sum() + 0.25 * result.xi.square().sum()
+    objective.backward()
+    assert generators.grad is not None
+    assert torch.isfinite(generators.grad).all()
+    assert torch.count_nonzero(generators.grad) > 0
+
+
+def test_pullback_group_block_head_layout_avoids_generic_membership_scan(monkeypatch, device):
+    generators = generate_glk_multihead(4, 2, device=device)
+    grad = torch.linspace(-0.5, 0.5, generators.shape[0], device=device)
+    phi = torch.linspace(-0.1, 0.1, generators.shape[0], device=device)
+    expected = pullback_group_direction(
+        grad,
+        phi,
+        generators,
+        mode="pullback_per_block",
+        irrep_dims=[2, 2],
+    )
+    monkeypatch.setattr(
+        phi_preconditioner,
+        "_generator_block_index",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("generic scan called")),
+    )
+    actual = pullback_group_direction(
+        grad,
+        phi,
+        generators,
+        mode="pullback_per_block",
+        irrep_dims=[2, 2],
+        coordinate_layout="block_head_row_major",
+    )
+    assert torch.equal(actual.v_phi, expected.v_phi)
+    assert torch.equal(actual.xi, expected.xi)
+    assert actual.series_order == expected.series_order
+
+
+def _assert_pullback_group_result_equal(
+    actual:   PullbackGroupDirectionResult,
+    expected: PullbackGroupDirectionResult,
+) -> None:
+    assert torch.equal(actual.v_phi, expected.v_phi)
+    assert torch.equal(actual.xi, expected.xi)
+    assert torch.equal(
+        actual.min_undamped_generalized_eigenvalue,
+        expected.min_undamped_generalized_eigenvalue,
+    )
+    assert torch.equal(
+        actual.undamped_generalized_condition,
+        expected.undamped_generalized_condition,
+    )
+    assert torch.equal(
+        actual.damped_generalized_condition,
+        expected.damped_generalized_condition,
+    )
+    assert torch.equal(actual.scaled_solve_residual, expected.scaled_solve_residual)
+    assert actual.series_order == expected.series_order
+
+
+def test_pullback_group_equal_block_layout_batches_one_exact_strict_solve(monkeypatch, device):
+    generators = generate_glk_multihead(4, 2, device=device)
+    grad = torch.linspace(-0.5, 0.5, 3 * generators.shape[0], device=device).reshape(3, -1)
+    phi = torch.linspace(-0.1, 0.1, 3 * generators.shape[0], device=device).reshape(3, -1)
+    expected = pullback_group_direction(
+        grad,
+        phi,
+        generators,
+        mode="pullback_per_block",
+        irrep_dims=[2, 2],
+    )
+    original = phi_preconditioner._full_pullback_group_direction
+    strict_solve_calls = 0
+
+    def count_strict_solves(*args, **kwargs):
+        nonlocal strict_solve_calls
+        strict_solve_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        phi_preconditioner,
+        "_full_pullback_group_direction",
+        count_strict_solves,
+    )
+    actual = pullback_group_direction(
+        grad,
+        phi,
+        generators,
+        mode="pullback_per_block",
+        coordinate_layout="block_head_row_major",
+        irrep_dims=[2, 2],
+    )
+
+    _assert_pullback_group_result_equal(actual, expected)
+    assert strict_solve_calls == 1
+
+
+def test_pullback_group_layout_nonidentical_local_bases_fall_back_to_independent_solves(
+    monkeypatch,
+    device,
+):
+    generators = generate_glk_multihead(4, 2, device=device)
+    permutation = torch.tensor([0, 1, 2, 3, 5, 4, 6, 7], device=device)
+    generators = generators[permutation]
+    grad = torch.linspace(-0.5, 0.5, generators.shape[0], device=device)
+    phi = torch.linspace(-0.1, 0.1, generators.shape[0], device=device)
+    expected = pullback_group_direction(
+        grad,
+        phi,
+        generators,
+        mode="pullback_per_block",
+        irrep_dims=[2, 2],
+    )
+    original = phi_preconditioner._full_pullback_group_direction
+    strict_solve_calls = 0
+
+    def count_strict_solves(*args, **kwargs):
+        nonlocal strict_solve_calls
+        strict_solve_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        phi_preconditioner,
+        "_full_pullback_group_direction",
+        count_strict_solves,
+    )
+    actual = pullback_group_direction(
+        grad,
+        phi,
+        generators,
+        mode="pullback_per_block",
+        coordinate_layout="block_head_row_major",
+        irrep_dims=[2, 2],
+    )
+
+    _assert_pullback_group_result_equal(actual, expected)
+    assert strict_solve_calls == 2
+
+
+def test_pullback_group_equal_blocks_with_mixed_series_orders_fall_back_exactly(
+    monkeypatch,
+    device,
+):
+    generators = generate_glk_multihead(4, 2, device=device).double()
+    block_40 = torch.tensor([0.0, -1.0, 1.0, 0.0], dtype=torch.float64, device=device)
+    block_48 = torch.tensor([0.0, -4.5, 4.5, 0.0], dtype=torch.float64, device=device)
+    phi_row = torch.cat((block_40, block_48))
+    phi = torch.stack((phi_row, phi_row), dim=0)
+    grad = torch.linspace(-0.5, 0.5, 2 * generators.shape[0], device=device).reshape(2, -1)
+    expected = pullback_group_direction(
+        grad,
+        phi,
+        generators,
+        mode="pullback_per_block",
+        irrep_dims=[2, 2],
+    )
+    assert expected.series_order == 48
+    original = phi_preconditioner._full_pullback_group_direction
+    strict_solve_calls = 0
+
+    def count_strict_solves(*args, **kwargs):
+        nonlocal strict_solve_calls
+        strict_solve_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        phi_preconditioner,
+        "_full_pullback_group_direction",
+        count_strict_solves,
+    )
+    actual = pullback_group_direction(
+        grad,
+        phi,
+        generators,
+        mode="pullback_per_block",
+        coordinate_layout="block_head_row_major",
+        irrep_dims=[2, 2],
+    )
+
+    _assert_pullback_group_result_equal(actual, expected)
+    assert strict_solve_calls == 3
+
+
+def test_pullback_group_equal_block_batch_preserves_sequential_exception_precedence(device):
+    generators = generate_glk_multihead(4, 2, device=device).double()
+    first_fails_regularity = torch.tensor(
+        [0.0, -math.pi, math.pi, 0.0],
+        dtype=torch.float64,
+        device=device,
+    )
+    later_fails_series = torch.tensor(
+        [0.0, -30.0, 30.0, 0.0],
+        dtype=torch.float64,
+        device=device,
+    )
+    phi = torch.cat((first_fails_regularity, later_fails_series)).unsqueeze(0)
+    grad = torch.ones_like(phi)
+    with pytest.raises(ValueError) as expected_error:
+        pullback_group_direction(
+            grad,
+            phi,
+            generators,
+            mode="pullback_per_block",
+            irrep_dims=[2, 2],
+        )
+    with pytest.raises(ValueError) as actual_error:
+        pullback_group_direction(
+            grad,
+            phi,
+            generators,
+            mode="pullback_per_block",
+            coordinate_layout="block_head_row_major",
+            irrep_dims=[2, 2],
+        )
+    assert str(actual_error.value) == str(expected_error.value)
+
+
+def test_pullback_group_equal_block_batch_bypasses_requires_grad_basis(monkeypatch, device):
+    source = generate_glk_multihead(4, 2, device=device).double()
+    grad = torch.linspace(-0.5, 0.5, 2 * source.shape[0], device=device).reshape(2, -1)
+    phi = torch.linspace(-0.1, 0.1, 2 * source.shape[0], device=device).reshape(2, -1)
+    generic_generators = source.clone().requires_grad_()
+    expected = pullback_group_direction(
+        grad,
+        phi,
+        generic_generators,
+        mode="pullback_per_block",
+        irrep_dims=[2, 2],
+    )
+    expected_objective = expected.v_phi.square().sum() + 0.25 * expected.xi.square().sum()
+    expected_objective.backward()
+    expected_gradient = generic_generators.grad.detach().clone()
+
+    layout_generators = source.clone().requires_grad_()
+    original = phi_preconditioner._full_pullback_group_direction
+    strict_solve_calls = 0
+
+    def count_strict_solves(*args, **kwargs):
+        nonlocal strict_solve_calls
+        strict_solve_calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        phi_preconditioner,
+        "_full_pullback_group_direction",
+        count_strict_solves,
+    )
+    actual = pullback_group_direction(
+        grad,
+        phi,
+        layout_generators,
+        mode="pullback_per_block",
+        coordinate_layout="block_head_row_major",
+        irrep_dims=[2, 2],
+    )
+    actual_objective = actual.v_phi.square().sum() + 0.25 * actual.xi.square().sum()
+    actual_objective.backward()
+
+    _assert_pullback_group_result_equal(actual, expected)
+    assert strict_solve_calls == 2
+    assert layout_generators.grad is not None
+    assert torch.equal(layout_generators.grad, expected_gradient)
+
+
+def test_pullback_group_equal_block_batch_falls_back_for_unmatched_leading_shapes(device):
+    generators = generate_glk_multihead(4, 2, device=device)
+    grad = torch.linspace(-0.5, 0.5, 3 * generators.shape[0], device=device).reshape(3, -1)
+    phi = torch.linspace(-0.1, 0.1, generators.shape[0], device=device)
+    expected = pullback_group_direction(
+        grad,
+        phi,
+        generators,
+        mode="pullback_per_block",
+        irrep_dims=[2, 2],
+    )
+    actual = pullback_group_direction(
+        grad,
+        phi,
+        generators,
+        mode="pullback_per_block",
+        coordinate_layout="block_head_row_major",
+        irrep_dims=[2, 2],
+    )
+    _assert_pullback_group_result_equal(actual, expected)
+
+
+def test_pullback_group_full_mode_ignores_partition_metadata(device):
+    generators = generate_glk_multihead(4, 2, device=device)
+    grad = torch.linspace(-0.5, 0.5, generators.shape[0], device=device)
+    phi = torch.linspace(-0.1, 0.1, generators.shape[0], device=device)
+    expected = pullback_group_direction(
+        grad,
+        phi,
+        generators,
+        mode="pullback",
+    )
+    actual = pullback_group_direction(
+        grad,
+        phi,
+        generators,
+        mode="pullback",
+        coordinate_layout="block_head_row_major",
+        irrep_dims=[2, 2],
+    )
+    assert torch.equal(actual.v_phi, expected.v_phi)
+    assert torch.equal(actual.xi, expected.xi)
+    assert torch.equal(
+        actual.min_undamped_generalized_eigenvalue,
+        expected.min_undamped_generalized_eigenvalue,
+    )
+    assert torch.equal(actual.scaled_solve_residual, expected.scaled_solve_residual)
+    assert actual.series_order == expected.series_order
 
 
 def _legacy_pullback_metric(

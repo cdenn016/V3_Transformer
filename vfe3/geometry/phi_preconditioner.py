@@ -27,6 +27,7 @@ position-dependent alternative for the non-compact regime.
 
 from collections import OrderedDict
 from dataclasses import dataclass
+import inspect
 import math
 import warnings
 import weakref
@@ -50,7 +51,30 @@ class PullbackGroupDirectionResult:
     series_order:                        int
 
 
+@dataclass(frozen=True)
+class _StrictBasisPreparation:
+    basis:             torch.Tensor
+    structure:         torch.Tensor
+    gram:              torch.Tensor
+    gram_factor:       torch.Tensor
+    gram_inverse_half: torch.Tensor
+    gram_is_identity:  bool
+
+
+@dataclass(frozen=True)
+class _StrictBlockPreparation:
+    index:               torch.Tensor
+    basis:               _StrictBasisPreparation
+    matches_first_basis: bool
+
+
+class _MixedPhiDifferentialOrder(ValueError):
+    """Signal that leading strict blocks have different first certified orders."""
+
+
 _PHI_GROUP_DIRECTIONS: Dict[str, Callable[..., PullbackGroupDirectionResult]] = {}
+_PHI_GROUP_DIRECTION_ACCEPTS_COORDINATE_LAYOUT: Dict[str, bool] = {}
+_PHI_GROUP_DIRECTION_REQUIRES_SOURCE_BASIS: Dict[str, bool] = {}
 
 _PHI_GROUP_MIN_SERIES_ORDER: int   = 40
 _PHI_GROUP_MAX_SERIES_ORDER: int   = 128
@@ -60,6 +84,15 @@ _PHI_GROUP_GRAM_RIDGE: float       = 1e-6
 _PHI_GROUP_MIN_UNDAMPED_EIG: float = 1e-8
 _PHI_GROUP_MAX_DAMPED_COND: float  = 1e6
 _PHI_GROUP_SOLVE_RESIDUAL: float   = 1e-10
+
+_STRICT_PULLBACK_PREP_CACHE_MAXSIZE: int = 32
+_STRICT_PULLBACK_PREP_CACHE: OrderedDict[
+    tuple,
+    tuple[
+        weakref.ReferenceType[torch.Tensor],
+        tuple[_StrictBlockPreparation, ...],
+    ],
+] = OrderedDict()
 
 
 def register_precond(name: str, *, override: bool = False) -> Callable:
@@ -87,7 +120,8 @@ def register_phi_group_direction(
     name: str,
 
     *,
-    override: bool = False,
+    override:              bool = False,
+    preserve_source_basis: bool = False,
 ) -> Callable:
     """Register one strict M-step pullback-group direction rule."""
     def _wrap(
@@ -97,7 +131,24 @@ def register_phi_group_direction(
             raise KeyError(
                 f"phi group direction {name!r} already registered; pass override=True to replace"
             )
+        try:
+            parameters = inspect.signature(fn).parameters.values()
+            accepts_coordinate_layout = any(
+                (
+                    parameter.name == "coordinate_layout"
+                    and parameter.kind in (
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    )
+                )
+                or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            accepts_coordinate_layout = False
         _PHI_GROUP_DIRECTIONS[name] = fn
+        _PHI_GROUP_DIRECTION_ACCEPTS_COORDINATE_LAYOUT[name] = accepts_coordinate_layout
+        _PHI_GROUP_DIRECTION_REQUIRES_SOURCE_BASIS[name] = bool(preserve_source_basis)
         return fn
     return _wrap
 
@@ -119,8 +170,9 @@ def pullback_group_direction(
     generators: torch.Tensor,             # (n_gen, K, K) registered basis
 
     *,
-    mode:       str,
-    irrep_dims: Optional[List[int]] = None,
+    mode:              str,
+    coordinate_layout: Optional[str]       = None,
+    irrep_dims:        Optional[List[int]] = None,
 ) -> PullbackGroupDirectionResult:
     r"""Return the strict M-step direction in an autocast-disabled float64 island.
 
@@ -129,12 +181,16 @@ def pullback_group_direction(
     left-trivialized group velocity ``xi = Psi_L(ad_phi) v_phi``.
     """
     with torch.autocast(device_type=grad_phi.device.type, enabled=False):
-        return get_phi_group_direction(mode)(
-            grad_phi,
-            phi,
-            generators,
-            irrep_dims=irrep_dims,
+        direction = get_phi_group_direction(mode)
+        kwargs = {"irrep_dims": irrep_dims}
+        if _PHI_GROUP_DIRECTION_ACCEPTS_COORDINATE_LAYOUT.get(mode, False):
+            kwargs["coordinate_layout"] = coordinate_layout
+        direction_generators = (
+            generators
+            if _PHI_GROUP_DIRECTION_REQUIRES_SOURCE_BASIS.get(mode, False)
+            else generators.to(device=phi.device, dtype=torch.float64)
         )
+        return direction(grad_phi, phi, direction_generators, **kwargs)
 
 
 def _strict_structure_constants(
@@ -182,6 +238,9 @@ def _strict_structure_constants(
 
 def _adaptive_phi_differentials(
     ad: torch.Tensor,                     # (..., n_gen, n_gen)
+
+    *,
+    require_uniform_leading_batch: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     r"""Evaluate certified right and left trivialized exponential differentials.
 
@@ -194,18 +253,16 @@ def _adaptive_phi_differentials(
     eye = torch.eye(n_gen, dtype=ad.dtype, device=ad.device).expand_as(ad).clone()
     psi_right = eye.clone()
     psi_left = eye.clone()
-    term_right = eye.clone()
-    term_left = eye.clone()
+    term = eye.clone()
     norm_one = torch.linalg.matrix_norm(ad, ord=1, dim=(-2, -1))
     norm_inf = torch.linalg.matrix_norm(ad, ord=float("inf"), dim=(-2, -1))
     use_one = norm_one <= norm_inf
     alpha = torch.where(use_one, norm_one, norm_inf)
     bound_k = torch.ones_like(alpha)
     for k in range(1, _PHI_GROUP_MAX_SERIES_ORDER):
-        term_right = torch.matmul(term_right, ad) / float(k + 1)
-        term_left = -torch.matmul(term_left, ad) / float(k + 1)
-        psi_right = psi_right + term_right
-        psi_left = psi_left + term_left
+        term = torch.matmul(term, ad) / float(k + 1)
+        psi_right = psi_right + term
+        psi_left = psi_left + (term if k % 2 == 0 else -term)
         bound_k = bound_k * alpha / float(k + 1)
         order = k + 1
         if order < _PHI_GROUP_MIN_SERIES_ORDER or order % _PHI_GROUP_SERIES_ORDER_STEP:
@@ -225,7 +282,16 @@ def _adaptive_phi_differentials(
         left_norm = torch.where(use_one, left_one, left_inf)
         right_ok = tail <= _PHI_GROUP_TAIL_TOL * torch.maximum(torch.ones_like(tail), right_norm)
         left_ok = tail <= _PHI_GROUP_TAIL_TOL * torch.maximum(torch.ones_like(tail), left_norm)
-        if bool((right_ok & left_ok & torch.isfinite(tail)).all()):
+        certified = right_ok & left_ok & torch.isfinite(tail)
+        if require_uniform_leading_batch:
+            leading_certified = certified.reshape(certified.shape[0], -1).all(dim=-1)
+            if bool(leading_certified.all()):
+                return psi_right, psi_left, order
+            if bool(leading_certified.any()):
+                raise _MixedPhiDifferentialOrder(
+                    "strict phi group blocks require different adaptive series orders"
+                )
+        elif bool(certified.all()):
             return psi_right, psi_left, order
     raise ValueError(
         f"strict phi group differential series certificate failed by order "
@@ -233,10 +299,204 @@ def _adaptive_phi_differentials(
     )
 
 
+def _build_strict_basis_preparation(
+    basis: torch.Tensor,                  # (n_gen, K, K) float64 target-device basis
+) -> _StrictBasisPreparation:
+    """Build the immutable tensors shared by strict directions for one basis."""
+    structure, gram = _strict_structure_constants(basis)
+    gram_factor, gram_info = torch.linalg.cholesky_ex(gram)
+    if bool((gram_info != 0).any()):
+        raise ValueError("strict phi group direction generator Gram factorization failed")
+    identity = torch.eye(gram.shape[-1], dtype=gram.dtype, device=gram.device)
+    gram_inverse_half = torch.linalg.solve_triangular(
+        gram_factor,
+        identity,
+        upper=False,
+    )
+    return _StrictBasisPreparation(
+        basis=basis,
+        structure=structure,
+        gram=gram,
+        gram_factor=gram_factor,
+        gram_inverse_half=gram_inverse_half,
+        gram_is_identity=bool(torch.equal(gram, identity)),
+    )
+
+
+def _strict_preparation_cache_key(
+    generators:       torch.Tensor,       # source basis
+    irrep_dims:       Optional[List[int]],
+    coordinate_layout: Optional[str],
+
+    *,
+    target_device: torch.device,
+    target_dtype:  torch.dtype,
+) -> tuple:
+    """Return the complete identity/version key for strict basis preparation."""
+    return (
+        id(generators),
+        int(generators._version),
+        tuple(generators.shape),
+        generators.device,
+        generators.dtype,
+        target_device,
+        target_dtype,
+        None if irrep_dims is None else tuple(irrep_dims),
+        coordinate_layout,
+    )
+
+
+def _build_strict_block_preparations(
+    generators:        torch.Tensor,      # source basis
+    irrep_dims:        Optional[List[int]],
+    coordinate_layout: Optional[str],
+
+    *,
+    target_device: torch.device,
+    target_dtype:  torch.dtype,
+    detach:        bool,
+) -> tuple[_StrictBlockPreparation, ...]:
+    """Build full or direct-sum local basis preparations on the staging device."""
+    source = generators.detach() if detach else generators
+    basis = source.to(device=target_device, dtype=target_dtype)
+    if detach:
+        # A cache value must not strongly retain its weakly keyed source, including when
+        # source and target device/dtype already match and ``Tensor.to`` returns itself.
+        basis = basis.clone()
+    if irrep_dims is None or len(irrep_dims) == 1:
+        index = torch.arange(basis.shape[0], dtype=torch.long, device=target_device)
+        return (
+            _StrictBlockPreparation(
+                index,
+                _build_strict_basis_preparation(basis),
+                True,
+            ),
+        )
+    if any(d <= 0 for d in irrep_dims) or sum(irrep_dims) != basis.shape[-1]:
+        raise ValueError("pullback_per_block requires positive irrep_dims summing to K")
+
+    if coordinate_layout == "block_head_row_major":
+        expected = sum(dimension * dimension for dimension in irrep_dims)
+        if basis.shape[0] != expected:
+            raise ValueError(
+                "block_head_row_major coordinates require one full row-major GL basis "
+                f"per block; got {basis.shape[0]} generators, expected {expected}"
+            )
+        indices = []
+        coordinate_start = 0
+        for dimension in irrep_dims:
+            coordinate_stop = coordinate_start + dimension * dimension
+            indices.append(
+                torch.arange(
+                    coordinate_start,
+                    coordinate_stop,
+                    dtype=torch.long,
+                    device=target_device,
+                )
+            )
+            coordinate_start = coordinate_stop
+    else:
+        block_of = _generator_block_index(basis, irrep_dims)
+        indices = [
+            (block_of == block).nonzero(as_tuple=True)[0]
+            for block in range(len(irrep_dims))
+        ]
+
+    preparations = []
+    first_local_basis = None
+    matrix_start = 0
+    for block, dimension in enumerate(irrep_dims):
+        index = indices[block]
+        if index.numel() == 0:
+            raise ValueError(f"pullback_per_block block {block} has no generators")
+        local_basis = basis[index][
+            :,
+            matrix_start:matrix_start + dimension,
+            matrix_start:matrix_start + dimension,
+        ].contiguous()
+        matches_first_basis = (
+            first_local_basis is None
+            or torch.equal(local_basis, first_local_basis)
+        )
+        if first_local_basis is None:
+            first_local_basis = local_basis
+        preparations.append(
+            _StrictBlockPreparation(
+                index,
+                _build_strict_basis_preparation(local_basis),
+                matches_first_basis,
+            )
+        )
+        matrix_start += dimension
+    return tuple(preparations)
+
+
+def _strict_block_preparations(
+    generators:        torch.Tensor,      # source basis
+    irrep_dims:        Optional[List[int]],
+    coordinate_layout: Optional[str],
+
+    *,
+    target_device: torch.device,
+    target_dtype:  torch.dtype,
+) -> tuple[_StrictBlockPreparation, ...]:
+    """Return weakly cached immutable strict-basis preparation, or bypass for autograd."""
+    if generators.requires_grad:
+        return _build_strict_block_preparations(
+            generators,
+            irrep_dims,
+            coordinate_layout,
+            target_device=target_device,
+            target_dtype=target_dtype,
+            detach=False,
+        )
+    key = _strict_preparation_cache_key(
+        generators,
+        irrep_dims,
+        coordinate_layout,
+        target_device=target_device,
+        target_dtype=target_dtype,
+    )
+    cached = _STRICT_PULLBACK_PREP_CACHE.get(key)
+    if cached is not None:
+        generators_ref, preparations = cached
+        if generators_ref() is generators:
+            _STRICT_PULLBACK_PREP_CACHE.move_to_end(key)
+            return preparations
+        _STRICT_PULLBACK_PREP_CACHE.pop(key, None)
+
+    preparations = _build_strict_block_preparations(
+        generators,
+        irrep_dims,
+        coordinate_layout,
+        target_device=target_device,
+        target_dtype=target_dtype,
+        detach=True,
+    )
+
+    def _remove_dead_entry(
+        generators_ref: weakref.ReferenceType[torch.Tensor],
+    ) -> None:
+        entry = _STRICT_PULLBACK_PREP_CACHE.get(key)
+        if entry is not None and entry[0] is generators_ref:
+            _STRICT_PULLBACK_PREP_CACHE.pop(key, None)
+
+    generators_ref = weakref.ref(generators, _remove_dead_entry)
+    _STRICT_PULLBACK_PREP_CACHE[key] = (generators_ref, preparations)
+    _STRICT_PULLBACK_PREP_CACHE.move_to_end(key)
+    while len(_STRICT_PULLBACK_PREP_CACHE) > _STRICT_PULLBACK_PREP_CACHE_MAXSIZE:
+        _STRICT_PULLBACK_PREP_CACHE.popitem(last=False)
+    return preparations
+
+
 def _full_pullback_group_direction(
     grad_phi:   torch.Tensor,             # (..., n_gen)
     phi:        torch.Tensor,             # (..., n_gen)
     generators: torch.Tensor,             # (n_gen, K, K)
+
+    *,
+    require_uniform_series_order: bool                              = False,
+    preparation:                  Optional[_StrictBasisPreparation] = None,
 ) -> PullbackGroupDirectionResult:
     r"""Compute one certified full-block pullback direction.
 
@@ -247,20 +507,25 @@ def _full_pullback_group_direction(
     """
     phi_64 = phi.to(dtype=torch.float64)
     grad_64 = grad_phi.to(dtype=torch.float64)
-    basis_64 = generators.to(dtype=torch.float64)
-    structure, gram = _strict_structure_constants(basis_64)
+    if preparation is None:
+        preparation = _build_strict_basis_preparation(
+            generators.to(device=phi.device, dtype=torch.float64)
+        )
+    basis_64 = preparation.basis
+    structure = preparation.structure
+    gram = preparation.gram
     ad = torch.einsum("...a,abc->...cb", phi_64, structure)
-    psi_right, psi_left, series_order = _adaptive_phi_differentials(ad)
+    psi_right, psi_left, series_order = _adaptive_phi_differentials(
+        ad,
+        require_uniform_leading_batch=require_uniform_series_order,
+    )
     pushed = torch.einsum("...ca,cij->...aij", psi_right, basis_64)
     exp_phi = torch.linalg.matrix_exp(torch.einsum("...a,aij->...ij", phi_64, basis_64))
     differential = torch.einsum("...aij,...jk->...aik", pushed, exp_phi)
     metric = torch.einsum("...aij,...bij->...ab", differential, differential)
     metric = 0.5 * (metric + metric.transpose(-1, -2))
-    gram_factor, gram_info = torch.linalg.cholesky_ex(gram)
-    if bool((gram_info != 0).any()):
-        raise ValueError("strict phi group direction generator Gram factorization failed")
-    identity = torch.eye(gram.shape[-1], dtype=gram.dtype, device=gram.device)
-    gram_inverse_half = torch.linalg.solve_triangular(gram_factor, identity, upper=False)
+    gram_factor = preparation.gram_factor
+    gram_inverse_half = preparation.gram_inverse_half
     whitened = torch.matmul(torch.matmul(gram_inverse_half, metric), gram_inverse_half.transpose(-1, -2))
     undamped_eigenvalues = torch.linalg.eigvalsh(0.5 * (whitened + whitened.transpose(-1, -2)))
     min_undamped = undamped_eigenvalues[..., 0]
@@ -293,8 +558,13 @@ def _full_pullback_group_direction(
         torch.einsum("...ab,...b->...a", damped, v_phi) - grad_64,
         dim=-1,
     )
+    damped_operator_norm = (
+        damped_eigenvalues[..., -1]
+        if preparation.gram_is_identity
+        else torch.linalg.matrix_norm(damped, ord=2, dim=(-2, -1))
+    )
     scale = (
-        torch.linalg.matrix_norm(damped, ord=2, dim=(-2, -1))
+        damped_operator_norm
         * torch.linalg.vector_norm(v_phi, dim=-1)
         + torch.linalg.vector_norm(grad_64, dim=-1)
     )
@@ -326,27 +596,41 @@ def _full_pullback_group_direction(
     )
 
 
-@register_phi_group_direction("pullback")
+@register_phi_group_direction("pullback", preserve_source_basis=True)
 def _pullback_group_direction(
     grad_phi:   torch.Tensor,             # (..., n_gen)
     phi:        torch.Tensor,             # (..., n_gen)
     generators: torch.Tensor,             # (n_gen, K, K)
 
     *,
-    irrep_dims: Optional[List[int]] = None,
+    coordinate_layout: Optional[str]       = None,
+    irrep_dims:        Optional[List[int]] = None,
 ) -> PullbackGroupDirectionResult:
-    del irrep_dims
-    return _full_pullback_group_direction(grad_phi, phi, generators)
+    del coordinate_layout, irrep_dims
+    preparation = _strict_block_preparations(
+        generators,
+        None,
+        None,
+        target_device=phi.device,
+        target_dtype=torch.float64,
+    )[0].basis
+    return _full_pullback_group_direction(
+        grad_phi,
+        phi,
+        generators,
+        preparation=preparation,
+    )
 
 
-@register_phi_group_direction("pullback_per_block")
+@register_phi_group_direction("pullback_per_block", preserve_source_basis=True)
 def _pullback_group_direction_per_block(
     grad_phi:   torch.Tensor,             # (..., n_gen)
     phi:        torch.Tensor,             # (..., n_gen)
     generators: torch.Tensor,             # (n_gen, K, K)
 
     *,
-    irrep_dims: Optional[List[int]] = None,
+    coordinate_layout: Optional[str]       = None,
+    irrep_dims:        Optional[List[int]] = None,
 ) -> PullbackGroupDirectionResult:
     r"""Solve each direct-sum block independently and aggregate global extrema.
 
@@ -357,49 +641,93 @@ def _pullback_group_direction_per_block(
     """
     if irrep_dims is None:
         raise ValueError("pullback_per_block requires irrep_dims")
+    preparations = _strict_block_preparations(
+        generators,
+        irrep_dims,
+        coordinate_layout,
+        target_device=phi.device,
+        target_dtype=torch.float64,
+    )
     if len(irrep_dims) == 1:
-        return _full_pullback_group_direction(grad_phi, phi, generators)
-    if any(d <= 0 for d in irrep_dims) or sum(irrep_dims) != generators.shape[-1]:
-        raise ValueError("pullback_per_block requires positive irrep_dims summing to K")
-
-    block_of = _generator_block_index(generators, irrep_dims)
+        return _full_pullback_group_direction(
+            grad_phi,
+            phi,
+            generators,
+            preparation=preparations[0].basis,
+        )
     grad_64 = grad_phi.to(dtype=torch.float64)
     phi_64 = phi.to(dtype=torch.float64)
     v_phi = torch.zeros_like(grad_64)
     xi = torch.zeros_like(grad_64)
-    local_results = []
-    start = 0
-    for block, dimension in enumerate(irrep_dims):
-        index = (block_of == block).nonzero(as_tuple=True)[0]
-        if index.numel() == 0:
-            raise ValueError(f"pullback_per_block block {block} has no generators")
-        local_basis = generators[index][
-            :,
-            start:start + dimension,
-            start:start + dimension,
-        ].contiguous()
-        local = _full_pullback_group_direction(
-            grad_64[..., index],
-            phi_64[..., index],
-            local_basis,
+    batch_equal_blocks = (
+        coordinate_layout == "block_head_row_major"
+        and grad_64.ndim > 1
+        and grad_64.shape[:-1] == phi_64.shape[:-1]
+        and not generators.requires_grad
+        and len(preparations) > 1
+        and len(set(irrep_dims)) == 1
+        and all(preparation.matches_first_basis for preparation in preparations)
+    )
+    if batch_equal_blocks:
+        batched_grad = torch.stack(
+            [grad_64[..., preparation.index] for preparation in preparations],
+            dim=0,
         )
-        v_phi = v_phi.index_copy(-1, index, local.v_phi)
-        xi = xi.index_copy(-1, index, local.xi)
-        local_results.append(local)
-        start += dimension
-
-    local_min_undamped = torch.stack(
-        [result.min_undamped_generalized_eigenvalue for result in local_results],
-        dim=0,
-    )
-    local_max_undamped = torch.stack(
-        [
-            result.min_undamped_generalized_eigenvalue
-            * result.undamped_generalized_condition
-            for result in local_results
-        ],
-        dim=0,
-    )
+        batched_phi = torch.stack(
+            [phi_64[..., preparation.index] for preparation in preparations],
+            dim=0,
+        )
+        try:
+            local = _full_pullback_group_direction(
+                batched_grad,
+                batched_phi,
+                preparations[0].basis.basis,
+                require_uniform_series_order=True,
+                preparation=preparations[0].basis,
+            )
+        except ValueError:
+            batch_equal_blocks = False
+    if batch_equal_blocks:
+        for block, preparation in enumerate(preparations):
+            v_phi = v_phi.index_copy(-1, preparation.index, local.v_phi[block])
+            xi = xi.index_copy(-1, preparation.index, local.xi[block])
+        local_min_undamped = local.min_undamped_generalized_eigenvalue
+        local_max_undamped = (
+            local.min_undamped_generalized_eigenvalue
+            * local.undamped_generalized_condition
+        )
+        local_scaled_residual = local.scaled_solve_residual
+        series_order = local.series_order
+    else:
+        local_results = []
+        for preparation in preparations:
+            index = preparation.index
+            local = _full_pullback_group_direction(
+                grad_64[..., index],
+                phi_64[..., index],
+                preparation.basis.basis,
+                preparation=preparation.basis,
+            )
+            v_phi = v_phi.index_copy(-1, index, local.v_phi)
+            xi = xi.index_copy(-1, index, local.xi)
+            local_results.append(local)
+        local_min_undamped = torch.stack(
+            [result.min_undamped_generalized_eigenvalue for result in local_results],
+            dim=0,
+        )
+        local_max_undamped = torch.stack(
+            [
+                result.min_undamped_generalized_eigenvalue
+                * result.undamped_generalized_condition
+                for result in local_results
+            ],
+            dim=0,
+        )
+        local_scaled_residual = torch.stack(
+            [result.scaled_solve_residual for result in local_results],
+            dim=0,
+        )
+        series_order = max(result.series_order for result in local_results)
     min_undamped = local_min_undamped.amin(dim=0)
     max_undamped = local_max_undamped.amax(dim=0)
     undamped_condition = max_undamped / min_undamped
@@ -426,10 +754,7 @@ def _pullback_group_direction_per_block(
             f"{maximum:.3e} exceeds {_PHI_GROUP_MAX_DAMPED_COND:.1e}"
         )
 
-    scaled_residual = torch.stack(
-        [result.scaled_solve_residual for result in local_results],
-        dim=0,
-    ).amax(dim=0)
+    scaled_residual = local_scaled_residual.amax(dim=0)
     if (
         not bool(torch.isfinite(scaled_residual).all())
         or bool((scaled_residual > _PHI_GROUP_SOLVE_RESIDUAL).any())
@@ -449,7 +774,7 @@ def _pullback_group_direction_per_block(
         undamped_generalized_condition=undamped_condition,
         damped_generalized_condition=damped_condition,
         scaled_solve_residual=scaled_residual,
-        series_order=max(result.series_order for result in local_results),
+        series_order=series_order,
     )
 
 

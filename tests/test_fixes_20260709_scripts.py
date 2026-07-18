@@ -3,6 +3,7 @@
 import inspect
 import sys
 import types
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ import torch
 
 import check_junit
 import generate_efe
+from vfe3.config import VFE3Config
 from vfe3.inference.e_step import e_step
 from vfe3.run_artifacts import semantic_config_fingerprint
 
@@ -230,7 +232,7 @@ def test_generate_efe_loads_self_bound_best_bundle(tmp_path):
         "config_from": None,
     })
 
-    assert loaded_config == config
+    assert loaded_config == asdict(VFE3Config(**config))
     assert torch.equal(loaded_state["weight"], state_dict["weight"])
 
 
@@ -282,7 +284,7 @@ def test_generate_efe_legacy_state_accepts_identical_bound_weights(tmp_path):
         "config_from": config_from,
     })
 
-    assert loaded_config == config
+    assert loaded_config == asdict(VFE3Config(**config))
     assert torch.equal(loaded_state["weight"], state_dict["weight"])
 
 

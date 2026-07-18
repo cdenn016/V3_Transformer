@@ -244,8 +244,9 @@ def stage_pullback_group_candidate(
         direction = pullback_group_direction(
             grad64,
             phi64,
-            generators64,
+            group.generators,
             mode=phi_precond_mode,
+            coordinate_layout=group.phi_coordinate_layout,
             irrep_dims=list(group.irrep_dims),
         )
         direction_tensors = (

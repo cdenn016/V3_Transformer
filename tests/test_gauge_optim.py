@@ -242,6 +242,72 @@ def test_pullback_group_trust_scales_the_learning_rate_weighted_right_factor(mon
     )
 
 
+def test_pullback_group_stage_passes_source_basis_and_registered_coordinate_layout(monkeypatch, device):
+    import vfe3.gauge_optim as gauge_optim
+
+    group = get_group("block_glk")(K=4, n_heads=2, dtype=torch.float32, device=device)
+    seen = {}
+
+    def record_direction(grad, phi, generators, **kwargs):
+        seen["generators"] = generators
+        seen["coordinate_layout"] = kwargs.get("coordinate_layout")
+        return _fixed_direction(torch.zeros_like(grad))
+
+    monkeypatch.setattr(gauge_optim, "pullback_group_direction", record_direction)
+    stage_pullback_group_candidate(
+        torch.ones(1, group.generators.shape[0], device=device),
+        torch.zeros(1, group.generators.shape[0], device=device),
+        group,
+        learning_rate=0.0,
+        trust_radius=0.25,
+        chart_max_norm=5.0,
+        bch_residual_max=1e-6,
+        phi_precond_mode="pullback_per_block",
+    )
+
+    assert seen["generators"] is group.generators
+    assert seen["coordinate_layout"] == "block_head_row_major"
+
+
+def test_pullback_group_stage_normalizes_basis_for_registered_extension(device):
+    import vfe3.geometry.phi_preconditioner as phi_preconditioner
+
+    name = "test_stage_normalized_registered_extension"
+    group = get_group("glk")(K=2, dtype=torch.float32, device=device)
+    seen = {}
+
+    @phi_preconditioner.register_phi_group_direction(name)
+    def registered_direction(grad, phi, generators, *, irrep_dims=None, **kwargs):
+        del phi, irrep_dims, kwargs
+        seen["generators"] = generators
+        return _fixed_direction(torch.zeros_like(grad))
+
+    try:
+        stage_pullback_group_candidate(
+            torch.ones(1, group.generators.shape[0], device=device),
+            torch.zeros(1, group.generators.shape[0], device=device),
+            group,
+            learning_rate=0.0,
+            trust_radius=0.25,
+            chart_max_norm=5.0,
+            bch_residual_max=1e-6,
+            phi_precond_mode=name,
+        )
+    finally:
+        for support_name in (
+            "_PHI_GROUP_DIRECTIONS",
+            "_PHI_GROUP_DIRECTION_ACCEPTS_COORDINATE_LAYOUT",
+            "_PHI_GROUP_DIRECTION_REQUIRES_SOURCE_BASIS",
+        ):
+            support = getattr(phi_preconditioner, support_name, None)
+            if support is not None:
+                support.pop(name, None)
+
+    assert seen["generators"].dtype == torch.float64
+    assert seen["generators"].device == group.generators.device
+    assert seen["generators"] is not group.generators
+
+
 @pytest.mark.parametrize(
     ("chart_norm", "phi_values", "delta_values", "reductions", "right_residual", "reversed_residual"),
     [
