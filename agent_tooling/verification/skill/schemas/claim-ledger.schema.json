@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Verification claim ledger",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "artifact_revision", "claims"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "artifact_revision": {"type": "string", "minLength": 1},
+    "claims": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "domain", "statement", "severity", "state", "artifact_revision", "criteria", "evidence", "counterevidence", "verifiers", "open_obligations", "evidence_invalidated"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "domain": {"enum": ["code", "experiment", "mathematics", "research", "source", "general"]},
+          "statement": {"type": "string", "minLength": 1},
+          "severity": {"enum": ["low", "medium", "high", "critical"]},
+          "state": {"enum": ["CANDIDATE", "LLM_SUPPORTED", "EVIDENCE_VERIFIED", "REFUTED", "INCONCLUSIVE"]},
+          "artifact_revision": {"type": "string", "minLength": 1},
+          "criteria": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["name", "score"], "properties": {"name": {"type": "string", "minLength": 1}, "score": {"type": "number", "minimum": 0, "maximum": 20}}}},
+          "evidence": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["kind", "location", "artifact_revision"], "properties": {"kind": {"enum": ["llm_judgment", "mechanical", "reproduced_output", "derivation", "formal_proof", "numerical", "primary_source", "reproduced_source"]}, "location": {"type": "string", "minLength": 1}, "artifact_revision": {"type": "string", "minLength": 1}}}},
+          "counterevidence": {"type": "array"},
+          "verifiers": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["role"], "properties": {"role": {"type": "string", "minLength": 1}}}},
+          "open_obligations": {"type": "array", "items": {"type": "string", "minLength": 1}},
+          "evidence_invalidated": {"type": "boolean"}
+        }
+      }
+    }
+  }
+}
