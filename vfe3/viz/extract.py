@@ -340,6 +340,7 @@ def _fe_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor] = No
         connection_M=getattr(model, "connection_M", None),
         connection_L=getattr(model, "connection_L", None),
         compact_phi_block_transport=model._compact_phi_blocks_enabled(),
+        transport_mean_per_head=True,
         transport_chart_max_norm=cfg.transport_chart_max_norm,
         transport_status=model._transport_status,
         log_prior=log_prior,

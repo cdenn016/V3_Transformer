@@ -39,8 +39,9 @@ def e_step_shared_kwargs(
     extractors dropped ``e_step_update`` / ``mm_damping`` / ``lambda_twohop`` /
     ``skip_belief_sigma_update``, which the committed baselines set off-default). Runtime objects
     (tau, lambda_beta, log_prior, rope, connections, gauge_parameterization) stay per-call-site;
-    The per-head mean contraction stays an explicit internal ``e_step`` parameter because the
-    diagnostic F does not consume it. ``reuse_pairwise_kl_stats`` is a mandatory shared argument,
+    The per-head mean contraction stays an explicit internal ``e_step`` parameter and is requested
+    by both production iteration and diagnostic F call sites.
+    ``reuse_pairwise_kl_stats`` is a mandatory shared argument,
     so both production iteration and its diagnostic F request the same pairwise-statistics reuse.
     ``free_energy_value`` declares every iteration-only key here as an explicit accept-and-ignore
     parameter, so one bag serves both consumers and a misspelled knob still raises ``TypeError``.

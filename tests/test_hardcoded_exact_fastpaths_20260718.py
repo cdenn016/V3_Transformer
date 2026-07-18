@@ -36,6 +36,56 @@ def _keyword_values(relative: str, keyword_name: str) -> list[ast.expr]:
     ]
 
 
+def _function_keyword_values(
+    relative:      str,
+    function_name: str,
+    keyword_name:  str,
+) -> list[ast.expr]:
+    tree = ast.parse((ROOT / relative).read_text(encoding="utf-8"))
+    functions = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    ]
+    assert len(functions) == 1, (relative, function_name)
+    return [
+        keyword.value
+        for node in ast.walk(functions[0])
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+        if keyword.arg == keyword_name
+    ]
+
+
+def _direct_call_keyword_values(
+    relative:      str,
+    function_name: str,
+    callee_name:   str,
+    keyword_name:  str,
+) -> list[ast.expr]:
+    tree = ast.parse((ROOT / relative).read_text(encoding="utf-8"))
+    functions = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    ]
+    assert len(functions) == 1, (relative, function_name)
+    return [
+        keyword.value
+        for node in ast.walk(functions[0])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == callee_name
+        for keyword in node.keywords
+        if keyword.arg == keyword_name
+    ]
+
+
+def _literal_true(values: list[ast.expr]) -> bool:
+    return bool(values) and all(
+        isinstance(value, ast.Constant) and value.value is True
+        for value in values
+    )
+
+
 def test_public_configuration_and_drivers_have_no_fastpath_controls() -> None:
     assert FORMER_CONFIG_FIELDS.isdisjoint(field.name for field in fields(VFE3Config))
     for relative in ("vfe3/config.py", "train_vfe3.py", "scaling.py", "ablation.py"):
@@ -103,3 +153,10 @@ def test_compact_phi_route_is_automatic(
     values.update(overrides)
     model = VFEModel(VFE3Config(**values)).eval()
     assert model._compact_phi_blocks_enabled() is expected
+
+
+def test_diagnostic_free_energy_requests_per_head_mean_transport() -> None:
+    assert _literal_true(_function_keyword_values(
+        "vfe3/viz/extract.py", "_fe_kwargs", "transport_mean_per_head"))
+    assert _literal_true(_direct_call_keyword_values(
+        "vfe3/inference/e_step.py", "e_step", "free_energy_value", "transport_mean_per_head"))
