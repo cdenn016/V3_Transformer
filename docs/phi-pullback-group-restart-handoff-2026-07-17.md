@@ -48,3 +48,10 @@ The live `main` checkout is already at `d7cb434` but contains user-owned edits
 to `scaling.py` and `train_vfe3.py` plus seven user-owned deletions under
 `vfe3_scaling_results/grow_K_GL10`. Do not alter those paths. The separate
 m-phi investigation worktree is clean and must remain intact.
+
+The user later explicitly authorized `commit push merge and ff`, superseding
+the public-destination block. The task branch integrated `origin/main` as
+`220fe4d`; the incoming changes were documentation-only. The resulting full
+suite retained exactly the 14 accepted baseline failures, zero errors, and 17
+skips. Publication, merge, WIP-preserving live-checkout fast-forward, and
+task-worktree cleanup are authorized to proceed.
