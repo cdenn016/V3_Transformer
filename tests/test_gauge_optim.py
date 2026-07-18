@@ -110,11 +110,64 @@ def test_default_adamw_one_step_is_byte_identical_to_golden():
         data = tensor.detach().cpu().contiguous().numpy().tobytes()
         return hashlib.sha256(data).hexdigest()
 
-    assert digest(model.prior_bank.mu_embed) == "ffc101ec6c9b0fc34e1089dda4b5b28cafa6e2d53678c257ced04723e6e2a66a"
-    assert digest(model.prior_bank.sigma_log_embed) == "b632d4a844923ebb4e8af9e1158ae9eb20ad37a64677bc53186235915d2790fd"
-    assert digest(model.prior_bank.phi_embed) == "e31bfece5ed86861d7d32f3e16214c17ddcb780dfda1116c3cffbf0e27a674b9"
+    assert digest(model.prior_bank.mu_embed) == "1c61e2af1b2713576867864e9fc8ac936bffd96951df0f5a4ada5e1a3ad4282d"
+    assert digest(model.prior_bank.sigma_log_embed) == "454c595a8d5428bfc820ac4611feb5192768fc1c2e6edbed5769be00b52f02d6"
+    assert digest(model.prior_bank.phi_embed) == "c099e3098e481e6c6ef7cd98547cabe941dc28af445a7d571f3a9e1efe4358cd"
     assert digest(model.prior_bank.decode_log_scale) == "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
-    assert digest(model.prior_bank.output_proj_weight) == "1bc018feb7e7c10fcd644d14bbf24a3ac2fe50073b9a355e2bcca69b907618de"
+    assert digest(model.prior_bank.output_proj_weight) == "5701bb9affeb0d65c7f25d137badde82ec706b5e899dc0aecbb3e08fccd0bd39"
+
+
+def test_default_adamw_one_step_matches_recompute_dense_low_level_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vfe3.config import VFE3Config
+    from vfe3.model import block as block_module
+    from vfe3.model.model import VFEModel
+    from vfe3.train import build_optimizer, train_step
+
+    torch.manual_seed(0)
+    cfg = VFE3Config(
+        vocab_size=8,
+        embed_dim=4,
+        n_heads=2,
+        max_seq_len=4,
+        n_layers=1,
+        n_e_steps=1,
+        pos_phi="none",
+    )
+    production = VFEModel(cfg)
+    oracle = VFEModel(cfg)
+    oracle.load_state_dict(production.state_dict())
+    tokens = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]], dtype=torch.long)
+    targets = torch.tensor([[1, 2, 3, 4], [2, 1, 0, 7]], dtype=torch.long)
+
+    def one_step(model: VFEModel) -> tuple[float, dict[str, torch.Tensor]]:
+        optimizer = build_optimizer(model, cfg)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+        loss = train_step(model, optimizer, scheduler, tokens, targets, grad_clip=1.0)
+        return loss, {name: value.detach().clone() for name, value in model.named_parameters()}
+
+    production_loss, production_parameters = one_step(production)
+    original_e_step = block_module.e_step
+
+    def recompute_dense_e_step(*args: object, **kwargs: object) -> object:
+        kwargs["reuse_pairwise_kl_stats"] = False
+        kwargs["compact_phi_block_transport"] = False
+        return original_e_step(*args, **kwargs)
+
+    monkeypatch.setattr(block_module, "e_step", recompute_dense_e_step)
+    oracle_loss, oracle_parameters = one_step(oracle)
+
+    assert production_loss == oracle_loss
+    assert production_parameters.keys() == oracle_parameters.keys()
+    for name in production_parameters:
+        torch.testing.assert_close(
+            production_parameters[name],
+            oracle_parameters[name],
+            atol=1e-6,
+            rtol=1e-6,
+            msg=lambda message, name=name: f"{name}: {message}",
+        )
 
 
 @pytest.mark.parametrize("value", [-1, 1.5, True, False, "2", None])

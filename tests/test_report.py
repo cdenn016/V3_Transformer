@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader
 from vfe3 import run_artifacts
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
+from vfe3.geometry.transport import CompactFactoredTransport
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts, finalize_run, semantic_config_fingerprint
 from vfe3.train import train
@@ -56,11 +57,15 @@ def test_converged_state_shapes_and_finite():
     assert st["mu"].shape == (n, k)
     assert st["phi"].shape[0] == n
     assert st["exp_phi"].shape == (n, k, k)
-    assert st["omega"].shape == (n, n, k, k)
+    assert isinstance(st["omega"], CompactFactoredTransport)
+    assert st["omega"].exp_blocks.shape == (n, 2, 2, 2)
+    assert st["omega"].inv_blocks.shape == (n, 2, 2, 2)
+    assert torch.isfinite(st["omega"].exp_blocks).all()
+    assert torch.isfinite(st["omega"].inv_blocks).all()
     assert st["energy"].shape[-2:] == (n, n)
     assert st["beta"].shape[-2:] == (n, n)
     assert st["self_div"].shape[0] == n
-    for key in ("mu", "sigma", "phi", "exp_phi", "omega", "energy", "beta", "self_div"):
+    for key in ("mu", "sigma", "phi", "exp_phi", "energy", "beta", "self_div"):
         assert torch.isfinite(st[key]).all(), key
 
 
