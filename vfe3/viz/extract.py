@@ -426,9 +426,8 @@ def belief_ce_bank(
     position-by-position; only valid targets (``targets != -100``) are kept. Returns the flattened
     per-token ``tr_sigma`` (M,), ``ce`` (M,) nats, the predicted-token ``token_ids`` (M,), and the
     per-token ``conf`` (M,) max-softmax probability and ``correct`` (M,) argmax-equals-gold indicator --
-    the aligned pairs the Spearman rho / CV gate (``vfe3.metrics.spearman_rho`` / ``cv``), the
-    sigma-validation gate (``vfe3.inference.sigma_gate``), and the Sigma-stratified-error /
-    Sigma-CE-scatter figures consume. ``max_batches`` caps the join.
+    the aligned pairs the Spearman rho / CV gate (``vfe3.metrics.spearman_rho`` / ``cv``) and the
+    Sigma-stratified-error / Sigma-CE-scatter figures consume. ``max_batches`` caps the join.
     """
     device = device or _model_device(model)
     if inference_bank is not None:

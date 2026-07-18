@@ -978,8 +978,7 @@ class VFEModel(nn.Module):
         ``run = no_grad() if e_step_gradient=='detach'
         else nullcontext()`` and ``amp`` contexts forward establishes, so a grad-enabled training caller
         and a no-grad inference caller both get the identical forward value. The no-grad property used by
-        the policy layer comes from the caller's ``@torch.no_grad`` scope (``generate``,
-        ``rollout_beliefs``), not from this method.
+        generation comes from the caller's ``@torch.no_grad`` scope, not from this method.
         """
         B, N = token_ids.shape
         if decode_last and N <= 0:
@@ -1482,27 +1481,6 @@ class VFEModel(nn.Module):
                         self._flip_reflection_sign_row(int(tid))        # mutate the source buffer in place
             return {"proposed": proposed, "accepted": accepted,
                     "mean_delta_f": (sum(dfs) / len(dfs)) if dfs else 0.0}
-
-    @torch.no_grad()
-    def rollout_beliefs(
-        self,
-        token_ids:     torch.Tensor,                     # (B, N) context ids (the action prefix)  -> D
-
-        *,
-        return_logits: bool          = True,             # continuation scoring needs the decode    -> A
-        decode_last:   bool          = False,            # decode only terminal logits as (B, 1, V)
-    ) -> 'Tuple[BeliefState, Optional[torch.Tensor]]':
-        r"""Public no-grad belief rollout: the active-inference contract's D (initial belief from the
-        current context) and the one-step B (transition rule) building block. A single forward of
-        ``token_ids`` through the shared belief seam under no_grad, returning (q*, logits). Appending a
-        candidate ACTION token to ``token_ids`` and re-calling realizes one transition q*_t -> q*_{t+1};
-        iterating it H times is the fixed-horizon rollout. The environment's response to a committed
-        action is appended by the generation loop AFTER selection, never inside the scored rollout.
-        By default it returns the SAME tensors ``forward`` would, so it adds no new numerical path;
-        ``decode_last=True`` preserves the complete belief and decodes only terminal ``(B, 1, V)`` logits.
-        """
-        return self.forward_beliefs(
-            token_ids, return_logits=return_logits, decode_last=decode_last, training=False)
 
     def forward(
         self,
@@ -2188,10 +2166,9 @@ class VFEModel(nn.Module):
         r"""Autoregressively extend each prompt by ``max_new_tokens`` tokens.
 
         Each step feeds the running sequence through :meth:`forward_beliefs` and decodes only the
-        last position as logits shaped ``(B, 1, V)``. The ordinary sampler truncates its context to
-        the last ``cfg.max_seq_len`` tokens, while a policy sampler preserves its complete context
-        and rejects a context-plus-candidate that exceeds the model bound. The returned sequence
-        keeps the FULL prompt followed by the generated ids. Because generation never enters the
+        last position as logits shaped ``(B, 1, V)``. The sampler truncates its context to the last
+        ``cfg.max_seq_len`` tokens. The returned sequence keeps the full prompt followed by the
+        generated ids. Because generation never enters the
         training/loss branch, it cannot corrupt training (runs under ``torch.no_grad``).
 
         Greedy (``greedy=True``) takes the argmax and ignores ``temperature``/``top_k``/
@@ -2204,25 +2181,15 @@ class VFEModel(nn.Module):
         -> E-step -> decode) for every generated token. Incremental belief reuse across
         steps is a future optimization.
         """
-        # audit F9 (2026-06-28): under a policy scorer the next token comes from _policy_select, which
-        # uses policy_top_k / policy_precision from config and does NOT consume the call-time sampler
-        # knobs. Reject them rather than silently ignoring them; 'greedy' IS honored (argmax vs sample
-        # of the policy posterior).
-        if self.cfg.policy_mode != "none" and (temperature != 1.0 or top_k is not None or top_p is not None):
-            raise ValueError(
-                "temperature/top_k/top_p are ignored when policy_mode != 'none' (the EFE policy posterior "
-                "uses policy_top_k and policy_precision); drop them or set policy_mode='none'. 'greedy' is "
-                "honored (argmax vs sample of the policy posterior).")
         # audit C13 (2026-07-01): validate the sampler arguments up front. A negative max_new_tokens
         # would silently no-op (empty loop, prompt returned unchanged); temperature<=0, out-of-range
         # top_k, and top_p outside (0, 1] fail late or produce invalid probabilities. Greedy ignores
-        # temperature/top_k/top_p (and the policy path rejects non-defaults above), so those three
-        # are checked only on the sampled policy_mode='none' path.
+        # temperature/top_k/top_p, so those three are checked only on the sampled path.
         if max_new_tokens < 0:
             raise ValueError(f"max_new_tokens must be >= 0, got {max_new_tokens}")
         if token_ids.shape[1] <= 0:
             raise ValueError("generate requires a nonempty token context")
-        if not greedy and self.cfg.policy_mode == "none":
+        if not greedy:
             if not (temperature > 0.0):
                 raise ValueError(f"temperature must be > 0, got {temperature}")
             if top_k is not None and not (1 <= top_k <= self.cfg.vocab_size):
@@ -2251,192 +2218,65 @@ class VFEModel(nn.Module):
                 UserWarning,
                 stacklevel=2,
             )
-        # PB-06 sigma-consumer gate: WHEN AND ONLY WHEN the ambiguity arm is the gated 'sigma_mc', derive
-        # the four live identities ONCE and verify the pre-registered consumer gate before any rollout,
-        # then thread them through _policy_select. policy_ambiguity_mode='likelihood_entropy' (and
-        # policy_mode='none') never hashes the model/code/corpus, inspects the specification, or reads the
-        # artifact -- the pure path stays untouched. Providers are resolved through vfe3.inference.sigma_gate
-        # at call time (no unpatchable aliases).
-        sigma_gate_ids: Dict[str, Optional[str]] = {}
-        if self.cfg.policy_ambiguity_mode == "sigma_mc":
-            from vfe3.inference import sigma_gate
-            from vfe3.run_artifacts import (model_behavior_fingerprint, semantic_config_fingerprint,
-                                            sigma_behavior_config)
-            behavior = model_behavior_fingerprint(sigma_behavior_config(self.cfg), self.state_dict())
-            spec = sigma_gate.sigma_gate_spec_identity()
-            if spec == "unknown":
-                raise ValueError(
-                    "policy_ambiguity_mode='sigma_mc' requires a resolvable governing specification "
-                    "identity; sigma_gate_spec_identity() returned 'unknown'.")
-            code = sigma_gate.sigma_consumer_code_identity()
-            meas_context = sigma_gate.sigma_measurement_context(self.cfg)
-            context_fp = semantic_config_fingerprint(meas_context)
-            sigma_gate.verify_sigma_consumer_gate(
-                self.cfg.policy_sigma_gate_artifact,
-                actual_model_behavior_sha256=behavior,
-                actual_spec_identity=spec,
-                actual_code_identity_sha256=code,
-                actual_measurement_context_sha256=context_fp,
-            )
-            sigma_gate_ids = dict(
-                model_behavior_sha256=behavior,
-                sigma_spec_identity=spec,
-                sigma_code_identity_sha256=code,
-                sigma_measurement_context_sha256=context_fp,
-            )
         seq = token_ids
         for _ in range(max_new_tokens):
-            if self.cfg.policy_mode == "none":
-                context = seq[:, -self.cfg.max_seq_len:]                 # (B, <=max_seq_len)
-                _belief, decoded = self.forward_beliefs(
-                    context, return_logits=True, decode_last=True, training=False)
-                logits = decoded[:, 0, :]                                # (B, V) last position
-                invalid_row = torch.isnan(logits).any(dim=-1) | torch.isposinf(logits).any(dim=-1)
-                if bool(invalid_row.any()):
-                    rows = invalid_row.nonzero(as_tuple=False).flatten().tolist()
+            context = seq[:, -self.cfg.max_seq_len:]                 # (B, <=max_seq_len)
+            _belief, decoded = self.forward_beliefs(
+                context, return_logits=True, decode_last=True, training=False)
+            logits = decoded[:, 0, :]                                # (B, V) last position
+            invalid_row = torch.isnan(logits).any(dim=-1) | torch.isposinf(logits).any(dim=-1)
+            if bool(invalid_row.any()):
+                rows = invalid_row.nonzero(as_tuple=False).flatten().tolist()
+                raise ValueError(
+                    f"generation logits contain NaN or +inf values in rows {rows}")
+            finite_row = torch.isfinite(logits).any(dim=-1)
+            if not bool(finite_row.all()):
+                rows = (~finite_row).nonzero(as_tuple=False).flatten().tolist()
+                raise ValueError(f"generation logits have no finite value in rows {rows}")
+            if greedy:
+                next_token = logits.argmax(dim=-1, keepdim=True)    # (B, 1)
+                retained_logits = torch.gather(logits, 1, next_token)
+                retained_finite = torch.isfinite(retained_logits).all(dim=-1)
+                if not bool(retained_finite.all()):
+                    rows = (~retained_finite).nonzero(as_tuple=False).flatten().tolist()
                     raise ValueError(
-                        f"generation logits contain NaN or +inf values in rows {rows}")
-                finite_row = torch.isfinite(logits).any(dim=-1)
-                if not bool(finite_row.all()):
-                    rows = (~finite_row).nonzero(as_tuple=False).flatten().tolist()
-                    raise ValueError(f"generation logits have no finite value in rows {rows}")
-                if greedy:
-                    next_token = logits.argmax(dim=-1, keepdim=True)    # (B, 1)
-                    retained_logits = torch.gather(logits, 1, next_token)
-                    retained_finite = torch.isfinite(retained_logits).all(dim=-1)
-                    if not bool(retained_finite.all()):
-                        rows = (~retained_finite).nonzero(as_tuple=False).flatten().tolist()
-                        raise ValueError(
-                            f"generation retained logits contain non-finite values in rows {rows}")
-                else:
-                    logits = logits / temperature
-                    retained = torch.ones_like(logits, dtype=torch.bool)
-                    if top_k is not None:
-                        kth = logits.topk(top_k, dim=-1).values[:, -1:]  # (B, 1) k-th largest
-                        remove_topk = logits < kth
-                        retained = ~remove_topk
-                        logits = logits.masked_fill(remove_topk, float("-inf"))
-                    retained_finite = torch.where(
-                        retained, torch.isfinite(logits), torch.ones_like(retained)
-                    ).all(dim=-1)
-                    if not bool(retained_finite.all()):
-                        rows = (~retained_finite).nonzero(as_tuple=False).flatten().tolist()
-                        raise ValueError(
-                            f"generation retained logits contain non-finite values in rows {rows}")
-                    if top_p is not None:
-                        sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
-                        sorted_probs = sorted_logits.softmax(dim=-1)       # compute the softmax once
-                        cumprobs = sorted_probs.cumsum(dim=-1)
-                        # Keep the smallest nucleus whose cumprob reaches top_p; the strict
-                        # shift always keeps the top token (its cumprob>=p never removes it).
-                        remove = cumprobs - sorted_probs >= top_p
-                        remove_unsorted = remove.scatter(-1, sorted_idx, remove)
-                        retained = retained & ~remove_unsorted
-                        logits = logits.masked_fill(remove_unsorted, float("-inf"))
-                    retained_finite = torch.where(
-                        retained, torch.isfinite(logits), torch.ones_like(retained)
-                    ).all(dim=-1)
-                    if not bool(retained_finite.all()):
-                        rows = (~retained_finite).nonzero(as_tuple=False).flatten().tolist()
-                        raise ValueError(
-                            f"generation retained logits contain non-finite values in rows {rows}")
-                    probs = logits.softmax(dim=-1)                      # (B, V)
-                    next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+                        f"generation retained logits contain non-finite values in rows {rows}")
             else:
-                # EFE policy rerank (no_grad). Reached only under a non-default policy_mode toggle, so
-                # default generation (policy_mode='none') is byte-identical (spec Section 3.4).
-                context = seq                                             # policy paths never truncate context
-                next_token = self._policy_select(context, greedy=greedy, **sigma_gate_ids)   # (B, 1)
+                logits = logits / temperature
+                retained = torch.ones_like(logits, dtype=torch.bool)
+                if top_k is not None:
+                    kth = logits.topk(top_k, dim=-1).values[:, -1:]  # (B, 1) k-th largest
+                    remove_topk = logits < kth
+                    retained = ~remove_topk
+                    logits = logits.masked_fill(remove_topk, float("-inf"))
+                retained_finite = torch.where(
+                    retained, torch.isfinite(logits), torch.ones_like(retained)
+                ).all(dim=-1)
+                if not bool(retained_finite.all()):
+                    rows = (~retained_finite).nonzero(as_tuple=False).flatten().tolist()
+                    raise ValueError(
+                        f"generation retained logits contain non-finite values in rows {rows}")
+                if top_p is not None:
+                    sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
+                    sorted_probs = sorted_logits.softmax(dim=-1)       # compute the softmax once
+                    cumprobs = sorted_probs.cumsum(dim=-1)
+                    # Keep the smallest nucleus whose cumprob reaches top_p; the strict
+                    # shift always keeps the top token (its cumprob>=p never removes it).
+                    remove = cumprobs - sorted_probs >= top_p
+                    remove_unsorted = remove.scatter(-1, sorted_idx, remove)
+                    retained = retained & ~remove_unsorted
+                    logits = logits.masked_fill(remove_unsorted, float("-inf"))
+                retained_finite = torch.where(
+                    retained, torch.isfinite(logits), torch.ones_like(retained)
+                ).all(dim=-1)
+                if not bool(retained_finite.all()):
+                    rows = (~retained_finite).nonzero(as_tuple=False).flatten().tolist()
+                    raise ValueError(
+                        f"generation retained logits contain non-finite values in rows {rows}")
+                probs = logits.softmax(dim=-1)                      # (B, V)
+                next_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
             seq = torch.cat([seq, next_token], dim=-1)
         return seq
-
-    @torch.no_grad()
-    def _policy_select(
-        self,
-        context: torch.Tensor,           # (B, N) current-context ids
-
-        *,
-        greedy:  bool = True,            # True -> argmax the policy posterior; else sample it
-        model_behavior_sha256:      Optional[str] = None,   # PB-06 consumer-gate identities (sigma_mc only)
-        sigma_spec_identity:        Optional[str] = None,
-        sigma_code_identity_sha256: Optional[str] = None,
-        sigma_measurement_context_sha256: Optional[str] = None,
-    ) -> torch.Tensor:                   # (B, 1) selected next-token id
-        r"""EFE policy selection over a top-``policy_top_k`` candidate menu (spec Section 3.4).
-
-        Decodes the base last-position logits once (the pre-registered candidate generator E), then
-        constructs the candidate menu: a one-step ``(B, Kp, 1)`` top-k menu for every mode except
-        ``policy_mode='efe_rollout'``, which builds the bounded H-step beam menu ``(B, Kp, H)`` through
-        :func:`vfe3.inference.candidate_menu.build_topk_policy_menu` (audit PB-05). The menu is scored
-        through the configured ``policy_mode`` scorer with the candidate prior E (the base softmax over
-        the one-step menu, or the beam log-softmax for efe_rollout), and the argmax (or a sample) of the
-        policy posterior selects a policy; the committed token is that policy's FIRST action (identical
-        to the selected token in the one-step case). The environment response to a committed action is
-        appended by the closed-loop driver, never here (the scored rollout appends the action only; spec
-        Section 2.2).
-
-        Note: ``policy_preference='task'`` / ``'held_out_predictive'`` need per-episode / per-corpus
-        context (the goal, or p_data) that ``generate`` does not supply, so those preferences are
-        driven through the closed-loop experiment harness, which calls the scorer directly; under
-        ``generate`` the meaningful preference is the global ``'flat'``.
-        """
-        from vfe3.inference.candidate_menu import build_topk_policy_menu
-        from vfe3.inference.policy import _validate_policy_context, get_policy, get_preference
-        # audit PB-05 (2026-07-12): efe_rollout (horizon>1) is now reachable through generate() via the
-        # bounded H-step beam menu (vfe3/inference/candidate_menu.py); only candidate CONSTRUCTION
-        # branches on policy_mode -- the one-step block below is unchanged. The scorer's cache gate is
-        # NOT relaxed: efe_rollout still fails closed on a cache-unsupported config inside
-        # get_policy('efe_rollout') (spec Section 3.5), not here.
-        horizon = self.cfg.policy_horizon if self.cfg.policy_mode == "efe_rollout" else 1
-        _validate_policy_context(context, horizon, self.cfg.max_seq_len)
-        _belief, decoded = self.forward_beliefs(
-            context, return_logits=True, decode_last=True, training=False,
-        )
-        base_logits = decoded[:, 0, :]                               # (B, V) base last-position logits
-        invalid_row = torch.isnan(base_logits).any(dim=-1) | torch.isposinf(base_logits).any(dim=-1)
-        if bool(invalid_row.any()):
-            rows = invalid_row.nonzero(as_tuple=False).flatten().tolist()
-            raise ValueError(
-                f"policy base logits contain NaN or +inf values in rows {rows}")
-        finite_row = torch.isfinite(base_logits).any(dim=-1)
-        if not bool(finite_row.all()):
-            rows = (~finite_row).nonzero(as_tuple=False).flatten().tolist()
-            raise ValueError(f"policy base logits have no finite value in rows {rows}")
-        if self.cfg.policy_mode == "efe_rollout":
-            candidates, log_prior = build_topk_policy_menu(        # (B, Kp, H) H-action beams, (B, Kp) log E
-                context, base_logits, self,
-                horizon=horizon, width=self.cfg.policy_top_k,
-            )
-        else:
-            Kp = self.cfg.policy_top_k
-            topk = base_logits.topk(Kp, dim=-1).indices            # (B, Kp) candidate token ids (generator E)
-            candidates = topk.unsqueeze(-1)                        # (B, Kp, 1) one-step action tokens
-            menu_logits = torch.gather(base_logits, 1, topk)      # (B, Kp) base logits over the menu
-            retained_finite = torch.isfinite(menu_logits).all(dim=-1)
-            if not bool(retained_finite.all()):
-                rows = (~retained_finite).nonzero(as_tuple=False).flatten().tolist()
-                raise ValueError(f"policy menu logits contain non-finite retained values in rows {rows}")
-            log_prior = torch.log_softmax(menu_logits, dim=-1)    # (B, Kp) log E(pi): base softmax over menu
-        preference = get_preference(self.cfg.policy_preference)(
-            self.prior_bank, device=base_logits.device)            # (V,)/(B,V) log p(o|C), on the model device (audit F5)
-        out = get_policy(self.cfg.policy_mode)(
-            context, candidates, preference, self,
-            gamma=self.cfg.policy_precision, horizon=self.cfg.policy_horizon,
-            score_terms=self.cfg.policy_score_terms, log_prior=log_prior, base_logits=base_logits,
-            ambiguity_mode=self.cfg.policy_ambiguity_mode,
-            model_behavior_sha256=model_behavior_sha256,
-            sigma_spec_identity=sigma_spec_identity,
-            sigma_code_identity_sha256=sigma_code_identity_sha256,
-            sigma_measurement_context_sha256=sigma_measurement_context_sha256,
-        )
-        if greedy:
-            idx = out.policy_posterior.argmax(dim=-1, keepdim=True)         # (B, 1) menu index
-        else:
-            idx = torch.multinomial(out.policy_posterior, num_samples=1)    # (B, 1)
-        selected = torch.gather(                                   # (B, 1, H) the selected policy sequence
-            candidates, 1, idx.unsqueeze(-1).expand(-1, -1, candidates.shape[-1]),
-        )
-        return selected[:, 0, :1]                                  # (B, 1) FIRST action of the selected policy
 
     def _fold_precision_bias(
         self,
