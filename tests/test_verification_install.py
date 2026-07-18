@@ -88,6 +88,10 @@ def _args(tmp_path: Path, *, project: bool = True) -> Namespace:
     (claude_home / "skills" / "unrelated.txt").write_text("keep\n", encoding="utf-8")
     (codex_home / "skills").mkdir()
     (codex_home / "skills" / "unrelated.txt").write_text("keep\n", encoding="utf-8")
+    for home, label in ((claude_home, "Claude"), (codex_home, "Codex")):
+        deep_audit = home / "skills" / "deep-audit"
+        deep_audit.mkdir()
+        (deep_audit / "SKILL.md").write_text(f"{label} deep-audit preface\n", encoding="utf-8")
     project_root: Path | None = None
     if project:
         project_root = tmp_path / "project"
@@ -201,8 +205,10 @@ def test_install_renders_six_agents_preserves_existing_surfaces_and_is_idempoten
     assert "Codex preface" in (args.codex_home / "AGENTS.md").read_text(encoding="utf-8")
     assert "project-policy.md policy body" in (args.project_root / "CLAUDE.md").read_text(encoding="utf-8")
     assert "project-policy.md policy body" in (args.project_root / "AGENTS.md").read_text(encoding="utf-8")
-    assert "deep-audit-integration.md policy body" in (args.claude_home / "CLAUDE.md").read_text(encoding="utf-8")
-    assert "deep-audit-integration.md policy body" in (args.codex_home / "AGENTS.md").read_text(encoding="utf-8")
+    assert "deep-audit-integration.md policy body" not in (args.claude_home / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "deep-audit-integration.md policy body" not in (args.codex_home / "AGENTS.md").read_text(encoding="utf-8")
+    assert "deep-audit-integration.md policy body" in (args.claude_home / "skills" / "deep-audit" / "SKILL.md").read_text(encoding="utf-8")
+    assert "deep-audit-integration.md policy body" in (args.codex_home / "skills" / "deep-audit" / "SKILL.md").read_text(encoding="utf-8")
     assert "global-policy.md policy body" in (args.claude_home / "CLAUDE.md").read_text(encoding="utf-8")
     assert "global-policy.md policy body" in (args.codex_home / "AGENTS.md").read_text(encoding="utf-8")
     assert "{{VERIFICATION_GATE_COMMAND}}" not in (args.claude_home / "skills" / "verification" / "SKILL.md").read_text(encoding="utf-8")
@@ -213,6 +219,93 @@ def test_install_renders_six_agents_preserves_existing_surfaces_and_is_idempoten
 
     after = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file() and ".pytest_cache" not in path.parts}
     assert after == before
+
+
+def test_install_excludes_and_removes_only_verification_skill_cache_artifacts(tmp_path: Path) -> None:
+    args = _args(tmp_path, project=False)
+    source_cache = args.source_root / "skill" / "scripts" / "nested" / "__pycache__"
+    source_cache.mkdir(parents=True)
+    (source_cache / "source.cpython-314.pyc").write_bytes(b"source cache")
+    (args.source_root / "skill" / "references" / "source-only.pyc").write_bytes(b"source bytecode")
+    outside_cache_files: list[Path] = []
+    for home in (args.claude_home, args.codex_home):
+        installed_skill = home / "skills" / "verification"
+        stale_cache = installed_skill / "scripts" / "__pycache__"
+        stale_cache.mkdir(parents=True)
+        (stale_cache / "stale.cpython-314.pyc").write_bytes(b"stale cache")
+        (installed_skill / "stale.pyc").write_bytes(b"stale bytecode")
+        keep_file = installed_skill / "custom" / "keep.txt"
+        keep_file.parent.mkdir()
+        keep_file.write_text("preserve me\n", encoding="utf-8")
+        outside_cache = home / "skills" / "unrelated-skill" / "__pycache__" / "keep.pyc"
+        outside_cache.parent.mkdir(parents=True)
+        outside_cache.write_bytes(b"outside cache")
+        outside_cache_files.append(outside_cache)
+
+    install(args)
+
+    for home in (args.claude_home, args.codex_home):
+        installed_skill = home / "skills" / "verification"
+        assert not any(path.name == "__pycache__" for path in installed_skill.rglob("*"))
+        assert not any(path.suffix == ".pyc" for path in installed_skill.rglob("*"))
+        assert (installed_skill / "custom" / "keep.txt").read_text(encoding="utf-8") == "preserve me\n"
+    assert all(path.read_bytes() == b"outside cache" for path in outside_cache_files)
+    assert (source_cache / "source.cpython-314.pyc").read_bytes() == b"source cache"
+
+
+def test_install_migrates_deep_audit_block_from_globals_to_skills_and_is_idempotent(tmp_path: Path) -> None:
+    args = _args(tmp_path, project=False)
+    marker = BLOCK_MARKERS["deep-audit-integration.md"]
+    source_block = (args.source_root / "blocks" / "deep-audit-integration.md").read_text(encoding="utf-8")
+    global_paths = (args.claude_home / "CLAUDE.md", args.codex_home / "AGENTS.md")
+    deep_skill_paths = (
+        args.claude_home / "skills" / "deep-audit" / "SKILL.md",
+        args.codex_home / "skills" / "deep-audit" / "SKILL.md",
+    )
+    for path in global_paths:
+        path.write_text(path.read_text(encoding="utf-8") + source_block, encoding="utf-8")
+    for path in deep_skill_paths:
+        path.write_text(
+            f"preserved prefix\n<!-- BEGIN {marker} -->\nstale body\n<!-- END {marker} -->\npreserved suffix\n",
+            encoding="utf-8",
+        )
+
+    install(args)
+
+    for path in global_paths:
+        text = path.read_text(encoding="utf-8")
+        assert f"<!-- BEGIN {marker} -->" not in text
+        assert "preface" in text
+        assert text.count(f"<!-- BEGIN {BLOCK_MARKERS['global-policy.md']} -->") == 1
+    for path in deep_skill_paths:
+        text = path.read_text(encoding="utf-8")
+        assert text.count(f"<!-- BEGIN {marker} -->") == 1
+        assert "deep-audit-integration.md policy body" in text
+        assert "preserved prefix" in text
+        assert "preserved suffix" in text
+    before = {path: path.read_bytes() for path in (*global_paths, *deep_skill_paths)}
+
+    install(args)
+
+    assert {path: path.read_bytes() for path in before} == before
+
+
+@pytest.mark.parametrize("fault", ("missing-claude", "missing-codex", "unreadable-claude", "unreadable-codex"))
+def test_install_preflights_both_deep_audit_skills_before_destination_writes(tmp_path: Path, fault: str) -> None:
+    args = _args(tmp_path, project=True)
+    destinations = (args.claude_home, args.codex_home, args.project_root)
+    target_home = args.claude_home if fault.endswith("claude") else args.codex_home
+    target = target_home / "skills" / "deep-audit" / "SKILL.md"
+    if fault.startswith("missing"):
+        target.unlink()
+    else:
+        target.write_bytes(b"\xff\xfe\x00")
+    before = {root: _tree_bytes(root) for root in destinations if root is not None}
+
+    with pytest.raises((FileNotFoundError, UnicodeDecodeError, ValueError)):
+        install(args)
+
+    assert {root: _tree_bytes(root) for root in destinations if root is not None} == before
 
 
 def test_install_merges_exactly_one_gate_stop_handler_and_preserves_json_keys(tmp_path: Path) -> None:

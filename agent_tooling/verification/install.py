@@ -124,6 +124,22 @@ def upsert_marked_block(text: str, marker: str, block: str) -> str:
     return f"{text}{separator}{begin}\n{block.rstrip()}\n{end}\n"
 
 
+def _remove_marked_block(text: str, marker: str) -> str:
+    begin = f"<!-- BEGIN {marker} -->"
+    end = f"<!-- END {marker} -->"
+    if begin not in text and end not in text:
+        return text
+    if text.count(begin) != 1 or text.count(end) != 1 or text.index(begin) > text.index(end):
+        raise ValueError(f"invalid marked block for {marker}")
+    start = text.index(begin)
+    finish = text.index(end, start) + len(end)
+    if text[finish:finish + 2] == "\r\n":
+        finish += 2
+    elif text[finish:finish + 1] == "\n":
+        finish += 1
+    return text[:start] + text[finish:]
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -206,11 +222,51 @@ def _preflight_skill_content(source: Path, shell: str) -> None:
         raise ValueError("rendered skill does not contain the expected shell fences")
 
 
-def _copy_skill(source: Path, destination: Path, shell: str) -> None:
+def _verification_skill_root(home: Path, destination: Path) -> Path:
+    expected = home / "skills" / "verification"
+    if destination.absolute() != expected.absolute():
+        raise ValueError("verification skill destination must be the explicit home skill root")
+    home_resolved = home.resolve()
+    destination_resolved = destination.resolve()
+    try:
+        destination_resolved.relative_to(home_resolved)
+    except ValueError as exc:
+        raise ValueError("verification skill destination resolves outside its explicit home") from exc
+    return destination_resolved
+
+
+def _clean_skill_caches(home: Path, destination: Path) -> None:
+    root = _verification_skill_root(home, destination)
+    cache_directories = sorted(
+        (path for path in root.rglob("__pycache__") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+    for cache_directory in cache_directories:
+        resolved = cache_directory.resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("cache directory resolves outside the verification skill root") from exc
+        shutil.rmtree(resolved)
+    for bytecode in root.rglob("*.pyc"):
+        resolved = bytecode.resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("bytecode file resolves outside the verification skill root") from exc
+        if resolved.is_file():
+            resolved.unlink()
+
+
+def _copy_skill(source: Path, destination: Path, home: Path, shell: str) -> None:
     if not source.is_dir():
         raise FileNotFoundError(source)
+    _verification_skill_root(home, destination)
     for path in sorted(source.rglob("*")):
         relative = path.relative_to(source)
+        if "__pycache__" in relative.parts or path.suffix == ".pyc":
+            continue
         target = destination / relative
         if path.is_dir():
             target.mkdir(parents=True, exist_ok=True)
@@ -219,6 +275,7 @@ def _copy_skill(source: Path, destination: Path, shell: str) -> None:
             shutil.copy2(path, target)
     skill_markdown = render_skill_markdown(destination, shell=shell)
     (destination / "SKILL.md").write_text(skill_markdown, encoding="utf-8")
+    _clean_skill_caches(home, destination)
 
 
 def _posix_hook_path(path: Path | str) -> str:
@@ -315,6 +372,18 @@ def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
+def _read_required_text(path: Path) -> str:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"cannot read required text file {path}: {exc}") from exc
+    if not text.strip():
+        raise ValueError(f"required text file is empty: {path}")
+    return text
+
+
 def _write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
@@ -338,6 +407,10 @@ def install(args: argparse.Namespace) -> None:
 
     claude_settings_path = claude_home / "settings.json"
     codex_hooks_path = codex_home / "hooks.json"
+    claude_deep_audit_path = claude_home / "skills" / "deep-audit" / "SKILL.md"
+    codex_deep_audit_path = codex_home / "skills" / "deep-audit" / "SKILL.md"
+    claude_deep_audit = _read_required_text(claude_deep_audit_path)
+    codex_deep_audit = _read_required_text(codex_deep_audit_path)
     claude_settings = _read_json(claude_settings_path)
     codex_hooks = _read_json(codex_hooks_path)
     claude_global = _read_text(claude_home / "CLAUDE.md")
@@ -349,22 +422,28 @@ def install(args: argparse.Namespace) -> None:
     codex_skill = codex_home / "skills" / "verification"
     claude_settings = _install_stop_handler(claude_settings, claude_skill / "scripts" / "verification_gate.py", shell)
     codex_hooks = _install_stop_handler(codex_hooks, codex_skill / "scripts" / "verification_gate.py", shell)
-    for filename in ("global-policy.md", "deep-audit-integration.md"):
-        marker = BLOCK_MARKERS[filename]
-        claude_global = upsert_marked_block(claude_global, marker, blocks[filename])
-        codex_global = upsert_marked_block(codex_global, marker, blocks[filename])
+    global_marker = BLOCK_MARKERS["global-policy.md"]
+    deep_audit_marker = BLOCK_MARKERS["deep-audit-integration.md"]
+    claude_global = _remove_marked_block(claude_global, deep_audit_marker)
+    codex_global = _remove_marked_block(codex_global, deep_audit_marker)
+    claude_global = upsert_marked_block(claude_global, global_marker, blocks["global-policy.md"])
+    codex_global = upsert_marked_block(codex_global, global_marker, blocks["global-policy.md"])
+    claude_deep_audit = upsert_marked_block(claude_deep_audit, deep_audit_marker, blocks["deep-audit-integration.md"])
+    codex_deep_audit = upsert_marked_block(codex_deep_audit, deep_audit_marker, blocks["deep-audit-integration.md"])
     if project_root is not None:
         marker = BLOCK_MARKERS["project-policy.md"]
         project_claude = upsert_marked_block(project_claude, marker, blocks["project-policy.md"])
         project_codex = upsert_marked_block(project_codex, marker, blocks["project-policy.md"])
 
-    _copy_skill(skill_source, claude_skill, shell)
-    _copy_skill(skill_source, codex_skill, shell)
+    _copy_skill(skill_source, claude_skill, claude_home, shell)
+    _copy_skill(skill_source, codex_skill, codex_home, shell)
     for role, spec in specs.items():
         _write_text(claude_home / "agents" / f"{role}.md", render_claude_agent(spec))
         _write_text(codex_home / "agents" / f"{role}.toml", render_codex_agent(spec))
     _write_text(claude_home / "CLAUDE.md", claude_global)
     _write_text(codex_home / "AGENTS.md", codex_global)
+    _write_text(claude_deep_audit_path, claude_deep_audit)
+    _write_text(codex_deep_audit_path, codex_deep_audit)
     if project_root is not None:
         _write_text(project_root / "CLAUDE.md", project_claude)
         _write_text(project_root / "AGENTS.md", project_codex)
