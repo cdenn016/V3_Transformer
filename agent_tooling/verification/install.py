@@ -25,6 +25,22 @@ BLOCK_MARKERS = {
     "project-policy.md": "VERIFICATION PROJECT POLICY",
     "deep-audit-integration.md": "VERIFICATION DEEP AUDIT INTEGRATION",
 }
+SKILL_MANIFEST = (
+    "SKILL.md",
+    "scripts/verification_gate.py",
+    "schemas/claim-ledger.schema.json",
+    "evals/evals.json",
+    "references/contract.md",
+    "references/criteria-code.md",
+    "references/criteria-math.md",
+    "references/criteria-evidence.md",
+    "references/criteria-experiment.md",
+    "references/criteria-general.md",
+)
+ADJUDICATOR_OUTPUT = {
+    "required": ["claim_id", "ledger_state", "rationale", "evidence_ids", "open_obligations", "validator_errors"],
+    "ledger_state": ["EVIDENCE_VERIFIED", "REFUTED", "INCONCLUSIVE"],
+}
 
 
 def _required_string(spec: dict[str, object], name: str) -> str:
@@ -34,13 +50,30 @@ def _required_string(spec: dict[str, object], name: str) -> str:
     return value
 
 
+def _optional_string_list(spec: dict[str, object], name: str) -> list[str] | None:
+    value = spec.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"agent spec {name} must be a list of strings")
+    return value
+
+
+def _literal(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
 def render_claude_agent(spec: dict[str, object]) -> str:
     """Render one neutral verifier spec as Claude agent Markdown."""
 
     name = _required_string(spec, "name")
     description = _required_string(spec, "description")
     instructions = _required_string(spec, "instructions")
-    return f"---\nname: {name}\ndescription: {description}\n---\n\n{instructions}\n"
+    tools = _optional_string_list(spec, "tools")
+    frontmatter = f"name: {_literal(name)}\ndescription: {_literal(description)}\n"
+    if tools is not None:
+        frontmatter += f"tools: {_literal(tools)}\n"
+    return f"---\n{frontmatter}---\n\n{instructions}\n"
 
 
 def render_codex_agent(spec: dict[str, object]) -> str:
@@ -49,13 +82,11 @@ def render_codex_agent(spec: dict[str, object]) -> str:
     name = _required_string(spec, "name")
     description = _required_string(spec, "description")
     instructions = _required_string(spec, "instructions")
-    return "".join(
-        (
-            f"name = {json.dumps(name)}\n",
-            f"description = {json.dumps(description)}\n",
-            f"instructions = {json.dumps(instructions)}\n",
-        )
-    )
+    tools = _optional_string_list(spec, "tools")
+    rendered = f"name = {_literal(name)}\ndescription = {_literal(description)}\ninstructions = {_literal(instructions)}\n"
+    if tools is not None:
+        rendered += f"tools = {_literal(tools)}\n"
+    return rendered
 
 
 def upsert_marked_block(text: str, marker: str, block: str) -> str:
@@ -112,8 +143,18 @@ def _read_specs(source_root: Path) -> dict[str, dict[str, object]]:
             raise ValueError(f"agent spec name must match filename: {path}")
         _required_string(value, "description")
         _required_string(value, "instructions")
+        _optional_string_list(value, "tools")
+        if role == "verifier-adjudicator" and value.get("output") != ADJUDICATOR_OUTPUT:
+            raise ValueError("verifier-adjudicator requires the exact structured output contract")
         specs[role] = value
     return specs
+
+
+def _preflight_skill(source: Path) -> None:
+    for relative_path in SKILL_MANIFEST:
+        required = source / relative_path
+        if not required.is_file():
+            raise FileNotFoundError(required)
 
 
 def _copy_skill(source: Path, destination: Path, shell: str) -> None:
@@ -131,9 +172,34 @@ def _copy_skill(source: Path, destination: Path, shell: str) -> None:
     (destination / "SKILL.md").write_text(skill_markdown, encoding="utf-8")
 
 
-def _gate_stop_handler(gate_path: Path) -> dict[str, object]:
-    command = f'"{Path(sys.executable).resolve()}" "{gate_path.resolve()}" hook'
+def _gate_command(gate_path: Path) -> str:
+    return f'"{Path(sys.executable).resolve()}" "{gate_path.resolve()}" hook'
+
+
+def _gate_stop_handler(command: str) -> dict[str, object]:
     return {"hooks": [{"type": "command", "command": command}]}
+
+
+def _is_verification_handler(value: object) -> bool:
+    return isinstance(value, dict) and isinstance(value.get("command"), str) and "verification_gate.py" in value["command"]
+
+
+def _remove_verification_handlers(stop: list[Any]) -> list[Any]:
+    retained: list[Any] = []
+    for entry in stop:
+        if not isinstance(entry, dict):
+            retained.append(entry)
+            continue
+        handlers = entry.get("hooks")
+        if isinstance(handlers, list):
+            remaining = [handler for handler in handlers if not _is_verification_handler(handler)]
+            if remaining:
+                updated = dict(entry)
+                updated["hooks"] = remaining
+                retained.append(updated)
+        elif not _is_verification_handler(entry):
+            retained.append(entry)
+    return retained
 
 
 def _install_stop_handler(settings: dict[str, Any], gate_path: Path) -> dict[str, Any]:
@@ -143,11 +209,9 @@ def _install_stop_handler(settings: dict[str, Any], gate_path: Path) -> dict[str
     stop = hooks.setdefault("Stop", [])
     if not isinstance(stop, list):
         raise ValueError("settings hooks.Stop must be a list")
-    existing = [entry for entry in stop if "verification_gate.py" in json.dumps(entry, sort_keys=True)]
-    if len(existing) > 1:
-        raise ValueError("settings contains more than one verification Stop handler")
-    if not existing:
-        stop.append(_gate_stop_handler(gate_path))
+    command = _gate_command(gate_path)
+    stop[:] = _remove_verification_handlers(stop)
+    stop.append(_gate_stop_handler(command))
     return settings
 
 
@@ -171,8 +235,7 @@ def install(args: argparse.Namespace) -> None:
     if shell not in {"powershell", "posix"}:
         raise ValueError("shell must be powershell or posix")
     skill_source = source_root / "skill"
-    if not (skill_source / "SKILL.md").is_file() or not (skill_source / "scripts" / "verification_gate.py").is_file():
-        raise FileNotFoundError(skill_source)
+    _preflight_skill(skill_source)
     specs = _read_specs(source_root)
     blocks = {filename: _read_block(source_root / "blocks" / filename, marker) for filename, marker in BLOCK_MARKERS.items()}
 
