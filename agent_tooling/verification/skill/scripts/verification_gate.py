@@ -50,8 +50,9 @@ _COUNTEREVIDENCE_FIELDS = frozenset({"kind", "location", "artifact_revision", "s
 _CRITERION_FIELDS = frozenset({"name", "score"})
 _VERIFIER_FIELDS = frozenset({"role"})
 _VIEW_FIELDS = frozenset({"calibration_kind", "unresolved_disagreement", "comparison", "scores"})
-_VIEW_COMPARISON_FIELDS = frozenset({"method", "candidate_count", "orders"})
+_VIEW_COMPARISON_FIELDS = frozenset({"method", "candidate_count", "candidate_ids", "pivot_ids", "orders", "matches"})
 _VIEW_SCORE_FIELDS = frozenset({"view_id", "criteria"})
+_MATCH_FIELDS = frozenset({"left", "right"})
 
 GATE_COMMAND_TOKEN = "{{VERIFICATION_GATE_COMMAND}}"
 
@@ -79,7 +80,7 @@ def render_skill_markdown(skill_root: Path) -> str:
         raise ValueError("skill template has no verification gate command token")
     if not gate_path.is_file():
         raise FileNotFoundError(gate_path)
-    command = f'"{Path(sys.executable).resolve()}" "{gate_path}"'
+    command = f'& "{Path(sys.executable).resolve()}" "{gate_path}"'
     return template.replace(GATE_COMMAND_TOKEN, command)
 
 
@@ -116,6 +117,7 @@ def _validate_views(
     prefix:              str,
     value:               object,
     aggregate_criteria:  dict[str, float],
+    severity:            object,
 ) -> tuple[list[str], bool]:
     """Validate auditable independent views and their criterion aggregation."""
 
@@ -138,17 +140,78 @@ def _validate_views(
         errors.extend(_field_errors(f"{prefix}: views comparison", comparison, _VIEW_COMPARISON_FIELDS))
         method = comparison.get("method")
         candidate_count = comparison.get("candidate_count")
+        candidate_ids = comparison.get("candidate_ids")
+        pivot_ids = comparison.get("pivot_ids")
         orders = comparison.get("orders")
+        matches = comparison.get("matches")
         if method not in {"pairwise", "pivot_tournament"}:
             errors.append(f"{prefix}: views comparison method must be pairwise or pivot_tournament")
         if isinstance(candidate_count, bool) or not isinstance(candidate_count, int) or candidate_count < 2:
             errors.append(f"{prefix}: views comparison candidate_count must be an integer of at least 2")
+        if not isinstance(candidate_ids, list) or any(not _nonempty_string(item) for item in candidate_ids):
+            errors.append(f"{prefix}: views comparison candidate_ids must be a list of nonempty strings")
+            candidate_set: set[str] = set()
+        else:
+            candidate_set = {str(item) for item in candidate_ids}
+            if len(candidate_set) != len(candidate_ids):
+                errors.append(f"{prefix}: views comparison candidate_ids must be unique")
+            if isinstance(candidate_count, int) and not isinstance(candidate_count, bool) and len(candidate_ids) != candidate_count:
+                errors.append(f"{prefix}: views comparison candidate_ids must match candidate_count")
+        if not isinstance(pivot_ids, list) or any(not _nonempty_string(item) for item in pivot_ids):
+            errors.append(f"{prefix}: views comparison pivot_ids must be a list of nonempty strings")
+            pivot_set: set[str] = set()
+        else:
+            pivot_set = {str(item) for item in pivot_ids}
+            if len(pivot_set) != len(pivot_ids):
+                errors.append(f"{prefix}: views comparison pivot_ids must be unique")
         if not isinstance(orders, list) or any(not _nonempty_string(item) for item in orders):
             errors.append(f"{prefix}: views comparison orders must be a list of nonempty strings")
         elif candidate_count == 2 and method == "pairwise" and not {"AB", "BA"}.issubset(set(orders)):
             errors.append(f"{prefix}: two-candidate pairwise comparison requires AB and BA orders")
         if isinstance(candidate_count, int) and not isinstance(candidate_count, bool) and candidate_count > 4 and method != "pivot_tournament":
             errors.append(f"{prefix}: more than four candidates require pivot_tournament")
+        if not isinstance(matches, list):
+            errors.append(f"{prefix}: views comparison matches must be a list")
+            match_items: list[dict[str, object]] = []
+        else:
+            match_items = []
+            for index, item in enumerate(matches):
+                match = _as_dict(item)
+                item_prefix = f"{prefix}: views comparison matches[{index}]"
+                if match is None:
+                    errors.append(f"{item_prefix} must be an object")
+                    continue
+                errors.extend(_field_errors(item_prefix, match, _MATCH_FIELDS))
+                left = match.get("left")
+                right = match.get("right")
+                if not _nonempty_string(left) or not _nonempty_string(right):
+                    errors.append(f"{item_prefix}: left and right must be nonempty strings")
+                    continue
+                match_items.append(match)
+        if method == "pivot_tournament":
+            if not pivot_set or not pivot_set < candidate_set:
+                errors.append(f"{prefix}: pivot_tournament requires pivot_ids as a nonempty proper subset of candidate_ids")
+            left_orientations: set[tuple[str, str]] = set()
+            right_orientations: set[tuple[str, str]] = set()
+            for index, match in enumerate(match_items):
+                left = str(match["left"])
+                right = str(match["right"])
+                item_prefix = f"{prefix}: views comparison matches[{index}]"
+                if left not in candidate_set or right not in candidate_set or left == right:
+                    errors.append(f"{item_prefix}: match must use distinct known candidate IDs")
+                    continue
+                pivots_in_match = int(left in pivot_set) + int(right in pivot_set)
+                if pivots_in_match != 1:
+                    errors.append(f"{item_prefix}: match must contain exactly one pivot ID")
+                    continue
+                if left in pivot_set:
+                    left_orientations.add((right, left))
+                else:
+                    right_orientations.add((left, right))
+            for nonpivot in candidate_set - pivot_set:
+                if not any(candidate == nonpivot for candidate, _ in left_orientations) or not any(candidate == nonpivot for candidate, _ in right_orientations):
+                    errors.append(f"{prefix}: every nonpivot requires both left and right orientations against a pivot")
+                    break
 
     score_records = views.get("scores")
     per_view_criteria: list[dict[str, float]] = []
@@ -172,6 +235,8 @@ def _validate_views(
             current: dict[str, float] = {}
             if not isinstance(criteria, list):
                 errors.append(f"{item_prefix}: criteria must be a list")
+            elif not criteria:
+                errors.append(f"{item_prefix}: criteria must contain at least one criterion")
             else:
                 for criterion_index, criterion_value in enumerate(criteria):
                     criterion = _as_dict(criterion_value)
@@ -185,18 +250,27 @@ def _validate_views(
                     if not _nonempty_string(name):
                         errors.append(f"{criterion_prefix}: name must be a nonempty string")
                     elif _score_is_valid(score):
-                        current[str(name)] = float(score)
+                        if str(name) in current:
+                            errors.append(f"{criterion_prefix}: name must not repeat within a view")
+                        else:
+                            current[str(name)] = float(score)
                     else:
                         errors.append(f"{criterion_prefix}: score must be a number from 0 to 20")
             per_view_criteria.append(current)
     if len(view_ids) != len(set(view_ids)):
         errors.append(f"{prefix}: views must contain unique view IDs")
+    if severity in {"high", "critical"} and len(set(view_ids)) < 4:
+        errors.append(f"{prefix}: {severity} claims require at least four unique views")
+    if not aggregate_criteria:
+        errors.append(f"{prefix}: criteria must contain at least one aggregate criterion")
     for name, aggregate_score in aggregate_criteria.items():
         values = [criteria.get(name) for criteria in per_view_criteria]
         if len(values) < 2 or any(score is None for score in values):
             errors.append(f"{prefix}: every view must score aggregate criterion '{name}'")
         elif not math.isclose(aggregate_score, sum(values) / len(values), rel_tol=0.0, abs_tol=1e-9):
             errors.append(f"{prefix}: aggregate criterion '{name}' does not equal mean view score")
+    if aggregate_criteria and any(set(criteria) != set(aggregate_criteria) for criteria in per_view_criteria):
+        errors.append(f"{prefix}: view criteria must exactly cover aggregate criteria")
     return errors, unresolved is True
 
 
@@ -224,6 +298,8 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
     claims_value = root.get("claims")
     if not isinstance(claims_value, list):
         return errors + ["ledger: claims must be a list"]
+    if not claims_value:
+        errors.append("ledger: claims must contain at least one claim")
 
     claim_items: list[tuple[str, int, object]] = []
     for index, claim in enumerate(claims_value):
@@ -280,9 +356,13 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                 if not _score_is_valid(score):
                     errors.append(f"{item_prefix}: score must be a number from 0 to 20")
                 elif _nonempty_string(criterion.get("name")):
-                    aggregate_criteria[str(criterion["name"])] = float(score)
+                    name = str(criterion["name"])
+                    if name in aggregate_criteria:
+                        errors.append(f"{item_prefix}: aggregate criterion name must not repeat")
+                    else:
+                        aggregate_criteria[name] = float(score)
 
-        view_errors, unresolved_disagreement = _validate_views(prefix, claim.get("views"), aggregate_criteria)
+        view_errors, unresolved_disagreement = _validate_views(prefix, claim.get("views"), aggregate_criteria, severity)
         errors.extend(view_errors)
 
         evidence_kinds: set[str] = set()
@@ -395,6 +475,8 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                     errors.append(f"{prefix}: {severity} closure requires {required_role}")
         if mode == "closure" and state in {"CANDIDATE", "LLM_SUPPORTED"}:
             errors.append(f"{prefix}: closure mode requires INCONCLUSIVE instead of {state}")
+        if mode == "triage" and state in {"EVIDENCE_VERIFIED", "REFUTED"}:
+            errors.append(f"{prefix}: triage mode permits only CANDIDATE, LLM_SUPPORTED, or INCONCLUSIVE instead of {state}")
 
     return errors
 

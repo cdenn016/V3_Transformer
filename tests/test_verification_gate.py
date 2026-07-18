@@ -21,7 +21,14 @@ def valid_code_claim() -> dict[str, object]:
         "views": {
             "calibration_kind": "independent_0_20",
             "unresolved_disagreement": False,
-            "comparison": {"method": "pairwise", "candidate_count": 2, "orders": ["AB", "BA"]},
+            "comparison": {
+                "method": "pairwise",
+                "candidate_count": 2,
+                "candidate_ids": ["A", "B"],
+                "pivot_ids": [],
+                "orders": ["AB", "BA"],
+                "matches": [],
+            },
             "scores": [
                 {"view_id": "code-a", "criteria": [{"name": "reachability", "score": 20}]},
                 {"view_id": "code-b", "criteria": [{"name": "reachability", "score": 20}]},
@@ -152,6 +159,33 @@ def test_triage_mode_allows_a_candidate_with_auditable_views() -> None:
     assert validate_ledger(ledger) == []
 
 
+def test_triage_mode_rejects_terminal_evidence_verified_state() -> None:
+    ledger = valid_ledger()
+    ledger["mode"] = "triage"
+
+    errors = validate_ledger(ledger)
+
+    assert any("CODE-001" in error and "triage mode" in error and "EVIDENCE_VERIFIED" in error for error in errors)
+
+
+def test_triage_mode_rejects_terminal_refuted_state() -> None:
+    ledger = refuted_code_ledger(
+        [{"kind": "mechanical", "location": "tests/test_parser.py", "artifact_revision": "abc123", "supports": False}]
+    )
+    ledger["mode"] = "triage"
+
+    errors = validate_ledger(ledger)
+
+    assert any("CODE-001" in error and "triage mode" in error and "REFUTED" in error for error in errors)
+
+
+def test_ledger_requires_at_least_one_claim() -> None:
+    ledger = valid_ledger()
+    ledger["claims"] = []
+
+    assert any("ledger: claims must contain at least one claim" == error for error in validate_ledger(ledger))
+
+
 def test_start_defaults_to_a_closure_ledger(tmp_path: Path) -> None:
     assert main(["start", "--cwd", str(tmp_path)]) == 0
 
@@ -226,6 +260,119 @@ def test_more_than_four_candidates_requires_a_pivot_tournament() -> None:
     errors = validate_ledger(ledger)
 
     assert any("CODE-001" in error and "pivot_tournament" in error for error in errors)
+
+
+def test_high_claim_requires_at_least_four_unique_views() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["severity"] = "high"
+    claim["verifiers"] = [{"role": "verifier-code"}, {"role": "verifier-skeptic"}, {"role": "verifier-adjudicator"}]
+
+    errors = validate_ledger(ledger)
+
+    assert any("CODE-001" in error and "four unique views" in error for error in errors)
+
+
+def test_high_claim_accepts_four_unique_views_with_challenge_roles() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["severity"] = "high"
+    claim["verifiers"] = [{"role": "verifier-code"}, {"role": "verifier-skeptic"}, {"role": "verifier-adjudicator"}]
+    views = claim["views"]
+    assert isinstance(views, dict)
+    scores = views["scores"]
+    assert isinstance(scores, list)
+    scores.extend(
+        [
+            {"view_id": "code-c", "criteria": [{"name": "reachability", "score": 20}]},
+            {"view_id": "code-d", "criteria": [{"name": "reachability", "score": 20}]},
+        ]
+    )
+
+    assert validate_ledger(ledger) == []
+
+
+def test_views_require_an_aggregate_criterion_and_nonempty_per_view_criteria() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["criteria"] = []
+    views = claim["views"]
+    assert isinstance(views, dict)
+    scores = views["scores"]
+    assert isinstance(scores, list)
+    first = scores[0]
+    assert isinstance(first, dict)
+    first["criteria"] = []
+
+    errors = validate_ledger(ledger)
+
+    assert any("CODE-001" in error and "at least one aggregate criterion" in error for error in errors)
+    assert any("CODE-001" in error and "at least one criterion" in error for error in errors)
+
+
+def test_view_criteria_must_exactly_cover_aggregate_criteria() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    views = claim["views"]
+    assert isinstance(views, dict)
+    scores = views["scores"]
+    assert isinstance(scores, list)
+    second = scores[1]
+    assert isinstance(second, dict)
+    second["criteria"] = [{"name": "unrelated", "score": 20}]
+
+    errors = validate_ledger(ledger)
+
+    assert any("CODE-001" in error and "exactly cover aggregate criteria" in error for error in errors)
+
+
+def valid_pivot_tournament() -> dict[str, object]:
+    return {
+        "method": "pivot_tournament",
+        "candidate_count": 5,
+        "candidate_ids": ["A", "B", "C", "D", "E"],
+        "pivot_ids": ["A"],
+        "orders": ["pivot_tournament"],
+        "matches": [
+            {"left": "A", "right": "B"}, {"left": "B", "right": "A"},
+            {"left": "A", "right": "C"}, {"left": "C", "right": "A"},
+            {"left": "A", "right": "D"}, {"left": "D", "right": "A"},
+            {"left": "A", "right": "E"}, {"left": "E", "right": "A"},
+        ],
+    }
+
+
+def test_pivot_tournament_requires_balanced_reconstructible_matches() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    views = claim["views"]
+    assert isinstance(views, dict)
+    views["comparison"] = valid_pivot_tournament()
+    comparison = views["comparison"]
+    assert isinstance(comparison, dict)
+    matches = comparison["matches"]
+    assert isinstance(matches, list)
+    matches.pop()
+
+    errors = validate_ledger(ledger)
+
+    assert any("CODE-001" in error and "both left and right orientations" in error for error in errors)
+
+
+def test_balanced_pivot_tournament_validates() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    views = claim["views"]
+    assert isinstance(views, dict)
+    views["comparison"] = valid_pivot_tournament()
+
+    assert validate_ledger(ledger) == []
 
 
 def test_errors_are_reported_in_claim_id_order() -> None:

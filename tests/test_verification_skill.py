@@ -39,7 +39,7 @@ def test_skill_activates_the_gate_and_validates_the_named_ledger() -> None:
 
 
 def test_copied_skill_renders_an_absolute_gate_command_for_an_unrelated_cwd(tmp_path: Path) -> None:
-    installed_skill = tmp_path / "installed" / "verification"
+    installed_skill = tmp_path / "installed skill with spaces" / "verification"
     shutil.copytree(SKILL_ROOT, installed_skill)
     rendered = render_skill_markdown(installed_skill)
     (installed_skill / "SKILL.md").write_text(rendered, encoding="utf-8")
@@ -47,18 +47,36 @@ def test_copied_skill_renders_an_absolute_gate_command_for_an_unrelated_cwd(tmp_
     assert "{{VERIFICATION_GATE_COMMAND}}" not in rendered
     assert str((installed_skill / "scripts" / "verification_gate.py").resolve()) in rendered
 
-    unrelated_cwd = tmp_path / "unrelated"
+    unrelated_cwd = tmp_path / "unrelated cwd"
     unrelated_cwd.mkdir()
-    result = subprocess.run(
-        [sys.executable, str(installed_skill / "scripts" / "verification_gate.py"), "start", "--cwd", str(unrelated_cwd)],
-        cwd=unrelated_cwd,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    start_command = next(line.strip() for line in rendered.splitlines() if line.strip().endswith("--mode closure"))
+    validate_command = next(line.strip() for line in rendered.splitlines() if line.strip().endswith(".verification/ledger.json"))
+    expected_prefix = f'& "{Path(sys.executable).resolve()}" "{(installed_skill / "scripts" / "verification_gate.py").resolve()}"'
+    assert start_command == f"{expected_prefix} start --cwd . --ledger .verification/ledger.json --mode closure"
+    assert validate_command == f"{expected_prefix} validate .verification/ledger.json"
+    result = subprocess.run(["powershell", "-NoProfile", "-Command", start_command], cwd=unrelated_cwd, check=False, capture_output=True, text=True)
 
     assert result.returncode == 0, result.stderr
-    assert (unrelated_cwd / ".verification" / "ledger.json").is_file()
+    ledger_path = unrelated_cwd / ".verification" / "ledger.json"
+    assert ledger_path.is_file()
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    ledger["artifact_revision"] = "rendered"
+    ledger["claims"] = [
+        {
+            "id": "RENDER-001", "domain": "code", "statement": "The installed gate executes.", "severity": "low",
+            "state": "EVIDENCE_VERIFIED", "artifact_revision": "rendered", "criteria": [{"name": "execution", "score": 20}],
+            "views": {
+                "calibration_kind": "independent_0_20", "unresolved_disagreement": False,
+                "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["A", "B"], "pivot_ids": [], "orders": ["AB", "BA"], "matches": []},
+                "scores": [{"view_id": "render-a", "criteria": [{"name": "execution", "score": 20}]}, {"view_id": "render-b", "criteria": [{"name": "execution", "score": 20}]}],
+            },
+            "evidence": [{"kind": "mechanical", "location": "render-test", "artifact_revision": "rendered"}],
+            "counterevidence": [], "verifiers": [{"role": "verifier-code"}], "open_obligations": [], "evidence_invalidated": False,
+        }
+    ]
+    ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+    validate_result = subprocess.run(["powershell", "-NoProfile", "-Command", validate_command], cwd=unrelated_cwd, check=False, capture_output=True, text=True)
+    assert validate_result.returncode == 0, validate_result.stdout
 
 
 def test_skill_requires_audits_proofs_and_current_domain_correctness_evidence() -> None:
