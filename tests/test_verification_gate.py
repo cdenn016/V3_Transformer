@@ -264,6 +264,28 @@ def test_more_than_four_candidates_requires_a_pivot_tournament() -> None:
     assert any("CODE-001" in error and "pivot_tournament" in error for error in errors)
 
 
+def test_two_to_four_candidates_require_a_pairwise_comparison() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    views = claim["views"]
+    assert isinstance(views, dict)
+    views["comparison"] = {
+        "method": "pivot_tournament",
+        "candidate_count": 4,
+        "candidate_ids": ["A", "B", "C", "D"],
+        "pivot_ids": ["A"],
+        "orders": ["pivot_tournament"],
+        "matches": [
+            {"left": "A", "right": "B"}, {"left": "B", "right": "A"},
+            {"left": "A", "right": "C"}, {"left": "C", "right": "A"},
+            {"left": "A", "right": "D"}, {"left": "D", "right": "A"},
+        ],
+    }
+
+    assert any("CODE-001" in error and "two through four candidates require pairwise" in error for error in validate_ledger(ledger))
+
+
 def test_high_claim_requires_at_least_four_unique_views() -> None:
     ledger = valid_ledger()
     claim = ledger["claims"][0]

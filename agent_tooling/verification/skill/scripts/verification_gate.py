@@ -191,6 +191,8 @@ def _validate_views(
             errors.append(f"{prefix}: views comparison orders must be a list of nonempty strings")
         elif candidate_count == 2 and method == "pairwise" and not {"AB", "BA"}.issubset(set(orders)):
             errors.append(f"{prefix}: two-candidate pairwise comparison requires AB and BA orders")
+        if isinstance(candidate_count, int) and not isinstance(candidate_count, bool) and 2 <= candidate_count <= 4 and method != "pairwise":
+            errors.append(f"{prefix}: two through four candidates require pairwise")
         if isinstance(candidate_count, int) and not isinstance(candidate_count, bool) and candidate_count > 4 and method != "pivot_tournament":
             errors.append(f"{prefix}: more than four candidates require pivot_tournament")
         if not isinstance(matches, list):
