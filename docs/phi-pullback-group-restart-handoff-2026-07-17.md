@@ -20,6 +20,26 @@ remain in these tasks. Task 5 is recorded by cleanup commit `2ae3ce2` and
 review-fix commit `023686f`. Resume at Task 6 rather than dispatching or
 reviewing Tasks 1 through 5 again.
 
+Task 6 is at a pre-CUDA checkpoint. Preserve the uncommitted task-owned files
+`benchmarks/benchmark_phi_pullback_group.py` and
+`tests/test_phi_pullback_group_benchmark.py`. The missing-module RED artifact
+is `C:\tmp\vfe3-phi-benchmark-red-20260717.xml`. The project-interpreter GREEN
+artifact is `C:\tmp\vfe3-phi-benchmark-green-20260717.xml`, and the actual
+CUDA-interpreter GREEN artifact is
+`C:\tmp\vfe3-phi-benchmark-cuda-env-green-20260717.xml`; both GREEN artifacts
+record eight tests, zero failures, zero errors, and zero skips.
+
+Use `C:\anaconda\python.exe` for the real run. It reports Python 3.12.7,
+PyTorch `2.10.0.dev20251210+cu128`, CUDA available, and NVIDIA GeForce RTX
+5090. Do not use the default `C:\Python314\python.exe` or the live `.venv` for
+CUDA; both PyTorch builds are CPU-only. The real run was deliberately paused
+because unrelated PID `25088` was using approximately 7.3 GiB and 85 percent
+of the GPU. Do not stop that process. After restart, verify the GPU is idle,
+rerun the eight-test contract under the Anaconda interpreter, then run
+`C:\anaconda\python.exe benchmarks\benchmark_phi_pullback_group.py`. No
+success or temporary JSON existed at the checkpoint; do not commit Task 6
+unless the fixed 20 percent UCB gate passes all three cases.
+
 ## Verification captured before restart
 
 - `python -m pytest tests/test_phi_preconditioner.py -k pullback_group`: 20
@@ -71,5 +91,5 @@ errors, and one skip.
 2. Preserve commits `b0bf9cb`, `843b45c`, `71e5481`, `085777f`, `43ed6d3`, and
    `045a245`, `574602f`, `6ad1cdc`, `2ae3ce2`, and `023686f`; do not re-dispatch
    Tasks 1 through 5.
-3. Proceed sequentially from Task 6 using the approved strict geometry,
-   stateless runtime, and serialized migration interfaces.
+3. Resume Task 6 from its pre-CUDA checkpoint using the approved strict
+   geometry, stateless runtime, and serialized migration interfaces.
