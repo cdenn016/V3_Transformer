@@ -12,11 +12,13 @@ from pathlib import Path
 import pytest
 import yaml
 
+import agent_tooling.verification.install as install_module
 from agent_tooling.verification.install import (
     AGENT_ROLES,
     BLOCK_MARKERS,
     GATE_STOP_STATUS_MESSAGE,
     effective_instructions,
+    _is_python_executable,
     render_claude_agent,
     render_codex_agent,
     install,
@@ -286,6 +288,41 @@ def test_install_replaces_stale_gate_handlers_after_home_move_and_preserves_unre
         false_positive_commands = false_positives_by_path[path]
         assert false_positive_commands == [command for command in commands if command in false_positive_commands]
     before = {path: path.read_bytes() for path in (new_claude / "settings.json", new_codex / "hooks.json")}
+
+    install(args)
+
+    assert {path: path.read_bytes() for path in before} == before
+
+
+@pytest.mark.parametrize("basename", ("python", "python3", "python3.12", "python.exe", "python3.exe", "python3.12.exe"))
+def test_python_executable_predicate_accepts_standard_posix_and_windows_basenames(basename: str) -> None:
+    assert _is_python_executable(basename)
+
+
+@pytest.mark.parametrize("basename", ("pythonish", "pythonish.exe", "pypy3", "not-python.exe"))
+def test_python_executable_predicate_rejects_unrelated_basenames(basename: str) -> None:
+    assert not _is_python_executable(basename)
+
+
+def test_posix_install_with_python3_replaces_its_gate_and_is_hook_json_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    args = _args(tmp_path, project=False)
+    args.shell = "posix"
+    monkeypatch.setattr(install_module.sys, "executable", "/usr/bin/python3")
+
+    install(args)
+
+    for path in (args.claude_home / "settings.json", args.codex_home / "hooks.json"):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        gate_handlers = [
+            handler
+            for handler in _stop_handlers(data)
+            if handler.get("statusMessage") == GATE_STOP_STATUS_MESSAGE
+        ]
+        assert len(gate_handlers) == 1
+        handler = gate_handlers[0]
+        assert handler["shell"] == "posix"
+        assert str(handler["command"]).startswith("/usr/bin/python3 ")
+    before = {path: path.read_bytes() for path in (args.claude_home / "settings.json", args.codex_home / "hooks.json")}
 
     install(args)
 

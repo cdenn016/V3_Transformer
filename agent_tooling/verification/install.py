@@ -221,7 +221,19 @@ def _copy_skill(source: Path, destination: Path, shell: str) -> None:
     (destination / "SKILL.md").write_text(skill_markdown, encoding="utf-8")
 
 
-def _gate_command(gate_path: Path) -> str:
+def _posix_hook_path(path: Path | str) -> str:
+    text = str(path)
+    if text.startswith("/"):
+        return text
+    text = str(path.resolve()).replace("\\", "/")
+    if len(text) >= 3 and text[1:3] == ":/":
+        return f"/{text[0].lower()}{text[2:]}"
+    return text
+
+
+def _gate_command(gate_path: Path, shell: str) -> str:
+    if shell == "posix":
+        return f"{shlex.quote(_posix_hook_path(sys.executable))} {shlex.quote(_posix_hook_path(gate_path))} hook"
     return f'"{Path(sys.executable).resolve()}" "{gate_path.resolve()}" hook'
 
 
@@ -240,7 +252,7 @@ def _gate_stop_handler(command: str, shell: str) -> dict[str, object]:
 
 def _is_python_executable(value: str) -> bool:
     executable = value.replace("\\", "/").rsplit("/", 1)[-1].lower()
-    return executable == "python" or executable.startswith("python") and executable.endswith(".exe")
+    return re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", executable) is not None
 
 
 def _split_hook_command(command: str, shell: str) -> list[str] | None:
@@ -293,7 +305,7 @@ def _install_stop_handler(settings: dict[str, Any], gate_path: Path, shell: str)
     stop = hooks.setdefault("Stop", [])
     if not isinstance(stop, list):
         raise ValueError("settings hooks.Stop must be a list")
-    command = _gate_command(gate_path)
+    command = _gate_command(gate_path, shell)
     stop[:] = _remove_verification_handlers(stop, shell)
     stop.append(_gate_stop_handler(command, shell))
     return settings
