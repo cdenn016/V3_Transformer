@@ -17,7 +17,7 @@ EXPECTED_LABELS = {
         "adamw_unbounded",
         "adamw_mass0.01",
         "adamw_lr0.003",
-        "pullback_natgrad_lr0.0015",
+        "pullback_group_lr0.0015",
         "adamw_projected_norm5",
     ],
     "pos_phi_composition": ["bch", "group_product", "none"],

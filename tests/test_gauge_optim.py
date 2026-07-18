@@ -369,6 +369,63 @@ def test_pullback_group_step_rejects_two_parameter_groups_atomically(monkeypatch
     assert optimizer.state_dict()["state"] == {}
 
 
+@pytest.mark.parametrize(
+    "bad_value",
+    [float("nan"), float("inf"), float("-inf")],
+    ids=["nan", "positive_inf", "negative_inf"],
+)
+def test_pullback_group_step_rejects_nonfinite_covector_before_any_staging_or_mutation(
+    monkeypatch,
+    bad_value,
+):
+    import vfe3.gauge_optim as gauge_optim
+
+    group = get_group("glk")(K=2, dtype=torch.float64)
+    finite = nn.Parameter(torch.zeros(1, 4, dtype=torch.float64))
+    mixed = nn.Parameter(torch.zeros(2, 4, dtype=torch.float64))
+    optimizer = _make_optimizer(
+        [
+            {"params": [finite], "lr": 0.1, "pullback_group": True, "weight_decay": 0.0},
+            {"params": [mixed], "lr": 0.1, "pullback_group": True, "weight_decay": 0.0},
+        ],
+        group,
+    )
+    finite.grad = torch.ones_like(finite)
+    mixed.grad = torch.zeros_like(mixed)
+    mixed.grad[0] = 1.0
+    mixed.grad[1, 0] = bad_value
+    parameter_before = [parameter.detach().clone() for parameter in (finite, mixed)]
+    gradient_before = [parameter.grad.clone() for parameter in (finite, mixed)]
+    staging_calls = []
+    original_stage = gauge_optim.stage_pullback_group_candidate
+
+    def _stage_spy(*args, **kwargs):
+        staging_calls.append(1)
+        return original_stage(*args, **kwargs)
+
+    monkeypatch.setattr(gauge_optim, "stage_pullback_group_candidate", _stage_spy)
+
+    with pytest.raises(FloatingPointError, match="nonfinite phi covector"):
+        optimizer.step()
+
+    assert staging_calls == []
+    for parameter, expected_parameter, expected_gradient in zip(
+        (finite, mixed),
+        parameter_before,
+        gradient_before,
+    ):
+        assert torch.equal(parameter, expected_parameter)
+        assert parameter.grad is not None
+        torch.testing.assert_close(
+            parameter.grad,
+            expected_gradient,
+            rtol=0.0,
+            atol=0.0,
+            equal_nan=True,
+        )
+    assert optimizer.state_dict()["state"] == {}
+
+
 def test_state_dict_roundtrips_omega_reorth_cadence(monkeypatch):
     import vfe3.gauge_optim as gauge_optim_mod
     from vfe3.geometry.groups import get_group

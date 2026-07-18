@@ -800,6 +800,19 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                 "omega retraction produced a nonfinite or singular group element"
             )
 
+        # Reject every nonfinite processed phi covector before deriving an active-row mask or
+        # staging any phi candidate. In particular, NaN must not compare false against zero and
+        # fall through the inactive-row path, which would otherwise permit finite siblings to move
+        # and consume the complete parameter gradient.
+        for phi_group in self.param_groups:
+            if not phi_group.get("pullback_group", False):
+                continue
+            for p in phi_group["params"]:
+                if p.grad is not None and not bool(torch.isfinite(p.grad).all()):
+                    raise FloatingPointError(
+                        "pullback group step received a nonfinite phi covector"
+                    )
+
         # Stage every stored phi-factor candidate before committing any manifold update. The processed
         # gradient is exactly the tensor present after GradScaler unscale and clipping at optimizer.step.
         # No pullback parameter touches ``self.state``; the route is stateless by construction.
