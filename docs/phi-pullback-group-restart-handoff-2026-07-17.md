@@ -10,11 +10,12 @@ denied because the GitHub destination was not verified as trusted or private.
 Do not remove the separate investigation worktree at
 `C:\tmp\vfe3-mphi-ng-investigation-20260717`.
 
-Tasks 1 and 2 are complete and independently approved. The Task 1 restart
+Tasks 1 through 3 are complete and independently approved. The Task 1 restart
 checkpoint `b0bf9cb` was completed by fix commit `843b45c`. Task 2 is recorded
 by runtime commit `71e5481` and atomic nonfinite-covector review fix `085777f`.
-No Critical or Important findings remain in either task. Resume at Task 3 rather
-than dispatching or reviewing Tasks 1 or 2 again.
+Task 3 is recorded by migration commit `43ed6d3` and live-topology slot-schema
+review fix `045a245`. No Critical or Important findings remain in these tasks.
+Resume at Task 4 rather than dispatching or reviewing Tasks 1 through 3 again.
 
 ## Verification captured before restart
 
@@ -38,15 +39,21 @@ Task 2 evidence is at
 `C:\tmp\vfe3-phi-task2-review-red-20260717.xml`,
 `C:\tmp\vfe3-phi-task2-review-green-20260717.xml`, and
 `C:\tmp\vfe3-phi-task2-review-focused-20260717.xml`. The focused artifact
-records 531 tests, with 530 passes and the one accepted baseline failure. Ten
-legacy expectation nodes remain assigned to Tasks 3 through 5 in
+records 531 tests, with 530 passes and the one accepted baseline failure. Nine
+legacy expectation nodes remain assigned to Tasks 4 and 5 in
 `.superpowers/sdd/progress.md`.
+
+Task 3 evidence is at `C:\tmp\vfe3-phi-migration-red-20260717.xml`,
+`C:\tmp\vfe3-phi-migration-slot-bypass-red-20260717.xml`,
+`C:\tmp\vfe3-phi-migration-slot-bypass-green-20260717.xml`, and
+`C:\tmp\vfe3-phi-migration-review-green-20260717.xml`. The final focused
+artifact records 384 tests, zero failures, zero errors, and two skips.
 
 ## Resume sequence
 
-1. Read `.superpowers/sdd/progress.md`, this handoff, and the Task 3 section of
+1. Read `.superpowers/sdd/progress.md`, this handoff, and the Task 4 section of
    the approved implementation plan.
-2. Preserve commits `b0bf9cb`, `843b45c`, `71e5481`, and `085777f`; do not
-   re-dispatch Tasks 1 or 2.
-3. Proceed sequentially from Task 3 using the approved strict geometry and
-   stateless runtime interfaces.
+2. Preserve commits `b0bf9cb`, `843b45c`, `71e5481`, `085777f`, `43ed6d3`, and
+   `045a245`; do not re-dispatch Tasks 1 through 3.
+3. Proceed sequentially from Task 4 using the approved strict geometry,
+   stateless runtime, and serialized migration interfaces.
