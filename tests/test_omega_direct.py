@@ -1636,7 +1636,7 @@ def test_gauge_parameterization_sweep_disables_positional_phi_for_all_cells():
     assert all(overrides["pos_phi"] == "none" for _, overrides in runs)
 
 
-def test_omega_direct_optimizer_warns_that_gauge_momentum_and_rule_do_not_apply():
+def test_omega_direct_optimizer_warns_that_phi_update_policy_does_not_apply():
     from vfe3.train import build_optimizer
 
     model = VFEModel(_cfg(gauge_parameterization="omega_direct"))

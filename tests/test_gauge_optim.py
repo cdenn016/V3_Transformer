@@ -783,7 +783,7 @@ def test_attempted_diagnostic_step_clears_stale_gauge_health():
         phi_precond_mode="pullback_per_block",
     )
     opt._collect_gauge_diag = True
-    opt._gauge_diag = {"pullback_cond_max": 123.0}
+    opt._gauge_diag = {"phi_pullback_damped_gen_cond_max": 123.0}
     phi.grad = None
 
     opt.step()

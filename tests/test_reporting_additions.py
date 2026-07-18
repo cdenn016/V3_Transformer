@@ -86,7 +86,10 @@ def test_validation_sanity_renders_with_eval_cadence_gaps():
 
 
 def test_optimizer_geometry_renders_with_ratio_synthesis():
-    h = _hist(("cos_nat_phi", "pullback_cond_median", "pullback_cond_max",
+    h = _hist(("phi_ridge_direction_cosine_mean",
+               "phi_pullback_damped_gen_cond_median", "phi_pullback_damped_gen_cond_max",
+               "phi_group_trust_scale_mean", "phi_group_trust_scale_min",
+               "phi_group_active_rows", "phi_group_chart_norm_max",
                "weight_norm_mu", "weight_norm_sigma", "weight_norm_phi",
                "grad_norm_mu", "grad_norm_sigma", "grad_norm_phi"))
     fig = figs.plot_optimizer_geometry(h); assert fig is not None; plt.close(fig)
@@ -138,7 +141,7 @@ def test_save_figures_emits_dashboards(tmp_path):
     art = RunArtifacts(str(tmp_path), cfg, model, dataset="synthetic", device=str(DEVICE))
     keys = ("holonomy_wilson", "cocycle_residual", "fisher_trace_mean", "belief_cond_p95",
             "estep_f_drop", "estep_r_mu_last", "generalization_gap", "val_holonomy_wilson",
-            "cos_nat_phi", "weight_norm_mu", "grad_norm_mu")
+            "phi_ridge_direction_cosine_mean", "weight_norm_mu", "grad_norm_mu")
     art.history = [{"step": s, **{k: 1.0 / (s + 1) + 0.1 for k in keys}} for s in range(12)]
     _save_figures(art, [3.0, 2.5], logging.getLogger("test"))
     for png in ("geometry_health.png", "estep_quality.png", "validation_sanity.png",

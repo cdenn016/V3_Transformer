@@ -615,7 +615,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
 
     "phi_chart_control": {
-        "description": "matched phi chart regularization, step scale, natural gradient, and projection",
+        "description": "matched phi chart regularization, step scale, pullback descent, and projection",
         "collect_diagnostics": True,
         "seeds": [6, 64, 23],
         "requires": {
@@ -931,7 +931,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         ],
     },
 
-    "m_phi_lr_natgrad": {  # D1 / EXP-8: the pullback-group LR sub-experiment.
+    "m_phi_lr_pullback_group": {  # D1 / EXP-8: the pullback-group LR sub-experiment.
         # Group descent bypasses Adam's per-coordinate normalization, so the AdamW-tuned
         # m_phi_lr need not transfer. Gated to the certified pullback-group path.
         "description": "log-spaced m_phi_lr on the pullback group M-step [D1/EXP-8]",
@@ -942,9 +942,9 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
 
     "mass_phi": {  # D1 / EXP-8: the regime knob (NOT phi_weight_decay, which is hard-zeroed under
-        # natural-grad). The pullback advantage is predicted to shrink as mass_phi rises (the frame-
+        # pullback group descent). The pullback advantage is predicted to shrink as mass_phi rises (the frame-
         # norm penalty pulls phi toward 0, where ad_phi -> 0 and the pullback metric -> I).
-        "description": "mass_phi frame-norm penalty -- natural-grad regime knob [D1/EXP-8]",
+        "description": "mass_phi frame-norm penalty: pullback-group regime knob [D1/EXP-8]",
         "param": "mass_phi", "values": [0.0, 0.001, 0.01, 0.1],
         "requires": {"m_phi_update_mode": "pullback_group",
                      "phi_precond_mode": "pullback_per_block", "e_phi_lr": 0.0,
@@ -1610,7 +1610,7 @@ SWEEP_ORDER: List[str] = [
  # "n_e_steps_em",
  # "gauge_mstep_optim",
 
-  #"m_phi_lr_natgrad",   havent run
+  #"m_phi_lr_pullback_group",   not run
 
  # "pos_extrapolation",
  # "rho_handoff",

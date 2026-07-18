@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import asdict
 from pathlib import Path
 
@@ -521,6 +522,86 @@ def test_visualization_best_model_verifies_raw_legacy_fingerprint_before_migrati
     torch.save(payload, checkpoint)
     with pytest.raises(ValueError, match="fingerprint mismatch"):
         load_best_model_state(checkpoint, cfg, map_location="cpu")
+
+
+def test_pullback_group_artifact_reports_fixed_factor_norm_route() -> None:
+    from vfe3.model.model import VFEModel
+    from vfe3.run_artifacts import _phi_chart_norm_route
+
+    adamw_cfg = VFE3Config(vocab_size=8, embed_dim=4, n_heads=2)
+    pullback_cfg = VFE3Config(
+        vocab_size=8,
+        embed_dim=4,
+        n_heads=2,
+        gauge_group="block_glk",
+        m_phi_update_mode="pullback_group",
+        phi_precond_mode="pullback_per_block",
+        transport_chart_max_norm=6.0,
+        phi_mstep_max_matrix_norm=None,
+    )
+    bounded_pullback_cfg = VFE3Config(
+        vocab_size=8,
+        embed_dim=4,
+        n_heads=2,
+        gauge_group="block_glk",
+        m_phi_update_mode="pullback_group",
+        phi_precond_mode="pullback_per_block",
+        transport_chart_max_norm=4.0,
+        phi_mstep_max_matrix_norm=3.0,
+    )
+
+    assert _phi_chart_norm_route(VFEModel(adamw_cfg), adamw_cfg) is None
+    assert (
+        _phi_chart_norm_route(VFEModel(pullback_cfg), pullback_cfg)
+        == "diagonal_gram:factor_radius=5.0"
+    )
+    assert (
+        _phi_chart_norm_route(VFEModel(bounded_pullback_cfg), bounded_pullback_cfg)
+        == "diagonal_gram:factor_radius=3.0"
+    )
+
+
+def test_retired_phi_optimizer_core_is_confined_to_migration_fixtures() -> None:
+    root = Path(__file__).parents[1]
+    python_files = [
+        *root.joinpath("vfe3").rglob("*.py"),
+        *root.joinpath("tests").rglob("*.py"),
+        root / "train_vfe3.py",
+        root / "ablation.py",
+        root / "scaling.py",
+    ]
+    source = {path.relative_to(root).as_posix(): path.read_text(encoding="utf-8") for path in python_files}
+    old_class = "GaugeNatural" + "GradAdamW"
+    assert all(old_class not in text for text in source.values())
+
+    production = "\n".join(
+        source[name]
+        for name in ("vfe3/gauge_optim.py", "vfe3/train.py", "vfe3/run_artifacts.py")
+    )
+    retired_moment = re.compile(
+        r"gauge_" + r"mom|gauge_" + r"m\b|gauge_" + r"v\b|gauge_" + r"step"
+    )
+    assert retired_moment.search(production) is None
+
+    retired_fields = (
+        "m_phi_" + "natural_grad",
+        "m_gauge_" + "momentum",
+        "m_gauge_" + "update_rule",
+    )
+    allowed = {
+        "vfe3/config.py",
+        "tests/test_config.py",
+        "tests/test_checkpoint_resume.py",
+        "tests/test_run_artifacts.py",
+        "tests/test_final_audit_integrity_20260716.py",
+        "tests/test_2026_07_15_cache_serialization_remediation.py",
+    }
+    hits = {
+        name
+        for name, text in source.items()
+        if any(field in text for field in retired_fields)
+    }
+    assert hits <= allowed
 
 
 def test_checkpoint_payload_is_loaded_on_cpu_before_device_restore(

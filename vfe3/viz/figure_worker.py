@@ -33,7 +33,7 @@ from vfe3.run_artifacts import (
 
 
 def _history_from_csv(path: Path) -> List[Dict[str, object]]:
-    """Rebuild the numeric in-memory history used by the ordinary figure pass."""
+    """Rebuild history, migrating retired diagnostic columns at the loader boundary."""
     if not path.is_file():
         return []
     history: List[Dict[str, object]] = []
@@ -48,6 +48,13 @@ def _history_from_csv(path: Path) -> List[Dict[str, object]]:
                     parsed[key] = float(raw)
                 except ValueError:
                     parsed[key] = raw
+            for old_key, new_key in {
+                "cos_nat_phi": "phi_ridge_direction_cosine_mean",
+                "pullback_cond_median": "phi_pullback_damped_gen_cond_median",
+                "pullback_cond_max": "phi_pullback_damped_gen_cond_max",
+            }.items():
+                if new_key not in parsed and old_key in parsed:
+                    parsed[new_key] = parsed[old_key]
             history.append(parsed)
     return history
 

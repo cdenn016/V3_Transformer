@@ -1474,19 +1474,19 @@ def plot_validation_sanity(
 
 @register_figure("optimizer_geometry")
 def plot_optimizer_geometry(
-    history: Dict,                       # step + cos_nat_phi / pullback cond / role weight & grad norms
+    history: Dict,                       # pullback-group certificates + role weight and gradient norms
 
     *,
     path:    Optional[str] = None,
 ):
-    r"""Information-geometric optimizer dashboard over training.
+    r"""Pullback-group optimizer dashboard over training.
 
-    Evidence that the gauge M-step is natural-gradient (information-geometric) rather than plain Adam:
-    the cosine between the natural and raw ``phi`` gradients, the pullback-metric condition number, the
-    per-role parameter weight norms, and the gradient-to-weight ratio ``||grad_theta|| / ||theta||`` per
-    role (synthesized from the logged grad and weight norms; multiply by the per-group LR for the true
-    update-to-weight ratio). Each panel self-gates on column presence; the pullback panel appears only
-    on the pullback precond modes, ``cos_nat_phi`` only on a natural-gradient gauge run."""
+    The phi panels show the fixed-coordinate cosine between the ridge-regularized chart direction and
+    processed covector, the reused damped generalized-condition certificate, the accepted right-factor
+    scale after BCH backtracking, active rows, and the accepted embedded chart norm. Role panels retain
+    parameter norms and ``||grad_theta|| / ||theta||``. The cosine is a reshaping diagnostic, not a
+    basis-invariant angle.
+    """
     hist = dict(history)
     for role in ("mu", "sigma", "phi"):                          # synthesize the gradient-to-weight ratio
         gk, wk = f"grad_norm_{role}", f"weight_norm_{role}"
@@ -1495,12 +1495,20 @@ def plot_optimizer_geometry(
             w = _np(hist[wk]).astype(float)
             hist[f"grad_weight_ratio_{role}"] = np.where(w > 0, g / w, np.nan)
     panels = [
-        {"title": "Natural-gradient alignment",
-         "ylabel": r"$\cos(\nabla^{\mathrm{nat}}_\phi,\nabla_\phi)$",
-         "series": [("cos_nat_phi", r"$\cos(\mathrm{nat},\mathrm{raw})$", _CB[0])]},
-        {"title": "Pullback conditioning", "ylabel": "condition number", "logy": True, "series": [
-            ("pullback_cond_median", "median", _CB[1]),
-            ("pullback_cond_max", "max", _CB[3])]},
+        {"title": "Ridge-direction cosine",
+         "ylabel": r"$\cos(v_\phi,g_\phi)$",
+         "series": [("phi_ridge_direction_cosine_mean", "ridge direction", _CB[0])]},
+        {"title": "Pullback conditioning", "ylabel": "damped generalized condition", "logy": True,
+         "series": [
+            ("phi_pullback_damped_gen_cond_median", "median", _CB[1]),
+            ("phi_pullback_damped_gen_cond_max", "max", _CB[3])]},
+        {"title": "Accepted factor scale", "ylabel": "scale", "series": [
+            ("phi_group_trust_scale_mean", "mean", _CB[0]),
+            ("phi_group_trust_scale_min", "min", _CB[1])]},
+        {"title": "Pullback active rows", "ylabel": "rows", "series": [
+            ("phi_group_active_rows", "active", _CB[2])]},
+        {"title": "Accepted chart norm", "ylabel": r"$\|\phi\|_F$", "series": [
+            ("phi_group_chart_norm_max", "max", _CB[3])]},
         {"title": "Role weight norms", "ylabel": r"$\|\theta\|_2$", "logy": True, "series": [
             ("weight_norm_mu", r"$\mu$", _CB[0]),
             ("weight_norm_sigma", r"$\Sigma$", _CB[1]),
@@ -1511,7 +1519,7 @@ def plot_optimizer_geometry(
             ("grad_weight_ratio_sigma", r"$\Sigma$", _CB[1]),
             ("grad_weight_ratio_phi", r"$\phi$", _CB[2])]},
     ]
-    return _history_dashboard(hist, panels, "Optimizer information geometry", path, ncols=2)
+    return _history_dashboard(hist, panels, "Pullback-group optimizer geometry", path, ncols=2)
 
 
 def plot_s_channel_refinement(
@@ -4183,9 +4191,14 @@ PUB_LABELS: Dict[str, str] = {
     "val_row_sum_error":       "attention row-sum error (max)",
     "val_pos_content_r2":      r"positional-content $R^2$",
     "val_head_redundancy_js":  "head redundancy (JS)",
-    # -- optimizer information geometry --
-    "cos_nat_phi":             r"$\cos(\nabla^{\mathrm{nat}}_\phi,\nabla_\phi)$",
-    "pullback_cond_median":    r"pullback-metric conditioning $\mathrm{med}\,\kappa$",
+    # -- pullback-group optimizer geometry --
+    "phi_ridge_direction_cosine_mean":     r"ridge-direction cosine $\cos(v_\phi,g_\phi)$",
+    "phi_pullback_damped_gen_cond_median": r"damped pullback condition $\mathrm{med}\ \kappa$",
+    "phi_pullback_damped_gen_cond_max":    r"damped pullback condition $\max\ \kappa$",
+    "phi_group_trust_scale_mean":          "accepted factor scale (mean)",
+    "phi_group_trust_scale_min":           "accepted factor scale (min)",
+    "phi_group_active_rows":               "active phi rows",
+    "phi_group_chart_norm_max":            r"accepted chart norm $\max\|\phi\|_F$",
 }
 
 

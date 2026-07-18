@@ -350,11 +350,17 @@ def _phi_chart_norm_route(
     model: torch.nn.Module,
     cfg:   object,
 ) -> Optional[str]:
-    """Persist the exact norm route only when the projected phi M-step is enabled."""
-    if getattr(cfg, "phi_mstep_max_matrix_norm", None) is None:
+    """Persist the active phi factor-bound norm route and pullback default radius."""
+    configured_radius = getattr(cfg, "phi_mstep_max_matrix_norm", None)
+    pullback_group = getattr(cfg, "m_phi_update_mode", "adamw") == "pullback_group"
+    if configured_radius is None and not pullback_group:
         return None
     route = getattr(model.group, "phi_norm_route", None)
-    return route() if route is not None else "dense_fallback"
+    route_name = route() if route is not None else "dense_fallback"
+    if pullback_group:
+        radius = 5.0 if configured_radius is None else float(configured_radius)
+        return f"{route_name}:factor_radius={radius}"
+    return route_name
 
 
 def sigma_behavior_config(
@@ -3716,11 +3722,13 @@ def _save_figures(
                 path=str(run / "validation_sanity.png"),
             )
             figs.plt.close(fig)
-        # Optimizer information-geometry dashboard: natural-gradient alignment, pullback conditioning,
-        # per-role weight norms, and the synthesized update-to-weight ratio. Present only on a gauge
-        # natural-grad run (cos_nat_phi / pullback) and when step_metrics captured the norms.
+        # Pullback-group optimizer dashboard: ridge-direction reshaping, certified conditioning,
+        # accepted factor scale/chart health, per-role weight norms, and gradient-to-weight ratio.
         hist_opt = _hist_subset((
-            "cos_nat_phi", "pullback_cond_median", "pullback_cond_max",
+            "phi_ridge_direction_cosine_mean",
+            "phi_pullback_damped_gen_cond_median", "phi_pullback_damped_gen_cond_max",
+            "phi_group_trust_scale_mean", "phi_group_trust_scale_min",
+            "phi_group_active_rows", "phi_group_chart_norm_max",
             "weight_norm_mu", "weight_norm_sigma", "weight_norm_phi",
             "grad_norm_mu", "grad_norm_sigma", "grad_norm_phi"))
         if hist_opt:

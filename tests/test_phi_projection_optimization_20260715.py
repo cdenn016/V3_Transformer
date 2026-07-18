@@ -402,11 +402,25 @@ def test_phi_chart_summary_route_is_none_when_disabled_and_named_when_enabled() 
         phi_mstep_max_matrix_norm=2.0,
     )
     enabled_model = VFEModel(enabled_cfg)
+    pullback_cfg = VFE3Config(
+        vocab_size=8,
+        embed_dim=4,
+        n_heads=2,
+        gauge_group="block_glk",
+        m_phi_update_mode="pullback_group",
+        phi_precond_mode="pullback_per_block",
+        transport_chart_max_norm=6.0,
+    )
+    pullback_model = VFEModel(pullback_cfg)
 
     assert run_artifacts._phi_chart_norm_route(disabled_model, disabled_cfg) is None
     assert (
         run_artifacts._phi_chart_norm_route(enabled_model, enabled_cfg)
         == "diagonal_gram"
+    )
+    assert (
+        run_artifacts._phi_chart_norm_route(pullback_model, pullback_cfg)
+        == "diagonal_gram:factor_radius=5.0"
     )
 
 

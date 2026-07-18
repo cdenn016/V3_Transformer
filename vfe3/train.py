@@ -1727,19 +1727,23 @@ def train(
                         if step_metrics is not None
                         else float("nan")
                     )
-            # Gauge M-step geometry diagnostics (D1/EXP-8): cos(nat,grad) and the pullback metric
-            # condition number, stashed by GaugeManifoldAdamW on this (log/eval) step. Written with a
-            # FIXED key set per run (NaN default, like the _VAL_DIAG_KEYS block below) so the columns are
-            # defined from the FIRST logged row regardless of active-rows timing -- log_metrics locks
-            # fieldnames on row 0, so a key first appearing later would break the CSV. cos_nat_phi for any
-            # natural-grad gauge run; pullback_cond_* only on the pullback modes (config-fixed per run);
-            # plain AdamW has no _gauge_diag attr, so its columns are absent and that CSV stays rectangular.
+            # Pullback-group M-step diagnostics use a fixed key set from the first logged row. The
+            # optimizer computes and host-reduces them only on this gated log/eval attempt; missing
+            # active rows emit NaN placeholders so metrics.csv remains rectangular. Plain AdamW has
+            # no _gauge_diag attribute, while omega-only manifold runs retain only omega diagnostics.
             if hasattr(optimizer, "_gauge_diag"):
                 _gd = optimizer._gauge_diag or {}
-                row["cos_nat_phi"] = _gd.get("cos_nat_phi", float("nan"))
-                if getattr(optimizer, "_precond_mode", "") in ("pullback", "pullback_per_block"):
-                    row["pullback_cond_median"] = _gd.get("pullback_cond_median", float("nan"))
-                    row["pullback_cond_max"]    = _gd.get("pullback_cond_max", float("nan"))
+                if any(group.get("pullback_group", False) for group in optimizer.param_groups):
+                    for _pk in (
+                        "phi_ridge_direction_cosine_mean",
+                        "phi_pullback_damped_gen_cond_median",
+                        "phi_pullback_damped_gen_cond_max",
+                        "phi_group_trust_scale_mean",
+                        "phi_group_trust_scale_min",
+                        "phi_group_active_rows",
+                        "phi_group_chart_norm_max",
+                    ):
+                        row[_pk] = _gd.get(_pk, float("nan"))
                 if getattr(optimizer, "_has_omega_group", False):
                     if getattr(optimizer, "_group_name", None) == "sp":
                         row["omega_symplectic_residual_median"] = _gd.get(

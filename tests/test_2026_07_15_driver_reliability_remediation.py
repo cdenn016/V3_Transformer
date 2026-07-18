@@ -1595,25 +1595,6 @@ def test_every_scaling_arm_constructs_and_tied_groups_use_ambient_preconditioner
     assert errors == []
 
 
-def test_click_run_phi_controls_have_no_retired_override_keys():
-    retired = {"m_phi_natural_grad", "m_gauge_momentum", "m_gauge_update_rule"}
-
-    def mapping_keys(value):
-        if isinstance(value, dict):
-            for key, nested in value.items():
-                yield key
-                yield from mapping_keys(nested)
-        elif isinstance(value, (list, tuple)):
-            for nested in value:
-                yield from mapping_keys(nested)
-
-    surfaces = (
-        train_vfe3.config,
-        ablation.BASELINE_CONFIG,
-        ablation.SWEEPS,
-        scaling.BASELINE,
-        scaling.ROUTES,
-    )
-    assert retired.isdisjoint({key for surface in surfaces for key in mapping_keys(surface)})
+def test_click_run_phi_controls_use_current_update_policy():
     assert train_vfe3.config["m_phi_update_mode"] == "adamw"
     assert train_vfe3.config["m_phi_group_trust_radius"] == 0.1

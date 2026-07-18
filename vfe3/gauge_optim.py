@@ -579,12 +579,11 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         self._omega_step         = 0                     # M-step counter for the reorth cadence
         self._group_name         = group.name
         self._has_omega_group    = any(item.get("omega", False) for item in self.param_groups)
-        # D1/EXP-8 training-time diagnostics, GATED: the caller (train.py) sets _collect_gauge_diag
-        # True only on a log/eval step, so the silent hot path computes NOTHING extra. When set, step()
-        # stashes cos(nat, grad) (1.0 for the conformal killing rescale; <1 when pullback reshapes the
-        # direction) and -- on the pullback modes -- the per-token metric condition number into
-        # _gauge_diag. Omega-direct groups additionally report active-row element condition, or the
-        # defining Sp(K,R) membership residual for ``sp``. train.py reads the fixed keys into metrics.csv.
+        # Training-time diagnostics are gated by train.py to log/eval steps. The silent hot path
+        # performs no diagnostic tensor work or host reduction. Pullback groups report the fixed-
+        # coordinate ridge-direction cosine, reused generalized-condition certificate, accepted
+        # right-factor scale, active-row count, and accepted chart norm. Omega-direct groups retain
+        # their element condition or defining Sp(K,R) membership residual.
         self._collect_gauge_diag = False
         self._gauge_diag: dict   = {}
 
@@ -735,8 +734,11 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         collect = self._collect_gauge_diag                             # gated: True only on log/eval steps
         if collect:
             self._gauge_diag = {}                                      # never expose a prior attempted step
-        cos_acc: List[float] = []
+        cos_acc: List[torch.Tensor] = []
         cond_acc: List[torch.Tensor] = []
+        trust_acc: List[torch.Tensor] = []
+        chart_acc: List[torch.Tensor] = []
+        phi_active_rows = 0
         omega_cond_acc: List[torch.Tensor] = []
         omega_sp_acc: List[torch.Tensor] = []
 
@@ -847,11 +849,18 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                         candidate.direction.v_phi,
                         flat_gradient[active].to(dtype=torch.float64),
                         dim=-1,
+                        eps=torch.finfo(torch.float64).tiny,
                     )
-                    cos_acc.append(float(cosine.mean()))
+                    cos_acc.append(cosine.reshape(-1))
                     cond_acc.append(
                         candidate.direction.damped_generalized_condition.reshape(-1)
                     )
+                    accepted_scale = candidate.trust_scale / torch.exp2(
+                        candidate.backtracking_reductions.to(dtype=torch.float64)
+                    )
+                    trust_acc.append(accepted_scale.reshape(-1))
+                    chart_acc.append(candidate.candidate_chart_norm.reshape(-1))
+                    phi_active_rows += candidate.candidate_phi.shape[0]
                 pending_updates.append((p, flat_phi, active, candidate))
             phi_plans[id(phi_group)] = (pending_updates, pending_zero_gradients)
 
@@ -867,7 +876,7 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                 continue
             if group.get("omega", False):
                 # omega_direct group: the params ARE stored GL(K) group elements U (shape (V, K, K)),
-                # not algebra coordinates. Step by a group-manifold retraction of the natural-gradient
+                # not algebra coordinates. Step by a group-manifold retraction of the Gram-projected
                 # tangent xi = Gram^{-1} proj_g(U^T E) (extract_phi computes exactly this): U <- U retr(-lr xi),
                 # active (nonzero-grad) rows only, then consume the grad so base AdamW no-ops on it.
                 # Compact storage (omega_compact_storage=True): the table is per-block stacks -- untied
@@ -936,11 +945,27 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
                         dirty.zero_()
         if collect:
             if cos_acc:
-                self._gauge_diag["cos_nat_phi"] = sum(cos_acc) / len(cos_acc)
-            if cond_acc:
+                all_cos = torch.cat(cos_acc)
                 allc = torch.cat(cond_acc)
-                self._gauge_diag["pullback_cond_median"] = float(allc.median())
-                self._gauge_diag["pullback_cond_max"]    = float(allc.max())
+                all_trust = torch.cat(trust_acc)
+                all_chart = torch.cat(chart_acc)
+                values = torch.stack((
+                    all_cos.mean(),
+                    allc.median(),
+                    allc.max(),
+                    all_trust.mean(),
+                    all_trust.min(),
+                    all_chart.max(),
+                )).cpu().tolist()
+                self._gauge_diag.update({
+                    "phi_ridge_direction_cosine_mean":         values[0],
+                    "phi_pullback_damped_gen_cond_median":     values[1],
+                    "phi_pullback_damped_gen_cond_max":        values[2],
+                    "phi_group_trust_scale_mean":              values[3],
+                    "phi_group_trust_scale_min":               values[4],
+                    "phi_group_active_rows":                   float(phi_active_rows),
+                    "phi_group_chart_norm_max":                values[5],
+                })
             if omega_cond_acc:
                 allc = torch.cat(omega_cond_acc)
                 self._gauge_diag["omega_condition_median"] = float(allc.median())
