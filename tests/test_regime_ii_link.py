@@ -432,13 +432,6 @@ def test_charted_model_runs_with_e_phi_lr_positive():
     assert torch.isfinite(loss)
 
 
-def test_cache_rejects_link_modes():
-    """The prefix belief cache is flat-only; both link modes are rejected (non-flat transport)."""
-    from vfe3.inference.belief_cache import cache_supported
-    for mode in ("regime_ii_link", "regime_ii_link_charted"):
-        assert not cache_supported(_tiny_cfg(transport_mode=mode)), mode
-
-
 # --- gradient + kernel verification ----------------------------------------------------------
 from vfe3.belief import BeliefState
 from vfe3.inference.e_step import build_belief_transport, free_energy_value

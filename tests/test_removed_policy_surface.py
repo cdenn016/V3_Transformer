@@ -6,6 +6,7 @@ import pytest
 
 from vfe3.config import VFE3Config, migrate_serialized_config
 from vfe3.model.model import VFEModel
+from vfe3.model.prior_bank import PriorBank
 
 
 FORMER_POLICY_FIELDS = frozenset({
@@ -26,6 +27,7 @@ def test_public_runtime_has_no_policy_surface() -> None:
     assert FORMER_POLICY_FIELDS.isdisjoint(field.name for field in fields(VFE3Config))
     assert not hasattr(VFEModel, "_policy_select")
     assert not hasattr(VFEModel, "rollout_beliefs")
+    assert not hasattr(PriorBank, "decode_point")
 
 
 @pytest.mark.parametrize("module", [

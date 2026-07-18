@@ -14,7 +14,6 @@ SLOW_TESTS: frozenset[str] = frozenset({
 })
 
 CUDA_TESTS: frozenset[str] = frozenset({
-    "test_generate.py::test_efe_rollout_sigma_mc_cuda_synthetic_pass",
     (
         "test_hierarchical_probabilistic_completeness_20260712.py"
         "::test_hierarchy_full_covariant_cuda_smoke"

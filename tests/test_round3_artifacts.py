@@ -1,13 +1,10 @@
 r"""Round-3 artifact-hygiene fixes (audit 2026-07-01 round-3).
 
-Pins three raising-path behaviors: ``_atomic_replace`` deletes its orphaned same-directory tmp
+Pins two raising-path behaviors: ``_atomic_replace`` deletes its orphaned same-directory tmp
 when the publish ultimately fails (while the success path still consumes it), the ``_emit``
-figure driver closes a pyplot figure a thunk registered before raising (tight_layout/savefig),
-and the sigma-gate artifact writer disambiguates lossy checkpoint-id slugs with a stable hash
-so two distinct ids never overwrite each other's PASS/FAIL record.
+figure driver closes a pyplot figure a thunk registered before raising (tight_layout/savefig).
 """
 
-import json
 from pathlib import Path
 
 import pytest
@@ -17,7 +14,6 @@ from torch.utils.data import DataLoader
 from vfe3 import run_artifacts
 from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
-from vfe3.inference.sigma_gate import write_sigma_gate_artifact
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import _atomic_replace
 
@@ -125,20 +121,3 @@ def test_comparison_emit_closes_figures_after_thunk_or_save_failure(
     assert set(figs.plt.get_fignums()) == before
     assert target.read_bytes() == b"SENTINEL"
     assert not list(comparison_dir.glob(".vocab_probability_heatmap_compare.*.tmp.png"))
-
-
-# ---------------------------------------------------------------- sigma-gate slug collision (punch item 7)
-
-def test_sigma_gate_colliding_checkpoint_ids_write_distinct_files(tmp_path):
-    # The slug is lossy ("ckpt a" / "ckpt:a" both map to "ckpt_a"); the raw-id hash suffix keeps
-    # the two records distinct instead of the second silently overwriting the first (C15 pattern).
-    p1 = write_sigma_gate_artifact({"status": "PASS"}, checkpoint_id="ckpt a",
-                                   spec_commit="x", seeds=(6,), out_dir=str(tmp_path))
-    p2 = write_sigma_gate_artifact({"status": "FAIL"}, checkpoint_id="ckpt:a",
-                                   spec_commit="x", seeds=(6,), out_dir=str(tmp_path))
-    assert p1 != p2
-    assert Path(p1).exists() and Path(p2).exists()
-    r1 = json.loads(Path(p1).read_text(encoding="utf-8"))
-    r2 = json.loads(Path(p2).read_text(encoding="utf-8"))
-    assert r1["checkpoint_id"] == "ckpt a" and r1["status"] == "PASS"
-    assert r2["checkpoint_id"] == "ckpt:a" and r2["status"] == "FAIL"

@@ -1,8 +1,7 @@
-r"""Round-3 registry-guard tests (audit 2026-07-01 round-3): every register_* decorator in the
-round-3 batch fails closed on a duplicate key (KeyError) and replaces only under override=True,
+r"""Round-3 registry-guard tests (audit 2026-07-01 round-3): every retained register_* decorator in
+the round-3 batch fails closed on a duplicate key (KeyError) and replaces only under override=True,
 completing the F12 fail-closed contract across the config-selected seams. Also pins that
-``override`` is KEYWORD-ONLY on every guarded register_* (punch item 6: register_policy had it
-positional).
+``override`` is keyword-only on every guarded register_*.
 
 Each check saves the original entry first and restores it via override=True in a ``finally``,
 so global registry state is unchanged for the rest of the suite.
@@ -22,7 +21,6 @@ from vfe3.geometry import phi_preconditioner as precond_mod
 from vfe3.geometry import retraction as retraction_mod
 from vfe3.geometry import rope as rope_mod
 from vfe3.gradients import kernels as kernels_mod
-from vfe3.inference import policy as policy_mod
 from vfe3.model import positional_phi as pos_phi_mod
 from vfe3.model import prior_bank as prior_bank_mod
 
@@ -40,8 +38,6 @@ _DECORATOR_REGISTRIES = [
     (pos_phi_mod.register_pos_phi,                pos_phi_mod._POS_PHI,                 "none"),
     (prior_bank_mod.register_encode,              prior_bank_mod._ENCODERS,             "per_token"),
     (numerics_mod.register_monitor,               numerics_mod._MONITORS,               "nan_fraction"),
-    (policy_mod.register_preference,              policy_mod._PREFERENCES,              "flat"),
-    (policy_mod.register_ambiguity,               policy_mod._AMBIGUITIES,              "likelihood_entropy"),
 ]
 
 _IDS = [reg.__name__ for reg, _, _ in _DECORATOR_REGISTRIES]
@@ -118,13 +114,11 @@ def test_register_group_duplicate_key_fails_closed_and_override_replaces_record(
 @pytest.mark.parametrize(
     "reg",
     [reg for reg, _, _ in _DECORATOR_REGISTRIES]
-    + [groups_mod.register_group, prior_bank_mod.register_decode,
-       policy_mod.register_policy, irreps_mod.register_irrep],
-    ids=_IDS + ["register_group", "register_decode", "register_policy", "register_irrep"],
+    + [groups_mod.register_group, prior_bank_mod.register_decode, irreps_mod.register_irrep],
+    ids=_IDS + ["register_group", "register_decode", "register_irrep"],
 )
 def test_override_parameter_is_keyword_only(reg):
-    # punch item 6: register_policy's override was positional; the convention (register_alpha,
-    # register_prior, register_compose) is keyword-only, pinned here for the whole batch.
+    # The registration convention is keyword-only, pinned here for the whole retained batch.
     param = inspect.signature(reg).parameters["override"]
     assert param.kind is inspect.Parameter.KEYWORD_ONLY
     assert param.default is False

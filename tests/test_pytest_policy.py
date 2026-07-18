@@ -271,7 +271,6 @@ def test_policy_sets_define_disjoint_execution_lanes() -> None:
 
 def test_cuda_and_external_tables_cover_the_dedicated_prerequisite_lanes() -> None:
     assert CUDA_TESTS == {
-        "test_generate.py::test_efe_rollout_sigma_mc_cuda_synthetic_pass",
         (
             "test_hierarchical_probabilistic_completeness_20260712.py"
             "::test_hierarchy_full_covariant_cuda_smoke"

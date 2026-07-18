@@ -24,16 +24,12 @@ import pytest
 import torch
 
 import ablation
-import efe_ring_experiment
-import generate_efe
 import multiseed_analysis
 import scaling
 import scaling_analysis
 import train_vfe3
 from vfe3.config import VFE3Config
-from vfe3.inference import ring_task
 from vfe3.run_artifacts import RunArtifacts
-from vfe3.runtime import deterministic_state, seed_everything
 from vfe3.viz import embedding_comparison, figures, report
 
 
@@ -94,49 +90,6 @@ def test_concurrent_json_publication_uses_unique_writer_temporaries(tmp_path, mo
     assert len(temporaries) == 2 and len(set(temporaries)) == 2
     assert json.loads((artifacts.run_dir / "shared.json").read_text())["writer"] in {1, 2}
     assert not list(artifacts.run_dir.glob("*.tmp"))
-
-
-def test_ring_training_applies_shared_deterministic_runtime_contract(monkeypatch):
-    monkeypatch.setattr(ring_task, "predictive_adequacy", lambda *args, **kwargs: 1.0)
-    seed_everything(0, deterministic=False)
-    try:
-        model, _ = ring_task.train_ring_checkpoint(
-            seed=17,
-            steps=0,
-            batch_size=2,
-            embed_dim=4,
-            n_heads=2,
-            n_layers=1,
-            n_e_steps=1,
-            device="cpu",
-            cfg_overrides={"deterministic": True},
-        )
-        state = deterministic_state()
-        assert model.cfg.deterministic is True
-        assert state == {
-            "algorithms": True,
-            "cudnn_deterministic": True,
-            "cudnn_benchmark": False,
-            "cublas_workspace_config": ":4096:8",
-        }
-    finally:
-        seed_everything(0, deterministic=False)
-
-
-def test_ring_seed_bundle_persists_effective_runtime_state(tmp_path):
-    model = ring_task.VFEModel(_tiny_config(max_seq_len=ring_task.SEQ_LEN))
-    path = tmp_path / "seed_1.pt"
-    efe_ring_experiment._save_seed_bundle(
-        path,
-        model,
-        {"seeds": [1], "steps": 1},
-        None,
-        seed=1,
-        adequacy=0.5,
-        status="trained",
-    )
-    bundle = torch.load(path, weights_only=True)
-    assert bundle["runtime_state"] == efe_ring_experiment._runtime_identity(torch.device("cpu"))
 
 
 def _write_scaling_run(
@@ -1142,185 +1095,6 @@ def test_scaling_loader_rejects_invalid_data_seed_before_cache_access(monkeypatc
 
     with pytest.raises(ValueError, match="data_seed.*exact nonnegative"):
         scaling.get_loader("wikitext-103", 4, 1, "train", data_seed=bad_seed)
-
-
-def test_stochastic_generation_is_controlled_by_explicit_generation_seed(monkeypatch):
-    monkeypatch.setattr(generate_efe, "_build_model", lambda *args, **kwargs: kwargs["policy_overrides"])
-    monkeypatch.setattr(
-        generate_efe,
-        "_generate",
-        lambda prompt_ids, model, cfg: torch.randint(0, 1000, (1, 8)),
-    )
-    cfg = dict(generate_efe.CONFIG, policy_mode="efe_one_step", generation_seed=314159)
-    prompt = torch.tensor([[1]], dtype=torch.long)
-
-    torch.manual_seed(1)
-    first = generate_efe._run_generation_arms(prompt, {}, {}, cfg, device="cpu")
-    torch.manual_seed(999)
-    second = generate_efe._run_generation_arms(prompt, {}, {}, cfg, device="cpu")
-
-    assert torch.equal(first[0], second[0])
-    assert torch.equal(first[1], second[1])
-
-
-def test_generation_main_atomically_persists_generation_seed_and_outputs(tmp_path, monkeypatch):
-    output = tmp_path / "efe_generation.json"
-    checkpoint = tmp_path / "fake.pt"
-    checkpoint.write_bytes(b"checkpoint-bytes")
-    cfg = dict(generate_efe.CONFIG)
-    cfg.update(checkpoint=str(checkpoint), dataset="synthetic", generation_seed=23,
-               output_path=str(output), device="cpu")
-
-    class _Tokenizer:
-        def encode(self, value):
-            del value
-            return [1, 2]
-
-        def decode(self, values):
-            return " ".join(str(value) for value in values)
-
-    monkeypatch.setattr(generate_efe, "CONFIG", cfg)
-    monkeypatch.setattr(
-        generate_efe, "_load_checkpoint",
-        lambda config, **kwargs: ({"vocab_size": 8}, {}),
-    )
-    monkeypatch.setattr(generate_efe, "_generation_code_identity", lambda: "c" * 64)
-    monkeypatch.setattr(
-        generate_efe, "_runtime_identity",
-        lambda device: {"device": {"type": str(device)}},
-    )
-    monkeypatch.setattr(generate_efe, "_tokenizer_for_dataset", lambda *args, **kwargs: _Tokenizer())
-    monkeypatch.setattr(
-        generate_efe,
-        "_run_generation_arms",
-        lambda *args, **kwargs: (torch.tensor([[1, 2, 3]]), torch.tensor([[1, 2, 4]])),
-    )
-
-    generate_efe.main()
-
-    record = json.loads(output.read_text(encoding="utf-8"))
-    assert record["schema_version"] == 3
-    assert record["checkpoint_sha256"] == hashlib.sha256(b"checkpoint-bytes").hexdigest()
-    assert record["model_state_sha256"] == hashlib.sha256().hexdigest()
-    assert record["generation_seed"] == 23
-    assert record["code_identity_sha256"] == "c" * 64
-    assert record["runtime_state"] == {"device": {"type": "cpu"}}
-    assert record["generation_contract"] == {
-        "dataset": "synthetic",
-        "prompt": cfg["prompt"],
-        "prompt_token_ids": [[1, 2]],
-        "max_new_tokens": cfg["max_new_tokens"],
-        "generation_seed": 23,
-        "greedy": cfg["greedy"],
-        "device": "cpu",
-        "policy": {
-            key: (list(cfg[key]) if key == "policy_score_terms" else cfg[key])
-            for key in generate_efe._POLICY_FIELDS
-        },
-    }
-    assert record["outputs"] == {"base_token_ids": [[1, 2, 3]], "policy_token_ids": [[1, 2, 4]]}
-    assert not list(tmp_path.glob("*.tmp"))
-
-
-def test_generation_checkpoint_digest_binds_the_exact_loaded_snapshot(tmp_path):
-    checkpoint = tmp_path / "checkpoint.pt"
-    original = {
-        "config": {"vocab_size": 8},
-        "model_state": {"weight": torch.tensor([1.0])},
-    }
-    replacement = {
-        "config": {"vocab_size": 8},
-        "model_state": {"weight": torch.tensor([9.0])},
-    }
-    torch.save(original, checkpoint)
-    snapshot = checkpoint.read_bytes()
-    digest = hashlib.sha256(snapshot).hexdigest()
-    torch.save(replacement, checkpoint)
-
-    config, state = generate_efe._load_checkpoint(
-        {"checkpoint": str(checkpoint), "config_from": None},
-        checkpoint_snapshot=snapshot,
-    )
-
-    assert config == vars(VFE3Config(**original["config"]))
-    assert torch.equal(state["weight"], original["model_state"]["weight"])
-    assert digest == hashlib.sha256(snapshot).hexdigest()
-    assert not torch.equal(state["weight"], replacement["model_state"]["weight"])
-
-
-@pytest.mark.parametrize("drift_source", ("checkpoint", "config_from"))
-def test_generation_refuses_to_publish_if_an_input_changes_mid_run(
-    tmp_path,
-    monkeypatch,
-    drift_source,
-):
-    checkpoint = tmp_path / "model.pt"
-    checkpoint.write_bytes(b"checkpoint-start")
-    config_from = tmp_path / "config.json"
-    config_from.write_bytes(b"config-start")
-    output = tmp_path / "generation.json"
-    output.write_bytes(b"SENTINEL")
-    cfg = dict(
-        generate_efe.CONFIG,
-        checkpoint=str(checkpoint),
-        config_from=str(config_from),
-        output_path=str(output),
-        dataset="synthetic",
-        device="cpu",
-    )
-
-    class _Tokenizer:
-        def encode(self, value):
-            del value
-            return [1]
-
-        def decode(self, values):
-            return str(values)
-
-    def mutate_input(*args, **kwargs):
-        del args, kwargs
-        target = checkpoint if drift_source == "checkpoint" else config_from
-        target.write_bytes(b"changed-during-generation")
-        return torch.tensor([[1, 2]]), None
-
-    monkeypatch.setattr(generate_efe, "CONFIG", cfg)
-    monkeypatch.setattr(
-        generate_efe, "_load_checkpoint",
-        lambda config, **kwargs: ({"vocab_size": 8}, {}),
-    )
-    monkeypatch.setattr(generate_efe, "_tokenizer_for_dataset", lambda *a, **k: _Tokenizer())
-    monkeypatch.setattr(generate_efe, "_run_generation_arms", mutate_input)
-
-    with pytest.raises(RuntimeError, match="changed during generation"):
-        generate_efe.main()
-
-    assert output.read_bytes() == b"SENTINEL"
-
-
-@pytest.mark.parametrize("alias_field", ("checkpoint", "config_from"))
-def test_generation_output_cannot_alias_input_checkpoint(
-    tmp_path,
-    monkeypatch,
-    alias_field,
-):
-    checkpoint = tmp_path / "model.pt"
-    checkpoint.write_bytes(b"trained-model")
-    cfg = dict(generate_efe.CONFIG, checkpoint=str(checkpoint), output_path=str(checkpoint))
-    if alias_field == "config_from":
-        other = tmp_path / "legacy.pt"
-        other.write_bytes(b"legacy-state")
-        cfg.update(checkpoint=str(other), config_from=str(checkpoint))
-    monkeypatch.setattr(generate_efe, "CONFIG", cfg)
-    monkeypatch.setattr(
-        generate_efe,
-        "_load_checkpoint",
-        lambda config: pytest.fail("alias validation ran after checkpoint loading"),
-    )
-
-    with pytest.raises(ValueError, match="must not alias"):
-        generate_efe.main()
-
-    assert checkpoint.read_bytes() == b"trained-model"
 
 
 def test_visualization_extra_declares_direct_networkx_dependency():
