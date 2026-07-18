@@ -678,22 +678,6 @@ class VFE3Config:
     decode_unigram_prior:      bool  = False
     unigram_kappa:             float = 1.0            # tempering on log pi_v (1.0 = exact Bayes rule)
 
-    # --- compute-reclamation package (exactness-preserving perf toggles, default OFF) ---
-    # Per-head (block-diagonal) transport_mean: contract each gauge block separately instead of the
-    # dense K-axis einsum (the off-blocks are exactly zero). Same sum, ~n_heads x fewer FLOPs on the
-    # dominant pair GEMM. Numerics: fp32 reassociation only (pinned allclose 1e-6).
-    transport_mean_per_head:       bool  = False
-
-    # Keep the eligible canonical flat block_glk phi path packed as (..., H, d, d): algebra
-    # embedding, vertex exponentials, positional/model-frame BCH, and live BCH retraction all omit
-    # dense (..., K, K) intermediates. Default OFF preserves the legacy layout and arithmetic;
-    # ON is algebraically equivalent with ordinary floating-point reassociation roundoff.
-    compact_phi_block_transport:   bool  = False
-
-    # Reuse one canonical diagonal-KL pair-statistics bundle between attention and the filtering
-    # gradient / MM consumer. Default OFF preserves the legacy arithmetic and routing exactly.
-    reuse_pairwise_kl_stats:       bool  = False
-    
     # fp64 island keying for stable_matrix_exp_pair. 'dim' (default): upcast when the block dim
     # >= its dim_threshold (the long-standing rule). 'norm': upcast only when the clamped block
     # Frobenius norm exceeds exp_fp64_norm_threshold -- the conditioning argument is a norm

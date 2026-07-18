@@ -518,9 +518,6 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
                                              # for linear-decode configs; user asserts sigma has no consumer)
 
     # --- compute reclamation (exactness-preserving perf; default OFF) ---
-    compact_phi_block_transport  = True,
-    reuse_pairwise_kl_stats   = True,
-    transport_mean_per_head   = True,       # per-head transport_mean einsum (~n_heads x fewer FLOPs, allclose 1e-6)
     exp_fp64_mode             = "dim",       # "dim" (long-standing: fp64 when block dim >= 20) | "norm" (fp64 only
                                              # when clamped ||M||_F >= exp_fp64_norm_threshold; d_head=25 blocks
                                              # currently run fp64 PERMANENTLY under "dim")
