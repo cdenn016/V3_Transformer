@@ -14,6 +14,7 @@ import torch
 
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
+from vfe3.train import _val_diagnostics
 
 
 def _tiny_model(**overrides) -> VFEModel:
@@ -112,3 +113,27 @@ def test_bf16_backward_reaches_prior_tables():
     loss.backward()
     assert model.prior_bank.mu_embed.grad is not None
     assert model.prior_bank.mu_embed.grad.abs().sum() > 0
+
+
+def test_bf16_head_mixer_validation_diagnostics_run_in_fp32():
+    r"""A bf16 head-mixer forward must leave the off-graph diagnostic replay in fp32."""
+    model = _tiny_model(
+        amp_dtype="bf16",
+        compact_phi_block_transport=True,
+        gauge_group="block_glk",
+        transport_mean_per_head=True,
+        use_head_mixer=True,
+    )
+    tok = torch.randint(0, 20, (2, 5))
+    tgt = torch.randint(0, 20, (2, 5))
+
+    model(tok, tgt)  # match the successful validation forward that precedes the diagnostic replay
+    snapshot = model.build_diagnostic_snapshot(tok)
+    diagnostics = model.diagnostics(tok, snapshot=snapshot)
+    val_diagnostics = _val_diagnostics(model, [(tok, tgt)], torch.device("cpu"))
+
+    assert snapshot.stack_output.mu.dtype == torch.float32
+    assert snapshot.stack_output.sigma.dtype == torch.float32
+    assert snapshot.beta_maps.dtype == torch.float32
+    assert torch.isfinite(torch.tensor(diagnostics["total"]))
+    assert torch.isfinite(torch.tensor(val_diagnostics["val_free_energy_total"]))

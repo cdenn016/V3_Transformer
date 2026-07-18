@@ -156,7 +156,12 @@ class DiagnosticSnapshot:
 
 
 def _freeze_tensor(value: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-    return None if value is None else value.detach().clone()
+    if value is None:
+        return None
+    frozen = value.detach()
+    if frozen.dtype in (torch.float16, torch.bfloat16):
+        frozen = frozen.float()
+    return frozen.clone()
 
 
 def _freeze_frame(
@@ -164,7 +169,9 @@ def _freeze_frame(
 ) -> 'torch.Tensor | CompactBlockElement | None':
     if value is None:
         return None
-    return value.detach().clone()
+    if isinstance(value, CompactBlockElement):
+        return CompactBlockElement(_freeze_tensor(value.blocks), value.K, value.tied)
+    return _freeze_tensor(value)
 
 
 def _freeze_belief(belief: BeliefState) -> BeliefState:
@@ -2729,17 +2736,24 @@ class VFEModel(nn.Module):
 
         log_prior = diagnostic["log_prior"]
         log_prior0 = self._first_sequence_log_prior(log_prior, token_ids.shape[0])
-        layer_outputs = tuple(diagnostic["layer_outputs"])
+        # Autocast can leave captured head-mixer outputs in bf16/fp16. Diagnostic transport is
+        # intentionally rebuilt outside autocast so matrix factorizations and condition-number
+        # probes remain fp32. Freeze and upcast the captured boundary before any replay contraction;
+        # otherwise compact transport combines fp32 frame factors with a low-precision belief.
+        layer_outputs = tuple(_freeze_belief(layer) for layer in diagnostic["layer_outputs"])
+        stack_output = _freeze_belief(capture["out"])
+        raw_s_belief = diagnostic["s_belief"]
+        s_belief = None if raw_s_belief is None else (
+            _freeze_tensor(raw_s_belief[0]), _freeze_tensor(raw_s_belief[1]))
         beta_maps = torch.stack([
             self._attention_map_for_belief(_sequence_belief(layer), log_prior0, diagnostic["rope"])
             for layer in layer_outputs
         ])
         gamma_maps = self._gamma_map_for_belief(
-            token_ids, capture["out"], diagnostic["s_belief"])
+            token_ids, stack_output, s_belief)
         trace = diagnostic["e_step_trace"]
         trace_free_energy = torch.stack([
             value.reshape(()) for value in trace["free_energy"]])
-        s_belief = diagnostic["s_belief"]
         s_encoded_belief = None
         if self._model_channel_active:
             # The forward capture owns refined s1 under s_e_step. Preserve one static s0 lookup too
@@ -2757,20 +2771,19 @@ class VFEModel(nn.Module):
                 for mu_p, sigma_p in diagnostic["layer_priors"]),
             layer_converged=tuple(
                 _freeze_belief(belief) for belief in diagnostic["layer_converged"]),
-            layer_outputs=tuple(_freeze_belief(belief) for belief in layer_outputs),
-            stack_output=_freeze_belief(capture["out"]),
+            layer_outputs=layer_outputs,
+            stack_output=stack_output,
             final_belief=_freeze_belief(final_belief),
             logits=_freeze_tensor(logits),
             beta_maps=_freeze_tensor(beta_maps),
             gamma_maps=_freeze_tensor(gamma_maps),
             model_phi=_freeze_tensor(
-                self._resolve_model_frame(token_ids, capture["out"].phi)),
+                self._resolve_model_frame(token_ids, stack_output.phi)),
             trace_states=tuple(_freeze_belief(belief) for belief in trace["beliefs"]),
             trace_free_energy=_freeze_tensor(trace_free_energy),
             s_encoded_belief=(None if s_encoded_belief is None else (
                 _freeze_tensor(s_encoded_belief[0]), _freeze_tensor(s_encoded_belief[1]))),
-            s_belief=(None if s_belief is None else (
-                _freeze_tensor(s_belief[0]), _freeze_tensor(s_belief[1]))),
+            s_belief=s_belief,
             rope=_freeze_tensor(diagnostic["rope"]),
             log_prior=_freeze_tensor(log_prior),
         )
