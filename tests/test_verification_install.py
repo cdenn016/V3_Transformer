@@ -15,6 +15,8 @@ import yaml
 from agent_tooling.verification.install import (
     AGENT_ROLES,
     BLOCK_MARKERS,
+    GATE_STOP_STATUS_MESSAGE,
+    effective_instructions,
     render_claude_agent,
     render_codex_agent,
     install,
@@ -118,7 +120,11 @@ def _tree_bytes(root: Path) -> dict[Path, bytes]:
 
 
 def _stop_commands(data: dict[str, object]) -> list[str]:
-    commands: list[str] = []
+    return [handler["command"] for handler in _stop_handlers(data) if isinstance(handler.get("command"), str)]
+
+
+def _stop_handlers(data: dict[str, object]) -> list[dict[str, object]]:
+    handlers_out: list[dict[str, object]] = []
     for entry in data["hooks"]["Stop"]:  # type: ignore[index]
         if not isinstance(entry, dict):
             continue
@@ -126,9 +132,9 @@ def _stop_commands(data: dict[str, object]) -> list[str]:
         if not isinstance(handlers, list):
             continue
         for handler in handlers:
-            if isinstance(handler, dict) and isinstance(handler.get("command"), str):
-                commands.append(handler["command"])
-    return commands
+            if isinstance(handler, dict):
+                handlers_out.append(handler)
+    return handlers_out
 
 
 def test_renderers_share_identical_neutral_instruction_bodies() -> None:
@@ -138,7 +144,8 @@ def test_renderers_share_identical_neutral_instruction_bodies() -> None:
     codex = render_codex_agent(spec)
 
     assert _claude_instruction(claude) == spec["instructions"] + "\n"
-    assert tomllib.loads(codex)["instructions"] == spec["instructions"]
+    assert _claude_instruction(claude) == effective_instructions(spec) + "\n"
+    assert tomllib.loads(codex)["instructions"] == effective_instructions(spec)
     assert tomllib.loads(codex)["name"] == "verifier-code"
 
 
@@ -158,8 +165,8 @@ def test_renderers_round_trip_adversarial_frontmatter_and_unicode() -> None:
     for field in ("name", "description", "tools"):
         assert claude_frontmatter[field] == spec[field]
         assert codex_data[field] == spec[field]
-    assert _claude_instruction(claude) == spec["instructions"] + "\n"
-    assert codex_data["instructions"] == spec["instructions"]
+    assert _claude_instruction(claude) == effective_instructions(spec) + "\n"
+    assert codex_data["instructions"] == effective_instructions(spec)
     assert "\\ud83d" not in codex
 
 
@@ -181,8 +188,9 @@ def test_install_renders_six_agents_preserves_existing_surfaces_and_is_idempoten
         spec = json.loads((args.source_root / "agents" / f"{role}.json").read_text(encoding="utf-8"))
         claude_text = (args.claude_home / "agents" / f"{role}.md").read_text(encoding="utf-8")
         codex_text = (args.codex_home / "agents" / f"{role}.toml").read_text(encoding="utf-8")
-        assert _claude_instruction(claude_text) == spec["instructions"] + "\n"
-        assert tomllib.loads(codex_text)["instructions"] == spec["instructions"]
+        expected = effective_instructions(spec)
+        assert _claude_instruction(claude_text) == expected + "\n"
+        assert tomllib.loads(codex_text)["instructions"] == expected
     assert (args.claude_home / "agents" / "unrelated.md").read_text(encoding="utf-8") == "keep\n"
     assert (args.codex_home / "agents" / "unrelated.toml").read_text(encoding="utf-8") == 'name = "keep"\n'
     assert (args.claude_home / "skills" / "unrelated.txt").read_text(encoding="utf-8") == "keep\n"
@@ -228,6 +236,29 @@ def test_install_replaces_stale_gate_handlers_after_home_move_and_preserves_unre
     new_codex = tmp_path / "moved codex"
     shutil.move(str(old_claude), new_claude)
     shutil.move(str(old_codex), new_codex)
+    false_positives_by_path: dict[Path, list[str]] = {}
+    for path, old_home in ((new_claude / "settings.json", old_claude), (new_codex / "hooks.json", old_codex)):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        old_gate = old_home / "skills" / "verification" / "scripts" / "verification_gate.py"
+        false_positive_commands = [
+            "echo verification_gate.py documentation",
+            f'"{Path(sys.executable).resolve()}" "{old_gate.with_name("other_verification_gate.py")}" hook',
+            f'"{Path(sys.executable).resolve()}" "{old_gate}" validate',
+            f'"{Path(sys.executable).resolve()}" "{old_gate}" hook',
+        ]
+        data["hooks"]["Stop"].append(
+            {
+                "hooks": [
+                    {"type": "command", "command": "echo group keep"},
+                    {"type": "command", "command": false_positive_commands[0]},
+                    {"type": "command", "statusMessage": GATE_STOP_STATUS_MESSAGE, "shell": "powershell", "command": false_positive_commands[1]},
+                    {"type": "command", "statusMessage": GATE_STOP_STATUS_MESSAGE, "shell": "powershell", "command": false_positive_commands[2]},
+                    {"type": "command", "statusMessage": GATE_STOP_STATUS_MESSAGE, "shell": "posix", "command": false_positive_commands[3]},
+                ]
+            }
+        )
+        path.write_text(json.dumps(data), encoding="utf-8")
+        false_positives_by_path[path] = false_positive_commands
     args.claude_home = new_claude
     args.codex_home = new_codex
 
@@ -241,9 +272,19 @@ def test_install_replaces_stale_gate_handlers_after_home_move_and_preserves_unre
         old_command = f'"{Path(sys.executable).resolve()}" "{(old_home / "skills" / "verification" / "scripts" / "verification_gate.py").resolve()}" hook'
         expected = f'"{Path(sys.executable).resolve()}" "{(new_home / "skills" / "verification" / "scripts" / "verification_gate.py").resolve()}" hook'
         commands = _stop_commands(data)
-        assert old_command not in commands
+        stale_handlers = [
+            handler
+            for handler in _stop_handlers(data)
+            if handler.get("type") == "command"
+            and handler.get("statusMessage") == GATE_STOP_STATUS_MESSAGE
+            and handler.get("shell") == "powershell"
+            and handler.get("command") == old_command
+        ]
+        assert stale_handlers == []
         assert commands.count(expected) == 1
         assert preserved_command in commands
+        false_positive_commands = false_positives_by_path[path]
+        assert false_positive_commands == [command for command in commands if command in false_positive_commands]
     before = {path: path.read_bytes() for path in (new_claude / "settings.json", new_codex / "hooks.json")}
 
     install(args)
@@ -306,6 +347,39 @@ def test_install_preflights_every_required_skill_artifact_before_destination_wri
     assert {root: _tree_bytes(root) for root in destinations if root is not None} == before
 
 
+@pytest.mark.parametrize(
+    "fault",
+    ("corrupt-schema", "corrupt-evals", "wrong-schema-root", "wrong-evals-root", "missing-command", "missing-shell", "duplicate-command"),
+)
+def test_install_preflights_skill_content_before_destination_writes(tmp_path: Path, fault: str) -> None:
+    args = _args(tmp_path)
+    destinations = (args.claude_home, args.codex_home, args.project_root)
+    before = {root: _tree_bytes(root) for root in destinations if root is not None}
+    skill = args.source_root / "skill"
+    if fault == "corrupt-schema":
+        (skill / "schemas" / "claim-ledger.schema.json").write_text("{ invalid", encoding="utf-8")
+    elif fault == "corrupt-evals":
+        (skill / "evals" / "evals.json").write_text("{ invalid", encoding="utf-8")
+    elif fault == "wrong-schema-root":
+        (skill / "schemas" / "claim-ledger.schema.json").write_text("[]", encoding="utf-8")
+    elif fault == "wrong-evals-root":
+        (skill / "evals" / "evals.json").write_text("[]", encoding="utf-8")
+    else:
+        template_path = skill / "SKILL.md"
+        template = template_path.read_text(encoding="utf-8")
+        token = "{{VERIFICATION_GATE_COMMAND}}" if fault != "missing-shell" else "{{VERIFICATION_GATE_SHELL}}"
+        if fault == "duplicate-command":
+            template += token
+        else:
+            template = template.replace(token, "", 1)
+        template_path.write_text(template, encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        install(args)
+
+    assert {root: _tree_bytes(root) for root in destinations if root is not None} == before
+
+
 def test_neutral_specs_enforce_structured_results_and_adjudicator_closure_abstention() -> None:
     for role in AGENT_ROLES:
         spec_path = REPOSITORY_ROOT / "agent_tooling" / "verification" / "agents" / f"{role}.json"
@@ -317,6 +391,11 @@ def test_neutral_specs_enforce_structured_results_and_adjudicator_closure_absten
                 "required": ["claim_id", "ledger_state", "rationale", "evidence_ids", "open_obligations", "validator_errors"],
                 "ledger_state": ["EVIDENCE_VERIFIED", "REFUTED", "INCONCLUSIVE"],
             }
+            expected = effective_instructions(spec)
+            assert "Required output schema:" in expected
+            assert json.dumps(output, indent=2) in expected
+            assert _claude_instruction(render_claude_agent(spec)) == expected + "\n"
+            assert tomllib.loads(render_codex_agent(spec))["instructions"] == expected
         else:
             assert "support" in body and "refute" in body and "abstain" in body
             assert "must not assign EVIDENCE_VERIFIED" in body

@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import shlex
 import shutil
 import sys
 from pathlib import Path
 from typing import Any
 
-from agent_tooling.verification.skill.scripts.verification_gate import render_skill_markdown
+from agent_tooling.verification.skill.scripts.verification_gate import (
+    GATE_COMMAND_TOKEN,
+    GATE_SHELL_TOKEN,
+    render_skill_markdown,
+)
 
 
 AGENT_ROLES = (
@@ -41,6 +47,8 @@ ADJUDICATOR_OUTPUT = {
     "required": ["claim_id", "ledger_state", "rationale", "evidence_ids", "open_obligations", "validator_errors"],
     "ledger_state": ["EVIDENCE_VERIFIED", "REFUTED", "INCONCLUSIVE"],
 }
+GATE_STOP_STATUS_MESSAGE = "Verification ledger gate"
+_SKILL_TOKEN_COUNTS = {GATE_COMMAND_TOKEN: 2, GATE_SHELL_TOKEN: 2}
 
 
 def _required_string(spec: dict[str, object], name: str) -> str:
@@ -63,12 +71,24 @@ def _literal(value: object) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def effective_instructions(spec: dict[str, object]) -> str:
+    """Return the single neutral instruction body rendered for both clients."""
+
+    instructions = _required_string(spec, "instructions")
+    output = spec.get("output")
+    if output is None:
+        return instructions
+    if not isinstance(output, dict):
+        raise ValueError("agent spec output must be an object")
+    return f"{instructions}\n\nRequired output schema:\n{json.dumps(output, indent=2, ensure_ascii=False)}"
+
+
 def render_claude_agent(spec: dict[str, object]) -> str:
     """Render one neutral verifier spec as Claude agent Markdown."""
 
     name = _required_string(spec, "name")
     description = _required_string(spec, "description")
-    instructions = _required_string(spec, "instructions")
+    instructions = effective_instructions(spec)
     tools = _optional_string_list(spec, "tools")
     frontmatter = f"name: {_literal(name)}\ndescription: {_literal(description)}\n"
     if tools is not None:
@@ -81,7 +101,7 @@ def render_codex_agent(spec: dict[str, object]) -> str:
 
     name = _required_string(spec, "name")
     description = _required_string(spec, "description")
-    instructions = _required_string(spec, "instructions")
+    instructions = effective_instructions(spec)
     tools = _optional_string_list(spec, "tools")
     rendered = f"name = {_literal(name)}\ndescription = {_literal(description)}\ninstructions = {_literal(instructions)}\n"
     if tools is not None:
@@ -157,6 +177,35 @@ def _preflight_skill(source: Path) -> None:
             raise FileNotFoundError(required)
 
 
+def _read_preflight_json(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON in {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"JSON object required in {path}")
+    return value
+
+
+def _preflight_skill_content(source: Path, shell: str) -> None:
+    schema = _read_preflight_json(source / "schemas" / "claim-ledger.schema.json")
+    if schema.get("type") != "object" or not isinstance(schema.get("required"), list) or not isinstance(schema.get("properties"), dict):
+        raise ValueError("claim-ledger schema must define an object root, required fields, and properties")
+    evals = _read_preflight_json(source / "evals" / "evals.json")
+    if evals.get("skill_name") != "verification" or not isinstance(evals.get("evals"), list):
+        raise ValueError("skill evals must define verification skill_name and an evals list")
+    template = (source / "SKILL.md").read_text(encoding="utf-8")
+    for token, expected_count in _SKILL_TOKEN_COUNTS.items():
+        if template.count(token) != expected_count:
+            raise ValueError(f"skill template must contain {token} exactly {expected_count} times")
+    rendered = render_skill_markdown(source, shell=shell)
+    if GATE_COMMAND_TOKEN in rendered or GATE_SHELL_TOKEN in rendered:
+        raise ValueError("rendered skill retains a verification render token")
+    shell_label = "powershell" if shell == "powershell" else "bash"
+    if rendered.count(f"```{shell_label}") != _SKILL_TOKEN_COUNTS[GATE_SHELL_TOKEN]:
+        raise ValueError("rendered skill does not contain the expected shell fences")
+
+
 def _copy_skill(source: Path, destination: Path, shell: str) -> None:
     if not source.is_dir():
         raise FileNotFoundError(source)
@@ -176,15 +225,50 @@ def _gate_command(gate_path: Path) -> str:
     return f'"{Path(sys.executable).resolve()}" "{gate_path.resolve()}" hook'
 
 
-def _gate_stop_handler(command: str) -> dict[str, object]:
-    return {"hooks": [{"type": "command", "command": command}]}
+def _gate_stop_handler(command: str, shell: str) -> dict[str, object]:
+    return {
+        "hooks": [
+            {
+                "type": "command",
+                "statusMessage": GATE_STOP_STATUS_MESSAGE,
+                "shell": shell,
+                "command": command,
+            }
+        ]
+    }
 
 
-def _is_verification_handler(value: object) -> bool:
-    return isinstance(value, dict) and isinstance(value.get("command"), str) and "verification_gate.py" in value["command"]
+def _is_python_executable(value: str) -> bool:
+    executable = value.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    return executable == "python" or executable.startswith("python") and executable.endswith(".exe")
 
 
-def _remove_verification_handlers(stop: list[Any]) -> list[Any]:
+def _split_hook_command(command: str, shell: str) -> list[str] | None:
+    try:
+        if shell == "posix":
+            return shlex.split(command, posix=True)
+        match = re.fullmatch(r'\s*"([^"]+)"\s+"([^"]+)"\s+(\S+)\s*', command)
+        return list(match.groups()) if match is not None else None
+    except ValueError:
+        return None
+
+
+def _is_verification_handler(value: object, shell: str) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if value.get("type") != "command" or value.get("statusMessage") != GATE_STOP_STATUS_MESSAGE or value.get("shell") != shell:
+        return False
+    command = value.get("command")
+    if not isinstance(command, str):
+        return False
+    parts = _split_hook_command(command, shell)
+    if parts is None or len(parts) != 3 or not _is_python_executable(parts[0]) or parts[2] != "hook":
+        return False
+    gate_path = parts[1].replace("\\", "/")
+    return gate_path.endswith("skills/verification/scripts/verification_gate.py")
+
+
+def _remove_verification_handlers(stop: list[Any], shell: str) -> list[Any]:
     retained: list[Any] = []
     for entry in stop:
         if not isinstance(entry, dict):
@@ -192,17 +276,17 @@ def _remove_verification_handlers(stop: list[Any]) -> list[Any]:
             continue
         handlers = entry.get("hooks")
         if isinstance(handlers, list):
-            remaining = [handler for handler in handlers if not _is_verification_handler(handler)]
+            remaining = [handler for handler in handlers if not _is_verification_handler(handler, shell)]
             if remaining:
                 updated = dict(entry)
                 updated["hooks"] = remaining
                 retained.append(updated)
-        elif not _is_verification_handler(entry):
+        elif not _is_verification_handler(entry, shell):
             retained.append(entry)
     return retained
 
 
-def _install_stop_handler(settings: dict[str, Any], gate_path: Path) -> dict[str, Any]:
+def _install_stop_handler(settings: dict[str, Any], gate_path: Path, shell: str) -> dict[str, Any]:
     hooks = settings.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         raise ValueError("settings hooks must be an object")
@@ -210,8 +294,8 @@ def _install_stop_handler(settings: dict[str, Any], gate_path: Path) -> dict[str
     if not isinstance(stop, list):
         raise ValueError("settings hooks.Stop must be a list")
     command = _gate_command(gate_path)
-    stop[:] = _remove_verification_handlers(stop)
-    stop.append(_gate_stop_handler(command))
+    stop[:] = _remove_verification_handlers(stop, shell)
+    stop.append(_gate_stop_handler(command, shell))
     return settings
 
 
@@ -236,6 +320,7 @@ def install(args: argparse.Namespace) -> None:
         raise ValueError("shell must be powershell or posix")
     skill_source = source_root / "skill"
     _preflight_skill(skill_source)
+    _preflight_skill_content(skill_source, shell)
     specs = _read_specs(source_root)
     blocks = {filename: _read_block(source_root / "blocks" / filename, marker) for filename, marker in BLOCK_MARKERS.items()}
 
@@ -250,8 +335,8 @@ def install(args: argparse.Namespace) -> None:
 
     claude_skill = claude_home / "skills" / "verification"
     codex_skill = codex_home / "skills" / "verification"
-    claude_settings = _install_stop_handler(claude_settings, claude_skill / "scripts" / "verification_gate.py")
-    codex_hooks = _install_stop_handler(codex_hooks, codex_skill / "scripts" / "verification_gate.py")
+    claude_settings = _install_stop_handler(claude_settings, claude_skill / "scripts" / "verification_gate.py", shell)
+    codex_hooks = _install_stop_handler(codex_hooks, codex_skill / "scripts" / "verification_gate.py", shell)
     for filename in ("global-policy.md", "deep-audit-integration.md"):
         marker = BLOCK_MARKERS[filename]
         claude_global = upsert_marked_block(claude_global, marker, blocks[filename])
