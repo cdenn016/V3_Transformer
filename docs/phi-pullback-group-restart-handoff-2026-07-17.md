@@ -10,10 +10,11 @@ denied because the GitHub destination was not verified as trusted or private.
 Do not remove the separate investigation worktree at
 `C:\tmp\vfe3-mphi-ng-investigation-20260717`.
 
-Task 1 is complete and independently approved. The restart checkpoint
-`b0bf9cb` was completed by fix commit `843b45c`; no Critical or Important
-review findings remain. Resume at Task 2 rather than dispatching or reviewing
-Task 1 again.
+Tasks 1 and 2 are complete and independently approved. The Task 1 restart
+checkpoint `b0bf9cb` was completed by fix commit `843b45c`. Task 2 is recorded
+by runtime commit `71e5481` and atomic nonfinite-covector review fix `085777f`.
+No Critical or Important findings remain in either task. Resume at Task 3 rather
+than dispatching or reviewing Tasks 1 or 2 again.
 
 ## Verification captured before restart
 
@@ -33,9 +34,19 @@ Machine-readable checkpoint artifacts live outside the repository at
 `C:\tmp\vfe3-estep-phi-checkpoint-20260717.xml`, and
 `C:\tmp\vfe3-phi-task1-file-checkpoint-20260717.xml`.
 
+Task 2 evidence is at
+`C:\tmp\vfe3-phi-task2-review-red-20260717.xml`,
+`C:\tmp\vfe3-phi-task2-review-green-20260717.xml`, and
+`C:\tmp\vfe3-phi-task2-review-focused-20260717.xml`. The focused artifact
+records 531 tests, with 530 passes and the one accepted baseline failure. Ten
+legacy expectation nodes remain assigned to Tasks 3 through 5 in
+`.superpowers/sdd/progress.md`.
+
 ## Resume sequence
 
-1. Read `.superpowers/sdd/progress.md`, this handoff, and the Task 2 brief.
-2. Preserve commits `b0bf9cb` and `843b45c`; do not re-dispatch Task 1.
-3. Proceed sequentially from Task 2 using the approved Task 1 public geometry
-   interface.
+1. Read `.superpowers/sdd/progress.md`, this handoff, and the Task 3 section of
+   the approved implementation plan.
+2. Preserve commits `b0bf9cb`, `843b45c`, `71e5481`, and `085777f`; do not
+   re-dispatch Tasks 1 or 2.
+3. Proceed sequentially from Task 3 using the approved strict geometry and
+   stateless runtime interfaces.
