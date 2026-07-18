@@ -1517,6 +1517,8 @@ def test_scaling_rejects_integer_enum_seed_values():
 def test_every_ablation_arm_constructs_with_only_invalid_arm_prerequisites_repaired():
     assert ablation.BASELINE_CONFIG["e_step_update"] == "mm_exact"
     assert ablation.BASELINE_CONFIG["phi_precond_mode"] == "pullback_per_block"
+    assert ablation.BASELINE_CONFIG["m_phi_update_mode"] == "adamw"
+    assert ablation.BASELINE_CONFIG["m_phi_group_trust_radius"] == 0.1
     assert ablation.SWEEP_ORDER == ["pos_extrapolation", "estep_depth_damping"]
 
     transport = dict(ablation.make_run_overrides("transport_mode"))
@@ -1546,6 +1548,17 @@ def test_every_ablation_arm_constructs_with_only_invalid_arm_prerequisites_repai
     assert cross["beta_attention_prior"] == "causal_noself"
     assert cross["gamma_attention_prior"] == "causal_noself"
 
+    gauge_optim = dict(ablation.make_run_overrides("gauge_mstep_optim"))
+    assert set(gauge_optim) == {"adamw", "pullback_group"}
+    assert gauge_optim["adamw"]["m_phi_update_mode"] == "adamw"
+    pullback_group = gauge_optim["pullback_group"]
+    assert pullback_group["m_phi_update_mode"] == "pullback_group"
+    assert pullback_group["phi_precond_mode"] == "pullback_per_block"
+    assert pullback_group["gauge_group"] == "block_glk"
+    assert pullback_group["embed_dim"] == 10 and pullback_group["n_heads"] == 2
+    assert pullback_group["e_phi_lr"] == 0.0
+    assert pullback_group["transport_chart_max_norm"] == 6.0
+
     errors = []
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -1562,6 +1575,8 @@ def test_every_ablation_arm_constructs_with_only_invalid_arm_prerequisites_repai
 
 def test_every_scaling_arm_constructs_and_tied_groups_use_ambient_preconditioner():
     assert scaling.BASELINE["phi_precond_mode"] == "pullback_per_block"
+    assert scaling.BASELINE["m_phi_update_mode"] == "adamw"
+    assert scaling.BASELINE["m_phi_group_trust_radius"] == 0.1
     tied_cells = scaling.ROUTES["blocks_K48_tied_2x"]
     assert len(tied_cells) == 5
     assert all(cell["overrides"]["phi_precond_mode"] == "killing" for cell in tied_cells)
@@ -1578,3 +1593,27 @@ def test_every_scaling_arm_constructs_and_tied_groups_use_ambient_preconditioner
                 except Exception as exc:
                     errors.append((route_name, cell["label"], str(exc)))
     assert errors == []
+
+
+def test_click_run_phi_controls_have_no_retired_override_keys():
+    retired = {"m_phi_natural_grad", "m_gauge_momentum", "m_gauge_update_rule"}
+
+    def mapping_keys(value):
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                yield key
+                yield from mapping_keys(nested)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                yield from mapping_keys(nested)
+
+    surfaces = (
+        train_vfe3.config,
+        ablation.BASELINE_CONFIG,
+        ablation.SWEEPS,
+        scaling.BASELINE,
+        scaling.ROUTES,
+    )
+    assert retired.isdisjoint({key for surface in surfaces for key in mapping_keys(surface)})
+    assert train_vfe3.config["m_phi_update_mode"] == "adamw"
+    assert train_vfe3.config["m_phi_group_trust_radius"] == 0.1

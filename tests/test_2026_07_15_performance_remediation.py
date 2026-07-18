@@ -12,7 +12,7 @@ from torch import nn
 from vfe3 import metrics
 from vfe3.config import VFE3Config
 from vfe3.ema import EMA
-from vfe3.gauge_optim import GaugeNaturalGradAdamW, project_phi_parameter_rows_
+from vfe3.gauge_optim import GaugeManifoldAdamW, project_phi_parameter_rows_
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.lie_ops import extract_phi, gram_pinv, retract_omega
 from vfe3.geometry.transport import CompactFactoredTransport
@@ -295,11 +295,13 @@ def test_direct_omega_reuses_basis_factorization_and_defers_determinant_diagnost
         )
 
     parameter = nn.Parameter(initial.clone())
-    optimizer = GaugeNaturalGradAdamW(
+    optimizer = GaugeManifoldAdamW(
         [{"params": [parameter], "lr": 0.03, "omega": True, "weight_decay": 0.0}],
-        group.generators,
-        group.irrep_dims,
-        group_name=group.name,
+        group,
+        phi_group_trust_radius=0.1,
+        phi_chart_max_norm=5.0,
+        phi_bch_residual_max=1e-6,
+        phi_precond_mode="pullback",
         weight_decay=0.0,
     )
     gram_calls = 0
@@ -339,11 +341,13 @@ def test_direct_omega_validation_has_one_host_decision_and_remains_fail_closed(
 ) -> None:
     group = get_group("glk")(K=2)
     parameter = nn.Parameter(torch.eye(2).expand(2, 2, 2).clone())
-    optimizer = GaugeNaturalGradAdamW(
+    optimizer = GaugeManifoldAdamW(
         [{"params": [parameter], "lr": 0.01, "omega": True, "weight_decay": 0.0}],
-        group.generators,
-        group.irrep_dims,
-        group_name=group.name,
+        group,
+        phi_group_trust_radius=0.1,
+        phi_chart_max_norm=5.0,
+        phi_bch_residual_max=1e-6,
+        phi_precond_mode="pullback",
         weight_decay=0.0,
     )
     bool_calls = 0
@@ -1282,14 +1286,16 @@ def test_direct_omega_retraction_is_atomic_across_parameter_groups(
     group = get_group("glk")(K=2, dtype=torch.float64)
     first = nn.Parameter(torch.eye(2, dtype=torch.float64).unsqueeze(0))
     second = nn.Parameter((1.1 * torch.eye(2, dtype=torch.float64)).unsqueeze(0))
-    optimizer = GaugeNaturalGradAdamW(
+    optimizer = GaugeManifoldAdamW(
         [
             {"params": [first], "lr": 0.1, "omega": True, "weight_decay": 0.0},
             {"params": [second], "lr": 0.1, "omega": True, "weight_decay": 0.0},
         ],
-        group.generators,
-        group.irrep_dims,
-        gauge_momentum=0.0,
+        group,
+        phi_group_trust_radius=0.1,
+        phi_chart_max_norm=5.0,
+        phi_bch_residual_max=1e-6,
+        phi_precond_mode="pullback",
         weight_decay=0.0,
     )
     first.grad = torch.full_like(first, 0.1)
@@ -1338,15 +1344,16 @@ def test_direct_omega_reorth_cadence_is_one_clock_for_all_groups(
     group = get_group("so_k")(K=2, dtype=torch.float64)
     first = nn.Parameter(torch.eye(2, dtype=torch.float64).repeat(2, 1, 1))
     second = nn.Parameter(torch.eye(2, dtype=torch.float64).repeat(2, 1, 1))
-    optimizer = GaugeNaturalGradAdamW(
+    optimizer = GaugeManifoldAdamW(
         [
             {"params": [first], "lr": 0.05, "omega": True, "weight_decay": 0.0},
             {"params": [second], "lr": 0.05, "omega": True, "weight_decay": 0.0},
         ],
-        group.generators,
-        group.irrep_dims,
-        gauge_momentum=0.0,
-        skew_symmetric=True,
+        group,
+        phi_group_trust_radius=0.1,
+        phi_chart_max_norm=5.0,
+        phi_bch_residual_max=1e-6,
+        phi_precond_mode="pullback",
         omega_reorth_every=2,
         weight_decay=0.0,
     )

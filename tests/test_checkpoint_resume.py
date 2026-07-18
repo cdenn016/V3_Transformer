@@ -516,7 +516,7 @@ def test_resume_matches_uninterrupted_run(tmp_path):
 def test_resume_matches_uninterrupted_run_geometric_mstep(tmp_path):
     r"""Resume equivalence for the GEOMETRIC M-step optimizer (m_phi_natural_grad=True).
 
-    This branch develops the gauge-geometric M-step, whose GaugeNaturalGradAdamW keeps a
+    This branch develops the gauge-geometric M-step, whose GaugeManifoldAdamW keeps a
     heavy-ball ``gauge_mom`` buffer in ``self.state[p]``. Resume restores the optimizer via the
     inherited ``state_dict``/``load_state_dict``; this pins that ``gauge_mom`` actually round-trips
     (a dropped buffer would silently restore wrong gauge momentum and diverge here)."""

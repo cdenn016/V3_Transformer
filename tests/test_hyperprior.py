@@ -276,10 +276,10 @@ def test_learnable_r_centroid_has_no_weight_decay():
 
 
 def test_learnable_r_grouped_under_natural_grad_optimizer():
-    # The other authorized optimizer path: m_phi_natural_grad=True returns GaugeNaturalGradAdamW; a
+    # The other authorized optimizer path: m_phi_natural_grad=True returns GaugeManifoldAdamW; a
     # trainable r must still be grouped (in a plain non-gauge group, mean@m_p_mu_lr / log-scale@m_p_sigma_lr).
     from vfe3.train import build_optimizer
-    from vfe3.gauge_optim import GaugeNaturalGradAdamW
+    from vfe3.gauge_optim import GaugeManifoldAdamW
     cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                      n_e_steps=1, use_prior_bank=True, lambda_h=0.5, prior_source="model_channel",
                      learnable_r=True, m_phi_natural_grad=True,
@@ -287,7 +287,7 @@ def test_learnable_r_grouped_under_natural_grad_optimizer():
     torch.manual_seed(0)
     m = VFEModel(cfg)
     opt = build_optimizer(m, cfg)
-    assert isinstance(opt, GaugeNaturalGradAdamW)
+    assert isinstance(opt, GaugeManifoldAdamW)
     opt_params = {id(p) for g in opt.param_groups for p in g["params"]}
     assert id(m.prior_bank.r_mu) in opt_params
     assert id(m.prior_bank.r_sigma_log) in opt_params

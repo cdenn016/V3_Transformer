@@ -15,7 +15,8 @@ import generate_efe
 import multiseed_analysis
 import scaling_analysis
 from vfe3.config import VFE3Config
-from vfe3.gauge_optim import GaugeNaturalGradAdamW
+from vfe3.gauge_optim import GaugeManifoldAdamW
+from vfe3.geometry.groups import get_group
 from vfe3.run_artifacts import RunArtifacts, load_checkpoint
 
 
@@ -491,11 +492,14 @@ def test_cuda_custom_optimizer_resume_preserves_cpu_control_state(tmp_path: Path
         pytest.skip("CUDA is unavailable")
     cfg = VFE3Config()
     source = torch.nn.Linear(2, 2)
-    source_generators = torch.eye(2).unsqueeze(0)
-    source_optimizer = GaugeNaturalGradAdamW(
+    source_group = get_group("glk")(K=2)
+    source_optimizer = GaugeManifoldAdamW(
         source.parameters(),
-        source_generators,
-        [2],
+        source_group,
+        phi_group_trust_radius=0.1,
+        phi_chart_max_norm=5.0,
+        phi_bch_residual_max=1e-6,
+        phi_precond_mode="pullback",
         lr=0.01,
     )
     source(torch.ones(1, 2)).sum().backward()
@@ -508,10 +512,14 @@ def test_cuda_custom_optimizer_resume_preserves_cpu_control_state(tmp_path: Path
     )
 
     target = torch.nn.Linear(2, 2).cuda()
-    target_optimizer = GaugeNaturalGradAdamW(
+    target_group = get_group("glk")(K=2, device="cuda")
+    target_optimizer = GaugeManifoldAdamW(
         target.parameters(),
-        source_generators.cuda(),
-        [2],
+        target_group,
+        phi_group_trust_radius=0.1,
+        phi_chart_max_norm=5.0,
+        phi_bch_residual_max=1e-6,
+        phi_precond_mode="pullback",
         lr=0.01,
     )
     assert load_checkpoint(

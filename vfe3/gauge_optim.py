@@ -1,47 +1,88 @@
-r"""Geometrically-correct M-step optimizer for the gauge frame (opt-in).
+r"""Mixed AdamW and stateless local-group updates for stored gauge frames.
 
-The gauge-frame prior tables ``phi_embed`` / ``pos_phi_free`` are Lie-algebra COORDINATES;
-their loss surface lives on the gauge group, not in Euclidean space, so the geometrically
-correct steepest-descent step is the NATURAL gradient under the metric the exponential map
-induces on the chart, ``G_ab(phi) = <d exp_phi(T_a), d exp_phi(T_b)>_F`` (the
-``pullback_per_block`` preconditioner).
-
-A position-dependent metric cannot be realized by preconditioning the gradient and then
-handing it to AdamW: Adam divides by the per-coordinate second moment, which re-flattens any
-metric scaling. (The Killing metric is conformal -- in the Frobenius-orthonormal E_ij basis the
-global ``killing`` inverse is exactly c*I on sl(K), so its natural gradient grad@(c*I) = c*grad
-is a uniform scalar rescale: direction-preserving, cos(nat,grad)=1. ``killing_per_block`` applies
-one such conformal factor c_h = 1/(2 d_h) per irrep block, so it is block-wise direction-preserving
-and globally direction-preserving exactly when the blocks share that factor -- which V3's equal-size
-irrep blocks guarantee; unequal blocks would reweight blocks against each other.) Because this
-natural-grad M-step steps the gauge group manually (``p.add_(buf, alpha=-lr)``, then sets
-``p.grad=None`` so AdamW never touches it), the conformal factor is NOT normalized away: here
-killing/killing_per_block are a direction-preserving effective-LR rescale by that conformal factor,
-NOT a no-op. They are an exact no-op only under Adam's per-coordinate scale-invariance, which this
-branch deliberately bypasses. Only the non-conformal ``pullback`` metric reshapes the step DIRECTION.
-So the gauge frame is stepped by natural-gradient descent with heavy-ball
-momentum, while every non-gauge parameter (mu / sigma / decode / ...) keeps standard AdamW --
-those carry diagonal Gaussian Fisher metrics that AdamW's per-coordinate adaptivity already
-realizes, so explicit preconditioning there is the documented no-op.
-
-``GaugeNaturalGradAdamW`` subclasses ``AdamW``: a param group flagged ``gauge=True`` is updated
-by the natural-gradient rule in ``step``; its gradient is then consumed (set to ``None``) so the
-trailing ``super().step()`` (standard AdamW) is a no-op on it and runs normally on every other
-group. Only ACTIVE rows (nonzero gradient -- the batch's tokens) are preconditioned, so a step's
-per-token metric solves touch the batch, not the whole vocabulary.
+Ordinary parameter groups retain standard AdamW. A stored phi-factor group selected by the
+``pullback_group`` policy is staged in float64 through the strict pullback direction, trust scaling,
+order-four BCH, and exact right-product validation. Every phi candidate is validated before any phi
+table is mutated; committed gradients are consumed so base AdamW cannot apply a second update.
+Stored ``omega_direct`` elements retain their established group-retraction and cadence state.
 """
 
 import math
 import warnings
-from typing import Dict, List, Optional
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Dict, List, Mapping, Optional
 
 import torch
 
 from vfe3.geometry.groups import GaugeGroup
-from vfe3.geometry.phi_preconditioner import precondition_phi_gradient, pullback_metric_per_block
+from vfe3.geometry.phi_preconditioner import (
+    PullbackGroupDirectionResult,
+    pullback_group_direction,
+)
 
 
 _PHI_PROJECTION_TEMPORARY_BYTES = 64 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class PhiUpdatePolicy:
+    optimizer_group_metadata: Mapping[str, object]
+    requires_manifold_optimizer: bool
+    requires_pullback_geometry: bool = False
+
+
+_PHI_UPDATE_POLICIES: Dict[str, PhiUpdatePolicy] = {}
+
+
+def register_phi_update_policy(
+    name:   str,
+    policy: PhiUpdatePolicy,
+
+    *,
+    override: bool = False,
+) -> None:
+    """Register immutable phi-update routing metadata under a duplicate-safe key."""
+    if name in _PHI_UPDATE_POLICIES and not override:
+        raise KeyError(
+            f"phi update policy {name!r} already registered; pass override=True to replace"
+        )
+    _PHI_UPDATE_POLICIES[name] = PhiUpdatePolicy(
+        optimizer_group_metadata=MappingProxyType(dict(policy.optimizer_group_metadata)),
+        requires_manifold_optimizer=bool(policy.requires_manifold_optimizer),
+        requires_pullback_geometry=bool(policy.requires_pullback_geometry),
+    )
+
+
+def get_phi_update_policy(name: str) -> PhiUpdatePolicy:
+    """Return immutable routing metadata for the selected phi update."""
+    if name not in _PHI_UPDATE_POLICIES:
+        raise KeyError(
+            f"no phi update policy {name!r}; available: {sorted(_PHI_UPDATE_POLICIES)}"
+        )
+    policy = _PHI_UPDATE_POLICIES[name]
+    return PhiUpdatePolicy(
+        optimizer_group_metadata=MappingProxyType(dict(policy.optimizer_group_metadata)),
+        requires_manifold_optimizer=policy.requires_manifold_optimizer,
+        requires_pullback_geometry=policy.requires_pullback_geometry,
+    )
+
+
+register_phi_update_policy(
+    "adamw",
+    PhiUpdatePolicy(
+        optimizer_group_metadata={},
+        requires_manifold_optimizer=False,
+    ),
+)
+register_phi_update_policy(
+    "pullback_group",
+    PhiUpdatePolicy(
+        optimizer_group_metadata={"pullback_group": True, "weight_decay": 0.0},
+        requires_manifold_optimizer=True,
+        requires_pullback_geometry=True,
+    ),
+)
 
 
 def embedded_phi_frobenius_norm(
@@ -84,6 +125,211 @@ def embedded_phi_frobenius_norm(
     basis = group.generators.to(device=phi.device, dtype=phi.dtype)
     embedded = torch.einsum("...a,aij->...ij", phi, basis)
     return torch.linalg.matrix_norm(embedded, ord="fro", dim=(-2, -1))
+
+
+@dataclass(frozen=True)
+class PullbackGroupCandidate:
+    candidate_phi:           torch.Tensor
+    trust_scale:             torch.Tensor
+    backtracking_reductions: torch.Tensor
+    candidate_chart_norm:    torch.Tensor
+    group_product_residual:  torch.Tensor
+    direction:               PullbackGroupDirectionResult
+
+
+def _require_positive_finite(value: float, name: str) -> float:
+    """Return a validated positive finite scalar."""
+    converted = float(value)
+    if not math.isfinite(converted) or converted <= 0.0:
+        raise ValueError(f"{name} must be finite and positive, got {value!r}")
+    return converted
+
+
+def _pullback_group_product_residual(
+    candidate_phi: torch.Tensor,             # (active, n_gen) BCH4 chart candidate
+    phi:           torch.Tensor,             # (active, n_gen) current chart
+    delta:         torch.Tensor,             # (active, n_gen) accepted right factor
+    group:         GaugeGroup,
+) -> torch.Tensor:                           # (active,) relative exact-product residual
+    r"""Compare ``exp(candidate)`` with the exact right product ``exp(phi) exp(delta)``."""
+    generators = group.generators.to(device=phi.device, dtype=torch.float64)
+    compact_blocks = (
+        group.name == "block_glk"
+        and len(group.irrep_dims) > 1
+        and len(set(group.irrep_dims)) == 1
+        and generators.shape[0]
+        == len(group.irrep_dims) * group.irrep_dims[0] * group.irrep_dims[0]
+    )
+    if compact_blocks:
+        n_blocks = len(group.irrep_dims)
+        block_dim = group.irrep_dims[0]
+
+        def _blocks(coordinates: torch.Tensor) -> torch.Tensor:
+            return coordinates.reshape(-1, n_blocks, block_dim, block_dim)
+
+        candidate_element = torch.linalg.matrix_exp(_blocks(candidate_phi))
+        current_element = torch.linalg.matrix_exp(_blocks(phi))
+        right_element = torch.linalg.matrix_exp(_blocks(delta))
+        reference = current_element @ right_element
+        error_sq = (candidate_element - reference).square().sum(dim=(-3, -2, -1))
+        reference_sq = reference.square().sum(dim=(-3, -2, -1))
+        return error_sq.sqrt() / reference_sq.sqrt().clamp_min(torch.finfo(torch.float64).tiny)
+
+    def _embedded(coordinates: torch.Tensor) -> torch.Tensor:
+        return torch.einsum("...a,aij->...ij", coordinates, generators)
+
+    candidate_element = torch.linalg.matrix_exp(_embedded(candidate_phi))
+    current_element = torch.linalg.matrix_exp(_embedded(phi))
+    right_element = torch.linalg.matrix_exp(_embedded(delta))
+    reference = current_element @ right_element
+    error = torch.linalg.matrix_norm(candidate_element - reference, dim=(-2, -1))
+    scale = torch.linalg.matrix_norm(reference, dim=(-2, -1))
+    return error / scale.clamp_min(torch.finfo(torch.float64).tiny)
+
+
+@torch.no_grad()
+def stage_pullback_group_candidate(
+    grad_phi: torch.Tensor,             # (active, n_gen) processed covector
+    phi:      torch.Tensor,             # (active, n_gen) current chart
+    group:    GaugeGroup,
+
+    *,
+    learning_rate:    float,
+    trust_radius:     float,
+    chart_max_norm:   float,
+    bch_residual_max: float,
+    phi_precond_mode: str,
+    max_backtracks:   int = 10,
+) -> PullbackGroupCandidate:
+    r"""Stage one certified float64 right-group update without mutating inputs."""
+    if not isinstance(group, GaugeGroup):
+        raise TypeError(f"group must be a GaugeGroup, got {type(group).__name__}")
+    if grad_phi.ndim != 2 or phi.ndim != 2 or grad_phi.shape != phi.shape:
+        raise ValueError(
+            "pullback group staging requires matching (active, n_gen) grad/phi tensors; "
+            f"got {tuple(grad_phi.shape)} and {tuple(phi.shape)}"
+        )
+    if grad_phi.shape[-1] != group.generators.shape[0]:
+        raise ValueError(
+            "pullback group staging requires full generator coordinates; got width "
+            f"{grad_phi.shape[-1]} and {group.generators.shape[0]} generators"
+        )
+    if grad_phi.device != phi.device:
+        raise ValueError(
+            f"pullback group grad/phi devices differ: {grad_phi.device} and {phi.device}"
+        )
+    learning_rate = float(learning_rate)
+    if not math.isfinite(learning_rate) or learning_rate < 0.0:
+        raise ValueError(
+            f"learning_rate must be finite and nonnegative, got {learning_rate!r}"
+        )
+    trust_radius = _require_positive_finite(trust_radius, "trust_radius")
+    chart_max_norm = _require_positive_finite(chart_max_norm, "chart_max_norm")
+    bch_residual_max = _require_positive_finite(bch_residual_max, "bch_residual_max")
+    if type(max_backtracks) is not int or max_backtracks < 0:
+        raise ValueError(
+            f"max_backtracks must be a nonnegative int, got {max_backtracks!r}"
+        )
+    if grad_phi.shape[0] == 0:
+        raise ValueError("pullback group staging requires at least one active row")
+
+    from vfe3.geometry.lie_ops import compose_bch
+
+    with torch.amp.autocast(grad_phi.device.type, enabled=False):
+        grad64 = grad_phi.to(dtype=torch.float64)
+        phi64 = phi.to(dtype=torch.float64)
+        generators64 = group.generators.to(device=phi.device, dtype=torch.float64)
+        if not bool(torch.isfinite(grad64).all()) or not bool(torch.isfinite(phi64).all()):
+            raise FloatingPointError("pullback group staging received a nonfinite grad or chart")
+        direction = pullback_group_direction(
+            grad64,
+            phi64,
+            generators64,
+            mode=phi_precond_mode,
+            irrep_dims=list(group.irrep_dims),
+        )
+        direction_tensors = (
+            direction.v_phi,
+            direction.xi,
+            direction.min_undamped_generalized_eigenvalue,
+            direction.undamped_generalized_condition,
+            direction.damped_generalized_condition,
+            direction.scaled_solve_residual,
+        )
+        if not all(bool(torch.isfinite(value).all()) for value in direction_tensors):
+            raise FloatingPointError("pullback group direction returned a nonfinite certificate")
+
+        right_factor = -learning_rate * direction.xi
+        right_norm = embedded_phi_frobenius_norm(
+            right_factor,
+            group,
+            warn_fallback=False,
+        )
+        tiny = torch.finfo(torch.float64).tiny
+        trust_scale = (trust_radius / right_norm.clamp_min(tiny)).clamp(max=1.0)
+        factor_scale = trust_scale.clone()
+        reductions = torch.zeros(
+            grad64.shape[0],
+            dtype=torch.long,
+            device=grad64.device,
+        )
+        residual_limit = min(1e-6, bch_residual_max)
+        for attempt in range(max_backtracks + 1):
+            delta = factor_scale.unsqueeze(-1) * right_factor
+            candidate_phi = compose_bch(
+                phi64,
+                delta,
+                generators64,
+                order=4,
+                block_dims=list(group.irrep_dims),
+                compact_blocks=(group.name == "block_glk"),
+            )
+            candidate_chart_norm = embedded_phi_frobenius_norm(
+                candidate_phi,
+                group,
+                warn_fallback=False,
+            )
+            if not bool(torch.isfinite(candidate_phi).all()) or not bool(
+                torch.isfinite(candidate_chart_norm).all()
+            ):
+                raise FloatingPointError("pullback group staging produced a nonfinite candidate")
+            if bool((candidate_chart_norm > chart_max_norm).any()):
+                maximum = float(candidate_chart_norm.max())
+                raise FloatingPointError(
+                    "pullback group candidate chart norm "
+                    f"{maximum:.6g} exceeds bound {chart_max_norm:.6g}"
+                )
+            group_product_residual = _pullback_group_product_residual(
+                candidate_phi,
+                phi64,
+                delta,
+                group,
+            )
+            if not bool(torch.isfinite(group_product_residual).all()):
+                raise FloatingPointError(
+                    "pullback group staging produced a nonfinite group-product residual"
+                )
+            failures = group_product_residual > residual_limit
+            if not bool(failures.any()):
+                return PullbackGroupCandidate(
+                    candidate_phi=candidate_phi,
+                    trust_scale=trust_scale,
+                    backtracking_reductions=reductions,
+                    candidate_chart_norm=candidate_chart_norm,
+                    group_product_residual=group_product_residual,
+                    direction=direction,
+                )
+            if attempt == max_backtracks:
+                maximum = float(group_product_residual.max())
+                raise FloatingPointError(
+                    "pullback group BCH residual "
+                    f"{maximum:.3e} exceeds {residual_limit:.1e} after "
+                    f"{max_backtracks} reductions"
+                )
+            factor_scale = torch.where(failures, 0.5 * factor_scale, factor_scale)
+            reductions = reductions + failures.to(dtype=torch.long)
+
+    raise AssertionError("unreachable pullback group staging path")
 
 
 def phi_projection_chunk_rows(
@@ -267,68 +513,58 @@ def _symplectic_membership_residual(
         return error.norm(dim=(-2, -1)) / J.norm()
 
 
-class GaugeNaturalGradAdamW(torch.optim.AdamW):
-    r"""AdamW everywhere, natural-gradient + momentum on the gauge-frame coordinate groups.
+class GaugeManifoldAdamW(torch.optim.AdamW):
+    r"""AdamW for ordinary groups plus stateless phi and stored-element group retractions.
 
-    For a group flagged ``gauge=True`` holding coordinates ``phi`` (shape ``(..., n_gen)``), with
-    ``nat = G(phi)^{-1} grad`` the natural gradient (active rows only), the step depends on
-    ``gauge_update_rule``::
-
-        # 'heavy_ball' (default):
-        buf  = momentum * buf + nat
-        phi -= lr * buf
-
-        # 'adam':                          # Adam moments ON the natural gradient (betas/eps from the group)
-        m    = beta1 * m + (1 - beta1) * nat
-        v    = beta2 * v + (1 - beta2) * nat^2
-        phi -= lr * (m / (1 - beta1^t)) / (sqrt(v / (1 - beta2^t)) + eps)
-
-    ``'heavy_ball'`` passes the natural gradient through unnormalized: the metric DIRECTION survives
-    but a tiny/badly-scaled phi gradient (and the metric inverse's shrink) barely moves the frame.
-    ``'adam'`` restores per-coordinate ``1/sqrt(v)`` magnitude normalization so phi actually trains,
-    while keeping the metric direction; for the conformal ``killing`` metric it collapses to plain
-    AdamW on phi (the conformal factor cancels in ``m/sqrt(v)``), for ``pullback_per_block`` it is a
-    hybrid that keeps part of the metric direction AND moves phi.
-
-    ``G(phi)`` is the metric named by ``precond_mode`` (``pullback_per_block`` for the exact
-    exp-map geometry). No weight decay is applied to the gauge frame (decoupled L2 in Euclidean
-    coordinates would be non-geometric; the ``mass_phi`` penalty handles frame-norm shrinkage in
-    the loss). The reduced-coordinate chart (``pos_phi_project_slk``) is NOT routed here -- the
-    full-width pullback metric is shape-incompatible with a reduced gradient -- so those params
-    stay on AdamW (the caller gates on width).
+    A parameter group marked ``pullback_group=True`` is staged through
+    :func:`stage_pullback_group_candidate` on active rows only. The update creates no optimizer
+    state for the phi table. A group marked ``omega=True`` retains the established direct-element
+    retraction and dirty-row cadence state.
     """
 
     # Signature-convention exception: torch.optim.Optimizer's contract REQUIRES params as the
-    # first positional argument (super().__init__(params, ...)), so the tensor `generators`
-    # cannot lead here as the project convention would otherwise mandate.
+    # first positional argument (super().__init__(params, ...)), so ``group`` follows it.
     def __init__(
         self,
         params,
-        generators:     torch.Tensor,         # (n_gen, K, K) gauge generator basis
-        irrep_dims:     List[int],            # block sizes (sum == K); used by *_per_block metrics
+        group: GaugeGroup,
 
         *,
-        precond_mode:       str           = "pullback_per_block",
-        gauge_momentum:     float         = 0.9,
-        gauge_update_rule:  str           = "heavy_ball",
-        omega_retract_mode: str           = "lie_exp",
-        skew_symmetric:     bool          = False,
-        omega_reorth_every: int           = 0,
-        group_name:         Optional[str] = None,
+        phi_group_trust_radius: float,
+        phi_chart_max_norm:     float,
+        phi_bch_residual_max:   float,
+        phi_precond_mode:       str,
+        omega_retract_mode:     str = "lie_exp",
+        omega_reorth_every:     int = 0,
         **kwargs,
     ) -> None:
+        if not isinstance(group, GaugeGroup):
+            raise TypeError(f"group must be a GaugeGroup, got {type(group).__name__}")
         if type(omega_reorth_every) is not int or omega_reorth_every < 0:
             raise ValueError(
                 "omega_reorth_every must be a nonnegative int, got "
                 f"{type(omega_reorth_every).__name__}: {omega_reorth_every!r}"
             )
-        if group_name is not None and (not isinstance(group_name, str) or not group_name):
-            raise ValueError(f"group_name must be a nonempty str or None, got {group_name!r}")
+        phi_group_trust_radius = _require_positive_finite(
+            phi_group_trust_radius,
+            "phi_group_trust_radius",
+        )
+        phi_chart_max_norm = _require_positive_finite(
+            phi_chart_max_norm,
+            "phi_chart_max_norm",
+        )
+        phi_bch_residual_max = _require_positive_finite(
+            phi_bch_residual_max,
+            "phi_bch_residual_max",
+        )
         super().__init__(params, **kwargs)
-        self._generators        = generators
-        self._irrep_dims        = irrep_dims
-        self._precond_mode      = precond_mode
-        self._gauge_momentum    = float(gauge_momentum)
+        self._group                  = group
+        self._generators             = group.generators
+        self._irrep_dims             = list(group.irrep_dims)
+        self._precond_mode           = phi_precond_mode
+        self._phi_group_trust_radius = phi_group_trust_radius
+        self._phi_chart_max_norm     = phi_chart_max_norm
+        self._phi_bch_residual_max   = phi_bch_residual_max
         # Group-manifold retraction for the omega_direct group (params flagged omega=True): 'lie_exp'
         # (matrix_exp; follows the one-parameter subgroup) or 'cayley' (exp-free (I-A/2)^{-1}(I+A/2)).
         self._omega_retract_mode = omega_retract_mode
@@ -336,21 +572,13 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
         # fp32 accumulation of exp(skew) retraction products walks the stored U off O(K) over many
         # M-steps, after which U^T stops being the exact inverse (the transpose fast path
         # build_transport_from_element relies on for skew groups). skew_symmetric mirrors
-        # model.group.skew_symmetric (threaded from build_optimizer); omega_reorth_every>0 turns on a
+        # group.skew_symmetric; omega_reorth_every>0 turns on a
         # periodic polar re-orthogonalization every that many M-steps. Default 0 = off = byte-identical.
-        self._skew_symmetric     = bool(skew_symmetric)
+        self._skew_symmetric     = bool(group.skew_symmetric)
         self._omega_reorth_every = omega_reorth_every
         self._omega_step         = 0                     # M-step counter for the reorth cadence
-        self._group_name         = group_name
-        self._has_omega_group    = any(group.get("omega", False) for group in self.param_groups)
-        # Moment rule for the natural-gradient gauge step: 'heavy_ball' (default; momentum only, no
-        # per-coordinate normalization) or 'adam' (Adam m/v/bias-correction ON the natural gradient,
-        # restoring 1/sqrt(v) normalization while keeping the metric direction).
-        if gauge_update_rule not in ("heavy_ball", "adam"):
-            raise ValueError(
-                f"gauge_update_rule must be 'heavy_ball' or 'adam', got {gauge_update_rule!r}"
-            )
-        self._gauge_update_rule = gauge_update_rule
+        self._group_name         = group.name
+        self._has_omega_group    = any(item.get("omega", False) for item in self.param_groups)
         # D1/EXP-8 training-time diagnostics, GATED: the caller (train.py) sets _collect_gauge_diag
         # True only on a log/eval step, so the silent hot path computes NOTHING extra. When set, step()
         # stashes cos(nat, grad) (1.0 for the conformal killing rescale; <1 when pullback reshapes the
@@ -363,15 +591,10 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
     def __setstate__(self, state) -> None:                             # type: ignore[override]
         r"""Restore generically, running Adam's step migration only where ``"step"`` exists.
 
-        ``Optimizer.load_state_dict`` dispatches to ``__setstate__``; ``Adam.__setstate__`` migrates
-        a legacy float ``"step"`` to a tensor and assumes EVERY non-empty per-parameter state carries
-        ``"step"``. A gauge param's state holds only ``"gauge_mom"`` ('heavy_ball') or
-        ``"gauge_m"``/``"gauge_v"``/``"gauge_step"`` ('adam') -- never ``"step"`` -- because
-        :meth:`step` consumes its grad to ``None`` so base AdamW skips it. Adam's assumption would
-        raise ``KeyError: 'step'`` and checkpoint RESUME would crash on the geometric M-step. Restore
-        via the base ``Optimizer`` (which carries the current-format param-group hyperparameters from
-        our own checkpoints) and run the float->tensor step migration only on states that actually
-        have ``"step"`` (the non-gauge AdamW groups).
+        ``Optimizer.load_state_dict`` dispatches to ``__setstate__``; ``Adam.__setstate__`` assumes
+        every non-empty per-parameter state carries ``"step"``. Omega state contains only its
+        dirty-row mask, so inherited Adam migration remains unsafe. Restore through the base
+        ``Optimizer`` and migrate only states that actually carry an Adam ``"step"`` slot.
         """
         torch.optim.Optimizer.__setstate__(self, state)
         for s in self.state.values():
@@ -408,7 +631,7 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
             import warnings
             self._omega_step = 0
             warnings.warn(
-                "GaugeNaturalGradAdamW checkpoint has no optimizer_extra.omega_step; the omega "
+                "GaugeManifoldAdamW checkpoint has no optimizer_extra.omega_step; the omega "
                 "reorthogonalization cadence restarts at zero (non-exact resume when "
                 "omega_reorth_every > 0).",
                 UserWarning,
@@ -444,7 +667,7 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
         if legacy_skew_cadence:
             import warnings
             warnings.warn(
-                "GaugeNaturalGradAdamW checkpoint predates optimizer_extra.omega_dirty_format; "
+                "GaugeManifoldAdamW checkpoint predates optimizer_extra.omega_dirty_format; "
                 "all omega rows were marked dirty so the next scheduled orthogonal projection "
                 "cannot silently skip pre-checkpoint drift.",
                 UserWarning,
@@ -499,15 +722,15 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
     @torch.no_grad()
     def step(self, closure=None):                                      # type: ignore[override]
         if closure is not None:
-            # The gauge groups are stepped and their grads consumed (set to None) BELOW, before the
+            # The manifold groups are stepped and their grads consumed (set to None) BELOW, before the
             # trailing super().step(). A closure that re-evaluates the loss would repopulate those grads
             # and let base AdamW step the frame a SECOND time. No caller passes a closure (GradScaler.step
             # and a bare optimizer.step() both call with closure=None), so reject it rather than risk the
             # double-step.
             raise NotImplementedError(
-                "GaugeNaturalGradAdamW does not support closure-based steps: the gauge gradient is "
-                "consumed before super().step(), so a closure that re-backpropagates would double-step "
-                "the frame. Call step() with no closure."
+                "GaugeManifoldAdamW does not support closure-based steps: a manifold gradient is "
+                "consumed before super().step(), so a closure that re-backpropagates would "
+                "double-step the frame. Call step() with no closure."
             )
         collect = self._collect_gauge_diag                             # gated: True only on log/eval steps
         if collect:
@@ -577,7 +800,58 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                 "omega retraction produced a nonfinite or singular group element"
             )
 
+        # Stage every stored phi-factor candidate before committing any manifold update. The processed
+        # gradient is exactly the tensor present after GradScaler unscale and clipping at optimizer.step.
+        # No pullback parameter touches ``self.state``; the route is stateless by construction.
+        phi_plans: Dict[int, tuple] = {}
+        for phi_group in self.param_groups:
+            if not phi_group.get("pullback_group", False):
+                continue
+            pending_updates = []
+            pending_zero_gradients = []
+            for p in phi_group["params"]:
+                if p.grad is None:
+                    continue
+                gradient = p.grad
+                flat_gradient = gradient.reshape(-1, gradient.shape[-1])
+                flat_phi = p.data.reshape(-1, p.data.shape[-1])
+                active = flat_gradient.abs().sum(dim=-1) > 0
+                if not bool(active.any()):
+                    pending_zero_gradients.append(p)
+                    continue
+                candidate = stage_pullback_group_candidate(
+                    flat_gradient[active],
+                    flat_phi[active],
+                    self._group,
+                    learning_rate=phi_group["lr"],
+                    trust_radius=self._phi_group_trust_radius,
+                    chart_max_norm=self._phi_chart_max_norm,
+                    bch_residual_max=self._phi_bch_residual_max,
+                    phi_precond_mode=self._precond_mode,
+                )
+                if collect:
+                    cosine = torch.nn.functional.cosine_similarity(
+                        candidate.direction.v_phi,
+                        flat_gradient[active].to(dtype=torch.float64),
+                        dim=-1,
+                    )
+                    cos_acc.append(float(cosine.mean()))
+                    cond_acc.append(
+                        candidate.direction.damped_generalized_condition.reshape(-1)
+                    )
+                pending_updates.append((p, flat_phi, active, candidate))
+            phi_plans[id(phi_group)] = (pending_updates, pending_zero_gradients)
+
         for group in self.param_groups:
+            if group.get("pullback_group", False):
+                pending_updates, pending_zero_gradients = phi_plans[id(group)]
+                for p, flat_phi, active, candidate in pending_updates:
+                    committed = candidate.candidate_phi.to(dtype=p.dtype)
+                    flat_phi[active] = committed
+                    p.grad = None
+                for p in pending_zero_gradients:
+                    p.grad = None
+                continue
             if group.get("omega", False):
                 # omega_direct group: the params ARE stored GL(K) group elements U (shape (V, K, K)),
                 # not algebra coordinates. Step by a group-manifold retraction of the natural-gradient
@@ -617,73 +891,6 @@ class GaugeNaturalGradAdamW(torch.optim.AdamW):
                 for p in pending_zero_gradients:
                     p.grad = None                                      # zero gradient is still consumed
                 continue
-            if not group.get("gauge", False):
-                continue
-            lr  = group["lr"]
-            mom = self._gauge_momentum
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                g   = p.grad
-                Gd  = self._generators.to(device=g.device, dtype=g.dtype)
-                # Flatten any leading axes to (rows, n_gen); precondition ACTIVE rows only.
-                flat_g   = g.reshape(-1, g.shape[-1])
-                flat_phi = p.data.reshape(-1, p.data.shape[-1])
-                active   = flat_g.abs().sum(dim=-1) > 0                 # rows that received gradient
-                nat = torch.zeros_like(flat_g)
-                if bool(active.any()):
-                    nat[active] = precondition_phi_gradient(
-                        flat_g[active], flat_phi[active], Gd,
-                        mode=self._precond_mode, irrep_dims=self._irrep_dims,
-                    )
-                    if collect:                                        # D1/EXP-8 diagnostics (sparse)
-                        cos = torch.nn.functional.cosine_similarity(
-                            nat[active], flat_g[active], dim=-1)        # (active,)
-                        cos_acc.append(float(cos.mean()))
-                        if self._precond_mode in ("pullback", "pullback_per_block"):
-                            from vfe3.numerics import condition_number
-                            Gm = pullback_metric_per_block(flat_phi[active], Gd, self._irrep_dims)
-                            eye = torch.eye(Gm.shape[-1], dtype=Gm.dtype, device=Gm.device)
-                            cond_acc.append(
-                                condition_number(Gm + 1e-6 * eye, kind="full").reshape(-1)
-                            )
-                nat = nat.reshape_as(g)
-
-                state = self.state[p]
-                if self._gauge_update_rule == "adam":
-                    # Adam moments (m, v, bias-correction) ON the natural gradient nat=G^-1 grad.
-                    # betas/eps come from the AdamW param group (torch fills the group defaults), so
-                    # this is literally AdamW applied to the preconditioned gradient: it restores the
-                    # per-coordinate 1/sqrt(v) normalization that heavy-ball lacks while keeping the
-                    # metric direction. Dense m/v over the whole table with a global step count mirror
-                    # plain AdamW on phi_embed (inactive rows have nat=0: m/v just decay), so under the
-                    # conformal killing metric this reproduces the AdamW arm; under pullback it keeps
-                    # part of the metric direction. State key 'gauge_step' (int, not 'step') so it is
-                    # untouched by Adam's float->tensor 'step' migration in __setstate__.
-                    b1, b2 = group["betas"]
-                    eps    = group["eps"]
-                    m = state.get("gauge_m")
-                    if m is None:
-                        m = torch.zeros_like(nat)
-                        state["gauge_m"] = m
-                        state["gauge_v"]    = torch.zeros_like(nat)
-                        state["gauge_step"] = 0
-                    v = state["gauge_v"]
-                    state["gauge_step"] += 1
-                    t = state["gauge_step"]
-                    m.mul_(b1).add_(nat, alpha=1 - b1)                  # m <- b1*m + (1-b1)*nat
-                    v.mul_(b2).addcmul_(nat, nat, value=1 - b2)         # v <- b2*v + (1-b2)*nat^2
-                    mhat = m / (1 - b1 ** t)
-                    vhat = v / (1 - b2 ** t)
-                    p.add_(mhat / (vhat.sqrt() + eps), alpha=-lr)       # phi <- phi - lr*mhat/(sqrt(vhat)+eps)
-                else:
-                    buf = state.get("gauge_mom")
-                    if buf is None:
-                        buf = torch.zeros_like(nat)
-                        state["gauge_mom"] = buf
-                    buf.mul_(mom).add_(nat)                             # heavy-ball: m <- mom*m + nat
-                    p.add_(buf, alpha=-lr)                             # phi <- phi - lr*m
-                p.grad = None                                          # consumed: AdamW no-ops on it
         # Orthogonality-drift control (default OFF: omega_reorth_every=0 -> byte-identical).
         # Polar reorth guarantees O(K) membership, which equals the structure group ONLY for the
         # single-block defining rep (so_k: rho(SO(K)) = SO(K)). Irrep towers are excluded because

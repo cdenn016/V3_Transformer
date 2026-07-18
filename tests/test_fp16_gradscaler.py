@@ -81,7 +81,7 @@ def test_fp16_scaler_scales_and_updates_params():
 
 
 def test_fp16_with_gauge_natural_grad_steps_the_frame():
-    # Option A: fp16 + m_phi_natural_grad (custom GaugeNaturalGradAdamW) must compose with the
+    # Option A: fp16 + m_phi_natural_grad (custom GaugeManifoldAdamW) must compose with the
     # scaler -- the gauge-frame table must move under a scaled step (not silently no-op).
     cfg = _tiny_cfg(amp_dtype="fp16", m_phi_natural_grad=True, pos_phi="learned")
     torch.manual_seed(0)

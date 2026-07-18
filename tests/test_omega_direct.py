@@ -305,11 +305,13 @@ def test_retract_omega_cayley_large_step_stays_in_component():
 
 
 def test_gauge_optim_omega_step_moves_active_rows_only():
-    from vfe3.gauge_optim import GaugeNaturalGradAdamW
-    G = generate_glk(3)
+    from vfe3.gauge_optim import GaugeManifoldAdamW
+    group = get_group("glk")(K=3)
     U = torch.nn.Parameter(torch.eye(3).expand(5, 3, 3).contiguous())
-    opt = GaugeNaturalGradAdamW([{"params": [U], "lr": 0.1, "omega": True, "weight_decay": 0.0}],
-                                G, [3], gauge_momentum=0.0)
+    opt = GaugeManifoldAdamW([{"params": [U], "lr": 0.1, "omega": True, "weight_decay": 0.0}],
+                                group, phi_group_trust_radius=0.1,
+                                phi_chart_max_norm=5.0, phi_bch_residual_max=1e-6,
+                                phi_precond_mode="pullback", weight_decay=0.0)
     U.grad = torch.zeros_like(U)
     U.grad[2] = torch.randn(3, 3, generator=torch.Generator().manual_seed(1))   # only row 2 active
     before = U.data.clone()
@@ -769,15 +771,16 @@ def test_omega_direct_sp_symplectic_membership_and_cocycle():
 
 
 def test_sp_omega_membership_diagnostic_detects_drift():
-    from vfe3.gauge_optim import GaugeNaturalGradAdamW
+    from vfe3.gauge_optim import GaugeManifoldAdamW
 
     grp = get_group("sp")(K=4)
     U = torch.nn.Parameter(torch.eye(4).expand(3, 4, 4).clone())
     with torch.no_grad():
         U[1, 0, 0] = 1.25
-    opt = GaugeNaturalGradAdamW(
+    opt = GaugeManifoldAdamW(
         [{"params": [U], "lr": 0.0, "omega": True, "weight_decay": 0.0}],
-        grp.generators, grp.irrep_dims, group_name=grp.name, weight_decay=0.0,
+        grp, phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
+        phi_bch_residual_max=1e-6, phi_precond_mode="pullback", weight_decay=0.0,
     )
     opt._collect_gauge_diag = True
     U.grad = torch.zeros_like(U)
@@ -831,7 +834,7 @@ def test_gauge_optim_omega_reorth_fires_on_cadence_for_single_block_skew(monkeyp
     reorth fires exactly on the cadence step, not before -- the ONLY case where reorth is correct
     (rho(SO(K)) = SO(K), so O(K) equals the structure group up to the reflection component)."""
     import vfe3.gauge_optim as gauge_optim_mod
-    from vfe3.gauge_optim import GaugeNaturalGradAdamW
+    from vfe3.gauge_optim import GaugeManifoldAdamW
     grp = get_group("so_k")(K=4)
     assert grp.irrep_dims == [4]                              # single block
     calls = []
@@ -842,9 +845,11 @@ def test_gauge_optim_omega_reorth_fires_on_cadence_for_single_block_skew(monkeyp
     monkeypatch.setattr(gauge_optim_mod, "_polar_orthogonalize", _spy)
 
     U = torch.nn.Parameter(torch.eye(4).expand(3, 4, 4).contiguous())
-    opt = GaugeNaturalGradAdamW([{"params": [U], "lr": 0.05, "omega": True, "weight_decay": 0.0}],
-                                grp.generators, grp.irrep_dims, gauge_momentum=0.0,
-                                skew_symmetric=True, omega_reorth_every=2)
+    opt = GaugeManifoldAdamW([{"params": [U], "lr": 0.05, "omega": True, "weight_decay": 0.0}],
+                                grp, phi_group_trust_radius=0.1,
+                                phi_chart_max_norm=5.0, phi_bch_residual_max=1e-6,
+                                phi_precond_mode="pullback", omega_reorth_every=2,
+                                weight_decay=0.0)
     gen = torch.Generator().manual_seed(3)
     U.grad = torch.zeros_like(U)
     U.grad[0] = 0.3 * torch.randn(4, 4, generator=gen)        # drifting grad, step 1
@@ -865,15 +870,17 @@ def test_gauge_optim_omega_reorth_is_noop_for_irrep_tower():
     reorth block must gate off (len(irrep_dims) == 1) and be a no-op here, even though
     skew_symmetric=True (a skew-only gate would have fired and silently relaxed the structure
     group)."""
-    from vfe3.gauge_optim import GaugeNaturalGradAdamW
+    from vfe3.gauge_optim import GaugeManifoldAdamW
     grp = get_group("so_n")(K=6, group_n=3, irrep_spec=[("l1", 2)])   # SO(3) l1 x2 -> dims [3,3]
     assert grp.irrep_dims == [3, 3]                            # multi-block tower
     assert grp.skew_symmetric is True
 
     U = torch.nn.Parameter(torch.eye(6).expand(2, 6, 6).contiguous())
-    opt = GaugeNaturalGradAdamW([{"params": [U], "lr": 0.05, "omega": True, "weight_decay": 0.0}],
-                                grp.generators, grp.irrep_dims, gauge_momentum=0.0,
-                                skew_symmetric=True, omega_reorth_every=1)
+    opt = GaugeManifoldAdamW([{"params": [U], "lr": 0.05, "omega": True, "weight_decay": 0.0}],
+                                grp, phi_group_trust_radius=0.1,
+                                phi_chart_max_norm=5.0, phi_bch_residual_max=1e-6,
+                                phi_precond_mode="pullback", omega_reorth_every=1,
+                                weight_decay=0.0)
     with torch.no_grad():
         U.data[0, :3, :3] = 1.2 * torch.eye(3)                # deliberately non-orthogonal, inactive row
     non_orth_before = U.data[0].clone()
@@ -1422,11 +1429,11 @@ def test_omega_compact_tied_shares_one_block():
 def test_omega_compact_optimizer_step_equals_full_step_on_blocks():
     """One optimizer step on the compact (V,H,d,d) table equals the full (V,K,K) step restricted
     to the blocks (fp): the per-block gl(d) retraction is the block-diagonal gl(K) retraction."""
-    from vfe3.gauge_optim import GaugeNaturalGradAdamW
-    from vfe3.geometry.generators import generate_glk_multihead
+    from vfe3.gauge_optim import GaugeManifoldAdamW
     from vfe3.geometry.lie_ops import _from_equal_diag_blocks
     V, H, d, K = 6, 2, 2, 4
-    G_full = generate_glk_multihead(K, H)                     # (8, 4, 4) block_glk basis
+    group = get_group("block_glk")(K=K, n_heads=H)
+    G_full = group.generators                                  # (8, 4, 4) block_glk basis
     g = torch.Generator().manual_seed(11)
     blocks = torch.eye(d).expand(V, H, d, d).clone() + 0.1 * torch.randn(V, H, d, d, generator=g)  # (V,H,d,d)
     Eb = torch.randn(V, H, d, d, generator=g)                 # per-block gradient
@@ -1442,8 +1449,11 @@ def test_omega_compact_optimizer_step_equals_full_step_on_blocks():
     pb_full.omega_embed.grad = _from_equal_diag_blocks(Eb, K)             # same grad, off-blocks zero
 
     def _opt(pb):
-        return GaugeNaturalGradAdamW([{"params": [pb.omega_embed], "lr": 0.1, "omega": True,
-                                       "weight_decay": 0.0}], G_full, [d] * H, gauge_momentum=0.0)
+        return GaugeManifoldAdamW([{"params": [pb.omega_embed], "lr": 0.1, "omega": True,
+                                       "weight_decay": 0.0}], group,
+                                      phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
+                                      phi_bch_residual_max=1e-6,
+                                      phi_precond_mode="pullback_per_block", weight_decay=0.0)
     _opt(pb_cmp).step()
     _opt(pb_full).step()
 
@@ -1456,10 +1466,10 @@ def test_omega_compact_tied_optimizer_step_moves_shared_block():
     """A tied (V,d,d) compact table (dim 3) must NOT fall through to the full (V,K,K) path -- it
     steps directly on the shared gl(d) block. Regression for the einsum size-mismatch crash the
     dim-only detection caused (RuntimeError: einsum ... size 2 ... does not broadcast ... size 4)."""
-    from vfe3.gauge_optim import GaugeNaturalGradAdamW
-    from vfe3.geometry.generators import generate_glk_multihead_tied
+    from vfe3.gauge_optim import GaugeManifoldAdamW
     V, H, d, K = 6, 2, 2, 4
-    G_full = generate_glk_multihead_tied(K, H)               # (4, 4, 4) tied basis; last dim == K
+    group = get_group("tied_block_glk")(K=K, n_heads=H)
+    G_full = group.generators                                # (4, 4, 4) tied basis; last dim == K
     pb = PriorBank(V, K, d * d, gauge_parameterization="omega_direct", irrep_dims=[d] * H,
                    omega_compact_storage=True, gauge_group_is_tied=True,
                    gauge_group_name="tied_block_glk")
@@ -1469,8 +1479,11 @@ def test_omega_compact_tied_optimizer_step_moves_shared_block():
     grad[3] = 0.0                                            # one inactive row
     pb.omega_embed.grad = grad.clone()
     before = pb.omega_embed.data.clone()
-    opt = GaugeNaturalGradAdamW([{"params": [pb.omega_embed], "lr": 0.1, "omega": True,
-                                  "weight_decay": 0.0}], G_full, [d] * H, gauge_momentum=0.0)
+    opt = GaugeManifoldAdamW([{"params": [pb.omega_embed], "lr": 0.1, "omega": True,
+                                  "weight_decay": 0.0}], group,
+                                 phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
+                                 phi_bch_residual_max=1e-6, phi_precond_mode="pullback",
+                                 weight_decay=0.0)
     opt.step()                                               # MUST NOT crash
     U = pb.omega_embed.data
     assert not torch.allclose(U[0], before[0])               # active shared block moved
@@ -1487,11 +1500,11 @@ def test_omega_compact_tied_step_magnitude_equals_full_tied_step():
     kron(I_H, E_ij) have Frobenius Gram = H*I, so the full-tied natural gradient carries a 1/H the
     intrinsic gl(d) basis (Gram = I) omits; without the 1/H rescale the compact-tied step is H x too
     large. Asserts assemble(compact_stepped) == full_stepped, tight tol (the H x bug would fail this)."""
-    from vfe3.gauge_optim import GaugeNaturalGradAdamW
-    from vfe3.geometry.generators import generate_glk_multihead_tied
+    from vfe3.gauge_optim import GaugeManifoldAdamW
     from vfe3.geometry.lie_ops import _from_equal_diag_blocks
     V, H, d, K = 6, 2, 2, 4
-    G_tied = generate_glk_multihead_tied(K, H)               # (4,4,4) tied basis; Frobenius Gram = H*I
+    group = get_group("tied_block_glk")(K=K, n_heads=H)
+    G_tied = group.generators                                # (4,4,4) tied basis; Frobenius Gram = H*I
     # sanity: the tied Gram really is H*I (the load-bearing fact behind the 1/H)
     assert torch.allclose(torch.einsum("aij,bij->ab", G_tied, G_tied),
                           float(H) * torch.eye(d * d), atol=1e-6)
@@ -1508,8 +1521,11 @@ def test_omega_compact_tied_step_magnitude_equals_full_tied_step():
     pb_cmp.omega_embed.grad  = E_cmp.clone()
 
     def _opt(pb):
-        return GaugeNaturalGradAdamW([{"params": [pb.omega_embed], "lr": 0.1, "omega": True,
-                                       "weight_decay": 0.0}], G_tied, [d] * H, gauge_momentum=0.0)
+        return GaugeManifoldAdamW([{"params": [pb.omega_embed], "lr": 0.1, "omega": True,
+                                       "weight_decay": 0.0}], group,
+                                      phi_group_trust_radius=0.1, phi_chart_max_norm=5.0,
+                                      phi_bch_residual_max=1e-6, phi_precond_mode="pullback",
+                                      weight_decay=0.0)
     _opt(pb_full).step()
     _opt(pb_cmp).step()
 

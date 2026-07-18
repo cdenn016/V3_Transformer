@@ -270,9 +270,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     
     
-    m_phi_natural_grad        = False,        # natural gradient on phi m-step
-    
-    m_gauge_update_rule       = "heavy_ball",       #'adam' or 'heavy_ball'
+    m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group"
+    m_phi_group_trust_radius  = 0.1,          # embedded Frobenius bound on the group factor
     
     phi_precond_mode          = "pullback_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
     phi_retract_mode          = "bch",                # "euclidean" | "bch"
@@ -623,7 +622,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             "gauge_parameterization": "phi",
             "e_phi_lr": 0.0,
             "mass_phi": 0.0,
-            "m_phi_natural_grad": False,
+            "m_phi_update_mode": "adamw",
             "phi_precond_mode": "pullback_per_block",
             "phi_mstep_max_matrix_norm": None,
         },
@@ -631,8 +630,8 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "adamw_unbounded", "m_phi_lr": 0.01},
             {"label": "adamw_mass0.01", "m_phi_lr": 0.01, "mass_phi": 0.01},
             {"label": "adamw_lr0.003", "m_phi_lr": 0.003},
-            {"label": "pullback_natgrad_lr0.0015", "m_phi_lr": 0.0015,
-             "m_phi_natural_grad": True},
+            {"label": "pullback_group_lr0.0015", "m_phi_lr": 0.0015,
+             "m_phi_update_mode": "pullback_group", "transport_chart_max_norm": 6.0},
             {"label": "adamw_projected_norm5", "m_phi_lr": 0.01,
              "phi_mstep_max_matrix_norm": 5.0},
         ],
@@ -919,26 +918,27 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     },
 
     "gauge_mstep_optim": {  # D1 / EXP-8: gauge M-step optimizer geometry.
-        # AdamW-on-phi vs the pullback natural-grad M-step (the exact exp-map metric, which reshapes
-        # the step DIRECTION) vs killing (conformal: a direction-preserving effective-LR rescale,
-        # cos(nat,grad)=1 -- the control that ISOLATES "reshaped direction" from "rescaled LR").
-        # e_phi_lr=0 keeps the preconditioner off the E-step so this measures the M-step only.
-        "description": "gauge M-step: AdamW vs pullback natural-grad vs killing conformal [D1/EXP-8]",
+        # AdamW-on-phi versus stateless pullback group descent. e_phi_lr=0 keeps the
+        # preconditioner off the E-step so this measures the M-step only.
+        "description": "gauge M-step: AdamW vs pullback group descent [D1/EXP-8]",
         "requires": {"e_phi_lr": 0.0},
         "configs": [
-            {"label": "adamw",    "m_phi_natural_grad": False},
-            {"label": "pullback", "m_phi_natural_grad": True, "phi_precond_mode": "pullback_per_block"},
-            {"label": "killing",  "m_phi_natural_grad": True, "phi_precond_mode": "killing_per_block"},
+            {"label": "adamw", "m_phi_update_mode": "adamw"},
+            {"label": "pullback_group", "m_phi_update_mode": "pullback_group",
+             "phi_precond_mode": "pullback_per_block", "gauge_group": "block_glk",
+             "embed_dim": 10, "n_heads": 2, "e_phi_lr": 0.0,
+             "transport_chart_max_norm": 6.0},
         ],
     },
 
-    "m_phi_lr_natgrad": {  # D1 / EXP-8: the natural-grad LR-mis-scaling sub-experiment.
-        # GaugeNaturalGradAdamW steps phi manually (bypassing Adam's per-coord normalization), so the
-        # AdamW-tuned m_phi_lr mis-scales; a log-spaced sweep should place the natural-grad optimum
-        # >=2x from the AdamW value. Gated to the pullback natural-grad path.
-        "description": "log-spaced m_phi_lr on the pullback natural-grad M-step [D1/EXP-8]",
+    "m_phi_lr_natgrad": {  # D1 / EXP-8: the pullback-group LR sub-experiment.
+        # Group descent bypasses Adam's per-coordinate normalization, so the AdamW-tuned
+        # m_phi_lr need not transfer. Gated to the certified pullback-group path.
+        "description": "log-spaced m_phi_lr on the pullback group M-step [D1/EXP-8]",
         "param": "m_phi_lr", "values": [0.0005, 0.0015, 0.005, 0.015, 0.05, 0.15],
-        "requires": {"m_phi_natural_grad": True, "phi_precond_mode": "pullback_per_block", "e_phi_lr": 0.0},
+        "requires": {"m_phi_update_mode": "pullback_group",
+                     "phi_precond_mode": "pullback_per_block", "e_phi_lr": 0.0,
+                     "transport_chart_max_norm": 6.0},
     },
 
     "mass_phi": {  # D1 / EXP-8: the regime knob (NOT phi_weight_decay, which is hard-zeroed under
@@ -946,7 +946,9 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # norm penalty pulls phi toward 0, where ad_phi -> 0 and the pullback metric -> I).
         "description": "mass_phi frame-norm penalty -- natural-grad regime knob [D1/EXP-8]",
         "param": "mass_phi", "values": [0.0, 0.001, 0.01, 0.1],
-        "requires": {"m_phi_natural_grad": True, "phi_precond_mode": "pullback_per_block", "e_phi_lr": 0.0},
+        "requires": {"m_phi_update_mode": "pullback_group",
+                     "phi_precond_mode": "pullback_per_block", "e_phi_lr": 0.0,
+                     "transport_chart_max_norm": 6.0},
     },
 
     "fisher_mu_precond": {  # B3 / EXP-14: Fisher natural-gradient vs raw-Euclidean E-step MEAN preconditioner.

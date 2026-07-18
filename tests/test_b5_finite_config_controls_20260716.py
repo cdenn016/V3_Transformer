@@ -127,7 +127,7 @@ def test_state_dependent_envelope_lists_reject_every_nonfinite_entry(
         VFE3Config(**kwargs)
 
 
-@pytest.mark.parametrize("name", ("pos_phi_scale", "m_gauge_momentum"))
+@pytest.mark.parametrize("name", ("pos_phi_scale", "m_phi_group_trust_radius"))
 @pytest.mark.parametrize("value", NONFINITE_VALUES)
 def test_active_frame_controls_reject_every_nonfinite_value(
     name:  str,

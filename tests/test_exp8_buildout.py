@@ -1,6 +1,6 @@
 r"""Tests for the 2026-06-22 EXP-8 build-out (pullback nat-grad gauge M-step + LR, D1):
 
-  * GaugeNaturalGradAdamW stashes the GATED training-time diagnostics -- cos(nat,grad) (=1 for the
+  * GaugeManifoldAdamW stashes the GATED training-time diagnostics -- cos(nat,grad) (=1 for the
     conformal killing rescale, a valid cosine for pullback) and the pullback metric condition number.
   * the diagnostics are silent (no compute, empty _gauge_diag) unless _collect_gauge_diag is set.
   * train() writes the cumulative wall_clock_s column into metrics.csv.
@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 import torch
 
 from vfe3.config import VFE3Config
-from vfe3.gauge_optim import GaugeNaturalGradAdamW
+from vfe3.gauge_optim import GaugeManifoldAdamW
 from vfe3.model.model import VFEModel
 from vfe3.train import build_optimizer, train
 from vfe3.run_artifacts import RunArtifacts
@@ -26,8 +26,8 @@ from vfe3.viz import figures as figs
 DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 
-def _natgrad_opt_with_grads(precond_mode: str) -> GaugeNaturalGradAdamW:
-    r"""A GaugeNaturalGradAdamW with phi_embed.grad populated by one backward pass."""
+def _natgrad_opt_with_grads(precond_mode: str) -> GaugeManifoldAdamW:
+    r"""A GaugeManifoldAdamW with phi_embed.grad populated by one backward pass."""
     cfg = VFE3Config(vocab_size=32, embed_dim=4, n_heads=2, max_seq_len=8,
                      gauge_group="block_glk", m_phi_natural_grad=True,
                      phi_precond_mode=precond_mode, m_phi_lr=0.01, e_phi_lr=0.0)
@@ -43,7 +43,7 @@ def _natgrad_opt_with_grads(precond_mode: str) -> GaugeNaturalGradAdamW:
 
 def test_gauge_diag_pullback_collects_cos_and_cond():
     opt = _natgrad_opt_with_grads("pullback_per_block")
-    assert isinstance(opt, GaugeNaturalGradAdamW)
+    assert isinstance(opt, GaugeManifoldAdamW)
     opt._collect_gauge_diag = True
     opt.step()
     gd = opt._gauge_diag

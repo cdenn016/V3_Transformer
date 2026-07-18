@@ -1741,6 +1741,10 @@ class VFEModel(nn.Module):
                 "cg_moment_energy_layers": layer_means.detach(),
                 "objective_total_with_cg": loss.detach(),
             }
+        # TODO(canonical-vfe-phi-mstep): `loss` is the outer supervised objective (CE plus
+        # enabled outer regularizers), so the pullback/group phi step consumes its covector.
+        # Add a separately selected fixed-returned-state VFE frame objective, declare whether
+        # beta/gamma are frozen or envelope-eliminated, and keep the optimizer objective-agnostic.
         return logits, loss, ce.detach()
 
     @property

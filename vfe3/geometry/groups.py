@@ -39,6 +39,7 @@ class GaugeGroup:
     irrep_dims:           List[int]                          # block sizes; sum == K
     skew_symmetric:       bool                               # exp(-M) = exp(M)^T fast path
     omega_direct_capable: bool                   = False     # stored group-element frame U_i is implemented
+    pullback_capability:  Optional[str]          = None      # certified strict M-step route, if any
     invariant_families:   Tuple[str, ...]        = ()        # registry-declared exact families; empty fails closed
     irrep_labels:         Optional[List[str]]    = None      # per-block label ('l1', 'sym2', ...); None = label-less
     algebra:              Optional[str]          = None      # irrep-registry algebra key ('so' | 'sp'); None = label-less
@@ -164,14 +165,14 @@ def register_group(
     invariant_families:   Tuple[str, ...]        = (),
 
     omega_direct_capable: Optional[bool]         = None,
+    pullback_capability:  Optional[str]          = None,
 ) -> Callable:
     """Decorator registering a GaugeGroup builder under ``name``.
 
-    ``omega_direct_capable`` advertises whether the registered builder supports stored
-    group-element frames. ``invariant_families`` declares the family names whose divergences are
-    exactly invariant under this builder's group action; omission means no family is certified.
-    The wrapper writes both declarations onto itself and every returned :class:`GaugeGroup`, so an
-    explicit override replaces the registry callable and its complete metadata atomically.
+    ``omega_direct_capable`` advertises stored group-element frames. ``pullback_capability`` names
+    a certified strict M-step implementation; omission fails closed. ``invariant_families`` declares
+    exact divergence invariance. The wrapper writes every declaration onto itself and each returned
+    :class:`GaugeGroup`, so an override replaces the callable and metadata atomically.
 
     Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an existing
     name silently shadowed the first. Pass ``override=True`` to replace deliberately.
@@ -194,10 +195,12 @@ def register_group(
                     f"gauge group builder {name!r} returned {type(group).__name__}, expected GaugeGroup"
                 )
             group.omega_direct_capable = capability
+            group.pullback_capability = pullback_capability
             group.invariant_families = families
             return group
 
         setattr(_coherent_builder, "omega_direct_capable", capability)
+        setattr(_coherent_builder, "pullback_capability", pullback_capability)
         setattr(_coherent_builder, "invariant_families", families)
         _GROUPS[name] = _coherent_builder
         return _coherent_builder
@@ -216,6 +219,7 @@ def get_group(name: str) -> Callable[..., GaugeGroup]:
 @register_group(
     "glk",
     omega_direct_capable=True,
+    pullback_capability="pullback",
     invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
 )
 def _build_glk(
@@ -240,6 +244,7 @@ def _build_glk(
 @register_group(
     "block_glk",
     omega_direct_capable=True,
+    pullback_capability="pullback_per_block",
     invariant_families=_GAUSSIAN_INVARIANT_FAMILIES,
 )
 def _build_block_glk(

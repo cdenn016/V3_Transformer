@@ -1,151 +1,372 @@
+import hashlib
+
 import pytest
 import torch
 from torch import nn
 
-from vfe3.geometry.generators import generate_glk_multihead
-from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
-from vfe3.gauge_optim import GaugeNaturalGradAdamW
+from vfe3.geometry.groups import get_group
+from vfe3.geometry.phi_preconditioner import PullbackGroupDirectionResult
+from vfe3.gauge_optim import (
+    GaugeManifoldAdamW,
+    PhiUpdatePolicy,
+    _PHI_UPDATE_POLICIES,
+    get_phi_update_policy,
+    stage_pullback_group_candidate,
+)
+
+
+def _make_optimizer(
+    param_groups,
+    group,
+    *,
+    trust_radius=0.1,
+    chart_max_norm=5.0,
+    bch_residual_max=1e-6,
+    phi_precond_mode="pullback",
+    **kwargs,
+):
+    return GaugeManifoldAdamW(
+        param_groups,
+        group,
+        phi_group_trust_radius=trust_radius,
+        phi_chart_max_norm=chart_max_norm,
+        phi_bch_residual_max=bch_residual_max,
+        phi_precond_mode=phi_precond_mode,
+        weight_decay=0.0,
+        **kwargs,
+    )
+
+
+def _fixed_direction(xi: torch.Tensor) -> PullbackGroupDirectionResult:
+    rows = xi.shape[:-1]
+    ones = torch.ones(rows, dtype=torch.float64, device=xi.device)
+    zeros = torch.zeros(rows, dtype=torch.float64, device=xi.device)
+    return PullbackGroupDirectionResult(
+        v_phi=xi.double(),
+        xi=xi.double(),
+        min_undamped_generalized_eigenvalue=ones,
+        undamped_generalized_condition=ones,
+        damped_generalized_condition=ones,
+        scaled_solve_residual=zeros,
+        series_order=40,
+    )
+
+
+def test_phi_update_policy_registry_contract_is_exact_and_immutable():
+    assert set(_PHI_UPDATE_POLICIES) == {"adamw", "pullback_group"}
+
+    adamw = get_phi_update_policy("adamw")
+    pullback = get_phi_update_policy("pullback_group")
+    assert isinstance(adamw, PhiUpdatePolicy)
+    assert dict(adamw.optimizer_group_metadata) == {}
+    assert adamw.requires_manifold_optimizer is False
+    assert adamw.requires_pullback_geometry is False
+    assert dict(pullback.optimizer_group_metadata) == {
+        "pullback_group": True,
+        "weight_decay": 0.0,
+    }
+    assert pullback.requires_manifold_optimizer is True
+    assert pullback.requires_pullback_geometry is True
+    with pytest.raises(TypeError):
+        pullback.optimizer_group_metadata["weight_decay"] = 1.0
+    assert dict(get_phi_update_policy("pullback_group").optimizer_group_metadata) == {
+        "pullback_group": True,
+        "weight_decay": 0.0,
+    }
+
+
+def test_default_adamw_one_step_is_byte_identical_to_golden():
+    from vfe3.config import VFE3Config
+    from vfe3.model.model import VFEModel
+    from vfe3.train import build_optimizer, train_step
+
+    torch.manual_seed(0)
+    cfg = VFE3Config(
+        vocab_size=8,
+        embed_dim=4,
+        n_heads=2,
+        max_seq_len=4,
+        n_layers=1,
+        n_e_steps=1,
+        pos_phi="none",
+    )
+    model = VFEModel(cfg)
+    optimizer = build_optimizer(model, cfg)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    tokens = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]], dtype=torch.long)
+    targets = torch.tensor([[1, 2, 3, 4], [2, 1, 0, 7]], dtype=torch.long)
+
+    loss = train_step(model, optimizer, scheduler, tokens, targets, grad_clip=1.0)
+
+    assert type(optimizer) is torch.optim.AdamW
+    assert [group["role"] for group in optimizer.param_groups] == ["mu", "sigma", "phi", "mu"]
+    state = optimizer.state_dict()["state"]
+    assert sorted(state) == [0, 1, 3, 4]
+    assert all(set(slot) == {"step", "exp_avg", "exp_avg_sq"} for slot in state.values())
+    assert 2 not in state
+    assert loss == 2.0770487785339355
+
+    def digest(tensor: torch.Tensor) -> str:
+        data = tensor.detach().cpu().contiguous().numpy().tobytes()
+        return hashlib.sha256(data).hexdigest()
+
+    assert digest(model.prior_bank.mu_embed) == "ffc101ec6c9b0fc34e1089dda4b5b28cafa6e2d53678c257ced04723e6e2a66a"
+    assert digest(model.prior_bank.sigma_log_embed) == "b632d4a844923ebb4e8af9e1158ae9eb20ad37a64677bc53186235915d2790fd"
+    assert digest(model.prior_bank.phi_embed) == "e31bfece5ed86861d7d32f3e16214c17ddcb780dfda1116c3cffbf0e27a674b9"
+    assert digest(model.prior_bank.decode_log_scale) == "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
+    assert digest(model.prior_bank.output_proj_weight) == "1bc018feb7e7c10fcd644d14bbf24a3ac2fe50073b9a355e2bcca69b907618de"
 
 
 @pytest.mark.parametrize("value", [-1, 1.5, True, False, "2", None])
 def test_direct_optimizer_rejects_invalid_omega_reorth_every(value):
-    generators = generate_glk_multihead(4, 2).float()
+    group = get_group("glk")(K=4)
     omega = nn.Parameter(torch.eye(4).unsqueeze(0))
 
     with pytest.raises(ValueError, match="omega_reorth_every"):
-        GaugeNaturalGradAdamW(
+        _make_optimizer(
             [{"params": [omega], "lr": 0.1, "omega": True, "weight_decay": 0.0}],
-            generators, [2, 2], omega_reorth_every=value, weight_decay=0.0,
+            group,
+            omega_reorth_every=value,
         )
 
 
-def test_gauge_step_is_natural_gradient_on_active_rows_only():
-    # The gauge group is stepped by phi <- phi - lr * (momentum*buf + natgrad), NOT by AdamW.
-    # With momentum 0 the step is exactly -lr * natural_gradient; rows with no gradient (tokens
-    # absent from the "batch") are untouched; the non-gauge param still gets a standard AdamW move.
-    G = generate_glk_multihead(4, 2).float()                  # K=4, d_h=2, n_gen=8, irrep [2,2]
-    irrep = [2, 2]
-    torch.manual_seed(0)
-    phi = nn.Parameter(torch.randn(6, 8) * 0.5)               # gauge-frame table (V=6, n_gen=8)
-    w   = nn.Parameter(torch.randn(6, 8))                     # a non-gauge parameter
-    opt = GaugeNaturalGradAdamW(
-        [{"params": [phi], "lr": 0.1, "gauge": True, "weight_decay": 0.0},
-         {"params": [w],   "lr": 0.1}],
-        G, irrep, precond_mode="pullback_per_block", gauge_momentum=0.0,
-        weight_decay=0.0,
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("trust_radius", 0.0),
+        ("trust_radius", float("nan")),
+        ("chart_max_norm", -1.0),
+        ("chart_max_norm", float("inf")),
+        ("bch_residual_max", 0.0),
+        ("bch_residual_max", float("nan")),
+    ],
+)
+def test_direct_optimizer_rejects_invalid_phi_bounds(name, value):
+    group = get_group("glk")(K=2)
+    phi = nn.Parameter(torch.zeros(1, 4))
+    kwargs = {name: value}
+    with pytest.raises(ValueError, match="finite and positive"):
+        _make_optimizer(
+            [{"params": [phi], "lr": 0.1, "pullback_group": True, "weight_decay": 0.0}],
+            group,
+            **kwargs,
+        )
+
+
+def test_pullback_group_step_moves_only_active_rows_and_creates_no_phi_state():
+    group = get_group("glk")(K=2)
+    phi = nn.Parameter(torch.zeros(5, 4))
+    optimizer = _make_optimizer(
+        [{"params": [phi], "lr": 0.05, "pullback_group": True, "weight_decay": 0.0}],
+        group,
     )
-    phi0, w0 = phi.detach().clone(), w.detach().clone()
-    g = torch.zeros(6, 8)
-    g[1] = torch.randn(8)
-    g[4] = torch.randn(8)                                     # only rows 1 and 4 are "active"
-    phi.grad = g.clone()
-    w.grad = torch.randn(6, 8)
-    opt.step()
+    before = phi.detach().clone()
+    phi.grad = torch.zeros_like(phi)
+    phi.grad[1, 0] = 1.0
+    phi.grad[3, 3] = -2.0
 
-    for r in (0, 2, 3, 5):                                    # inactive rows untouched
-        assert torch.allclose(phi.detach()[r], phi0[r], atol=1e-7)
-    nat = precondition_phi_gradient(g[[1, 4]], phi0[[1, 4]], G,
-                                    mode="pullback_per_block", irrep_dims=irrep)
-    assert torch.allclose(phi.detach()[1], phi0[1] - 0.1 * nat[0], atol=1e-5)
-    assert torch.allclose(phi.detach()[4], phi0[4] - 0.1 * nat[1], atol=1e-5)
-    assert not torch.allclose(w.detach(), w0)                 # non-gauge param moved (AdamW)
+    optimizer.step()
+
+    assert torch.equal(phi.detach()[[0, 2, 4]], before[[0, 2, 4]])
+    assert not torch.equal(phi.detach()[1], before[1])
+    assert not torch.equal(phi.detach()[3], before[3])
+    assert phi.grad is None
+    assert phi not in optimizer.state
+    assert optimizer.state_dict()["state"] == {}
 
 
-def test_pullback_carries_geometry_killing_does_not():
-    # The crux of "geometric correctness": at nonzero phi the pullback natural-gradient direction
-    # DEPARTS from the raw gradient (the exp-map metric is non-conformal), whereas the per-block
-    # Killing metric is conformal (a scalar * I), so its natural gradient stays PARALLEL to the raw
-    # gradient -- a no-op direction. Only pullback changes the trajectory.
-    G = generate_glk_multihead(4, 2).double()
-    irrep = [2, 2]
-    torch.manual_seed(2)
-    phi  = torch.randn(5, 8, dtype=torch.float64) * 0.6
-    grad = torch.randn(5, 8, dtype=torch.float64)
-    nat_pb  = precondition_phi_gradient(grad, phi, G, mode="pullback_per_block", irrep_dims=irrep)
-    nat_kil = precondition_phi_gradient(grad, phi, G, mode="killing_per_block", irrep_dims=irrep)
-    cos_pb  = torch.cosine_similarity(nat_pb,  grad, dim=-1)
-    cos_kil = torch.cosine_similarity(nat_kil, grad, dim=-1)
-    assert (cos_kil > 1 - 1e-9).all()                        # Killing per-block: parallel to grad
-    assert (cos_pb.abs() < 0.999).any()                      # pullback: genuinely rotates the step
-
-
-def test_build_optimizer_selects_natural_grad_and_trains_phi_embed():
-    # End-to-end wiring: m_phi_natural_grad=True -> build_optimizer returns GaugeNaturalGradAdamW,
-    # and one train step runs and moves the gauge-frame table (geometric path is live, not dead).
+def test_build_optimizer_selects_pullback_group_route_and_moves_phi_embed():
     from vfe3.config import VFE3Config
     from vfe3.model.model import VFEModel
     from vfe3.train import build_optimizer, train_step
 
     cfg = VFE3Config(
-        vocab_size=12, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
-        gauge_group="block_glk", pos_phi="none",
-        m_phi_natural_grad=True, phi_precond_mode="pullback_per_block",
-        m_phi_lr=0.1, m_gauge_momentum=0.9,
+        vocab_size=12,
+        embed_dim=4,
+        n_heads=2,
+        max_seq_len=8,
+        n_layers=1,
+        gauge_group="block_glk",
+        pos_phi="none",
+        m_phi_update_mode="pullback_group",
+        phi_precond_mode="pullback_per_block",
+        transport_chart_max_norm=6.0,
+        m_phi_lr=0.1,
     )
     torch.manual_seed(0)
     model = VFEModel(cfg)
-    opt = build_optimizer(model, cfg)
-    assert isinstance(opt, GaugeNaturalGradAdamW)
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 1.0)
-    phi0 = model.prior_bank.phi_embed.detach().clone()
-    tokens  = torch.randint(0, 12, (4, 8))
+    optimizer = build_optimizer(model, cfg)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    phi_before = model.prior_bank.phi_embed.detach().clone()
+    tokens = torch.randint(0, 12, (4, 8))
     targets = torch.randint(0, 12, (4, 8))
-    loss = train_step(model, opt, sched, tokens, targets, grad_clip=1.0)
+
+    loss = train_step(model, optimizer, scheduler, tokens, targets, grad_clip=1.0)
+
+    assert isinstance(optimizer, GaugeManifoldAdamW)
     assert torch.isfinite(torch.tensor(float(loss)))
-    assert not torch.allclose(model.prior_bank.phi_embed.detach(), phi0)
+    assert not torch.equal(model.prior_bank.phi_embed.detach(), phi_before)
+    assert model.prior_bank.phi_embed not in optimizer.state
 
 
-def test_adam_rule_with_identity_metric_matches_plain_adamw():
-    # gauge_update_rule='adam' runs Adam's m/v/bias-correction ON the natural gradient. With
-    # precond_mode='none' the metric is the identity (nat == grad), so the gauge step must reproduce
-    # plain AdamW on phi (weight_decay 0, same betas/eps) -- this pins the new rule to the optimizer
-    # it is meant to be, and is exactly why the conformal-killing arm collapses to AdamW.
-    G = generate_glk_multihead(4, 2).double()
-    irrep = [2, 2]
-    torch.manual_seed(0)
-    init  = torch.randn(6, 8, dtype=torch.float64) * 0.5
-    phi_g = nn.Parameter(init.clone())                       # stepped by the gauge 'adam' rule
-    phi_r = nn.Parameter(init.clone())                       # stepped by reference AdamW
-    opt_g = GaugeNaturalGradAdamW(
-        [{"params": [phi_g], "lr": 0.05, "gauge": True, "weight_decay": 0.0}],
-        G, irrep, precond_mode="none", gauge_update_rule="adam", weight_decay=0.0,
+def test_pullback_group_trust_scales_the_learning_rate_weighted_right_factor(monkeypatch):
+    import vfe3.gauge_optim as gauge_optim
+
+    group = get_group("glk")(K=2, dtype=torch.float64)
+    xi = torch.tensor([[4.0, 0.0, 0.0, 0.0]], dtype=torch.float64)
+    monkeypatch.setattr(
+        gauge_optim,
+        "pullback_group_direction",
+        lambda *args, **kwargs: _fixed_direction(xi),
     )
-    opt_r = torch.optim.AdamW([phi_r], lr=0.05, weight_decay=0.0)
-    torch.manual_seed(1)
-    for _ in range(20):
-        g = torch.randn(6, 8, dtype=torch.float64)           # dense -> every row active (nat == grad)
-        phi_g.grad = g.clone()
-        phi_r.grad = g.clone()
-        opt_g.step()
-        opt_r.step()
-        assert torch.allclose(phi_g.detach(), phi_r.detach(), atol=1e-10, rtol=0)
+
+    candidate = stage_pullback_group_candidate(
+        torch.ones_like(xi),
+        torch.zeros_like(xi),
+        group,
+        learning_rate=0.5,
+        trust_radius=0.25,
+        chart_max_norm=5.0,
+        bch_residual_max=1e-6,
+        phi_precond_mode="pullback",
+    )
+
+    assert candidate.trust_scale.item() == pytest.approx(0.125)
+    assert candidate.backtracking_reductions.item() == 0
+    assert candidate.candidate_chart_norm.item() == pytest.approx(0.25)
+    assert torch.allclose(
+        candidate.candidate_phi,
+        torch.tensor([[-0.25, 0.0, 0.0, 0.0]], dtype=torch.float64),
+        atol=1e-15,
+        rtol=0.0,
+    )
 
 
-def test_adam_rule_normalizes_tiny_gradient_unlike_heavy_ball():
-    # The empirical failure mode the toggle fixes: a tiny/badly-scaled phi gradient barely moves the
-    # frame under heavy-ball (no magnitude normalization), but the 'adam' rule rescales each
-    # coordinate by 1/sqrt(v) to an ~lr-sized step, so phi actually trains. Same gradient, same lr.
-    G = generate_glk_multihead(4, 2).double()
-    irrep = [2, 2]
-    torch.manual_seed(0)
-    init = torch.randn(6, 8, dtype=torch.float64) * 0.5
-    tiny = torch.randn(6, 8, dtype=torch.float64) * 1e-3     # small, like the real phi gradient (~0.06)
+@pytest.mark.parametrize(
+    ("phi_values", "delta_values", "reductions", "right_residual", "reversed_residual"),
+    [
+        (
+            [0.4461370124222645, -0.37866876575372294, 1.1203006449654396, -2.7207532407183694],
+            [0.0075751275839514645, -0.002453059541722277, -0.003516904099976695, -0.002529014357447788],
+            6,
+            5.48315e-7,
+            1.083e-4,
+        ),
+        (
+            [0.19176642751290957, -1.411275433700944, 3.477796870171524, -3.297947273280199],
+            [0.008133453045635446, 0.0015903479064029997, -0.0025065446684178387, -0.001781968201968022],
+            7,
+            9.92428e-7,
+            8.28e-5,
+        ),
+    ],
+)
+def test_pullback_group_bch_backtracks_and_certifies_right_product_order(
+    monkeypatch,
+    phi_values,
+    delta_values,
+    reductions,
+    right_residual,
+    reversed_residual,
+):
+    import vfe3.gauge_optim as gauge_optim
 
-    def run(rule):
-        phi = nn.Parameter(init.clone())
-        opt = GaugeNaturalGradAdamW(
-            [{"params": [phi], "lr": 0.05, "gauge": True, "weight_decay": 0.0}],
-            G, irrep, precond_mode="none", gauge_update_rule=rule,
-            gauge_momentum=0.9, weight_decay=0.0,
+    group = get_group("glk")(K=2, dtype=torch.float64)
+    phi = torch.tensor([phi_values], dtype=torch.float64)
+    delta = torch.tensor([delta_values], dtype=torch.float64)
+    monkeypatch.setattr(
+        gauge_optim,
+        "pullback_group_direction",
+        lambda *args, **kwargs: _fixed_direction(-delta),
+    )
+
+    candidate = stage_pullback_group_candidate(
+        torch.ones_like(phi),
+        phi,
+        group,
+        learning_rate=1.0,
+        trust_radius=1.0,
+        chart_max_norm=6.0,
+        bch_residual_max=1e-6,
+        phi_precond_mode="pullback",
+    )
+
+    accepted_delta = delta / (2 ** reductions)
+    embedded = lambda value: torch.einsum("...a,aij->...ij", value, group.generators)
+    exp_candidate = torch.linalg.matrix_exp(embedded(candidate.candidate_phi))
+    exp_phi = torch.linalg.matrix_exp(embedded(phi))
+    exp_delta = torch.linalg.matrix_exp(embedded(accepted_delta))
+    right = exp_phi @ exp_delta
+    reversed_product = exp_delta @ exp_phi
+    actual_right = torch.linalg.matrix_norm(exp_candidate - right) / torch.linalg.matrix_norm(right)
+    actual_reversed = (
+        torch.linalg.matrix_norm(exp_candidate - reversed_product)
+        / torch.linalg.matrix_norm(reversed_product)
+    )
+    assert candidate.backtracking_reductions.item() == reductions
+    assert candidate.group_product_residual.item() == pytest.approx(right_residual, rel=2e-6)
+    assert actual_right.item() == pytest.approx(right_residual, rel=2e-6)
+    assert actual_reversed.item() == pytest.approx(reversed_residual, rel=5e-4)
+
+
+def test_pullback_group_candidate_rejects_chart_bound(monkeypatch):
+    import vfe3.gauge_optim as gauge_optim
+
+    group = get_group("glk")(K=2, dtype=torch.float64)
+    phi = torch.tensor([[0.99, 0.0, 0.0, 0.0]], dtype=torch.float64)
+    xi = torch.tensor([[-0.2, 0.0, 0.0, 0.0]], dtype=torch.float64)
+    monkeypatch.setattr(
+        gauge_optim,
+        "pullback_group_direction",
+        lambda *args, **kwargs: _fixed_direction(xi),
+    )
+
+    with pytest.raises(FloatingPointError, match="chart norm"):
+        stage_pullback_group_candidate(
+            torch.ones_like(phi),
+            phi,
+            group,
+            learning_rate=1.0,
+            trust_radius=1.0,
+            chart_max_norm=1.0,
+            bch_residual_max=1e-6,
+            phi_precond_mode="pullback",
         )
-        for _ in range(10):
-            phi.grad = tiny.clone()
-            opt.step()
-        return (phi.detach() - init).norm().item()
 
-    moved_hb   = run("heavy_ball")
-    moved_adam = run("adam")
-    assert moved_adam > 20 * moved_hb                         # adam normalizes; heavy-ball crawls
+
+def test_pullback_group_step_rejects_two_parameter_groups_atomically(monkeypatch):
+    import vfe3.gauge_optim as gauge_optim
+
+    group = get_group("glk")(K=2, dtype=torch.float64)
+    good = nn.Parameter(torch.zeros(1, 4, dtype=torch.float64))
+    bad = nn.Parameter(torch.tensor([[0.99, 0.0, 0.0, 0.0]], dtype=torch.float64))
+    xi = torch.tensor([[-0.2, 0.0, 0.0, 0.0]], dtype=torch.float64)
+    monkeypatch.setattr(
+        gauge_optim,
+        "pullback_group_direction",
+        lambda *args, **kwargs: _fixed_direction(xi),
+    )
+    optimizer = _make_optimizer(
+        [
+            {"params": [good], "lr": 1.0, "pullback_group": True, "weight_decay": 0.0},
+            {"params": [bad], "lr": 1.0, "pullback_group": True, "weight_decay": 0.0},
+        ],
+        group,
+        trust_radius=1.0,
+        chart_max_norm=1.0,
+    )
+    good_before = good.detach().clone()
+    bad_before = bad.detach().clone()
+    good.grad = torch.ones_like(good)
+    bad.grad = torch.ones_like(bad)
+
+    with pytest.raises(FloatingPointError, match="chart norm"):
+        optimizer.step()
+
+    assert torch.equal(good, good_before)
+    assert torch.equal(bad, bad_before)
+    assert good.grad is not None and bad.grad is not None
+    assert optimizer.state_dict()["state"] == {}
 
 
 def test_state_dict_roundtrips_omega_reorth_cadence(monkeypatch):
@@ -155,10 +376,10 @@ def test_state_dict_roundtrips_omega_reorth_cadence(monkeypatch):
     group = get_group("so_k")(K=4)
 
     def _optimizer(U):
-        return GaugeNaturalGradAdamW(
+        return _make_optimizer(
             [{"params": [U], "lr": 0.05, "omega": True, "weight_decay": 0.0}],
-            group.generators, group.irrep_dims, gauge_momentum=0.0,
-            skew_symmetric=True, omega_reorth_every=3,
+            group,
+            omega_reorth_every=3,
         )
 
     source_U = nn.Parameter(torch.eye(4).expand(2, 4, 4).contiguous())
@@ -212,10 +433,10 @@ def test_omega_reorthogonalizes_only_dirty_rows(monkeypatch, device):
         return original_polar(rows)
 
     monkeypatch.setattr(gauge_optim_mod, "_polar_orthogonalize", _spy)
-    opt = GaugeNaturalGradAdamW(
+    opt = _make_optimizer(
         [{"params": [U], "lr": 0.05, "omega": True, "weight_decay": 0.0}],
-        group.generators, group.irrep_dims, skew_symmetric=True,
-        omega_reorth_every=2, weight_decay=0.0,
+        group,
+        omega_reorth_every=2,
     )
     U.grad = torch.zeros_like(U)
     U.grad[1, 0, 1] = 1.0
@@ -236,10 +457,10 @@ def test_dirty_rows_clear_after_cadence():
     group = get_group("so_k")(K=4)
 
     def _optimizer(parameter):
-        return GaugeNaturalGradAdamW(
+        return _make_optimizer(
             [{"params": [parameter], "lr": 0.05, "omega": True, "weight_decay": 0.0}],
-            group.generators, group.irrep_dims, skew_symmetric=True,
-            omega_reorth_every=2, weight_decay=0.0,
+            group,
+            omega_reorth_every=2,
         )
 
     source_U = nn.Parameter(torch.eye(4).expand(4, 4, 4).clone())
@@ -276,10 +497,10 @@ def test_pre_o5_checkpoint_with_omega_step_marks_every_row_dirty():
     group = get_group("so_k")(K=4)
 
     def _optimizer(parameter):
-        return GaugeNaturalGradAdamW(
+        return _make_optimizer(
             [{"params": [parameter], "lr": 0.05, "omega": True, "weight_decay": 0.0}],
-            group.generators, group.irrep_dims, skew_symmetric=True,
-            omega_reorth_every=3, weight_decay=0.0,
+            group,
+            omega_reorth_every=3,
         )
 
     source_U = nn.Parameter(torch.eye(4).expand(5, 4, 4).clone())
@@ -308,19 +529,19 @@ def test_current_checkpoint_without_dirty_mask_defaults_clean():
 
     group = get_group("so_k")(K=4)
     source_U = nn.Parameter(torch.eye(4).expand(3, 4, 4).clone())
-    source_opt = GaugeNaturalGradAdamW(
+    source_opt = _make_optimizer(
         [{"params": [source_U], "lr": 0.0, "omega": True, "weight_decay": 0.0}],
-        group.generators, group.irrep_dims, skew_symmetric=True,
-        omega_reorth_every=2, weight_decay=0.0,
+        group,
+        omega_reorth_every=2,
     )
     checkpoint = source_opt.state_dict()
     assert checkpoint["optimizer_extra"]["omega_dirty_format"] == 1
 
     resumed_U = nn.Parameter(source_U.detach().clone())
-    resumed_opt = GaugeNaturalGradAdamW(
+    resumed_opt = _make_optimizer(
         [{"params": [resumed_U], "lr": 0.0, "omega": True, "weight_decay": 0.0}],
-        group.generators, group.irrep_dims, skew_symmetric=True,
-        omega_reorth_every=2, weight_decay=0.0,
+        group,
+        omega_reorth_every=2,
     )
     resumed_opt.load_state_dict(checkpoint)
 
@@ -334,9 +555,9 @@ def test_compact_omega_condition_captures_cross_block_scale():
     group = get_group("block_glk")(K=4, n_heads=2)
     blocks = torch.stack([100.0 * torch.eye(2), 0.01 * torch.eye(2)]).unsqueeze(0)
     U = nn.Parameter(blocks)
-    opt = GaugeNaturalGradAdamW(
+    opt = _make_optimizer(
         [{"params": [U], "lr": 0.0, "omega": True, "weight_decay": 0.0}],
-        group.generators, group.irrep_dims, group_name=group.name, weight_decay=0.0,
+        group,
     )
     opt._collect_gauge_diag = True
     U.grad = torch.ones_like(U)
@@ -351,12 +572,9 @@ def test_zero_omega_gradient_is_consumed_without_empty_diagnostics():
 
     group = get_group("glk")(K=3)
     omega = nn.Parameter(torch.eye(3).repeat(5, 1, 1))
-    optimizer = GaugeNaturalGradAdamW(
+    optimizer = _make_optimizer(
         [{"params": [omega], "lr": 0.05, "omega": True, "weight_decay": 0.0}],
-        group.generators,
-        group.irrep_dims,
-        group_name=group.name,
-        weight_decay=0.0,
+        group,
     )
     optimizer._collect_gauge_diag = True
     optimizer._gauge_diag = {"omega_condition_max": 123.0}
@@ -372,11 +590,12 @@ def test_zero_omega_gradient_is_consumed_without_empty_diagnostics():
 
 
 def test_attempted_diagnostic_step_clears_stale_gauge_health():
-    group = generate_glk_multihead(4, 2).float()
-    phi = nn.Parameter(torch.zeros(3, group.shape[0]))
-    opt = GaugeNaturalGradAdamW(
-        [{"params": [phi], "lr": 0.0, "gauge": True, "weight_decay": 0.0}],
-        group, [2, 2], weight_decay=0.0,
+    group = get_group("block_glk")(K=4, n_heads=2)
+    phi = nn.Parameter(torch.zeros(3, group.generators.shape[0]))
+    opt = _make_optimizer(
+        [{"params": [phi], "lr": 0.0, "pullback_group": True, "weight_decay": 0.0}],
+        group,
+        phi_precond_mode="pullback_per_block",
     )
     opt._collect_gauge_diag = True
     opt._gauge_diag = {"pullback_cond_max": 123.0}

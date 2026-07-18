@@ -1,6 +1,8 @@
 from collections.abc import MutableMapping
+from dataclasses import fields
 
 import pytest
+import torch
 
 from vfe3.config import VFE3Config, config_from_serialized
 
@@ -25,6 +27,129 @@ def test_config_defaults():
     assert cfg.kl_max == 100.0
     assert cfg.divergence_family == "renyi"
     assert cfg.renyi_order == 1.0
+
+
+def test_phi_update_defaults_and_retired_fields_are_removed():
+    cfg = VFE3Config()
+    field_names = {field.name for field in fields(VFE3Config)}
+
+    assert cfg.m_phi_update_mode == "adamw"
+    assert cfg.m_phi_group_trust_radius == 0.1
+    assert "m_phi_natural_grad" not in field_names
+    assert "m_gauge_momentum" not in field_names
+    assert "m_gauge_update_rule" not in field_names
+
+
+def _valid_pullback_config(**overrides):
+    values = {
+        "embed_dim": 10,
+        "n_heads": 1,
+        "gauge_group": "glk",
+        "gauge_parameterization": "phi",
+        "m_phi_update_mode": "pullback_group",
+        "phi_precond_mode": "pullback",
+        "transport_chart_max_norm": 6.0,
+        "pos_phi": "none",
+    }
+    values.update(overrides)
+    return VFE3Config(**values)
+
+
+def test_phi_update_mode_is_validated_against_live_policy_registry():
+    with pytest.raises(ValueError, match="m_phi_update_mode"):
+        VFE3Config(m_phi_update_mode="unknown")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [0.0, -0.1, float("nan"), float("inf"), float("-inf")],
+)
+def test_phi_group_trust_radius_must_be_finite_and_positive(value):
+    with pytest.raises(ValueError, match="m_phi_group_trust_radius"):
+        VFE3Config(m_phi_group_trust_radius=value)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (
+            {"gauge_parameterization": "omega_direct", "e_phi_lr": 0.0},
+            "gauge_parameterization",
+        ),
+        ({"gauge_group": "so_k"}, "pullback capability"),
+        ({"gauge_group": "tied_block_glk", "n_heads": 2}, "pullback capability"),
+        ({"embed_dim": 13}, "embed_dim"),
+        (
+            {
+                "embed_dim": 26,
+                "n_heads": 2,
+                "gauge_group": "block_glk",
+                "phi_precond_mode": "pullback_per_block",
+            },
+            "d_head",
+        ),
+        (
+            {
+                "gauge_group": "block_glk",
+                "n_heads": 2,
+                "phi_precond_mode": "pullback_per_block",
+                "cross_couplings": [(0, 1)],
+            },
+            "cross_couplings",
+        ),
+        ({"phi_precond_mode": "pullback_per_block"}, "pullback capability"),
+        (
+            {
+                "gauge_group": "block_glk",
+                "n_heads": 2,
+                "phi_precond_mode": "pullback",
+            },
+            "pullback capability",
+        ),
+        ({"pos_phi_project_slk": True}, "pos_phi_project_slk"),
+        ({"transport_chart_max_norm": None}, "transport_chart_max_norm"),
+        ({"transport_chart_max_norm": 5.0}, "transport_chart_max_norm"),
+        ({"transport_chart_max_norm": 4.0}, "transport_chart_max_norm"),
+        ({"transport_chart_max_norm": 20.0}, "transport_chart_max_norm"),
+        ({"transport_chart_max_norm": 21.0}, "transport_chart_max_norm"),
+    ],
+)
+def test_pullback_group_config_fails_closed(overrides, message):
+    with pytest.raises(ValueError, match=message):
+        _valid_pullback_config(**overrides)
+
+
+def test_pullback_group_rejects_custom_override_without_capability_metadata():
+    from vfe3.geometry.groups import GaugeGroup, _GROUPS, register_group
+
+    original = _GROUPS["glk"]
+    try:
+        @register_group("glk", override=True, invariant_families=("gaussian",))
+        def _custom_glk(K, *, dtype=None, device=None):
+            del dtype, device
+            return GaugeGroup(
+                name="glk",
+                generators=torch.eye(K).reshape(1, K, K),
+                irrep_dims=[K],
+                skew_symmetric=False,
+            )
+
+        with pytest.raises(ValueError, match="pullback capability"):
+            _valid_pullback_config()
+    finally:
+        _GROUPS["glk"] = original
+
+
+def test_pullback_group_accepts_certified_k10_full_and_two_gl5_routes():
+    full = _valid_pullback_config()
+    blocked = _valid_pullback_config(
+        gauge_group="block_glk",
+        n_heads=2,
+        phi_precond_mode="pullback_per_block",
+    )
+
+    assert full.gauge_group == "glk" and full.phi_precond_mode == "pullback"
+    assert blocked.d_head == 5 and blocked.phi_precond_mode == "pullback_per_block"
 
 
 def test_config_rejects_unknown_family():

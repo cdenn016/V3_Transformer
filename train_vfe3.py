@@ -153,9 +153,8 @@ config = dict(
     
     
     
-    m_phi_natural_grad        = False,        # natural gradient on phi m-step
-    
-    m_gauge_update_rule       = "heavy_ball",       #'adam' or 'heavy_ball'
+    m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group"
+    m_phi_group_trust_radius  = 0.1,          # embedded Frobenius bound on the group factor
     
     phi_precond_mode          = "pullback_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
     phi_retract_mode          = "bch",                # "euclidean" | "bch"

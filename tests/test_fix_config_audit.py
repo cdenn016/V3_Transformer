@@ -4,7 +4,7 @@ Covers the config-only audit findings: the config-level freeze-warning (learnabl
 under straight_through/detach; pos_phi='learned' is the DEFAULT and is warned at the MODEL
 level instead), the new unroll+oracle detached-tangent freeze-warning, that amp_dtype='fp16'
 is accepted for forward (fp16 TRAINING / GradScaler is a documented buildout), the
-m_phi_natural_grad footgun warning, the new close_basis field, and that the DEFAULT config
+the pullback-group compatibility gate, the new close_basis field, and that the DEFAULT config
 constructs silently.
 
 These tests touch ONLY the config dataclass (no model build), so they are device-agnostic
@@ -28,10 +28,17 @@ def test_amp_dtype_fp16_accepted_for_forward() -> None:
     assert cfg.amp_dtype == "fp16"
 
 
-def test_m_phi_natural_grad_without_pullback_warns() -> None:
-    """m_phi_natural_grad=True + non-pullback phi_precond_mode warns (no geometric metric)."""
-    with pytest.warns(UserWarning, match="phi_precond_mode"):
-        VFE3Config(m_phi_natural_grad=True, phi_precond_mode="none")
+def test_pullback_group_without_pullback_preconditioner_fails_closed() -> None:
+    """The selected group update cannot silently degrade to an identity/conformal direction."""
+    with pytest.raises(ValueError, match="pullback capability"):
+        VFE3Config(
+            embed_dim=4,
+            n_heads=1,
+            gauge_group="glk",
+            m_phi_update_mode="pullback_group",
+            phi_precond_mode="none",
+            transport_chart_max_norm=6.0,
+        )
 
 
 def test_close_basis_field_exists_and_defaults_none() -> None:

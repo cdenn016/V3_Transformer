@@ -585,39 +585,16 @@ class VFE3Config:
     m_s_phi_lr:                float = 0.015
     
     
-    # Geometrically-correct gauge M-step (opt-in, default OFF -> plain AdamW on phi_embed/pos_phi_free).
-    # When True the gauge-frame prior tables (phi_embed, pos_phi_free) are updated by NATURAL-GRADIENT
-    # descent + heavy-ball momentum under the phi_precond_mode metric (set phi_precond_mode=
-    # "pullback_per_block" for the exact exp-map metric), instead of being placed in AdamW. This is the
-    # only way the gauge geometry reaches the M-step: a position-dependent metric cannot ride inside
-    # AdamW -- Adam's per-coordinate normalization re-flattens any metric. Here the gauge group is
-    # stepped manually WITHOUT Adam normalization (gauge_optim clears p.grad=None after the natural-
-    # gradient step), so the Killing metric is NOT a no-op: being conformal (a scalar * I in the
-    # Frobenius-orthonormal E_ij basis), killing/killing_per_block rescale the phi step by that
-    # constant conformal factor -- a direction-preserving effective-LR change, an exact no-op ONLY
-    # under Adam's scale-invariance. The non-conformal pullback metric additionally changes the step
-    # direction (it reshapes the gradient along the metric's eigendirections -- the genuinely position-
-    # dependent geometry). Per-token metric solves run on the active rows
-    # only but are still real compute, so this is an opt-in extreme path; the pure AdamW path is the
-    # default. Everything except the gauge frame (mu/sigma/decode/...) stays on AdamW.
-    m_phi_natural_grad:        bool  = False
-    m_gauge_momentum:          float = 0.9   # heavy-ball momentum for the natural-gradient gauge step
-   
-    # Moment rule for the natural-gradient gauge step (only when m_phi_natural_grad=True):
-    #   'heavy_ball' (default): buf = m_gauge_momentum*buf + nat; phi -= lr*buf. NO per-coordinate
-    #     magnitude normalization -- the raw phi gradient scale (and the metric inverse's shrink)
-    #     pass straight through, so a tiny/badly-scaled phi gradient barely moves the frame.
-    #   'adam': run Adam's m, v, bias-correction ON the natural gradient nat = G^{-1} grad (betas/eps
-    #     from the AdamW group). Restores the per-coordinate 1/sqrt(v) normalization that lets phi
-    #     actually train, while keeping the metric DIRECTION. For the conformal killing metric this
-    #     collapses to plain AdamW on phi (the conformal factor cancels in m/sqrt(v)); for the non-
-    #     conformal pullback metric it is a hybrid: part of the metric direction survives AND phi moves.
-    #     Use with phi_precond_mode='pullback_per_block' for a geometric step that is not just AdamW.
-    m_gauge_update_rule:       str   = "heavy_ball"
+    # Stored phi-factor M-step policy. "adamw" is the default and preserves the established optimizer
+    # topology. "pullback_group" opts into a stateless strict pullback direction followed by a local
+    # right-group retraction. The trust radius bounds the learning-rate-weighted right factor in the
+    # embedded Frobenius norm. The strict path is intentionally limited by validation below.
+    m_phi_update_mode:         str   = "adamw"
+    m_phi_group_trust_radius:  float = 0.1
 
-    # Optional post-M-step chart guard. After a successful optimizer step, rows whose embedded
-    # matrix Frobenius norm exceeds this radius are projected back along the same algebra ray.
-    # None preserves the historical unconstrained M-step exactly.
+    # Optional post-M-step chart guard. AdamW projects rows back along their algebra ray after the
+    # optimizer step. The pullback-group route instead treats this value as an in-optimizer candidate
+    # bound and rejects atomically; when None, that route uses the fixed factor radius 5.0.
     phi_mstep_max_matrix_norm: Optional[float] = None
 
     weight_decay:              float = 0.05
@@ -626,8 +603,8 @@ class VFE3Config:
     # pos_phi_free), default 0.065. Decoupled decay on phi sets an LR-invariant frame-norm ceiling
     # (|phi*| ~ E[normalized-grad]/wd) that pulls the transport exp(phi.G) toward the identity; this
     # knob decouples that from the belief-table weight_decay so it can be swept (set 0 for full
-    # gauge-frame protection). Inert under m_phi_natural_grad=True (phi is natural-gradient stepped,
-    # AdamW decay 0 on the gauge groups regardless).
+    # gauge-frame protection). The pullback-group policy supplies weight_decay=0 through its registry
+    # metadata, so this field remains specific to the AdamW phi route.
     phi_weight_decay:          float = 0.065
 
     # SEPARATE AdamW weight decay for the Regime-II edge connection connection_W (audit 2026-06-10
@@ -860,9 +837,14 @@ class VFE3Config:
         if self.pos_phi != "none" and not math.isfinite(self.pos_phi_scale):
             raise ValueError(
                 f"pos_phi_scale must be finite when pos_phi is active, got {self.pos_phi_scale}")
-        if not math.isfinite(self.m_gauge_momentum):
+        if not (
+            math.isfinite(self.m_phi_group_trust_radius)
+            and self.m_phi_group_trust_radius > 0.0
+        ):
             raise ValueError(
-                f"m_gauge_momentum must be finite, got {self.m_gauge_momentum}")
+                "m_phi_group_trust_radius must be finite and positive, got "
+                f"{self.m_phi_group_trust_radius}"
+            )
         # sigma_max caps the covariance in the SPD retractions (clamp max=sigma_max); a nonfinite
         # or sub-eps cap would push the clamped covariance below eps / negative / NaN (audit
         # 2026-07-01 F2). None stays permissive (no cap).
@@ -1823,24 +1805,71 @@ class VFE3Config:
         _require(self.gradient_mode, _VALID_GRADIENT_MODES, "gradient_mode")
         from vfe3.geometry.phi_preconditioner import _PRECOND
         _require(self.phi_precond_mode, tuple(sorted(_PRECOND)), "phi_precond_mode")
-        _require(self.m_gauge_update_rule, ("heavy_ball", "adam"), "m_gauge_update_rule")
-        # The natural-gradient gauge M-step (m_phi_natural_grad=True) carries a POSITION-DEPENDENT
-        # metric only under the pullback family ('pullback' / 'pullback_per_block'). With any other
-        # phi_precond_mode it degenerates to plain heavy-ball momentum SGD on phi with NO geometric
-        # metric: 'killing'/'killing_per_block' are conformal (a scalar * I) -> only an effective-LR
-        # rescale, and 'none'/'clip' apply no metric at all. Warn (non-breaking) so the geometric step
-        # is actually selected; set phi_precond_mode='pullback_per_block' for the documented step.
-        if self.m_phi_natural_grad and self.phi_precond_mode not in ("pullback", "pullback_per_block"):
-            import warnings
-            warnings.warn(
-                f"m_phi_natural_grad=True with phi_precond_mode={self.phi_precond_mode!r} runs plain "
-                "heavy-ball momentum SGD on phi with NO position-dependent metric: "
-                "'killing'/'killing_per_block' are conformal (only an effective-LR rescale) and "
-                "'none'/'clip' apply no metric. Set phi_precond_mode='pullback_per_block' for the "
-                "documented geometric (pullback natural-gradient) gauge M-step.",
-                UserWarning,
-                stacklevel=2,
+        from vfe3.gauge_optim import _PHI_UPDATE_POLICIES, get_phi_update_policy
+        _require(
+            self.m_phi_update_mode,
+            tuple(sorted(_PHI_UPDATE_POLICIES)),
+            "m_phi_update_mode",
+        )
+        phi_update_policy = get_phi_update_policy(self.m_phi_update_mode)
+        if phi_update_policy.requires_pullback_geometry:
+            if self.gauge_parameterization != "phi":
+                raise ValueError(
+                    "the selected phi update requires gauge_parameterization='phi'; got "
+                    f"{self.gauge_parameterization!r}"
+                )
+            from vfe3.geometry.groups import get_group
+            group_builder = get_group(self.gauge_group)
+            capability = getattr(group_builder, "pullback_capability", None)
+            if capability != self.phi_precond_mode:
+                raise ValueError(
+                    f"gauge_group={self.gauge_group!r} has registered pullback capability "
+                    f"{capability!r}, which does not certify phi_precond_mode="
+                    f"{self.phi_precond_mode!r}; phase one requires a built-in bracket-closed "
+                    "full/per-block pullback pairing"
+                )
+            if self.gauge_group == "glk":
+                if self.embed_dim > 12:
+                    raise ValueError(
+                        "pullback_group with gauge_group='glk' requires embed_dim <= 12; got "
+                        f"embed_dim={self.embed_dim}"
+                    )
+            elif self.gauge_group == "block_glk":
+                if self.cross_couplings is not None:
+                    raise ValueError(
+                        "pullback_group requires untied block_glk without cross_couplings"
+                    )
+                if self.d_head > 12:
+                    raise ValueError(
+                        "pullback_group with gauge_group='block_glk' requires d_head <= 12; got "
+                        f"d_head={self.d_head}"
+                    )
+            else:
+                raise ValueError(
+                    "pullback_group phase one accepts only built-in glk or untied block_glk; "
+                    f"got gauge_group={self.gauge_group!r}"
+                )
+            if self.pos_phi_project_slk:
+                raise ValueError(
+                    "pullback_group does not support pos_phi_project_slk=True because the stored "
+                    "factor metric is defined on the full registered chart"
+                )
+            factor_radius = (
+                self.phi_mstep_max_matrix_norm
+                if self.phi_mstep_max_matrix_norm is not None
+                else 5.0
             )
+            from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM
+            if self.transport_chart_max_norm is None or not (
+                factor_radius
+                < self.transport_chart_max_norm
+                < TRANSPORT_CLAMP_MAX_NORM
+            ):
+                raise ValueError(
+                    "pullback_group requires an explicit transport_chart_max_norm satisfying "
+                    f"{factor_radius} < transport_chart_max_norm < "
+                    f"{TRANSPORT_CLAMP_MAX_NORM}; got {self.transport_chart_max_norm!r}"
+                )
         
         from vfe3.geometry.lie_ops import _COMPOSE      # phi retraction & pos-phi share the compose registry
         _require(self.phi_retract_mode, tuple(sorted(_COMPOSE)), "phi_retract_mode")
@@ -1962,8 +1991,8 @@ class VFE3Config:
         # per head). The tied gauge's shared generators kron(I_n, gl(d_head)) each act on EVERY
         # block, so the per-block partition does not exist; reject BOTH at construction, mirroring
         # the so_n/sp_n irrep-tower guard (audit 2026-07-12 N14 -- previously only the killing
-        # variant was rejected, so the m_gauge_update_rule-recommended 'pullback_per_block' pairing
-        # crashed opaquely at the first E-step / natural-gradient optimizer step). The ambient
+        # variant was rejected, so a 'pullback_per_block' pairing crashed opaquely at the first
+        # E-step / frame-optimizer step). The ambient
         # 'killing'/'pullback' (full-basis metrics), 'clip', and 'none' are unaffected.
         if (self.gauge_group == "tied_block_glk"
                 and self.phi_precond_mode in ("killing_per_block", "pullback_per_block")):

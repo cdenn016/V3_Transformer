@@ -37,7 +37,9 @@ from vfe3.data.datasets import make_dataloader
 from vfe3.ema import EMA
 from vfe3.free_energy import attention_tau
 from vfe3.gauge_optim import (
+    GaugeManifoldAdamW,
     embedded_phi_frobenius_norm,
+    get_phi_update_policy,
     phi_projection_chunk_rows,
     project_phi_parameter_rows_,
 )
@@ -105,7 +107,7 @@ def _warn_phi_transport_clamp(
     default) and returns the surrogate ``exp(max_norm * M/||M||_F)``, NOT ``exp(M)``; its per-call
     monitor is opt-in because
     it costs a host sync on the E-step hot path. The M-step, however, steps ``phi_embed`` /
-    ``pos_phi_free`` with NO trust region (``GaugeNaturalGradAdamW`` / plain AdamW), so a drifting
+    ``pos_phi_free`` under plain AdamW with no configured projection, so a drifting
     row silently enters the surrogate regime (audit 2026-07-05 m8). This check runs only on
     log/eval-cadence steps (off the hot path) and shares the exact norm kernel used by the projected
     M-step. Certified orthogonal bases use their diagonal Gram; uncertified custom bases use the
@@ -193,17 +195,15 @@ def build_optimizer(
     scale) -- so those sanctioned-NN-exception toggles train rather than tripping the coverage guard.
     """
     pb = model.prior_bank
-    # Geometric gauge M-step (opt-in, cfg.m_phi_natural_grad): the gauge-frame coordinate groups
-    # (phi_embed, and the full-width pos_phi_free) are flagged gauge=True so GaugeNaturalGradAdamW
-    # steps them by natural gradient under cfg.phi_precond_mode instead of AdamW; weight_decay=0 on
-    # those groups (Euclidean L2 on phi is non-geometric -- mass_phi shrinks the frame in the loss).
-    # Default OFF: the flag is absent and every group is plain AdamW, byte-identical to before.
-    nat = cfg.m_phi_natural_grad
+    # The selected policy contributes metadata only to stored phi-factor groups. An empty AdamW
+    # policy leaves every established group dictionary unchanged. The pullback-group policy marks
+    # those factors for stateless local-group staging and supplies weight_decay=0.
+    phi_update_policy = get_phi_update_policy(cfg.m_phi_update_mode)
+    phi_group_metadata = dict(phi_update_policy.optimizer_group_metadata)
     # omega_direct (cfg.gauge_parameterization='omega_direct'): omega_embed holds GL(K) group elements
     # U directly (not phi coordinates), so it is grouped {"omega": True} and stepped by the group-
-    # manifold retraction in GaugeNaturalGradAdamW. Default ('phi') leaves this False and the branch dead.
+    # manifold retraction in GaugeManifoldAdamW. Default ('phi') leaves this False and the branch dead.
     omega_direct = cfg.gauge_parameterization == "omega_direct"
-    n_gen = model.group.generators.shape[0]
     # Each group carries an explicit "role" in {mu, sigma, phi} -- the belief-component family it
     # steps (mean-LR / scale-LR / gauge-LR). The grad-norm decomposition (train_step) aggregates the
     # pre-clip grad by role, so the figure attributes the signal correctly REGARDLESS of group order
@@ -211,13 +211,11 @@ def build_optimizer(
     # 0 while the live s_mu_embed carries the mean signal -- both are role='mu'). Role is used in
     # preference to the group INDEX (the old 0/1/2 assumption broke whenever a config rerouted the
     # active mean/scale capacity off mu_embed/sigma_log_embed) and to the LR VALUE (m_p_mu_lr and
-    # m_phi_lr may coincide). Extra dict keys ride alongside "gauge"/"weight_decay" and are ignored
-    # by AdamW / GaugeNaturalGradAdamW.
+    # m_phi_lr may coincide). Extra dict keys ride alongside the optimizer metadata and are ignored
+    # by base AdamW.
     phi_group = {"params": [pb.phi_embed], "lr": cfg.m_phi_lr, "weight_decay": cfg.phi_weight_decay,
                  "role": "phi"}
-    if nat:
-        phi_group["gauge"] = True
-        phi_group["weight_decay"] = 0.0
+    phi_group.update(phi_group_metadata)
     # sigma_weight_decay (default None = inherit the global weight_decay, the long-standing
     # behavior): a dedicated AdamW decay for the log-variance tables. The global decay pulls
     # log sigma toward 0 (sigma toward 1) -- an unintended lognormal prior fighting the configured
@@ -254,14 +252,7 @@ def build_optimizer(
     if getattr(model, "pos_phi_free", None) is not None:        # pos_phi='learned' positional table
         pos_group = {"params": [model.pos_phi_free], "lr": cfg.m_phi_lr,      # a gauge-frame scale
                      "weight_decay": cfg.phi_weight_decay, "role": "phi"}     # decayed like phi_embed
-        # Natural-grad the positional frame too. pos_phi_free is created at FULL coordinate width
-        # (n_gen) and project_phi_to_slk preserves that width, so this width guard is currently
-        # ALWAYS satisfied (audit 2026-06-13 L2: there is no reduced-width chart today). It is kept
-        # defensively: a future reduced-width pos_phi would be shape-incompatible with the
-        # full-generator pullback metric and must fall back to AdamW here.
-        if nat and model.pos_phi_free.shape[-1] == n_gen:
-            pos_group["gauge"] = True
-            pos_group["weight_decay"] = 0.0
+        pos_group.update(phi_group_metadata)
         groups.append(pos_group)
     if getattr(pb, "s_phi_embed", None) is not None:             # s_frame_mode='phi_tilde'
         model_frame_params = [pb.s_phi_embed]
@@ -273,9 +264,7 @@ def build_optimizer(
             "weight_decay": cfg.phi_weight_decay,
             "role": "phi",
         }
-        if nat and all(parameter.shape[-1] == n_gen for parameter in model_frame_params):
-            model_frame_group["gauge"] = True
-            model_frame_group["weight_decay"] = 0.0
+        model_frame_group.update(phi_group_metadata)
         groups.append(model_frame_group)
     if getattr(pb, "s_mu_embed", None) is not None:             # model-channel s tables (lambda_gamma>0 or
         groups.append({"params": [pb.s_mu_embed],        "lr": cfg.m_p_mu_lr,    "role": "mu"})    # prior_source=model_channel):
@@ -330,7 +319,7 @@ def build_optimizer(
         # calibration (a prior, not capacity) -- the same exemption t5_bias/output_proj_bias/r
         # carry. role='mu' is the catch-all for learned non-variance/non-gauge tables; NO gauge
         # flag (the temperature touches no gauge transport), so the group rides as plain AdamW
-        # even under GaugeNaturalGradAdamW.
+        # even under GaugeManifoldAdamW.
         groups.append({"params": [model.log_kappa_beta],  "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
     if getattr(model, "log_kappa_gamma", None) is not None:     # learnable_kappa_gamma=True (model channel)
         groups.append({"params": [model.log_kappa_gamma], "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
@@ -339,7 +328,7 @@ def build_optimizer(
     # gamma/beta are normalization calibration, not capacity (decaying gamma toward 0 shrinks the
     # normalized signal; the same exemption t5_bias / log_kappa / output_proj_bias carry). role='mu'
     # is the catch-all for learned non-variance/non-gauge tables; NO gauge flag (the affine touches
-    # no gauge transport), so it rides as plain AdamW even under GaugeNaturalGradAdamW.
+    # no gauge transport), so it rides as plain AdamW even under GaugeManifoldAdamW.
     ln_affine = []
     for _nm in (getattr(model, "block_norm", None), getattr(model, "final_norm", None)):
         if isinstance(_nm, torch.nn.Module):
@@ -369,34 +358,35 @@ def build_optimizer(
             f"train. Add them to a param group."
         )
 
-    if nat or omega_direct:
+    if phi_update_policy.requires_manifold_optimizer or omega_direct:
         if omega_direct:
             import warnings
             warnings.warn(
                 "gauge_parameterization='omega_direct' updates omega_embed with stateless "
-                "retraction SGD: m_gauge_momentum and m_gauge_update_rule do not apply to the omega "
-                "group. They apply only to phi-coordinate gauge groups when "
-                "m_phi_natural_grad=True.",
+                "retraction SGD. The phi update policy applies only to stored phi factors and "
+                "does not alter omega element retraction state or math.",
                 UserWarning,
                 stacklevel=2,
             )
-        # Geometrically-correct gauge frame: natural-gradient + momentum on the gauge groups under
-        # cfg.phi_precond_mode (set it to 'pullback_per_block' for the exact exp-map metric -- killing
-        # is conformal, so under this manual natural-grad step (which AdamW never normalizes) it is a
-        # direction-preserving effective-LR rescale by the conformal factor, NOT a no-op; only the
-        # non-conformal pullback metric reshapes the step direction), AdamW on every other group.
-        # Under omega_direct the {"omega": True} group is stepped by the group-manifold retraction
-        # (cfg.omega_retract_mode) instead; both custom steps live in GaugeNaturalGradAdamW.
-        # fused is off: the custom gauge step bypasses the fused kernel, and the non-gauge groups are few.
-        from vfe3.gauge_optim import GaugeNaturalGradAdamW
-        return GaugeNaturalGradAdamW(
-            groups, model.group.generators, list(model.group.irrep_dims),
-            precond_mode=cfg.phi_precond_mode, gauge_momentum=cfg.m_gauge_momentum,
-            gauge_update_rule=cfg.m_gauge_update_rule,
+        # Stored phi factors and direct omega elements use one mixed optimizer; every other group
+        # remains standard AdamW. Fused execution stays off for this opt-in manifold route.
+        return GaugeManifoldAdamW(
+            groups,
+            model.group,
+            phi_group_trust_radius=cfg.m_phi_group_trust_radius,
+            phi_chart_max_norm=(
+                cfg.phi_mstep_max_matrix_norm
+                if cfg.phi_mstep_max_matrix_norm is not None
+                else 5.0
+            ),
+            phi_bch_residual_max=(
+                min(1e-6, cfg.bch_residual_max)
+                if cfg.bch_residual_max is not None
+                else 1e-6
+            ),
+            phi_precond_mode=cfg.phi_precond_mode,
             omega_retract_mode=cfg.omega_retract_mode,
-            skew_symmetric=model.group.skew_symmetric,
             omega_reorth_every=cfg.omega_reorth_every,
-            group_name=model.group.name,
             weight_decay=cfg.weight_decay,
         )
     # fused AdamW (one CUDA kernel for the whole M-step) when the priors live on CUDA; it is
@@ -728,7 +718,11 @@ def train_step(
     _cfg = model.cfg
     if did_step and _cfg.learnable_r and _cfg.r_update_mode == "barycenter":
         model.prior_bank.barycenter_r_()   # gated with the optimizer step: never M-step on poisoned grads
-    if did_step and _cfg.phi_mstep_max_matrix_norm is not None:
+    if (
+        did_step
+        and getattr(_cfg, "m_phi_update_mode", "adamw") == "adamw"
+        and _cfg.phi_mstep_max_matrix_norm is not None
+    ):
         collect_projection_stats = metrics_out is not None
         if collect_projection_stats:
             projection_device = model.group.generators.device
@@ -1734,7 +1728,7 @@ def train(
                         else float("nan")
                     )
             # Gauge M-step geometry diagnostics (D1/EXP-8): cos(nat,grad) and the pullback metric
-            # condition number, stashed by GaugeNaturalGradAdamW on this (log/eval) step. Written with a
+            # condition number, stashed by GaugeManifoldAdamW on this (log/eval) step. Written with a
             # FIXED key set per run (NaN default, like the _VAL_DIAG_KEYS block below) so the columns are
             # defined from the FIRST logged row regardless of active-rows timing -- log_metrics locks
             # fieldnames on row 0, so a key first appearing later would break the CSV. cos_nat_phi for any
