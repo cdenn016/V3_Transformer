@@ -10,7 +10,7 @@ from typing import Any
 
 
 CLAIM_STATES = frozenset({"CANDIDATE", "LLM_SUPPORTED", "EVIDENCE_VERIFIED", "REFUTED", "INCONCLUSIVE"})
-DOMAINS = frozenset({"code", "experiment", "mathematics", "research", "source", "general"})
+DOMAINS = frozenset({"code", "experiment", "mathematics", "evidence", "research", "source", "general"})
 SEVERITIES = frozenset({"low", "medium", "high", "critical"})
 EVIDENCE_KINDS = frozenset(
     {
@@ -43,6 +43,7 @@ _CLAIM_FIELDS = frozenset(
     }
 )
 _EVIDENCE_FIELDS = frozenset({"kind", "location", "artifact_revision"})
+_COUNTEREVIDENCE_FIELDS = frozenset({"kind", "location", "artifact_revision", "supports"})
 _CRITERION_FIELDS = frozenset({"name", "score"})
 _VERIFIER_FIELDS = frozenset({"role"})
 
@@ -70,6 +71,14 @@ def _closure_evidence(domain: str) -> frozenset[str]:
     if domain == "mathematics":
         return frozenset({"derivation", "formal_proof"})
     return frozenset({"primary_source", "reproduced_source"})
+
+
+def _refutation_evidence(domain: str) -> frozenset[str]:
+    if domain in {"code", "experiment"}:
+        return frozenset({"mechanical", "reproduced_output"})
+    if domain == "mathematics":
+        return frozenset({"derivation", "formal_proof"})
+    return frozenset({"primary_source", "reproduced_output"})
 
 
 def validate_ledger(data: dict[str, object]) -> list[str]:
@@ -173,9 +182,33 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                 elif _nonempty_string(revision) and evidence_revision != revision:
                     errors.append(f"{prefix}: stale evidence at evidence[{evidence_index}]")
 
+        counterevidence_kinds: set[str] = set()
         counterevidence = claim.get("counterevidence")
         if not isinstance(counterevidence, list):
             errors.append(f"{prefix}: counterevidence must be a list")
+        else:
+            for counterevidence_index, value in enumerate(counterevidence):
+                entry = _as_dict(value)
+                item_prefix = f"{prefix}: counterevidence[{counterevidence_index}]"
+                if entry is None:
+                    errors.append(f"{item_prefix} must be an object")
+                    continue
+                errors.extend(_field_errors(item_prefix, entry, _COUNTEREVIDENCE_FIELDS))
+                kind = entry.get("kind")
+                supports = entry.get("supports")
+                if kind not in EVIDENCE_KINDS:
+                    errors.append(f"{item_prefix}: kind must be one of {', '.join(sorted(EVIDENCE_KINDS))}")
+                elif supports is False:
+                    counterevidence_kinds.add(str(kind))
+                if not _nonempty_string(entry.get("location")):
+                    errors.append(f"{item_prefix}: location must be a nonempty string")
+                counterevidence_revision = entry.get("artifact_revision")
+                if not _nonempty_string(counterevidence_revision):
+                    errors.append(f"{item_prefix}: artifact_revision must be a nonempty string")
+                elif _nonempty_string(revision) and counterevidence_revision != revision:
+                    errors.append(f"{prefix}: stale counterevidence at counterevidence[{counterevidence_index}]")
+                if not isinstance(supports, bool):
+                    errors.append(f"{item_prefix}: supports must be a boolean")
 
         roles: set[str] = set()
         verifiers = claim.get("verifiers")
@@ -213,6 +246,11 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                 if not evidence_kinds.intersection(eligible):
                     required = " or ".join(sorted(eligible))
                     errors.append(f"{prefix}: EVIDENCE_VERIFIED {domain} claims require {required} evidence")
+        if state == "REFUTED" and isinstance(domain, str) and domain in DOMAINS:
+            eligible = _refutation_evidence(domain)
+            if not counterevidence_kinds.intersection(eligible):
+                required = " or ".join(sorted(eligible))
+                errors.append(f"{prefix}: REFUTED {domain} claims require current {required} counterevidence with supports false")
         if severity in {"high", "critical"} and state in {"EVIDENCE_VERIFIED", "REFUTED"}:
             for required_role in ("verifier-skeptic", "verifier-adjudicator"):
                 if required_role not in roles:
@@ -262,8 +300,6 @@ def run_hook(payload: dict[str, object]) -> tuple[int, dict[str, object] | None]
         return _block("hook payload cwd must name an existing directory")
     marker = cwd / ".verification" / "active.json"
     if not marker.exists():
-        return 0, None
-    if payload.get("stop_hook_active") is False:
         return 0, None
     try:
         activation = json.loads(marker.read_text(encoding="utf-8"))

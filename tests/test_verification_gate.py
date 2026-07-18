@@ -151,7 +151,7 @@ def test_active_invalid_ledger_blocks(tmp_path: Path) -> None:
     activate(tmp_path, ledger)
 
     exit_code, response = run_hook(
-        {"cwd": str(tmp_path), "stop_hook_active": True, "last_assistant_message": ".verification/ledger.json"}
+        {"cwd": str(tmp_path), "stop_hook_active": False, "last_assistant_message": ".verification/ledger.json"}
     )
 
     assert exit_code == 0
@@ -164,7 +164,7 @@ def test_active_valid_ledger_requires_final_message_reference(tmp_path: Path) ->
     activate(tmp_path, valid_ledger())
 
     exit_code, response = run_hook(
-        {"cwd": str(tmp_path), "stop_hook_active": True, "last_assistant_message": "Implementation is complete."}
+        {"cwd": str(tmp_path), "stop_hook_active": False, "last_assistant_message": "Implementation is complete."}
     )
 
     assert exit_code == 0
@@ -178,7 +178,7 @@ def test_active_valid_referenced_ledger_passes_and_removes_only_marker(tmp_path:
     ledger_before = ledger_path.read_bytes()
 
     exit_code, response = run_hook(
-        {"cwd": str(tmp_path), "stop_hook_active": True, "last_assistant_message": "Ledger: .verification/ledger.json"}
+        {"cwd": str(tmp_path), "stop_hook_active": False, "last_assistant_message": "Ledger: .verification/ledger.json"}
     )
 
     assert exit_code == 0
@@ -200,3 +200,59 @@ def test_hook_rejects_ledger_path_traversal(tmp_path: Path) -> None:
     assert response is not None
     assert response["decision"] == "block"
     assert "traversal" in response["reason"]
+
+
+def refuted_code_ledger(counterevidence: list[dict[str, object]]) -> dict[str, object]:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["state"] = "REFUTED"
+    claim["evidence"] = []
+    claim["counterevidence"] = counterevidence
+    return ledger
+
+
+def test_refuted_code_claim_requires_counterevidence() -> None:
+    errors = validate_ledger(refuted_code_ledger([]))
+
+    assert any("CODE-001" in error and "REFUTED code claims require" in error for error in errors)
+
+
+def test_refuted_code_claim_rejects_llm_only_counterevidence() -> None:
+    errors = validate_ledger(
+        refuted_code_ledger(
+            [{"kind": "llm_judgment", "location": "agent-output.md", "artifact_revision": "abc123", "supports": False}]
+        )
+    )
+
+    assert any("CODE-001" in error and "REFUTED code claims require" in error for error in errors)
+
+
+def test_refuted_code_claim_rejects_stale_counterevidence() -> None:
+    errors = validate_ledger(
+        refuted_code_ledger(
+            [{"kind": "mechanical", "location": "tests/test_parser.py", "artifact_revision": "old-revision", "supports": False}]
+        )
+    )
+
+    assert any("CODE-001" in error and "stale counterevidence" in error for error in errors)
+
+
+def test_refuted_code_claim_rejects_wrong_polarity_counterevidence() -> None:
+    errors = validate_ledger(
+        refuted_code_ledger(
+            [{"kind": "mechanical", "location": "tests/test_parser.py", "artifact_revision": "abc123", "supports": True}]
+        )
+    )
+
+    assert any("CODE-001" in error and "REFUTED code claims require" in error for error in errors)
+
+
+def test_refuted_code_claim_accepts_current_mechanical_counterevidence() -> None:
+    errors = validate_ledger(
+        refuted_code_ledger(
+            [{"kind": "mechanical", "location": "tests/test_parser.py", "artifact_revision": "abc123", "supports": False}]
+        )
+    )
+
+    assert errors == []
