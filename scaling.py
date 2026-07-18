@@ -36,9 +36,9 @@ import hashlib
 import json
 import logging
 import math
-import shutil
 import stat
 import time
+import warnings
 from collections.abc import Mapping
 from dataclasses import asdict
 from dataclasses import fields as _dc_fields
@@ -47,7 +47,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from vfe3.config import VFE3Config
+from vfe3.config import VFE3Config, migrate_serialized_config
 from vfe3.data.datasets import (
     _tokenizer_tag,
     cache_source_identity,
@@ -94,8 +94,8 @@ CONFIG: Dict[str, Any] = {
     # parameter routes for an equal-token budget (so tokens_seen is constant and the exponent is clean).
     "max_steps":  None,
 
-    # Skip cells whose run dir already holds a summary.json built from the SAME config (idempotent
-    # reruns / crash recovery), exactly like ablation.py's resume.
+    # Protect verified completed cells with the same effective config and corpus. Prior-code records
+    # are skipped with explicit provenance labeling; partial cells are restarted.
     "resume":     True,
 
     "output_dir": "vfe3_scaling_results",
@@ -885,7 +885,7 @@ def _cached_scaling_metrics(summary: Mapping[str, object]) -> Dict[str, object]:
     return {key: scaling_point[key] for key in required}
 
 
-def _cell_is_current(
+def _cell_resume_status(
     run_dir: Path,
     cfg:     VFE3Config,
     dataset: str,
@@ -895,61 +895,76 @@ def _cell_is_current(
     *,
     source_identities: Optional[Mapping[str, object]] = None,
     code_identity:     Optional[Mapping[str, object]] = None,
-) -> bool:
-    r"""True iff the run dir already holds a summary.json AND its config.json equals the config we would
-    build now (guards resume against baseline drift / a changed dataset). ``max_tokens`` is a loader
-    seam, not a VFE3Config field, so it never lands in config.json; it is compared against the
-    persisted scaling_cell.json (a missing/old cell meta or key fails closed -> re-run). The summary
-    must carry the exact digest of that reuse contract, including its config, data, and code identity,
-    plus a complete, internally consistent metric payload. ``main`` supplies one invocation-owned
-    source snapshot so this check does not re-hash the corpus for every cached cell; standalone API
-    calls without a supplied snapshot retain the fresh per-call check. A persisted failure marker
-    invalidates reuse. The saved code identity must match the current HEAD; dirty reuse additionally
-    requires equal nonempty dirty-tree fingerprints."""
+) -> Optional[str]:
+    r"""Classify one verified completed cell for restart handling.
+
+    ``current`` means the effective config, corpus, and code identity all match this invocation.
+    ``recorded_prior_code`` means the internally bound result has the same effective config and corpus
+    but was produced under another code identity; restart protects and skips that completed record,
+    while downstream analysis retains the saved provenance and can reject mixed-code aggregation.
+    ``None`` means the cell is missing, partial, corrupt, or belongs to another effective experiment.
+    Historical configs are compared only after the repository's strict serialized-config migration,
+    so retired inert fields do not force a completed cell to be overwritten."""
     if (not (run_dir / "summary.json").exists()
             or not (run_dir / "config.json").exists()
             or (run_dir / "scaling_failure.json").exists()):
-        return False
+        return None
     try:
         saved = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
         summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
         built = json.loads(json.dumps(asdict(cfg), default=str))
     except Exception:
-        return False
+        return None
     if (not isinstance(saved, Mapping) or not isinstance(summary, Mapping)
-            or saved.get("dataset") != dataset or saved.get("config") != built):
-        return False
+            or saved.get("dataset") != dataset
+            or not isinstance(saved.get("config"), Mapping)):
+        return None
+    raw_saved_config = dict(saved["config"])
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            migrated = migrate_serialized_config(
+                raw_saved_config,
+                source=str(run_dir / "config.json"),
+                strict_unknown=True,
+            )
+        saved_effective = json.loads(json.dumps(asdict(migrated.config), default=str))
+    except (TypeError, ValueError):
+        return None
+    if saved_effective != built:
+        return None
     try:
         cellmeta = json.loads((run_dir / "scaling_cell.json").read_text(encoding="utf-8"))
         provenance = json.loads((run_dir / "provenance.json").read_text(encoding="utf-8"))
         if not isinstance(cellmeta, Mapping) or not isinstance(provenance, Mapping):
-            return False
+            return None
     except Exception:
-        return False
+        return None
     if cellmeta.get("schema_version") != _SCALING_CELL_SCHEMA_VERSION:
-        return False
+        return None
     if cellmeta.get("dataset") != dataset:
-        return False
+        return None
     try:
-        built_sha256 = _canonical_json_sha256(built)
+        saved_config_sha256 = _canonical_json_sha256(raw_saved_config)
         contract_sha256 = _scaling_reuse_contract_sha256(cellmeta)
     except (TypeError, ValueError):
-        return False
+        return None
     saved_contract_sha256 = cellmeta.get(_SCALING_REUSE_DIGEST_FIELD)
     if (not isinstance(saved_contract_sha256, str)
             or len(saved_contract_sha256) != 64
             or saved_contract_sha256 != contract_sha256
             or summary.get(_SCALING_SUMMARY_DIGEST_FIELD) != saved_contract_sha256
-            or cellmeta.get("config_sha256") != built_sha256):
-        return False
+            or cellmeta.get("config_sha256") != saved_config_sha256):
+        return None
     if _scaling_result_status(_cached_scaling_metrics(summary)) != "complete":
-        return False
+        return None
     if cellmeta.get("max_tokens", None) != (int(max_tokens) if max_tokens is not None else None):
-        return False
+        return None
     saved_sources = cellmeta.get("data_sources")
     if not isinstance(saved_sources, Mapping):
-        return False
+        return None
     try:
+        recorded = _validated_scaling_code_identity(cellmeta.get("code_identity"))
         current_sources = (
             _data_source_identities(dataset)
             if source_identities is None
@@ -961,25 +976,34 @@ def _cell_is_current(
             else _validated_scaling_code_identity(code_identity)
         )
     except (FileNotFoundError, OSError, RuntimeError, TypeError, ValueError):
-        return False
+        return None
     if dict(saved_sources) != current_sources:
-        return False
-    if cellmeta.get("code_identity") != current:
-        return False
-    saved_sha = provenance.get("git_sha")
-    current_sha = current.get("git_sha")
-    if not isinstance(saved_sha, str) or not saved_sha or saved_sha != current_sha:
-        return False
-    saved_dirty = provenance.get("git_dirty")
-    current_dirty = current.get("git_dirty")
-    if saved_dirty is False and current_dirty is False:
-        return True
-    if saved_dirty is not True or current_dirty is not True:
-        return False
-    saved_fingerprint = provenance.get("git_dirty_fingerprint")
-    current_fingerprint = current.get("git_dirty_fingerprint")
-    return (isinstance(saved_fingerprint, str) and bool(saved_fingerprint)
-            and saved_fingerprint == current_fingerprint)
+        return None
+    if any(provenance.get(key) != value for key, value in recorded.items()):
+        return None
+    return "current" if recorded == current else "recorded_prior_code"
+
+
+def _cell_is_current(
+    run_dir: Path,
+    cfg:     VFE3Config,
+    dataset: str,
+
+    max_tokens: Optional[int] = None,
+
+    *,
+    source_identities: Optional[Mapping[str, object]] = None,
+    code_identity:     Optional[Mapping[str, object]] = None,
+) -> bool:
+    """Return whether a completed cell matches the current effective experiment and code."""
+    return _cell_resume_status(
+        run_dir,
+        cfg,
+        dataset,
+        max_tokens=max_tokens,
+        source_identities=source_identities,
+        code_identity=code_identity,
+    ) == "current"
 
 
 def _path_is_reparse_point(path: Path) -> bool:
@@ -1038,8 +1062,32 @@ def _trusted_scaling_run_dir(
     return current
 
 
+def _archive_scaling_design(design_path: Path) -> Optional[Path]:
+    """Move a prior invocation manifest into append-only history before creating another."""
+    if not design_path.exists():
+        if design_path.is_symlink() or _path_is_reparse_point(design_path):
+            raise ValueError("scaling design path may not be a symlink or reparse point")
+        return None
+    if (_path_is_reparse_point(design_path) or not design_path.is_file()
+            or design_path.resolve(strict=True).parent != design_path.parent.resolve(strict=True)):
+        raise ValueError("scaling design path must be a direct regular file")
+    archive_root = design_path.parent / ".invocations"
+    if archive_root.exists():
+        if _path_is_reparse_point(archive_root) or not archive_root.is_dir():
+            raise ValueError("scaling invocation archive must be a real directory")
+    else:
+        archive_root.mkdir()
+    for index in range(1, 1_000_000):
+        archived = archive_root / f"scaling_design__invocation_{index:04d}.json"
+        if archived.exists() or archived.is_symlink() or _path_is_reparse_point(archived):
+            continue
+        design_path.rename(archived)
+        return archived
+    raise RuntimeError("scaling invocation archive exhausted its numeric namespace")
+
+
 def _scaling_owner_payload(route: str, label: str, seed: int) -> Dict[str, object]:
-    """Return the exact identity that authorizes destructive scaling-cell cleanup."""
+    """Return the exact identity that authorizes scaling-cell attempt archival."""
     portable_path_component_key(route, field="scaling owner route")
     portable_path_component_key(label, field="scaling owner label")
     return {
@@ -1128,88 +1176,48 @@ def _authorize_scaling_cell(run_dir: Path, route: str, label: str, seed: int) ->
     return owner_path
 
 
-def _reset_stale_scaling_artifacts(
+def _archive_scaling_attempt(
     run_dir: Path,
 
     *,
     route: str,
     label: str,
     seed:  int,
-) -> None:
-    r"""Remove only runner-owned artifacts before recomputing one deterministic scaling cell."""
+) -> Path:
+    r"""Move one owned cell attempt intact into its append-only archive.
+
+    A fresh ``RunArtifacts`` instance must never target a populated directory because its writers
+    replace canonical filenames. Archiving the entire directory first preserves every runner-owned
+    artifact and every user-added file without interpreting or deleting either class.
+    """
     if not run_dir.exists():
-        return
+        raise FileNotFoundError(run_dir)
 
     if _path_is_reparse_point(run_dir):
         raise ValueError("scaling cell directory may not be a symlink or junction")
     if not run_dir.is_dir():
         raise ValueError("scaling cell path exists but is not a directory")
     _authorize_scaling_cell(run_dir, route, label, seed)
-    owned_directories = ("attention", "checkpoints", "figures")
-    owned_files = {
-        "best_model.pt",
-        "config.json",
-        "estep_depth_sensitivity.json",
-        "metrics.csv",
-        "metrics_per_layer.csv",
-        "phi_numerics.json",
-        "provenance.json",
-        "pure_path_report.json",
-        "research.json",
-        "scaling_cell.json",
-        "scaling_failure.json",
-        "scaling_result.json",
-        "summary.json",
-        "test_results.json",
-        "validation_results.json",
-    }
-    owned_figures = {
-        "belief_condition.png",
-        "estep_convergence_trend.png",
-        "estep_depth_sensitivity.png",
-        "estep_grad_norm_decomposition.png",
-        "estep_quality.png",
-        "free_energy_codescent.png",
-        "free_energy_decomposition.png",
-        "gauge_trace_spread.png",
-        "geometry_health.png",
-        "grad_norm.png",
-        "grad_norm_decomposition.png",
-        "holonomy.png",
-        "kappa_beta_history.png",
-        "kappa_block_trajectory.png",
-        "kappa_gamma_history.png",
-        "loss_curve.png",
-        "model_channel_terms.png",
-        "optimizer_geometry.png",
-        "phi_numerics_reference.png",
-        "val_ppl.png",
-        "validation_sanity.png",
-    }
-    for name in owned_directories:
-        path = run_dir / name
-        if path.is_symlink():
-            path.unlink()
-        elif _path_is_reparse_point(path):
-            path.rmdir()
-        elif path.is_dir():
-            shutil.rmtree(path)
-        elif path.exists():
-            path.unlink()
-    for path in run_dir.iterdir():
-        if path.name not in owned_files and path.name not in owned_figures:
+    archive_root = run_dir.parent / ".attempts"
+    if archive_root.exists():
+        if _path_is_reparse_point(archive_root) or not archive_root.is_dir():
+            raise ValueError("scaling attempt archive must be a real directory")
+    else:
+        archive_root.mkdir()
+    for index in range(1, 1_000_000):
+        archived = archive_root / f"s{seed}__attempt_{index:04d}"
+        if archived.exists() or archived.is_symlink() or _path_is_reparse_point(archived):
             continue
-        if path.is_symlink():
-            path.unlink()
-        elif _path_is_reparse_point(path):
-            if path.is_dir():
-                path.rmdir()
-            else:
-                path.unlink()
-        elif path.is_file():
-            path.unlink()
-        else:
-            raise ValueError(f"runner-owned scaling file path has an unsafe type: {path}")
+        run_dir.rename(archived)
+        return archived
+    raise RuntimeError("scaling attempt archive exhausted its numeric namespace")
+
+
+def _scaling_cell_has_payload(run_dir: Path) -> bool:
+    """Return whether a cell contains anything beyond its ownership sentinel."""
+    return run_dir.is_dir() and any(
+        path.name != _SCALING_OWNER_FILENAME for path in run_dir.iterdir()
+    )
 
 
 def run_cell(
@@ -1242,36 +1250,54 @@ def run_cell(
     try:
         cfg = VFE3Config(**cfg_dict)
     except (ValueError, NotImplementedError, TypeError) as exc:
-        _reset_stale_scaling_artifacts(
+        preserve_existing = _scaling_cell_has_payload(run_dir)
+        logger.warning("  [config rejected] %s: %s", label, exc)
+        return {"label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
+                "error_kind": "config", "error": str(exc), "seed": seed,
+                "preserve_existing": preserve_existing,
+                "test_ce": None, "test_ppl": None, "test_bits_per_token": None,
+                "test_bpc": None, "n_params": None}
+
+    resume_status: Optional[str] = None
+    if CONFIG["resume"]:
+        if _cell_is_current(
+            run_dir, cfg, dataset, max_tokens=max_tokens,
+            source_identities=invocation_sources,
+            code_identity=invocation_code_identity,
+        ):
+            resume_status = "current"
+        else:
+            resume_status = _cell_resume_status(
+                run_dir, cfg, dataset, max_tokens=max_tokens,
+                source_identities=invocation_sources,
+                code_identity=invocation_code_identity,
+            )
+    if resume_status is not None:
+        summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+        metrics = _cached_scaling_metrics(summary)
+        marker = "CACHED" if resume_status == "current" else "RECORDED"
+        suffix = (
+            ""
+            if resume_status == "current"
+            else "  (complete prior-code result preserved; provenance retained)"
+        )
+        print(f"    [{marker}] {label} s{seed}  test_ce={metrics['test_ce']}  "
+              f"N={metrics['n_params']}{suffix}")
+        return {"label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
+                "error_kind": None, "seed": seed, "cached": True,
+                "cache_status": resume_status,
+                **metrics}
+
+    if _scaling_cell_has_payload(run_dir):
+        archived = _archive_scaling_attempt(
             run_dir,
             route=cell["route"],
             label=label,
             seed=seed,
         )
-        logger.warning("  [config rejected] %s: %s", label, exc)
-        return {"label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
-                "error_kind": "config", "error": str(exc), "seed": seed,
-                "test_ce": None, "test_ppl": None, "test_bits_per_token": None,
-                "test_bpc": None, "n_params": None}
-
-    if CONFIG["resume"] and _cell_is_current(
-            run_dir, cfg, dataset, max_tokens=max_tokens,
-            source_identities=invocation_sources,
-            code_identity=invocation_code_identity):
-        summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
-        metrics = _cached_scaling_metrics(summary)
-        print(f"    [CACHED] {label} s{seed}  test_ce={metrics['test_ce']}  "
-              f"N={metrics['n_params']}")
-        return {"label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
-                "error_kind": None, "seed": seed, "cached": True,
-                **metrics}
-
-    _reset_stale_scaling_artifacts(
-        run_dir,
-        route=cell["route"],
-        label=label,
-        seed=seed,
-    )
+        print(f"    [ARCHIVED] {label} s{seed} previous attempt preserved at {archived}")
+        run_dir.mkdir()
+        _authorize_scaling_cell(run_dir, cell["route"], label, seed)
 
     pred_n, n_gen = predict_n_params(cfg)
     seed_everything(cfg.seed, deterministic=cfg.deterministic)
@@ -1539,7 +1565,14 @@ def main() -> int:
 
     design = _scaling_design(route_names, seeds)
     design_path = output_dir / "scaling_design.json"
-    _write_json_atomic(design_path, design)
+    try:
+        archived_design = _archive_scaling_design(design_path)
+        if archived_design is not None:
+            print(f"  [ARCHIVED] previous scaling design preserved at {archived_design}")
+        _write_json_atomic(design_path, design)
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.error("scaling design publication refused to overwrite prior data: %s", exc)
+        return 1
     design_cells = {
         (cell["route"], cell["label"], int(cell["seed"])): cell
         for cell in design["cells"]
@@ -1580,33 +1613,33 @@ def main() -> int:
                     if published.get("error") is None:
                         published["error"] = (
                             "scaling result is incomplete, non-finite, non-positive, or inconsistent")
-                try:
-                    run_dir = _trusted_scaling_run_dir(
-                        output_dir, name, cell["label"], int(seed)
-                    )
-                    _write_json_atomic(run_dir / "scaling_result.json", published)
-                    if status != "complete":
-                        _write_json_atomic(run_dir / "scaling_failure.json", published)
+                persist_result = not res.get("cached") and not res.get("preserve_existing")
+                if persist_result:
+                    try:
+                        run_dir = _trusted_scaling_run_dir(
+                            output_dir, name, cell["label"], int(seed)
+                        )
+                        _write_json_atomic(run_dir / "scaling_result.json", published)
+                        if status != "complete":
+                            _write_json_atomic(run_dir / "scaling_failure.json", published)
+                            incomplete = True
+                    except (OSError, ValueError) as exc:
+                        published["status"] = "failed"
+                        published["error_kind"] = "path"
+                        published["error"] = str(exc)
+                        status = "failed"
                         incomplete = True
-                    else:
-                        try:
-                            (run_dir / "scaling_failure.json").unlink()
-                        except FileNotFoundError:
-                            pass
-                except (OSError, ValueError) as exc:
-                    published["status"] = "failed"
-                    published["error_kind"] = "path"
-                    published["error"] = str(exc)
-                    status = "failed"
+                        logger.error(
+                            "refusing per-cell publication outside the owned scaling tree: %s", exc
+                        )
+                elif status != "complete":
                     incomplete = True
-                    logger.error(
-                        "refusing per-cell publication outside the owned scaling tree: %s", exc
-                    )
                 manifest_cell = design_cells[(name, cell["label"], int(seed))]
                 manifest_cell.update({
                     "status": status,
                     "error_kind": published.get("error_kind"),
                     "error": published.get("error"),
+                    "cache_status": published.get("cache_status"),
                 })
                 design["status"] = "incomplete" if incomplete else "running"
                 _trusted_scaling_output_dir(output_dir)

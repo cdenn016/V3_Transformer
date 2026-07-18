@@ -329,6 +329,8 @@ def harvest(input_dir: Path) -> List[Dict[str, Any]]:
     held-out test numbers, the structural config, the cell's route/scale_knob, and provenance."""
     rows: List[Dict[str, Any]] = []
     for summ_path in sorted(input_dir.glob("**/summary.json")):
+        if ".attempts" in summ_path.parts:
+            continue
         run = summ_path.parent
         summ = _read_json(summ_path)
         sp = summ.get("scaling_point", {})

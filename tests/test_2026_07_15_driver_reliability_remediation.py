@@ -1245,12 +1245,13 @@ def test_scaling_completion_rejects_internally_inconsistent_metrics(field, value
     assert scaling._scaling_result_status(result) != "complete"
 
 
-def test_scaling_successful_rerun_removes_stale_failure_marker(tmp_path, monkeypatch):
+def test_scaling_rerun_refuses_unowned_failure_marker_without_deleting_it(tmp_path, monkeypatch):
     cell = {"label": "probe", "route": "probe_route", "scale_knob": "embed_dim", "overrides": {}}
     run_dir = tmp_path / "probe_route" / "probe" / "s6"
     run_dir.mkdir(parents=True)
     failure = run_dir / "scaling_failure.json"
     failure.write_text(json.dumps({"error": "old failure"}), encoding="utf-8")
+    original = failure.read_bytes()
     monkeypatch.setattr(scaling, "ROUTES", {"probe_route": [cell]})
     monkeypatch.setitem(scaling.CONFIG, "routes", ["probe_route"])
     monkeypatch.setitem(scaling.CONFIG, "seeds", [6])
@@ -1271,8 +1272,8 @@ def test_scaling_successful_rerun_removes_stale_failure_marker(tmp_path, monkeyp
         "cached": False,
     })
 
-    assert scaling.main() == 0
-    assert not failure.exists()
+    assert scaling.main() == 1
+    assert failure.read_bytes() == original
 
 
 def test_scaling_rejects_negative_seed_values():

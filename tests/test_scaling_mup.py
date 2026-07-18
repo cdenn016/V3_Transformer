@@ -41,7 +41,7 @@ def _complete_scaling_summary():
     return {**metrics, "scaling_point": dict(metrics)}
 
 
-def test_scaling_recompute_removes_owned_stale_artifacts_but_preserves_user_notes(tmp_path):
+def test_scaling_rerun_archives_owned_attempt_without_deleting_any_file(tmp_path):
     run_dir = tmp_path / "cell"
     (run_dir / "figures").mkdir(parents=True)
     (run_dir / scaling._SCALING_OWNER_FILENAME).write_text(
@@ -64,31 +64,44 @@ def test_scaling_recompute_removes_owned_stale_artifacts_but_preserves_user_note
     user_plot = run_dir / "user_plot.png"
     user_plot.write_bytes(b"preserve me too")
 
-    scaling._reset_stale_scaling_artifacts(
+    archived = scaling._archive_scaling_attempt(
         run_dir,
         route="grow_K",
         label="K20",
         seed=0,
     )
 
-    assert note.read_text(encoding="utf-8") == "preserve me"
-    assert user_plot.read_bytes() == b"preserve me too"
-    assert not (run_dir / "figures").exists()
-    assert not (run_dir / "checkpoints").exists()
-    assert not (run_dir / "attention").exists()
-    assert not (run_dir / "loss_curve.png").exists()
-    assert not (run_dir / "summary.json").exists()
-    assert not (run_dir / "best_model.pt").exists()
+    assert not run_dir.exists()
+    assert archived.name == "s0__attempt_0001"
+    assert (archived / "user_notes.txt").read_text(encoding="utf-8") == "preserve me"
+    assert (archived / "user_plot.png").read_bytes() == b"preserve me too"
+    assert (archived / "figures" / "old.png").read_bytes() == b"stale"
+    assert (archived / "checkpoints" / "step_1.pt").read_bytes() == b"stale"
+    assert (archived / "attention" / "old.png").read_bytes() == b"stale"
+    assert (archived / "loss_curve.png").read_bytes() == b"stale"
+    assert (archived / "summary.json").read_bytes() == b"stale"
+    assert (archived / "best_model.pt").read_bytes() == b"stale"
 
 
-def test_scaling_recompute_rejects_and_preserves_an_unowned_collision(tmp_path):
+def test_scaling_invocation_archives_previous_design_without_overwriting_it(tmp_path):
+    design_path = tmp_path / "scaling_design.json"
+    design_path.write_bytes(b"previous invocation manifest")
+
+    archived = scaling._archive_scaling_design(design_path)
+
+    assert not design_path.exists()
+    assert archived == tmp_path / ".invocations" / "scaling_design__invocation_0001.json"
+    assert archived.read_bytes() == b"previous invocation manifest"
+
+
+def test_scaling_archive_rejects_and_preserves_an_unowned_collision(tmp_path):
     run_dir = tmp_path / "cell"
     run_dir.mkdir()
     note = run_dir / "user_notes.txt"
     note.write_text("preserve me", encoding="utf-8")
 
     with pytest.raises(ValueError, match="ownership|promotable"):
-        scaling._reset_stale_scaling_artifacts(
+        scaling._archive_scaling_attempt(
             run_dir,
             route="grow_K",
             label="K20",
@@ -99,7 +112,7 @@ def test_scaling_recompute_rejects_and_preserves_an_unowned_collision(tmp_path):
     assert sorted(path.name for path in run_dir.iterdir()) == ["user_notes.txt"]
 
 
-def test_scaling_recompute_promotes_one_exact_legacy_cell_marker(tmp_path):
+def test_scaling_archive_promotes_and_preserves_one_exact_legacy_cell_marker(tmp_path):
     run_dir = tmp_path / "cell"
     run_dir.mkdir()
     (run_dir / "scaling_cell.json").write_text(
@@ -109,19 +122,22 @@ def test_scaling_recompute_promotes_one_exact_legacy_cell_marker(tmp_path):
     stale = run_dir / "summary.json"
     stale.write_text("{}", encoding="utf-8")
 
-    scaling._reset_stale_scaling_artifacts(
+    archived = scaling._archive_scaling_attempt(
         run_dir,
         route="grow_K",
         label="K20",
         seed=0,
     )
 
-    owner = json.loads(
-        (run_dir / scaling._SCALING_OWNER_FILENAME).read_text(encoding="utf-8")
-    )
+    owner = json.loads((
+        archived / scaling._SCALING_OWNER_FILENAME
+    ).read_text(encoding="utf-8"))
     assert owner == scaling._scaling_owner_payload("grow_K", "K20", 0)
-    assert not (run_dir / "scaling_cell.json").exists()
-    assert not stale.exists()
+    assert json.loads((archived / "scaling_cell.json").read_text(encoding="utf-8")) == {
+        "route": "grow_K", "label": "K20", "seed": 0,
+    }
+    assert (archived / "summary.json").read_text(encoding="utf-8") == "{}"
+    assert not run_dir.exists()
 
 
 def test_scaling_cell_path_rejects_reparse_ancestor_and_traversal(tmp_path, monkeypatch):
@@ -396,6 +412,136 @@ def test_cell_is_current_rejects_non_object_cell_metadata(tmp_path, malformed):
     assert scaling._cell_is_current(run_dir, cfg, ds, max_tokens=1000) is False
 
 
+def test_resume_preserves_complete_prior_code_cell_and_advances_to_next_seed(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    cell = {
+        "label": "K60",
+        "route": "grow_K",
+        "scale_knob": "embed_dim",
+        "overrides": {
+            "vocab_size": 64,
+            "embed_dim": 60,
+            "n_heads": 4,
+            "gauge_group": "block_glk",
+        },
+    }
+    dataset = "wikitext-103"
+    saved_code = {
+        "git_sha": "saved-head",
+        "git_dirty": True,
+        "git_dirty_fingerprint": "saved-dirty",
+    }
+    current_code = {
+        "git_sha": "current-head",
+        "git_dirty": False,
+        "git_dirty_fingerprint": None,
+    }
+    cfg = VFE3Config(**scaling._cell_cfg_dict(cell["overrides"], 6, 1))
+    saved_config = json.loads(json.dumps(asdict(cfg), default=str))
+    saved_config["policy_mode"] = "none"
+
+    run_dir = tmp_path / "grow_K" / "K60" / "s6"
+    run_dir.mkdir(parents=True)
+    cellmeta = {
+        "schema_version": 2,
+        "label": "K60",
+        "route": "grow_K",
+        "scale_knob": "embed_dim",
+        "overrides": dict(cell["overrides"]),
+        "predicted_n_params": 10,
+        "n_gen": 900,
+        "seed": 6,
+        "max_tokens": None,
+        "dataset": dataset,
+        "config_sha256": scaling._canonical_json_sha256(saved_config),
+        "code_identity": saved_code,
+        "data_sources": _SOURCE_IDENTITIES,
+    }
+    digest = scaling._canonical_json_sha256(cellmeta)
+    cellmeta["reuse_contract_sha256"] = digest
+    summary = _complete_scaling_summary()
+    summary["scaling_reuse_contract_sha256"] = digest
+    (run_dir / "summary.json").write_text(json.dumps(summary), encoding="utf-8")
+    (run_dir / "config.json").write_text(json.dumps({
+        "dataset": dataset,
+        "config": saved_config,
+    }), encoding="utf-8")
+    (run_dir / "scaling_cell.json").write_text(json.dumps(cellmeta), encoding="utf-8")
+    (run_dir / "provenance.json").write_text(json.dumps({
+        "seed": 6,
+        **saved_code,
+    }), encoding="utf-8")
+    recorded_result = run_dir / "scaling_result.json"
+    recorded_result.write_bytes(b"original recorded result")
+    (run_dir / scaling._SCALING_OWNER_FILENAME).write_text(json.dumps(
+        scaling._scaling_owner_payload("grow_K", "K60", 6)
+    ), encoding="utf-8")
+
+    monkeypatch.setitem(scaling.CONFIG, "routes", ["grow_K"])
+    monkeypatch.setitem(scaling.CONFIG, "seeds", [6, 64])
+    monkeypatch.setitem(scaling.CONFIG, "dataset", dataset)
+    monkeypatch.setitem(scaling.CONFIG, "max_tokens", None)
+    monkeypatch.setitem(scaling.CONFIG, "max_steps", 1)
+    monkeypatch.setitem(scaling.CONFIG, "output_dir", str(tmp_path))
+    monkeypatch.setitem(scaling.CONFIG, "device", "cpu")
+    monkeypatch.setitem(scaling.CONFIG, "resume", True)
+    monkeypatch.setitem(scaling.ROUTES, "grow_K", [cell])
+    monkeypatch.setattr(scaling, "_current_code_identity", lambda: dict(current_code))
+    monkeypatch.setattr(
+        scaling,
+        "_data_source_identities",
+        lambda dataset: {split: dict(value) for split, value in _SOURCE_IDENTITIES.items()},
+    )
+    monkeypatch.setattr(scaling, "_cleanup", lambda: None)
+    monkeypatch.setattr(
+        scaling,
+        "_archive_scaling_attempt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("completed scaling cell was selected for recomputation")
+        ),
+    )
+
+    real_run_cell = scaling.run_cell
+    observed = []
+    launched = []
+
+    def resume_probe(selected_cell, selected_dir, seed, **kwargs):
+        if seed == 6:
+            result = real_run_cell(selected_cell, selected_dir, seed, **kwargs)
+            observed.append(result)
+            return result
+        launched.append(seed)
+        return {
+            "label": "K60",
+            "route": "grow_K",
+            "scale_knob": "embed_dim",
+            "error_kind": None,
+            "seed": seed,
+            "cached": False,
+            "test_ce": 2.0,
+            "test_ppl": math.exp(2.0),
+            "test_bits_per_token": 2.0 / math.log(2.0),
+            "test_bpc": None,
+            "n_params": 10,
+        }
+
+    monkeypatch.setattr(scaling, "run_cell", resume_probe)
+
+    assert scaling.main() == 0
+    assert launched == [64]
+    assert observed[0]["cached"] is True
+    assert observed[0]["cache_status"] == "recorded_prior_code"
+    design = json.loads((tmp_path / "scaling_design.json").read_text(encoding="utf-8"))
+    seed6 = next(entry for entry in design["cells"] if entry["seed"] == 6)
+    assert seed6["status"] == "complete"
+    assert seed6["cache_status"] == "recorded_prior_code"
+    assert recorded_result.read_bytes() == b"original recorded result"
+    assert "[RECORDED] K60 s6" in capsys.readouterr().out
+
+
 # --------------------------------------------------------------------------- PB-07: end-to-end
 # registered scaling figures (capacity_scaling.png / pareto_frontier.png) driven by scaling_analysis
 
@@ -490,6 +636,28 @@ def _write_val_run(root, *, route, scale_knob, label, seed, embed_dim, n_heads, 
         "val_data_sha256": "val-a", "test_data_sha256": "test-a", "data_sha256": "test-a",
     }), encoding="utf-8")
     _record_complete_scaling_cell(root, route, label, seed, scale_knob)
+
+
+def test_scaling_analysis_ignores_preserved_attempt_archives(tmp_path):
+    _write_val_run(
+        tmp_path,
+        route="grow_K",
+        scale_knob="embed_dim",
+        label="K20",
+        seed=6,
+        embed_dim=20,
+        n_heads=4,
+        n_layers=1,
+        n_params=1000,
+        best_val_ppl=20.0,
+        wall_time_s=10.0,
+    )
+    run_dir = tmp_path / "grow_K" / "K20" / "s6"
+    archive_root = run_dir.parent / ".attempts"
+    archive_root.mkdir()
+    run_dir.rename(archive_root / "s6__attempt_0001")
+
+    assert scaling_analysis.harvest(tmp_path) == []
 
 
 def test_scaling_analysis_emits_capacity_scaling_and_pareto_frontier_pngs(tmp_path, monkeypatch):
