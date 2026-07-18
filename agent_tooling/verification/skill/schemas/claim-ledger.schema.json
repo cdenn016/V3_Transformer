@@ -14,7 +14,7 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "domain", "statement", "severity", "state", "artifact_revision", "criteria", "escalation_triggers", "views", "evidence", "counterevidence", "verifiers", "open_obligations", "evidence_invalidated"],
+        "required": ["id", "domain", "statement", "severity", "state", "artifact_revision", "criteria", "escalation_triggers", "escalation_target", "views", "evidence", "counterevidence", "verifiers", "open_obligations", "evidence_invalidated"],
         "properties": {
           "id": {"type": "string", "minLength": 1},
           "domain": {"enum": ["code", "experiment", "mathematics", "evidence", "research", "source", "general"]},
@@ -24,6 +24,7 @@
           "artifact_revision": {"type": "string", "minLength": 1},
           "criteria": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["name", "score"], "properties": {"name": {"type": "string", "minLength": 1}, "score": {"type": "number", "minimum": 0, "maximum": 20}}}},
           "escalation_triggers": {"type": "array", "uniqueItems": true, "items": {"enum": ["small_margin", "high_dispersion", "criterion_disagreement", "high_severity"]}},
+          "escalation_target": {"enum": [2, 4, 8]},
           "views": {
             "type": "object",
             "additionalProperties": false,

@@ -19,6 +19,7 @@ def valid_code_claim() -> dict[str, object]:
         "artifact_revision": "abc123",
         "criteria": [{"name": "reachability", "score": 20}],
         "escalation_triggers": [],
+        "escalation_target": 2,
         "views": {
             "calibration_kind": "independent_0_20",
             "unresolved_disagreement": False,
@@ -268,6 +269,8 @@ def test_high_claim_requires_at_least_four_unique_views() -> None:
     claim = ledger["claims"][0]
     assert isinstance(claim, dict)
     claim["severity"] = "high"
+    claim["escalation_triggers"] = ["high_severity"]
+    claim["escalation_target"] = 4
     claim["verifiers"] = [{"role": "verifier-code"}, {"role": "verifier-skeptic"}, {"role": "verifier-adjudicator"}]
 
     errors = validate_ledger(ledger)
@@ -280,6 +283,8 @@ def test_high_claim_accepts_four_unique_views_with_challenge_roles() -> None:
     claim = ledger["claims"][0]
     assert isinstance(claim, dict)
     claim["severity"] = "high"
+    claim["escalation_triggers"] = ["high_severity"]
+    claim["escalation_target"] = 4
     claim["verifiers"] = [{"role": "verifier-code"}, {"role": "verifier-skeptic"}, {"role": "verifier-adjudicator"}]
     views = claim["views"]
     assert isinstance(views, dict)
@@ -405,6 +410,20 @@ def test_pairwise_matches_reject_unknown_or_identical_candidate_ids() -> None:
     assert any("CODE-001" in error and "distinct known candidate IDs" in error for error in validate_ledger(ledger))
 
 
+def test_pairwise_comparisons_require_the_complete_ordered_grid() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    views = claim["views"]
+    assert isinstance(views, dict)
+    comparison = views["comparison"]
+    assert isinstance(comparison, dict)
+    comparison["candidate_count"] = 3
+    comparison["candidate_ids"] = ["A", "B", "C"]
+
+    assert any("CODE-001" in error and "complete ordered pair grid" in error for error in validate_ledger(ledger))
+
+
 def test_pivot_tournament_requires_every_pivot_for_every_nonpivot_in_both_orientations() -> None:
     ledger = valid_ledger()
     claim = ledger["claims"][0]
@@ -445,11 +464,12 @@ def test_escalation_triggers_require_four_views_for_low_severity_claims() -> Non
     claim = ledger["claims"][0]
     assert isinstance(claim, dict)
     claim["escalation_triggers"] = ["small_margin"]
+    claim["escalation_target"] = 4
 
     assert any("CODE-001" in error and "four unique views" in error for error in validate_ledger(ledger))
 
 
-def test_unresolved_low_severity_disagreement_requires_four_views() -> None:
+def test_unresolved_low_severity_disagreement_requires_the_eight_view_stage() -> None:
     ledger = valid_ledger()
     claim = ledger["claims"][0]
     assert isinstance(claim, dict)
@@ -459,7 +479,7 @@ def test_unresolved_low_severity_disagreement_requires_four_views() -> None:
     assert isinstance(views, dict)
     views["unresolved_disagreement"] = True
 
-    assert any("CODE-001" in error and "four unique views" in error for error in validate_ledger(ledger))
+    assert any("CODE-001" in error and "escalation_target 8" in error for error in validate_ledger(ledger))
 
 
 def test_four_views_satisfy_escalation_trigger_requirement() -> None:
@@ -467,6 +487,7 @@ def test_four_views_satisfy_escalation_trigger_requirement() -> None:
     claim = ledger["claims"][0]
     assert isinstance(claim, dict)
     claim["escalation_triggers"] = ["criterion_disagreement"]
+    claim["escalation_target"] = 4
     views = claim["views"]
     assert isinstance(views, dict)
     scores = views["scores"]
@@ -477,6 +498,58 @@ def test_four_views_satisfy_escalation_trigger_requirement() -> None:
     ])
 
     assert validate_ledger(ledger) == []
+
+
+def test_escalation_target_must_equal_actual_views_and_follow_protocol() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["escalation_target"] = 4
+
+    errors = validate_ledger(ledger)
+
+    assert any("CODE-001" in error and "must equal escalation_target" in error for error in errors)
+    assert any("CODE-001" in error and "requires escalation_target 2" in error for error in errors)
+
+
+def test_high_severity_requires_high_severity_trigger_and_target_four() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["severity"] = "high"
+    claim["escalation_target"] = 4
+    claim["verifiers"] = [{"role": "verifier-code"}, {"role": "verifier-skeptic"}, {"role": "verifier-adjudicator"}]
+    views = claim["views"]
+    assert isinstance(views, dict)
+    scores = views["scores"]
+    assert isinstance(scores, list)
+    scores.extend([
+        {"view_id": "code-c", "criteria": [{"name": "reachability", "score": 20}]},
+        {"view_id": "code-d", "criteria": [{"name": "reachability", "score": 20}]},
+    ])
+
+    assert any("CODE-001" in error and "high_severity" in error for error in validate_ledger(ledger))
+
+
+def test_unresolved_disagreement_requires_criterion_trigger_and_target_eight() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["state"] = "INCONCLUSIVE"
+    claim["open_obligations"] = ["Resolve disagreement."]
+    claim["escalation_target"] = 4
+    claim["escalation_triggers"] = ["criterion_disagreement"]
+    views = claim["views"]
+    assert isinstance(views, dict)
+    views["unresolved_disagreement"] = True
+    scores = views["scores"]
+    assert isinstance(scores, list)
+    scores.extend([
+        {"view_id": "code-c", "criteria": [{"name": "reachability", "score": 20}]},
+        {"view_id": "code-d", "criteria": [{"name": "reachability", "score": 20}]},
+    ])
+
+    assert any("CODE-001" in error and "requires escalation_target 8" in error for error in validate_ledger(ledger))
 
 
 def test_errors_are_reported_in_claim_id_order() -> None:

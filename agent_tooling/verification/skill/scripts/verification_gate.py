@@ -40,6 +40,7 @@ _CLAIM_FIELDS = frozenset(
         "artifact_revision",
         "criteria",
         "escalation_triggers",
+        "escalation_target",
         "views",
         "evidence",
         "counterevidence",
@@ -58,6 +59,7 @@ _VIEW_SCORE_FIELDS = frozenset({"view_id", "criteria"})
 _MATCH_FIELDS = frozenset({"left", "right"})
 
 GATE_COMMAND_TOKEN = "{{VERIFICATION_GATE_COMMAND}}"
+GATE_SHELL_TOKEN = "{{VERIFICATION_GATE_SHELL}}"
 
 
 def _as_dict(value: object) -> dict[str, object] | None:
@@ -88,18 +90,20 @@ def render_skill_markdown(skill_root: Path, shell: str = "powershell") -> str:
     template_path = root / "SKILL.md"
     gate_path = root / "scripts" / "verification_gate.py"
     template = template_path.read_text(encoding="utf-8")
-    if GATE_COMMAND_TOKEN not in template:
-        raise ValueError("skill template has no verification gate command token")
+    if GATE_COMMAND_TOKEN not in template or GATE_SHELL_TOKEN not in template:
+        raise ValueError("skill template has unresolved verification render tokens")
     if not gate_path.is_file():
         raise FileNotFoundError(gate_path)
     python_path = Path(sys.executable).resolve()
     if shell == "powershell":
         command = f'& "{python_path}" "{gate_path}"'
+        shell_label = "powershell"
     elif shell == "posix":
         command = f"{shlex.quote(_posix_path(python_path))} {shlex.quote(_posix_path(gate_path))}"
+        shell_label = "bash"
     else:
         raise ValueError("shell must be powershell or posix")
-    return template.replace(GATE_COMMAND_TOKEN, command)
+    return template.replace(GATE_COMMAND_TOKEN, command).replace(GATE_SHELL_TOKEN, shell_label)
 
 
 def _field_errors(prefix: str, value: dict[str, object], fields: frozenset[str]) -> list[str]:
@@ -136,7 +140,7 @@ def _validate_views(
     value:               object,
     aggregate_criteria:  dict[str, float],
     severity:            object,
-    escalation_required: bool,
+    escalation_target:   object,
 ) -> tuple[list[str], bool]:
     """Validate auditable independent views and their criterion aggregation."""
 
@@ -225,10 +229,9 @@ def _validate_views(
         if method == "pairwise":
             if not valid_matches:
                 errors.append(f"{prefix}: pairwise comparison requires at least one explicit match")
-            for left, right in valid_matches:
-                if (right, left) not in valid_matches:
-                    errors.append(f"{prefix}: each pairwise comparison requires both ordered orientations")
-                    break
+            expected_matches = {(left, right) for left in candidate_set for right in candidate_set if left != right}
+            if valid_matches != expected_matches:
+                errors.append(f"{prefix}: pairwise comparison requires the complete ordered pair grid with both ordered orientations")
         if method == "pivot_tournament":
             if not pivot_set or not pivot_set < candidate_set:
                 errors.append(f"{prefix}: pivot_tournament requires pivot_ids as a nonempty proper subset of candidate_ids")
@@ -291,8 +294,9 @@ def _validate_views(
             per_view_criteria.append(current)
     if len(view_ids) != len(set(view_ids)):
         errors.append(f"{prefix}: views must contain unique view IDs")
-    if (severity in {"high", "critical"} or unresolved is True or escalation_required) and len(set(view_ids)) < 4:
-        errors.append(f"{prefix}: escalation, unresolved disagreement, high, and critical claims require at least four unique views")
+    if escalation_target in {2, 4, 8} and len(set(view_ids)) != escalation_target:
+        target_word = {2: "two", 4: "four", 8: "eight"}[escalation_target]
+        errors.append(f"{prefix}: requires {target_word} unique views; actual count must equal escalation_target {escalation_target}")
     if not aggregate_criteria:
         errors.append(f"{prefix}: criteria must contain at least one aggregate criterion")
     for name, aggregate_score in aggregate_criteria.items():
@@ -366,7 +370,7 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
         if severity not in SEVERITIES:
             errors.append(f"{prefix}: severity must be one of {', '.join(sorted(SEVERITIES))}")
         escalation_triggers = claim.get("escalation_triggers")
-        escalation_required = False
+        trigger_set: set[str] = set()
         if not isinstance(escalation_triggers, list):
             errors.append(f"{prefix}: escalation_triggers must be a list")
         elif any(trigger not in ESCALATION_TRIGGERS for trigger in escalation_triggers):
@@ -374,7 +378,10 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
         elif len(set(escalation_triggers)) != len(escalation_triggers):
             errors.append(f"{prefix}: escalation_triggers must be unique")
         else:
-            escalation_required = bool(escalation_triggers)
+            trigger_set = {str(trigger) for trigger in escalation_triggers}
+        escalation_target = claim.get("escalation_target")
+        if isinstance(escalation_target, bool) or escalation_target not in {2, 4, 8}:
+            errors.append(f"{prefix}: escalation_target must be 2, 4, or 8")
         state = claim.get("state")
         if state not in CLAIM_STATES:
             errors.append(f"{prefix}: state must be one of {', '.join(sorted(CLAIM_STATES))}")
@@ -415,9 +422,20 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
             claim.get("views"),
             aggregate_criteria,
             severity,
-            escalation_required,
+            escalation_target,
         )
         errors.extend(view_errors)
+        if severity in {"high", "critical"} and "high_severity" not in trigger_set:
+            errors.append(f"{prefix}: high and critical severity require high_severity in escalation_triggers")
+        if unresolved_disagreement and "criterion_disagreement" not in trigger_set:
+            errors.append(f"{prefix}: unresolved disagreement requires criterion_disagreement in escalation_triggers")
+        escalation_required = bool(trigger_set) or severity in {"high", "critical"} or unresolved_disagreement
+        if not escalation_required and escalation_target != 2:
+            errors.append(f"{prefix}: no escalation requirement requires escalation_target 2")
+        elif unresolved_disagreement and escalation_target != 8:
+            errors.append(f"{prefix}: unresolved disagreement after a four-view pass requires escalation_target 8")
+        elif escalation_required and escalation_target not in {4, 8}:
+            errors.append(f"{prefix}: escalation requires escalation_target 4 or 8")
 
         evidence_kinds: set[str] = set()
         evidence = claim.get("evidence")
