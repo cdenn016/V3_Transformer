@@ -40,10 +40,18 @@ class FactoredTransport:
     with the exactly-zero off-block terms dropped, equal to fp32 reassociation.
     """
 
-    exp_phi:       torch.Tensor           # (..., N, K, K) exp(phi_i . G)
-    exp_neg_phi:   torch.Tensor           # (..., N, K, K) exp(-phi_j . G)
-    irrep_dims:    List[int]              # equal block sizes; sum == K, len > 1
-    mean_per_head: bool = False           # transport_mean contracts per gauge block (fp32 reassociation only)
+    exp_phi:                 torch.Tensor  # (..., N, K, K) exp(phi_i . G)
+    exp_neg_phi:             torch.Tensor  # (..., N, K, K) exp(-phi_j . G)
+    irrep_dims:              List[int]     # equal block sizes; sum == K, len > 1
+    mean_per_head:           bool = False  # transport_mean contracts per gauge block
+    same_frame_flat_cocycle: bool = False  # one vertex table supplies U_i and true inverse U_j^-1
+
+    def __post_init__(self) -> None:
+        if type(self.same_frame_flat_cocycle) is not bool:
+            raise ValueError(
+                "same_frame_flat_cocycle must be a bool, got "
+                f"{type(self.same_frame_flat_cocycle).__name__}: "
+                f"{self.same_frame_flat_cocycle!r}")
 
     def to_dense_omega(self) -> torch.Tensor:
         r"""Rebuild the dense Omega_ij = exp(phi_i) exp(-phi_j) (..., N, N, K, K).
@@ -121,10 +129,11 @@ class CompactFactoredTransport:
     compatibility boundary for legacy consumers that require a dense pairwise operator.
     """
 
-    exp_blocks:    torch.Tensor           # (..., N, H, d, d) stored U_i blocks
-    inv_blocks:    torch.Tensor           # (..., N, H, d, d) true U_j^{-1} blocks
-    K:             int
-    mean_per_head: bool = False
+    exp_blocks:              torch.Tensor  # (..., N, H, d, d) stored U_i blocks
+    inv_blocks:              torch.Tensor  # (..., N, H, d, d) true U_j^{-1} blocks
+    K:                       int
+    mean_per_head:           bool = False
+    same_frame_flat_cocycle: bool = False
 
     def __post_init__(self) -> None:
         compatible = (
@@ -148,6 +157,11 @@ class CompactFactoredTransport:
             raise ValueError(
                 "mean_per_head must be a bool, got "
                 f"{type(self.mean_per_head).__name__}: {self.mean_per_head!r}")
+        if type(self.same_frame_flat_cocycle) is not bool:
+            raise ValueError(
+                "same_frame_flat_cocycle must be a bool, got "
+                f"{type(self.same_frame_flat_cocycle).__name__}: "
+                f"{self.same_frame_flat_cocycle!r}")
 
     @property
     def n_blocks(self) -> int:
@@ -183,6 +197,7 @@ class CompactFactoredTransport:
             self.inv_blocks.unsqueeze(normalized),
             self.K,
             mean_per_head=self.mean_per_head,
+            same_frame_flat_cocycle=self.same_frame_flat_cocycle,
         )
 
     def to_dense_omega(self) -> torch.Tensor:
@@ -1472,12 +1487,14 @@ def build_transport_from_element(
         return CompactFactoredTransport(
             omega.expanded_blocks(), u_inv.expanded_blocks(), omega.K,
             mean_per_head=mean_per_head,
+            same_frame_flat_cocycle=True,
         )
     block_dims = group.irrep_dims
     if len(block_dims) > 1 and len(set(block_dims)) == 1:
         return FactoredTransport(
             exp_phi=omega, exp_neg_phi=u_inv, irrep_dims=list(block_dims),
             mean_per_head=mean_per_head,
+            same_frame_flat_cocycle=True,
         )
     Omega = torch.einsum("...ikl,...jlm->...ijkm", omega, u_inv)   # (B, N, N, K, K)
     return {"exp_phi": omega, "exp_neg_phi": u_inv, "Omega": Omega}
@@ -1587,11 +1604,12 @@ def build_factored_transport(
             eye_d = torch.eye(d, device=phi.device, dtype=phi.dtype)
             eye = eye_d.expand(*phi.shape[:-1], H, d, d).contiguous()
             return CompactFactoredTransport(
-                exp_blocks=eye, inv_blocks=eye, K=K, mean_per_head=mean_per_head)
+                exp_blocks=eye, inv_blocks=eye, K=K, mean_per_head=mean_per_head,
+                same_frame_flat_cocycle=True)
         eye_K = torch.eye(K, device=phi.device, dtype=phi.dtype)
         eye = eye_K.expand(*phi.shape[:-1], K, K).contiguous()
         return FactoredTransport(exp_phi=eye, exp_neg_phi=eye, irrep_dims=list(group.irrep_dims),
-                                 mean_per_head=mean_per_head)
+                                 mean_per_head=mean_per_head, same_frame_flat_cocycle=True)
     if gauge_mode != "learned":
         raise ValueError(f"gauge_mode must be 'learned' or 'trivial', got {gauge_mode!r}")
 
@@ -1629,7 +1647,7 @@ def build_factored_transport(
             inv_blocks = right_inv @ inv_blocks
         return CompactFactoredTransport(
             exp_blocks=exp_blocks, inv_blocks=inv_blocks, K=group.generators.shape[-1],
-            mean_per_head=mean_per_head)
+            mean_per_head=mean_per_head, same_frame_flat_cocycle=True)
 
     phi_matrix = torch.einsum("...na,aij->...nij", phi, group.generators)
     # exp_dim: same block-scale float64-island keying as compute_transport_operators (see the
@@ -1662,7 +1680,44 @@ def build_factored_transport(
         exp_phi = exp_phi @ right_exp
         exp_neg_phi = right_inv @ exp_neg_phi
     return FactoredTransport(exp_phi=exp_phi, exp_neg_phi=exp_neg_phi, irrep_dims=list(group.irrep_dims),
-                             mean_per_head=mean_per_head)
+                             mean_per_head=mean_per_head, same_frame_flat_cocycle=True)
+
+
+def _certifies_same_frame_flat_cocycle(
+    omega: 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport',
+) -> bool:
+    r"""Whether a transport certifies an analytically identity self map."""
+    if isinstance(omega, (CompactFactoredTransport, FactoredTransport)):
+        return omega.same_frame_flat_cocycle
+    if isinstance(omega, RopeTransport):
+        return _certifies_same_frame_flat_cocycle(omega.base)
+    return False
+
+
+def _restore_certified_self_links_(
+    output: torch.Tensor,  # (..., N, N, *event) already allocated transported output
+    source: torch.Tensor,  # (..., N, *event) source values
+    omega:  'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport',
+
+    *,
+    event_ndim: int,
+) -> torch.Tensor:
+    r"""Overwrite the diagonal view for a certified same-frame flat cocycle in place."""
+    if not _certifies_same_frame_flat_cocycle(omega):
+        return output
+    query_axis = -(event_ndim + 2)
+    key_axis = -(event_ndim + 1)
+    source_token_axis = -(event_ndim + 1)
+    if output.shape[query_axis] != output.shape[key_axis]:
+        return output
+    if source.shape[source_token_axis] != output.shape[key_axis]:
+        return output
+    diagonal = output.diagonal(offset=0, dim1=query_axis, dim2=key_axis)
+    diagonal = diagonal.movedim(-1, source_token_axis)
+    if diagonal.shape != source.shape:
+        return output
+    diagonal.copy_(source)
+    return output
 
 
 def transport_mean(
@@ -1693,16 +1748,20 @@ def transport_mean(
         # un-rotated base, post-rotate the result by R_i. R_j^T mu_j = sum_l R[j,l,k] mu[j,l].
         m = torch.einsum("...jlk,...jl->...jk", omega.rope, mu)        # (..., N, K)
         t = transport_mean(omega.base, m)                             # (..., N, N, K)
-        return torch.einsum("...ikl,...ijl->...ijk", omega.rope, t)   # post-rotate by R_i
+        out = torch.einsum("...ikl,...ijl->...ijk", omega.rope, t)    # post-rotate by R_i
+        return _restore_certified_self_links_(out, mu, omega, event_ndim=1)
     if isinstance(omega, DirectLinkTransport):
         return _direct_link_mean(omega, mu)
     if isinstance(omega, CompactFactoredTransport):
-        return _compact_factored_mean(omega, mu)
+        out = _compact_factored_mean(omega, mu)
+        return _restore_certified_self_links_(out, mu, omega, event_ndim=1)
     if isinstance(omega, FactoredTransport):
         if omega.mean_per_head:
-            return _factored_per_head_mean(omega, mu)
-        m = torch.einsum("...jlp,...jp->...jl", omega.exp_neg_phi, mu)  # (..., N, K): exp(-phi_j) @ mu_j
-        return torch.einsum("...ikl,...jl->...ijk", omega.exp_phi, m)   # (..., N, N, K): exp(phi_i) @ m_j
+            out = _factored_per_head_mean(omega, mu)
+        else:
+            m = torch.einsum("...jlp,...jp->...jl", omega.exp_neg_phi, mu)  # (..., N, K): exp(-phi_j) @ mu_j
+            out = torch.einsum("...ikl,...jl->...ijk", omega.exp_phi, m)    # (..., N, N, K): exp(phi_i) @ m_j
+        return _restore_certified_self_links_(out, mu, omega, event_ndim=1)
     return torch.einsum("...ijkl,...jl->...ijk", omega, mu)
 
 
@@ -1765,11 +1824,20 @@ def transport_covariance(
                 "...nhkl,...nhml->...nhkm", omega.base.inv_blocks, blocks)
             rotated = CompactFactoredTransport(
                 exp_blocks, inv_blocks, omega.base.K,
-                mean_per_head=omega.base.mean_per_head)
+                mean_per_head=omega.base.mean_per_head,
+                same_frame_flat_cocycle=omega.base.same_frame_flat_cocycle)
             return transport_covariance(rotated, sigma, diagonal_out=diagonal_out)
         # Other full-gauge bases use the established rotated dense operator.
-        return transport_covariance(_rope_dense_omega(omega.base, omega.rope), sigma,
-                                    diagonal_out=diagonal_out)
+        out = transport_covariance(_rope_dense_omega(omega.base, omega.rope), sigma,
+                                   diagonal_out=diagonal_out)
+        if isinstance(omega.base, FactoredTransport):
+            is_diag = (
+                sigma.dim() == omega.base.exp_phi.dim() - 1
+                if diagonal_out is None else diagonal_out
+            )
+            return _restore_certified_self_links_(
+                out, sigma, omega, event_ndim=(1 if is_diag else 2))
+        return out
     if isinstance(omega, DirectLinkTransport):
         if _direct_link_is_diagonal(omega, sigma, diagonal_out):
             return _direct_link_diagonal_covariance(omega, sigma)
@@ -1780,16 +1848,22 @@ def transport_covariance(
             if diagonal_out is None else diagonal_out
         )
         if is_diag:
-            return _compact_factored_diagonal_covariance(omega, sigma)
-        return _compact_factored_full_covariance(omega, sigma)
+            out = _compact_factored_diagonal_covariance(omega, sigma)
+        else:
+            out = _compact_factored_full_covariance(omega, sigma)
+        return _restore_certified_self_links_(
+            out, sigma, omega, event_ndim=(1 if is_diag else 2))
     if isinstance(omega, FactoredTransport):
         # Diagonal sigma is (..., N, K) -> same rank as exp_phi minus the trailing K axis; a full
         # sigma is (..., N, K, K) -> same rank as exp_phi (the dense-Omega rank-gap is +1 here
         # because the factored exps carry one fewer N axis than the dense (..., N, N, K, K)).
         is_diag = sigma.dim() == omega.exp_phi.dim() - 1 if diagonal_out is None else diagonal_out
-        if not is_diag:
-            return _factored_full_covariance(omega, sigma)
-        return _factored_diagonal_covariance(omega, sigma)
+        if is_diag:
+            out = _factored_diagonal_covariance(omega, sigma)
+        else:
+            out = _factored_full_covariance(omega, sigma)
+        return _restore_certified_self_links_(
+            out, sigma, omega, event_ndim=(1 if is_diag else 2))
     is_diag = sigma.dim() == omega.dim() - 2 if diagonal_out is None else diagonal_out
     if is_diag:
         return torch.einsum("...ijkl,...ijkl,...jl->...ijk", omega, omega, sigma)

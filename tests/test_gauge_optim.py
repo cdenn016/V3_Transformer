@@ -110,11 +110,11 @@ def test_default_adamw_one_step_is_byte_identical_to_golden():
         data = tensor.detach().cpu().contiguous().numpy().tobytes()
         return hashlib.sha256(data).hexdigest()
 
-    assert digest(model.prior_bank.mu_embed) == "1c61e2af1b2713576867864e9fc8ac936bffd96951df0f5a4ada5e1a3ad4282d"
-    assert digest(model.prior_bank.sigma_log_embed) == "454c595a8d5428bfc820ac4611feb5192768fc1c2e6edbed5769be00b52f02d6"
-    assert digest(model.prior_bank.phi_embed) == "c099e3098e481e6c6ef7cd98547cabe941dc28af445a7d571f3a9e1efe4358cd"
+    assert digest(model.prior_bank.mu_embed) == "75c40d1b09a080c392223ff5160794c886e371193b7ba79a18fcab05febfd288"
+    assert digest(model.prior_bank.sigma_log_embed) == "6f5f7fe389ec74bc1a27b0a162defce8b50aedc1ebbcd601bcfea12442c1cb33"
+    assert digest(model.prior_bank.phi_embed) == "0526f6ab4e6fc547285a40cdabb36444f16e3b6523d79c5e5766861fcc661adb"
     assert digest(model.prior_bank.decode_log_scale) == "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
-    assert digest(model.prior_bank.output_proj_weight) == "5701bb9affeb0d65c7f25d137badde82ec706b5e899dc0aecbb3e08fccd0bd39"
+    assert digest(model.prior_bank.output_proj_weight) == "a200e956283737dd6aaba9de0194aecf2d1613bdb76b71feb12f8c641fd0b708"
 
 
 def test_default_adamw_one_step_matches_recompute_dense_low_level_oracle(

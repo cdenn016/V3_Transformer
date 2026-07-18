@@ -93,9 +93,9 @@ def diagonal_kl_pair_stats(
 
     delta_tq = mu_t_f - mu_q_f.unsqueeze(-2)
 
-    sigma_q_reduce = sigma_q_safe
-    sigma_t_reduce = sigma_t_safe
-    delta_reduce = delta_tq
+    sigma_q_reduce = sigma_q_safe.double()
+    sigma_t_reduce = sigma_t_safe.double()
+    delta_reduce = delta_tq.double()
     trace_term = _reduce_coordinate_term(
         sigma_q_reduce.unsqueeze(-2) / sigma_t_reduce,
         irrep_dims=irrep_dims,

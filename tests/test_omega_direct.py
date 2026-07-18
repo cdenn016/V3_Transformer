@@ -88,6 +88,7 @@ def test_element_transport_block_glk_is_factored():
     U = torch.eye(4).expand(1, 3, 4, 4).contiguous()
     built = build_transport_from_element(U, grp)
     assert isinstance(built, FactoredTransport)
+    assert built.same_frame_flat_cocycle
     mu = torch.randn(1, 3, 4)
     mt = transport_mean(built, mu)                           # (1,3,3,4) via the factored fast path
     assert mt.shape == (1, 3, 3, 4)
@@ -142,6 +143,7 @@ def test_compact_element_transport_omega_direct_wires_mean_per_head():
 
     for built in (direct, forward, replay):
         assert isinstance(built, CompactFactoredTransport) and built.mean_per_head
+        assert built.same_frame_flat_cocycle
     dense = direct.to_dense_omega()
     expected = transport_mean(dense, mu)
     for built in (direct, forward, replay):
@@ -965,6 +967,31 @@ def test_compact_diagonal_covariance_d_greater_than_keys_never_builds_pairs(monk
     got = transport_covariance(compact, sigma)
     expected = transport_covariance(dense, sigma)
     assert torch.allclose(got, expected, atol=2e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("representation", ["dense_vertex", "compact"])
+def test_uncertified_arbitrary_factored_factors_do_not_overwrite_self_links(
+    representation: str,
+) -> None:
+    N, H, d, K = 3, 2, 2, 4
+    if representation == "compact":
+        exp_blocks = 2.0 * torch.eye(d).expand(N, H, d, d).clone()
+        inv_blocks = 3.0 * torch.eye(d).expand(N, H, d, d).clone()
+        factored = CompactFactoredTransport(exp_blocks, inv_blocks, K)
+    else:
+        exp_phi = 2.0 * torch.eye(K).expand(N, K, K).clone()
+        exp_neg_phi = 3.0 * torch.eye(K).expand(N, K, K).clone()
+        factored = FactoredTransport(exp_phi, exp_neg_phi, irrep_dims=[d] * H)
+    mu = torch.arange(N * K, dtype=torch.float32).reshape(N, K) + 1.0
+    sigma = torch.arange(N * K, dtype=torch.float32).reshape(N, K) + 0.5
+    self_links = torch.arange(N)
+
+    mean = transport_mean(factored, mu)
+    covariance = transport_covariance(factored, sigma, diagonal_out=True)
+
+    assert not factored.same_frame_flat_cocycle
+    assert torch.equal(mean[self_links, self_links], 6.0 * mu)
+    assert torch.equal(covariance[self_links, self_links], 36.0 * sigma)
 
 
 def test_compact_full_gauge_rope_covariance_matches_dense_oracle():

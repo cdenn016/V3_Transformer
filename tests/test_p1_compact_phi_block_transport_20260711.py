@@ -1,5 +1,6 @@
 """P1 compact phi block transport: routing, equivalence, and model wiring."""
 
+import dataclasses
 import importlib
 
 import pytest
@@ -18,9 +19,13 @@ from vfe3.geometry.retraction import retract_phi
 from vfe3.geometry.transport import (
     CompactFactoredTransport,
     FactoredTransport,
+    RopeTransport,
     transport_covariance,
     transport_mean,
+    transport_scale,
 )
+from vfe3.gradients import oracle as oracle_module
+from vfe3.gradients.pairwise_stats import diagonal_kl_pair_stats
 from vfe3.inference.e_step import build_belief_transport
 from vfe3.inference.e_step import phi_alignment_loss
 from vfe3.model.model import VFEModel
@@ -193,6 +198,188 @@ def test_compact_phi_block_transport_preserves_global_full_frame_clamp_and_dtype
     legacy_neg = _equal_diag_blocks(legacy.exp_neg_phi, 2, 2)
     assert torch.equal(compact.exp_blocks, legacy_pos)
     assert torch.equal(compact.inv_blocks, legacy_neg)
+
+
+@pytest.mark.parametrize("compact_enabled", [False, True], ids=("dense_vertex", "compact"))
+def test_certified_flat_cocycle_has_exact_self_links_and_off_diagonal_parity(
+    monkeypatch:      pytest.MonkeyPatch,
+    compact_enabled: bool,
+) -> None:
+    torch.manual_seed(41)
+    group = get_group("block_glk")(4, 2)
+    phi = (0.05 * torch.randn(1, 4, group.generators.shape[0])).requires_grad_()
+    mu = torch.randn(1, 4, 4, requires_grad=True)
+    sigma_diag = (torch.rand(1, 4, 4) + 0.5).requires_grad_()
+    scale = (torch.rand(1, 4, 4) + 0.5).requires_grad_()
+    raw = torch.randn(1, 4, 4, 4)
+    sigma_full = (raw @ raw.transpose(-1, -2) + 0.5 * torch.eye(4)).requires_grad_()
+    transport = build_belief_transport(
+        phi,
+        group,
+        transport_mode="flat",
+        transport_mean_per_head=True,
+        compact_phi_block_transport=compact_enabled,
+    )
+
+    expected_type = CompactFactoredTransport if compact_enabled else FactoredTransport
+    assert isinstance(transport, expected_type)
+    assert transport.same_frame_flat_cocycle
+    uncertified = dataclasses.replace(transport, same_frame_flat_cocycle=False)
+
+    def _dense_forbidden(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("certified self-link correction materialized a dense pair operator")
+
+    monkeypatch.setattr(expected_type, "to_dense_omega", _dense_forbidden)
+    mean_kernel_name = "_compact_factored_mean" if compact_enabled else "_factored_per_head_mean"
+    original_mean_kernel = getattr(transport_module, mean_kernel_name)
+    allocated_pointers: list[int] = []
+
+    def _capture_mean_output(*args: object, **kwargs: object) -> torch.Tensor:
+        output = original_mean_kernel(*args, **kwargs)
+        allocated_pointers.append(output.data_ptr())
+        return output
+
+    monkeypatch.setattr(transport_module, mean_kernel_name, _capture_mean_output)
+    mean = transport_mean(transport, mu)
+    assert mean.data_ptr() == allocated_pointers[0]
+    covariance_diag = transport_covariance(transport, sigma_diag, diagonal_out=True)
+    covariance_full = transport_covariance(transport, sigma_full, diagonal_out=False)
+    projected_scale = transport_scale(scale, transport)
+    raw_mean = transport_mean(uncertified, mu)
+    raw_covariance_diag = transport_covariance(uncertified, sigma_diag, diagonal_out=True)
+    raw_covariance_full = transport_covariance(uncertified, sigma_full, diagonal_out=False)
+    raw_projected_scale = transport_scale(scale, uncertified)
+
+    self_links = torch.arange(mu.shape[-2])
+    off_diagonal = ~torch.eye(mu.shape[-2], dtype=torch.bool)
+    assert torch.equal(mean[:, self_links, self_links], mu)
+    assert torch.equal(covariance_diag[:, self_links, self_links], sigma_diag)
+    assert torch.equal(covariance_full[:, self_links, self_links], sigma_full)
+    assert torch.equal(projected_scale[:, self_links, self_links], scale)
+    assert torch.equal(mean[:, off_diagonal], raw_mean[:, off_diagonal])
+    assert torch.equal(covariance_diag[:, off_diagonal], raw_covariance_diag[:, off_diagonal])
+    assert torch.equal(covariance_full[:, off_diagonal], raw_covariance_full[:, off_diagonal])
+    assert torch.equal(projected_scale[:, off_diagonal], raw_projected_scale[:, off_diagonal])
+
+    stats = diagonal_kl_pair_stats(
+        mu,
+        sigma_diag,
+        mean,
+        covariance_diag,
+        irrep_dims=[2, 2],
+    )
+    assert torch.equal(
+        stats.energy[..., self_links, self_links],
+        torch.zeros_like(stats.energy[..., self_links, self_links]),
+    )
+    assert torch.equal(
+        stats.pair_mask[..., self_links, self_links],
+        torch.zeros_like(stats.pair_mask[..., self_links, self_links]),
+    )
+
+    self_objective = (
+        mean[:, self_links, self_links].sum()
+        + covariance_diag[:, self_links, self_links].sum()
+        + covariance_full[:, self_links, self_links].sum()
+        + projected_scale[:, self_links, self_links].sum()
+    )
+    self_gradients = torch.autograd.grad(
+        self_objective,
+        (phi, mu, sigma_diag, sigma_full, scale),
+        retain_graph=True,
+    )
+    assert torch.equal(self_gradients[0], torch.zeros_like(phi))
+    assert torch.equal(self_gradients[1], torch.ones_like(mu))
+    assert torch.equal(self_gradients[2], torch.ones_like(sigma_diag))
+    assert torch.equal(self_gradients[3], torch.ones_like(sigma_full))
+    torch.testing.assert_close(
+        self_gradients[4],
+        torch.ones_like(scale),
+        atol=1e-7,
+        rtol=0.0,
+    )
+
+    mean_weight = torch.randn_like(mean)
+    diagonal_weight = torch.randn_like(covariance_diag)
+    full_weight = torch.randn_like(covariance_full)
+    scale_weight = torch.randn_like(projected_scale)
+    mean_weight[:, self_links, self_links] = 0.0
+    diagonal_weight[:, self_links, self_links] = 0.0
+    full_weight[:, self_links, self_links] = 0.0
+    scale_weight[:, self_links, self_links] = 0.0
+    corrected_objective = (
+        (mean * mean_weight).sum()
+        + (covariance_diag * diagonal_weight).sum()
+        + (covariance_full * full_weight).sum()
+        + (projected_scale * scale_weight).sum()
+    )
+    raw_objective = (
+        (raw_mean * mean_weight).sum()
+        + (raw_covariance_diag * diagonal_weight).sum()
+        + (raw_covariance_full * full_weight).sum()
+        + (raw_projected_scale * scale_weight).sum()
+    )
+    corrected_gradients = torch.autograd.grad(
+        corrected_objective,
+        (phi, mu, sigma_diag, sigma_full, scale),
+        retain_graph=True,
+    )
+    raw_gradients = torch.autograd.grad(
+        raw_objective,
+        (phi, mu, sigma_diag, sigma_full, scale),
+    )
+    for corrected, reference in zip(corrected_gradients, raw_gradients):
+        assert torch.equal(corrected, reference)
+
+
+def test_same_frame_certificate_survives_supported_compositions() -> None:
+    torch.manual_seed(43)
+    group = get_group("block_glk")(4, 2)
+    phi = 0.03 * torch.randn(1, 3, group.generators.shape[0])
+    dense_vertex = build_belief_transport(phi, group, transport_mode="flat")
+    compact = build_belief_transport(
+        phi,
+        group,
+        transport_mode="flat",
+        compact_phi_block_transport=True,
+    )
+    reflected = build_belief_transport(
+        phi,
+        group,
+        transport_mode="flat",
+        reflection=torch.tensor([[1.0, -1.0, 1.0]]),
+    )
+    rope_matrix, _ = torch.linalg.qr(torch.randn(1, 3, 4, 4))
+    wrapped = build_belief_transport(
+        phi,
+        group,
+        transport_mode="flat",
+        rope=rope_matrix,
+        rope_on_cov=True,
+        compact_phi_block_transport=True,
+    )
+
+    assert isinstance(dense_vertex, FactoredTransport)
+    assert isinstance(compact, CompactFactoredTransport)
+    assert isinstance(reflected, FactoredTransport)
+    assert isinstance(wrapped, RopeTransport)
+    assert dense_vertex.same_frame_flat_cocycle
+    assert compact.same_frame_flat_cocycle
+    assert compact.unsqueeze(0).same_frame_flat_cocycle
+    assert dataclasses.replace(dense_vertex, mean_per_head=True).same_frame_flat_cocycle
+    assert oracle_module._transport_to_float(compact).same_frame_flat_cocycle
+    assert oracle_module._transport_to_float(dense_vertex).same_frame_flat_cocycle
+    assert reflected.same_frame_flat_cocycle
+    assert wrapped.base.same_frame_flat_cocycle
+
+    mu = torch.randn(1, 3, 4)
+    sigma = torch.rand(1, 3, 4) + 0.5
+    self_links = torch.arange(mu.shape[-2])
+    assert torch.equal(transport_mean(wrapped, mu)[:, self_links, self_links], mu)
+    assert torch.equal(
+        transport_covariance(wrapped, sigma, diagonal_out=True)[:, self_links, self_links],
+        sigma,
+    )
 
 
 @pytest.mark.parametrize("mean_per_head", [False, True])

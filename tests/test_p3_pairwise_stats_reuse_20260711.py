@@ -196,7 +196,7 @@ def test_diagonal_kl_pair_stats_preserve_exact_zero_energy_boundary() -> None:
     assert torch.equal(stats.delta_tq, torch.zeros_like(stats.delta_tq))
 
 
-def test_diagonal_kl_pair_stats_match_compact_self_link_float32_mask() -> None:
+def test_diagonal_kl_pair_stats_match_certified_compact_self_link_mask() -> None:
     torch.manual_seed(0)
     group = get_group("block_glk")(4, 2)
     phi = 0.05 * torch.randn(1, 4, group.generators.shape[0], dtype=torch.float32)
@@ -235,10 +235,25 @@ def test_diagonal_kl_pair_stats_match_compact_self_link_float32_mask() -> None:
         (reference_energy > 0.0) & (reference_energy < 100.0)
     ).to(reference_energy.dtype)
     self_links = torch.arange(mu_q.shape[-2])
+    off_diagonal = ~torch.eye(mu_q.shape[-2], dtype=torch.bool)
 
-    assert (reference_energy[..., self_links, self_links] == 0.0).any()
-    assert torch.equal(stats.energy, reference_energy)
-    assert torch.equal(stats.pair_mask, reference_mask)
+    assert transport.same_frame_flat_cocycle
+    torch.testing.assert_close(
+        stats.energy[..., off_diagonal],
+        reference_energy[..., off_diagonal],
+        atol=1e-5,
+        rtol=1e-6,
+    )
+    assert torch.equal(
+        stats.energy[..., self_links, self_links],
+        torch.zeros_like(stats.energy[..., self_links, self_links]),
+    )
+    assert torch.equal(
+        stats.pair_mask[..., self_links, self_links],
+        torch.zeros_like(stats.pair_mask[..., self_links, self_links]),
+    )
+    generic_active = reference_mask.bool()
+    assert torch.equal(stats.pair_mask[generic_active], reference_mask[generic_active])
 
 
 def test_p3_exact_kl_max_self_energy_gates_saturated_row_to_pass_through() -> None:

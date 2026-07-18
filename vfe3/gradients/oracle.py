@@ -44,6 +44,7 @@ def _transport_to_float(
         return CompactFactoredTransport(
             omega.exp_blocks.float(), omega.inv_blocks.float(), omega.K,
             mean_per_head=omega.mean_per_head,
+            same_frame_flat_cocycle=omega.same_frame_flat_cocycle,
         )
     if isinstance(omega, DirectLinkTransport):
         return DirectLinkTransport(
@@ -57,6 +58,7 @@ def _transport_to_float(
             exp_neg_phi=omega.exp_neg_phi.float(),
             irrep_dims=omega.irrep_dims,
             mean_per_head=omega.mean_per_head,
+            same_frame_flat_cocycle=omega.same_frame_flat_cocycle,
         )
     if isinstance(omega, RopeTransport):
         return RopeTransport(
