@@ -288,15 +288,6 @@ def test_config_from_serialized_warns_and_drops_unknown_legacy_fields():
     assert cfg.diagonal_covariance is True
 
 
-def test_config_from_serialized_restores_policy_term_tuple_from_json():
-    cfg = config_from_serialized(
-        {"policy_score_terms": ["risk", "ambiguity"]},
-        source="config.json",
-    )
-
-    assert cfg.policy_score_terms == ("risk", "ambiguity")
-
-
 def test_serialized_phi_config_migration_returns_frozen_typed_provenance_copy():
     payload = {
         "vocab_size": 17,
@@ -442,25 +433,12 @@ def test_config_from_serialized_remains_config_only_compatibility_wrapper():
             {
                 "m_phi_natural_grad": False,
                 "unrelated_legacy_field": "ignored",
-                "policy_score_terms": ["risk", "ambiguity"],
             },
             source="legacy config.json",
         )
 
     assert isinstance(cfg, VFE3Config)
     assert cfg.m_phi_update_mode == "adamw"
-    assert cfg.policy_score_terms == ("risk", "ambiguity")
-
-
-def test_direct_construction_accepts_policy_score_terms_list():
-    """Audit 2026-07-12 N8: a directly-constructed config with a LIST policy_score_terms is
-    semantically valid -- the membership check accepts any iterable and config_from_serialized
-    coerces lists -- but the logprob_control tuple-equality gate spuriously rejected it
-    (["risk","ambiguity"] != ("risk","ambiguity")). __post_init__ now coerces list -> tuple
-    (the irrep_spec / cross_couplings precedent), protecting both paths identically."""
-    cfg = VFE3Config(policy_mode="logprob_control", policy_preference="flat",
-                     policy_score_terms=["risk", "ambiguity"])
-    assert cfg.policy_score_terms == ("risk", "ambiguity")
 
 
 def test_config_rejects_nan_min_lr():

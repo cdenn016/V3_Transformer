@@ -1,10 +1,8 @@
-r"""Phase 0 byte-identity gate for the active-inference build-out: the forward_beliefs / rollout_beliefs
-extraction (docs/superpowers/specs/2026-06-28-active-inference-efe-policy-scorer-spec.md, Section 3.1).
+r"""Regression gate for the shared ``forward_beliefs`` extraction.
 
 The refactor factors the inline belief pipeline of ``VFEModel.forward`` (encode -> pos_phi -> optional
 s-refine -> precision-bias fold -> vfe_stack -> final_norm) into the shared seam ``forward_beliefs``,
-with ``rollout_beliefs`` the public no-grad wrapper the EFE scorer and generate share. It must leave
-``forward`` and ``generate`` byte-identical to the pre-remediation baseline.
+It must leave ``forward`` and ``generate`` byte-identical to the pre-remediation baseline.
 
 Two complementary guards, mirroring tests/test_perf_equivalence.py's "freeze the pre-refactor numerics"
 discipline:
@@ -12,8 +10,8 @@ discipline:
       2026-07-13 remediation,
       across the configs that exercise every touched branch: (a) inference logits, (b) dense training,
       (c) fused-chunked training, (d) mstep_self_coupling_weight>0, (e) mass_phi>0, (f) linear decode.
-  (2) within-version seam invariants asserted bit-exactly with torch.equal (machine-independent): the
-      return_logits=True branch equals forward(targets=None), and rollout_beliefs equals forward_beliefs.
+  (2) a within-version seam invariant asserted bit-exactly with torch.equal (machine-independent):
+      the return_logits=True branch equals forward(targets=None).
 """
 import torch
 
@@ -138,17 +136,6 @@ def test_seam_forward_beliefs_equals_forward_inference():
     assert belief.mu.shape == (2, 8, 4) and (belief.sigma > 0).all()
     assert torch.equal(fb_logits, fwd_logits)
     assert m.forward_beliefs(_TOK, return_logits=False)[1] is None
-
-
-def test_seam_rollout_beliefs_equals_forward_beliefs():
-    m = _build(_base())
-    with torch.no_grad():
-        fb_belief, fb_logits = m.forward_beliefs(_TOK, return_logits=True)
-        ro_belief, ro_logits = m.rollout_beliefs(_TOK)
-    assert torch.equal(ro_logits, fb_logits)
-    assert torch.equal(ro_belief.mu, fb_belief.mu)
-    assert torch.equal(ro_belief.sigma, fb_belief.sigma)
-    assert torch.equal(ro_belief.phi, fb_belief.phi)
 
 
 def test_capture_out_param_enriched_on_mstep_path():

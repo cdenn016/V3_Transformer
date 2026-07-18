@@ -358,7 +358,6 @@ def test_validate_token_range_rejects_negative_ids():
     ("source_path", "callee", "expected_value_kind"),
     [
         ("train_vfe3.py",        "make_dataloader", "active-config"),
-        ("sigma_gate_measure.py", "make_dataloader", "active-config"),
         ("vfe3/train.py",         "make_dataloader", "active-config"),
         ("vfe3/viz/report.py",    "make_dataloader", "active-config"),
         ("ablation.py",           "make_dataloader", "forwarded"),

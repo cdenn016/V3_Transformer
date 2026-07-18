@@ -1154,7 +1154,6 @@ The component map links each public responsibility to its source owner.
 | Model channel, blocks, stack, and forward path | [`vfe3/model/model.py`](vfe3/model/model.py), [`stack.py`](vfe3/model/stack.py), [`block.py`](vfe3/model/block.py) |
 | Encode and decode boundaries | [`vfe3/model/prior_bank.py`](vfe3/model/prior_bank.py) |
 | Outer training and optimizer coverage | [`vfe3/train.py`](vfe3/train.py) |
-| Generation and policy scoring | [`vfe3/inference/policy.py`](vfe3/inference/policy.py), [`generate_efe.py`](generate_efe.py), [`efe_ring_experiment.py`](efe_ring_experiment.py) |
 | Run persistence and provenance | [`vfe3/run_artifacts.py`](vfe3/run_artifacts.py) |
 | Numeric diagnostics | [`vfe3/metrics.py`](vfe3/metrics.py) |
 | Figure extraction and rendering | [`vfe3/viz/`](vfe3/viz/), [`make_figures.py`](make_figures.py) |
@@ -1172,7 +1171,6 @@ registry-dispatched.
 | Pure-profile controls | A selectable one-channel, flat-transport, constant-self-coupling, covariance-updating, KL-decoding path remains available without learned Q/K/V projections, MLPs, pointwise activations, a mixer, or detached precision weighting. |
 | Opt-in experiments | Full covariance, Laplace beliefs, alternate groups, omega-direct and reflection frames, several nonflat transports, CG coupling, alternate position and decode modes, randomized depth, policy scoring, and richer diagnostics. |
 | Partial implementations | The diagonal family projects a general GL(K) action. The same-scale model channel is live and now follows the configured family (including full-covariance `s`/`r`) and the shared nonflat transport, but it keeps one global centroid `r` and a single meta-scale. It is not the full multiscale hierarchy. |
-| Policy-scorer reachability | `efe_one_step` (H=1) is reachable through `generate()` for any config. `efe_rollout` (H>1) is reachable only through the bounded H-step beam menu (`vfe3/inference/candidate_menu.py`) and only when the belief-prefix cache supports the config (`vfe3/inference/belief_cache.py::cache_supported`); an unsupported config fails closed instead of paying a dishonest full recompute. The `sigma_mc` ambiguity estimator is fully executable (an antithetic Monte Carlo sampler over the terminal belief covariance, `vfe3/inference/policy.py`) but stays gate-closed behind a four-identity consumer gate (`vfe3/inference/sigma_gate.py`): the shipped preregistration resolves the live specification identity to FAIL, so no `sigma_mc` configuration can be constructed or generated in production until a matching empirical PASS gate artifact exists. |
 | Deliberate stubs | The registered `gauge_fixed` encode seam raises instead of silently substituting another encoder. |
 | Interpretations | Tokens as agents, transported agreement as consensus or predictive coding, layers as inference time, and learning as symmetry breaking are readings of the computation, not additional executable mechanisms. |
 | Broader future theory | The full multiscale PIFB hierarchy, distinct model and belief timescales, validated nontrivial holonomy dynamics, and broader physical or philosophical claims remain outside the implemented transformer. |
@@ -1207,8 +1205,6 @@ python train_vfe3.py
 | [`ablation.py`](ablation.py) | Named architecture and configuration ablations. |
 | [`scaling.py`](scaling.py) | Width, group, and training-budget scaling runs. |
 | [`make_figures.py`](make_figures.py) | Regenerates eligible figures from a saved run. |
-| [`generate_efe.py`](generate_efe.py) | Checkpoint-based generation and policy comparison driver. |
-| [`efe_ring_experiment.py`](efe_ring_experiment.py) | Controlled ring experiment for goal-directed policy scoring. |
 
 ### Test commands
 

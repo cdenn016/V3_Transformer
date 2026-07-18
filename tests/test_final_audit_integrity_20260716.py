@@ -12,13 +12,12 @@ from pathlib import Path
 import pytest
 import torch
 
-import generate_efe
 import multiseed_analysis
 import scaling_analysis
 from vfe3.config import VFE3Config
 from vfe3.gauge_optim import GaugeManifoldAdamW
 from vfe3.geometry.groups import get_group
-from vfe3.run_artifacts import RunArtifacts, load_checkpoint
+from vfe3.run_artifacts import RunArtifacts, load_checkpoint, semantic_config_fingerprint
 
 
 def _sha256(value: object) -> str:
@@ -449,54 +448,6 @@ def test_multiseed_main_derives_missing_per_layer_intent_from_config(
     assert summary["withheld"]["per_layer"] is True
 
 
-def test_generation_rejects_unknown_checkpoint_config_fields(tmp_path: Path) -> None:
-    checkpoint = tmp_path / "checkpoint.pt"
-    config = asdict(VFE3Config())
-    config["future_behavior_knob"] = "nondefault"
-    torch.save({
-        "config": config,
-        "model_state": {"weight": torch.tensor([1.0])},
-    }, checkpoint)
-
-    with pytest.raises(ValueError, match="unknown.*future_behavior_knob"):
-        generate_efe._load_checkpoint({
-            "checkpoint": str(checkpoint),
-            "config_from": None,
-        })
-
-
-def test_generation_verifies_raw_legacy_fingerprint_before_config_migration(
-    tmp_path: Path,
-) -> None:
-    checkpoint = tmp_path / "legacy-checkpoint.pt"
-    raw_config = asdict(VFE3Config())
-    raw_config.pop("m_phi_update_mode")
-    raw_config["m_phi_natural_grad"] = False
-    torch.save({
-        "config": raw_config,
-        "config_fingerprint": generate_efe.semantic_config_fingerprint(raw_config),
-        "model_state": {"weight": torch.tensor([1.0])},
-    }, checkpoint)
-
-    migrated, state = generate_efe._load_checkpoint({
-        "checkpoint": str(checkpoint),
-        "config_from": None,
-    })
-
-    assert migrated["m_phi_update_mode"] == "adamw"
-    assert "m_phi_natural_grad" not in migrated
-    assert torch.equal(state["weight"], torch.tensor([1.0]))
-
-    corrupt = torch.load(checkpoint, weights_only=True)
-    corrupt["config_fingerprint"] = "0" * 64
-    torch.save(corrupt, checkpoint)
-    with pytest.raises(ValueError, match="fingerprint mismatch"):
-        generate_efe._load_checkpoint({
-            "checkpoint": str(checkpoint),
-            "config_from": None,
-        })
-
-
 def test_visualization_best_model_verifies_raw_legacy_fingerprint_before_migration(
     tmp_path: Path,
 ) -> None:
@@ -511,7 +462,7 @@ def test_visualization_best_model_verifies_raw_legacy_fingerprint_before_migrati
     payload = {
         "model_state": model.state_dict(),
         "config": raw_config,
-        "config_fingerprint": generate_efe.semantic_config_fingerprint(raw_config),
+        "config_fingerprint": semantic_config_fingerprint(raw_config),
     }
     torch.save(payload, checkpoint)
 

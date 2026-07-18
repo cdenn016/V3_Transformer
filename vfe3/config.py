@@ -467,48 +467,6 @@ class VFE3Config:
     decode_chunk_size:         int   = 8192
     encode_mode:               str   = "per_token"   #"per_token_additive"
 
-    # --- active-inference EFE policy scorer (opt-in, no-grad, default OFF) ---
-    # Reranks candidate token continuations by an Expected-Free-Energy functional inside generate()
-    # (spec docs/superpowers/specs/2026-06-28-active-inference-efe-policy-scorer-spec.md). policy_mode
-    # is the registry dispatch key; 'none' (default) short-circuits generate() to its verbatim
-    # pre-existing body, so forward() and generate() are byte-identical to the no-policy build. The
-    # other five fields below are READ ONLY when policy_mode != 'none', so their defaults are inert on
-    # the pure path. No learned parameter is created; the scorer is tensor scoring over existing
-    # beliefs/priors under @torch.no_grad.
-    policy_mode:               str             = "none"   # registry key: none | logprob_control | efe_one_step | efe_rollout
-    policy_horizon:            int             = 1        # fixed finite rollout depth H (efe_one_step uses 1).
-    #                          NOTE (audit 2026-07-01 F3): H>1 (efe_rollout) deepens only the belief ROLLOUT;
-    #                          the EFE score is still read from the single TERMINAL predictive q(o|pi_H),
-    #                          not the per-step horizon sum sum_{tau=1..H} G_tau.
-    policy_top_k:              int             = 8        # candidate menu size Kp (the fixed top-Kp generator)
-    policy_precision:          float           = 1.0      # policy precision gamma in softmax(-gamma G)
-    policy_preference:         str             = "task"   # preference registry key -> p(o | C)
-    policy_score_terms:        Tuple[str, ...] = ("risk", "ambiguity")  # which EFE terms enter G(pi)
-    # sigma-validation gate (spec Sections 2.7, 4.5, Guard 4): a PRECONDITION RECORD (audit 2026-07-01
-    # F5, current contract updated PB-06). Setting it True (with a policy_sigma_gate_artifact pointing
-    # at a PASS sigma-gate record) records that the pre-registered sigma gate passed; it is only ONE of
-    # several requirements for policy_ambiguity_mode='sigma_mc' (alongside an EFE scorer, a Gaussian
-    # family, exactly policy_sigma_mc_samples=16, and a prereg-registered PASS governing identity) and
-    # never unlocks the gated estimator by itself -- the ambiguity term stays 'likelihood_entropy'
-    # unless policy_ambiguity_mode is explicitly set to 'sigma_mc' AND every other precondition below
-    # holds. May be set True ONLY together with the artifact: __post_init__ enforces BOTH the structural
-    # check (artifact named) AND the content check (the file exists and carries status=='PASS', via
-    # vfe3.inference.sigma_gate.verify_gate_artifact), so a FAIL/missing/unreadable record cannot flip
-    # the flag silently. VFEModel.generate is the Phase-3 consumer: it derives the four live identities
-    # (model behavior, spec, code, measurement context) and calls verify_sigma_consumer_gate before any
-    # sigma_mc dispatch, re-checking the spec_commit MATCH against the live spec identity there.
-    policy_sigma_ambiguity_validated: bool          = False
-    policy_sigma_gate_artifact:       Optional[str] = None
-    # policy_ambiguity_mode selects the EFE ambiguity estimator (ambiguity registry key). The default
-    # 'likelihood_entropy' is the sigma-free arm (I == 0 at the v1 point belief). 'sigma_mc' is the
-    # gated sigma-derived arm (PB-06): valid ONLY with an EFE scorer, a Gaussian family,
-    # policy_sigma_ambiguity_validated=True, a PASS gate artifact, and exactly policy_sigma_mc_samples=16,
-    # AND only when the content-based governing identity is registered PASS in the shipped preregistry
-    # (the shipped identity is FAIL, so sigma_mc cannot be constructed in production -- the live model /
-    # corpus checks stay at the consumer boundary in VFEModel.generate).
-    policy_ambiguity_mode:            str           = "likelihood_entropy"
-    policy_sigma_mc_samples:          int           = 16
-
     # cross-block belief handoff (mu_q -> mu_p)
     prior_handoff_rho:         float = 1.0          # 1.0 = full flow; 0.0 = priors frozen
     prior_handoff_sigma:       float = 0.0          # sigma damping (0.0 = frozen at embedding)
@@ -2036,125 +1994,6 @@ class VFE3Config:
             )
         if self.decode_chunk_size < 1:
             raise ValueError(f"decode_chunk_size must be >= 1, got {self.decode_chunk_size}")
-        # active-inference EFE policy scorer: validate the registry dispatch key against the policy
-        # registry (add-by-registering, like transport_mode / decode_mode above). 'none' (default) is
-        # registered, so the pure path validates; a not-yet-registered scorer key raises here until the
-        # build phase that registers it lands. Local import avoids a config <- inference.policy cycle.
-        from vfe3.inference.policy import _AMBIGUITIES, _GENERATE_SAFE_PREFERENCES, _POLICIES
-        _require(self.policy_mode, tuple(sorted(_POLICIES)), "policy_mode")
-        _require(self.policy_ambiguity_mode, tuple(sorted(_AMBIGUITIES)), "policy_ambiguity_mode")
-        if self.policy_top_k < 1:
-            raise ValueError(f"policy_top_k must be >= 1, got {self.policy_top_k}")
-        if self.policy_horizon < 1:
-            raise ValueError(f"policy_horizon must be >= 1, got {self.policy_horizon}")
-        if not math.isfinite(self.policy_precision) or self.policy_precision <= 0.0:
-            raise ValueError(
-                f"policy_precision (gamma) must be finite and > 0, got {self.policy_precision}")
-        # audit F5 (2026-06-28): close the construction gaps where an invalid policy config validated and
-        # only failed deep inside generate(). score_terms must be a nonempty subset of the EFE term names
-        # the scorer assembles (a typo otherwise surfaces as a cryptic KeyError in _policy_efe_one_step).
-        # List -> tuple coercion (audit 2026-07-12 N8; the irrep_spec/cross_couplings precedent): a
-        # directly-constructed LIST is semantically valid but failed the logprob_control tuple-equality
-        # gate below, while the deserialized path already coerced -- protect both paths identically.
-        if isinstance(self.policy_score_terms, list):
-            self.policy_score_terms = tuple(self.policy_score_terms)
-        _efe_score_terms = ("risk", "ambiguity", "epistemic")
-        if len(self.policy_score_terms) == 0:
-            raise ValueError("policy_score_terms must be nonempty; G(pi) is a sum over the EFE terms")
-        bad_terms = tuple(t for t in self.policy_score_terms if t not in _efe_score_terms)
-        if bad_terms:
-            raise ValueError(
-                f"policy_score_terms {bad_terms} not in {_efe_score_terms}; G(pi) is a sum over these "
-                f"EFE terms (spec Section 3.2).")
-        if self.policy_mode == "logprob_control" and self.policy_horizon != 1:
-            raise ValueError(
-                f"policy_mode='logprob_control' accepts only policy_horizon=1 because it scores one "
-                f"continuation token; got policy_horizon={self.policy_horizon}.")
-        if (self.policy_mode == "logprob_control"
-                and self.policy_score_terms != ("risk", "ambiguity")):
-            raise ValueError(
-                f"policy_mode='logprob_control' accepts only the default policy_score_terms="
-                f"('risk', 'ambiguity') metadata because it scores raw continuation log-probability; "
-                f"got {self.policy_score_terms}.")
-        # mode/horizon pairing: efe_one_step is the H=1 scorer (H>1 is efe_rollout, gated on a belief
-        # cache). Reject the mismatch at construction rather than mid-generate (policy.py raises there).
-        if self.policy_mode == "efe_one_step" and self.policy_horizon != 1:
-            raise ValueError(
-                f"policy_mode='efe_one_step' is the H=1 scorer but policy_horizon={self.policy_horizon}; "
-                f"set policy_horizon=1, or use policy_mode='efe_rollout' for H>1 (spec Section 3.5).")
-        if self.policy_mode == "efe_rollout" and self.policy_horizon <= 1:
-            raise ValueError(
-                f"policy_mode='efe_rollout' is the H>1 horizon scorer but policy_horizon={self.policy_horizon}; "
-                f"set policy_horizon>1, or use policy_mode='efe_one_step' for H=1 (spec Section 3.5).")
-        # the fixed top-Kp candidate menu cannot be wider than the vocabulary (base_logits.topk(Kp) would
-        # raise a cryptic torch index error). Only meaningful once a scorer is on (inert at 'none').
-        if self.policy_mode != "none" and self.policy_top_k > self.vocab_size:
-            raise ValueError(
-                f"policy_top_k={self.policy_top_k} exceeds vocab_size={self.vocab_size}; the candidate "
-                f"menu cannot be wider than the vocabulary.")
-        # audit F4 (2026-06-28): generate()'s generic policy path cannot supply a per-episode goal or a
-        # per-corpus p_data, so context-requiring preferences are invalid there. FAIL-CLOSED against the
-        # _GENERATE_SAFE_PREFERENCES allow-list (mirrors the policy_mode/_POLICIES check above): reject
-        # at construction (with policy_mode != 'none') rather than failing mid-generate with a
-        # missing-goal TypeError. 'task'/'held_out_predictive' are driven through a harness that calls
-        # the scorer directly (the ring experiment keeps policy_mode='none' and builds the preference).
-        if self.policy_mode != "none" and self.policy_preference not in _GENERATE_SAFE_PREFERENCES:
-            raise ValueError(
-                f"policy_preference={self.policy_preference!r} is not usable in the generic generate() "
-                f"policy path; only {tuple(sorted(_GENERATE_SAFE_PREFERENCES))} carry no per-episode "
-                f"context. 'task' (needs a goal) and 'held_out_predictive' (needs p_data) must be "
-                f"driven through a harness that calls the scorer directly, which keeps "
-                f"policy_mode='none' (spec Section 3.4)."
-            )
-        # Guard 4 (spec Sections 4.5/7): the sigma flag cannot be flipped without a PASSING gate
-        # artifact, so V3 sigma cannot be called an ambiguity/epistemic value before the pre-registered
-        # gate passes. Structural check (artifact named) PLUS content check (file exists + status=='PASS')
-        # so a FAIL/missing/unreadable record cannot silently validate the flag. The spec_commit MATCH is
-        # verified by the Phase-3 consumer that unlocks the sigma arm (it knows the live spec commit;
-        # vfe3.inference.sigma_gate.verify_gate_artifact does that full check there).
-        if self.policy_sigma_ambiguity_validated:
-            if not self.policy_sigma_gate_artifact:
-                raise ValueError(
-                    "policy_sigma_ambiguity_validated=True requires policy_sigma_gate_artifact to point "
-                    "at a PASS sigma-gate record (spec Sections 2.7, 4.5); the flag cannot be set "
-                    "without one.")
-            from vfe3.inference.sigma_gate import verify_gate_artifact
-            verify_gate_artifact(self.policy_sigma_gate_artifact)
-        # PB-06: the gated sigma_mc ambiguity. Structural preconditions first (an EFE scorer, a Gaussian
-        # family, the validated precondition flag, a named artifact, and exactly the sealed sample count
-        # S=16), then the prereg-aware artifact verification against the CURRENT content-based governing
-        # identity. Construction cannot verify the not-yet-constructed live model or current corpus;
-        # those checks remain at the consumer boundary (VFEModel.generate -> verify_sigma_consumer_gate).
-        if self.policy_ambiguity_mode == "sigma_mc":
-            if self.policy_mode not in ("efe_one_step", "efe_rollout"):
-                raise ValueError(
-                    f"policy_ambiguity_mode='sigma_mc' requires an EFE scorer "
-                    f"(policy_mode in ('efe_one_step', 'efe_rollout')), got {self.policy_mode!r}.")
-            if self.family not in ("gaussian_diagonal", "gaussian_full"):
-                raise ValueError(
-                    f"policy_ambiguity_mode='sigma_mc' requires a Gaussian family "
-                    f"(gaussian_diagonal or gaussian_full), got family={self.family!r}.")
-            if not self.policy_sigma_ambiguity_validated:
-                raise ValueError(
-                    "policy_ambiguity_mode='sigma_mc' requires policy_sigma_ambiguity_validated=True "
-                    "with a PASS sigma-gate artifact (spec Sections 2.7, 4.5).")
-            if not self.policy_sigma_gate_artifact:
-                raise ValueError(
-                    "policy_ambiguity_mode='sigma_mc' requires policy_sigma_gate_artifact to point at a "
-                    "PASS sigma-gate record.")
-            if self.policy_sigma_mc_samples != 16:
-                raise ValueError(
-                    f"policy_ambiguity_mode='sigma_mc' requires the preregistered "
-                    f"policy_sigma_mc_samples=16, got {self.policy_sigma_mc_samples}.")
-            from vfe3.inference import sigma_gate
-            current_spec = sigma_gate.sigma_gate_spec_identity()
-            if current_spec == "unknown":
-                raise ValueError(
-                    "policy_ambiguity_mode='sigma_mc' requires a resolvable governing specification "
-                    "identity; sigma_gate_spec_identity() returned 'unknown' (missing/undecodable "
-                    "governing docs).")
-            sigma_gate.verify_sigma_prereg_gate(
-                self.policy_sigma_gate_artifact, actual_spec_identity=current_spec)
         # decode_bias is a learned per-vocab log-unigram bias on the use_prior_bank=False LINEAR
         # decode (logits = mu_q @ W^T + b). On the prior-bank KL path the per-vocab priors
         # (mu_p, sigma_p) already carry the unigram role, so the bias is never created there; warn
@@ -2838,6 +2677,19 @@ _RETIRED_PHI_CONFIG_FIELDS = frozenset({
     "m_gauge_momentum",
     "m_gauge_update_rule",
 })
+_RETIRED_POLICY_CONFIG_FIELDS = frozenset({
+    "policy_mode",
+    "policy_horizon",
+    "policy_top_k",
+    "policy_precision",
+    "policy_preference",
+    "policy_score_terms",
+    "policy_sigma_ambiguity_validated",
+    "policy_sigma_gate_artifact",
+    "policy_ambiguity_mode",
+    "policy_sigma_mc_samples",
+})
+_RETIRED_CONFIG_FIELDS = _RETIRED_PHI_CONFIG_FIELDS | _RETIRED_POLICY_CONFIG_FIELDS
 
 
 @dataclass(frozen=True)
@@ -2888,7 +2740,7 @@ def migrate_serialized_config(
     known = set(config_fields)
     unknown = sorted(
         str(key) for key in raw_config
-        if key not in known and key not in _RETIRED_PHI_CONFIG_FIELDS
+        if key not in known and key not in _RETIRED_CONFIG_FIELDS
     )
     if unknown:
         if strict_unknown:
@@ -2900,7 +2752,15 @@ def migrate_serialized_config(
             UserWarning,
             stacklevel=2,
         )
-    consumed_retired_keys = frozenset(raw_config.keys() & _RETIRED_PHI_CONFIG_FIELDS)
+    consumed_retired_keys = frozenset(raw_config.keys() & _RETIRED_CONFIG_FIELDS)
+    retired_policy_keys = frozenset(raw_config.keys() & _RETIRED_POLICY_CONFIG_FIELDS)
+    if retired_policy_keys:
+        warnings.warn(
+            f"serialized config from {source} contains retired active-inference field(s) "
+            f"{sorted(retired_policy_keys)}; ignoring them",
+            UserWarning,
+            stacklevel=2,
+        )
 
     legacy_stateful_phi_optimizer = False
     legacy_phi_value: Optional[bool] = None
@@ -2952,8 +2812,6 @@ def migrate_serialized_config(
             source=source,
             optional_bool=config_fields[name].type == Optional[bool],
         )
-    if isinstance(migrated.get("policy_score_terms"), list):
-        migrated["policy_score_terms"] = tuple(migrated["policy_score_terms"])
     return SerializedConfigMigration(
         config=VFE3Config(**migrated),
         raw_config=raw_config,

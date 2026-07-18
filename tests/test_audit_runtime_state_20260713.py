@@ -1,7 +1,6 @@
 """Regression tests for the validated 2026-07-13 runtime/state audit findings."""
 
 import logging
-import math
 import types
 import warnings
 
@@ -11,7 +10,6 @@ import torch
 from vfe3 import metrics
 from vfe3.config import VFE3Config
 from vfe3.ema import EMA
-from vfe3.inference.policy import _efe_score
 from vfe3.families.base import get_family
 from vfe3.model.model import VFEModel
 from vfe3.train import _save_eval_attention_maps, _val_diagnostics
@@ -58,25 +56,6 @@ def test_sigma_max_none_disables_ceiling_diagnostic():
 def test_linear_decode_warns_when_nondefault_decode_tau_is_inert():
     with pytest.warns(UserWarning, match="decode_tau=.*inert.*use_prior_bank=False"):
         _tiny_config(use_prior_bank=False, decode_tau=0.25)
-
-
-def test_efe_score_rejects_empty_direct_caller_score_terms():
-    model = VFEModel(_tiny_config())
-    context = torch.tensor([[0, 1, 2]])
-    candidates = torch.tensor([[[3], [4]]])
-    preference = torch.full((model.cfg.vocab_size,), -math.log(model.cfg.vocab_size))
-    with pytest.raises(ValueError, match="score_terms must be nonempty"):
-        _efe_score(
-            context,
-            candidates,
-            preference,
-            model,
-            gamma=1.0,
-            score_terms=(),
-            ambiguity_mode="likelihood_entropy",
-            log_prior=None,
-            base_logits=None,
-        )
 
 
 def test_free_energy_metric_wrapper_keeps_tensor_annotations():
