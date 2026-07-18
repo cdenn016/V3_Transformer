@@ -28,6 +28,7 @@ from vfe3.run_artifacts import (
     RunArtifacts,
     _calibration_and_strata,
     _pure_path_report,
+    _validate_best_model_mapping,
     finalize_run,
     semantic_config_fingerprint,
 )
@@ -354,6 +355,36 @@ def test_best_model_bundle_grad_clip_changes_fingerprint(tmp_path):
     assert bundle_a["config"]["grad_clip"] == 1.0
     assert bundle_b["config"]["grad_clip"] == 0.25
     assert bundle_a["config_fingerprint"] != bundle_b["config_fingerprint"]
+
+
+def test_best_model_selection_validates_raw_legacy_fingerprint_before_migration(tmp_path):
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    raw_legacy = asdict(cfg)
+    raw_legacy.pop("m_phi_update_mode")
+    raw_legacy["m_phi_natural_grad"] = False
+    bundle = {
+        "model_state": model.state_dict(),
+        "config": raw_legacy,
+        "config_fingerprint": semantic_config_fingerprint(raw_legacy),
+    }
+
+    validated = _validate_best_model_mapping(
+        bundle,
+        cfg,
+        model.state_dict(),
+        "legacy best-model test bundle",
+    )
+    assert validated["config"] == raw_legacy
+
+    bundle["config_fingerprint"] = "0" * 64
+    with pytest.raises(RuntimeError, match="fingerprint mismatch"):
+        _validate_best_model_mapping(
+            bundle,
+            cfg,
+            model.state_dict(),
+            "corrupt legacy best-model test bundle",
+        )
 
 
 def test_save_checkpoint_is_loadable(tmp_path):

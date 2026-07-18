@@ -464,6 +464,65 @@ def test_generation_rejects_unknown_checkpoint_config_fields(tmp_path: Path) -> 
         })
 
 
+def test_generation_verifies_raw_legacy_fingerprint_before_config_migration(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "legacy-checkpoint.pt"
+    raw_config = asdict(VFE3Config())
+    raw_config.pop("m_phi_update_mode")
+    raw_config["m_phi_natural_grad"] = False
+    torch.save({
+        "config": raw_config,
+        "config_fingerprint": generate_efe.semantic_config_fingerprint(raw_config),
+        "model_state": {"weight": torch.tensor([1.0])},
+    }, checkpoint)
+
+    migrated, state = generate_efe._load_checkpoint({
+        "checkpoint": str(checkpoint),
+        "config_from": None,
+    })
+
+    assert migrated["m_phi_update_mode"] == "adamw"
+    assert "m_phi_natural_grad" not in migrated
+    assert torch.equal(state["weight"], torch.tensor([1.0]))
+
+    corrupt = torch.load(checkpoint, weights_only=True)
+    corrupt["config_fingerprint"] = "0" * 64
+    torch.save(corrupt, checkpoint)
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        generate_efe._load_checkpoint({
+            "checkpoint": str(checkpoint),
+            "config_from": None,
+        })
+
+
+def test_visualization_best_model_verifies_raw_legacy_fingerprint_before_migration(
+    tmp_path: Path,
+) -> None:
+    from vfe3.viz.run_loading import load_best_model_state
+
+    cfg = VFE3Config(vocab_size=8, embed_dim=4, n_heads=2, max_seq_len=4, n_layers=1)
+    model = torch.nn.Linear(4, 4)
+    raw_config = asdict(cfg)
+    raw_config.pop("m_phi_update_mode")
+    raw_config["m_phi_natural_grad"] = False
+    checkpoint = tmp_path / "best_model.pt"
+    payload = {
+        "model_state": model.state_dict(),
+        "config": raw_config,
+        "config_fingerprint": generate_efe.semantic_config_fingerprint(raw_config),
+    }
+    torch.save(payload, checkpoint)
+
+    loaded = load_best_model_state(checkpoint, cfg, map_location="cpu")
+    assert set(loaded) == set(model.state_dict())
+
+    payload["config_fingerprint"] = "f" * 64
+    torch.save(payload, checkpoint)
+    with pytest.raises(ValueError, match="fingerprint mismatch"):
+        load_best_model_state(checkpoint, cfg, map_location="cpu")
+
+
 def test_checkpoint_payload_is_loaded_on_cpu_before_device_restore(
     tmp_path:    Path,
     monkeypatch: pytest.MonkeyPatch,

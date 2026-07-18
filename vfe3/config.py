@@ -9,6 +9,7 @@ variant swaps without editing call sites.
 import math
 import warnings
 from dataclasses import dataclass, fields
+from numbers import Real
 from typing import Any, List, Mapping, Optional, Tuple
 
 # Seams with a live registry (gauge_group, lambda_alpha_mode, attention priors, norms; alongside
@@ -2832,43 +2833,143 @@ class VFE3Config:
         return "detach" if self.detach_e_step else self.e_step_gradient
 
 
-def config_from_serialized(
+_RETIRED_PHI_CONFIG_FIELDS = frozenset({
+    "m_phi_natural_grad",
+    "m_gauge_momentum",
+    "m_gauge_update_rule",
+})
+
+
+@dataclass(frozen=True)
+class SerializedConfigMigration:
+    """Typed result of normalizing one historical serialized configuration."""
+
+    config:                        VFE3Config
+    raw_config:                    Mapping[str, Any]
+    consumed_retired_keys:         frozenset[str]
+    legacy_stateful_phi_optimizer: bool
+
+
+def _normalize_serialized_boolean(
+    value: object,
+    name:  str,
+
+    *,
+    source:        str,
+    optional_bool: bool = False,
+) -> 'bool | None':
+    """Normalize the exact boolean spellings admitted by serialized configs."""
+    if type(value) is bool or (value is None and optional_bool):
+        return value
+    if isinstance(value, str) and value.casefold() in ("false", "true"):
+        return value.casefold() == "true"
+    raise ValueError(
+        f"serialized boolean field {name!r} from {source} must be a bool or the exact spelling "
+        f"'true'/'false' (case-insensitive), got {value!r}"
+    )
+
+
+def migrate_serialized_config(
     payload: Mapping[str, Any],
 
     *,
-    source: str,
-) -> VFE3Config:
-    """Build an effective config, normalizing booleans and warning about unknown fields."""
+    source:         str,
+    strict_unknown: bool = False,
+) -> SerializedConfigMigration:
+    """Migrate one raw serialized mapping into the current typed config schema.
+
+    The copied ``raw_config`` remains byte-semantically distinct from the effective config so
+    artifact consumers can verify its historical fingerprint before applying this migration.
+    """
     if not isinstance(payload, Mapping):
         raise ValueError(f"serialized config from {source} must be a mapping")
+    raw_config = dict(payload)
     config_fields = {field.name: field for field in fields(VFE3Config)}
     known = set(config_fields)
-    unknown = sorted(str(key) for key in payload if key not in known)
+    unknown = sorted(
+        str(key) for key in raw_config
+        if key not in known and key not in _RETIRED_PHI_CONFIG_FIELDS
+    )
     if unknown:
+        if strict_unknown:
+            raise ValueError(
+                f"serialized config from {source} contains unknown field(s) {unknown}"
+            )
         warnings.warn(
             f"serialized config from {source} contains unknown field(s) {unknown}; ignoring them",
             UserWarning,
             stacklevel=2,
         )
-    migrated = {key: value for key, value in payload.items() if key in known}
+    consumed_retired_keys = frozenset(raw_config.keys() & _RETIRED_PHI_CONFIG_FIELDS)
+
+    legacy_stateful_phi_optimizer = False
+    legacy_phi_value: Optional[bool] = None
+    if "m_phi_natural_grad" in raw_config:
+        legacy_phi_value = bool(_normalize_serialized_boolean(
+            raw_config["m_phi_natural_grad"],
+            "m_phi_natural_grad",
+            source=source,
+        ))
+        legacy_stateful_phi_optimizer = legacy_phi_value
+
+    if "m_gauge_momentum" in raw_config:
+        momentum = raw_config["m_gauge_momentum"]
+        if (type(momentum) is bool or not isinstance(momentum, Real)
+                or not math.isfinite(float(momentum))):
+            raise ValueError(
+                f"serialized retired field 'm_gauge_momentum' from {source} must be a finite "
+                f"numeric value, got {momentum!r}"
+            )
+    if "m_gauge_update_rule" in raw_config:
+        update_rule = raw_config["m_gauge_update_rule"]
+        if update_rule not in ("heavy_ball", "adam"):
+            raise ValueError(
+                f"serialized retired field 'm_gauge_update_rule' from {source} must be one of "
+                f"('heavy_ball', 'adam'), got {update_rule!r}"
+            )
+
+    if legacy_phi_value is not None and "m_phi_update_mode" in raw_config:
+        current_mode = raw_config["m_phi_update_mode"]
+        compatible = legacy_phi_value is False and current_mode == "adamw"
+        if not compatible:
+            raise ValueError(
+                f"serialized phi optimizer controls conflict in {source}: "
+                f"m_phi_natural_grad={legacy_phi_value!r} and "
+                f"m_phi_update_mode={current_mode!r}"
+            )
+
+    migrated = {key: value for key, value in raw_config.items() if key in known}
+    migrated.setdefault("m_phi_update_mode", "adamw")
     bool_fields = {
         name for name, field in config_fields.items()
         if field.type is bool or field.type == Optional[bool]
     }
     for name in sorted(bool_fields & migrated.keys()):
         value = migrated[name]
-        if type(value) is bool or (value is None and config_fields[name].type == Optional[bool]):
-            continue
-        if isinstance(value, str) and value.casefold() in ("false", "true"):
-            migrated[name] = value.casefold() == "true"
-            continue
-        raise ValueError(
-            f"serialized boolean field {name!r} from {source} must be a bool or the exact spelling "
-            f"'true'/'false' (case-insensitive), got {value!r}"
+        migrated[name] = _normalize_serialized_boolean(
+            value,
+            name,
+            source=source,
+            optional_bool=config_fields[name].type == Optional[bool],
         )
     if isinstance(migrated.get("policy_score_terms"), list):
         migrated["policy_score_terms"] = tuple(migrated["policy_score_terms"])
-    return VFE3Config(**migrated)
+    return SerializedConfigMigration(
+        config=VFE3Config(**migrated),
+        raw_config=raw_config,
+        consumed_retired_keys=consumed_retired_keys,
+        legacy_stateful_phi_optimizer=legacy_stateful_phi_optimizer,
+    )
+
+
+def config_from_serialized(
+    payload: Mapping[str, Any],
+
+    *,
+    source: str,
+) -> VFE3Config:
+    """Return only the effective config for source-compatible weight-only consumers."""
+    return migrate_serialized_config(payload, source=source).config
 
 
 def _require(value: Optional[str], valid: Tuple[object, ...], name: str) -> None:

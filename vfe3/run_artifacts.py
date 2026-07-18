@@ -35,14 +35,18 @@ import sys
 import tempfile
 import time
 from contextlib import contextmanager
-from dataclasses import asdict, fields
+from dataclasses import asdict
 from numbers import Real
 from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 import torch
 
-from vfe3.config import VFE3Config, config_from_serialized
+from vfe3.config import (
+    SerializedConfigMigration,
+    VFE3Config,
+    migrate_serialized_config,
+)
 from vfe3.contracts import DataState, DataStateBuffer
 from vfe3.ema import EMA
 from vfe3.process_utils import run_process_tree
@@ -770,21 +774,18 @@ def _selection_semantic_config(
 
     A live :class:`VFE3Config` starts from ``asdict`` directly. A SERIALIZED mapping is first checked
     key-by-key against the current fields -- an unknown newer field FAILS CLOSED rather than being
-    silently ignored (as :func:`config_from_serialized` would) -- and is then migrated through
-    ``config_from_serialized`` so a genuinely older mapping acquires the current defaults for any
+    silently ignored by a permissive loader -- and is then passed through strict typed migration so
+    a genuinely older mapping acquires the current defaults for any
     field it predates. The raw mapping's full ``config_fingerprint`` is verified elsewhere (before
     this normalization), so default migration never hides excluded-field tampering."""
     if isinstance(config, VFE3Config):
         normalized = asdict(config)
     elif isinstance(config, Mapping):
-        known = {field.name for field in fields(VFE3Config)}
-        unknown = sorted(str(key) for key in config if key not in known)
-        if unknown:
-            raise ValueError(
-                f"best-model selection config carries field(s) unknown to this code version "
-                f"{unknown}; refusing to migrate (an artifact from a newer code version)")
-        normalized = asdict(config_from_serialized(
-            config, source="best-model selection compatibility"))
+        normalized = asdict(migrate_serialized_config(
+            config,
+            source="best-model selection compatibility",
+            strict_unknown=True,
+        ).config)
     else:
         raise TypeError(
             f"_selection_semantic_config expects a VFE3Config or mapping, got {type(config).__name__}")
@@ -1025,7 +1026,17 @@ def _validate_optimizer_state(
             continue
         parameter, group = parameter_by_id[parameter_id]
         keys = set(state)
-        if keys & {"step", "exp_avg", "exp_avg_sq", "max_exp_avg_sq"}:
+        if bool(group.get("pullback_group", False)):
+            raise RuntimeError(
+                "checkpoint optimizer_state contains unsupported parameter slots for a stateless "
+                "pullback-group parameter"
+            )
+        elif bool(group.get("omega", False)):
+            dirty = state.get("omega_dirty")
+            if (keys != {"omega_dirty"} or not isinstance(dirty, torch.Tensor)
+                    or dirty.dtype != torch.bool or dirty.shape != (parameter.shape[0],)):
+                raise RuntimeError("checkpoint optimizer_state omega_dirty is invalid")
+        elif keys & {"step", "exp_avg", "exp_avg_sq", "max_exp_avg_sq"}:
             required = {"step", "exp_avg", "exp_avg_sq"}
             if not required.issubset(keys):
                 raise RuntimeError("checkpoint optimizer_state has incomplete AdamW slots")
@@ -1062,31 +1073,6 @@ def _validate_optimizer_state(
                         or not bool(torch.isfinite(value).all())):
                     raise RuntimeError(
                         f"checkpoint optimizer_state {name} is incompatible with its parameter")
-        elif bool(group.get("gauge", False)):
-            if "gauge_mom" in state:
-                tensor_slots = ["gauge_mom"]
-            elif {"gauge_m", "gauge_v", "gauge_step"}.issubset(keys):
-                tensor_slots = ["gauge_m", "gauge_v"]
-                gauge_step = state["gauge_step"]
-                if (type(gauge_step) is not int or gauge_step < 0
-                        or gauge_step > maximum_slot_step):
-                    raise RuntimeError("checkpoint optimizer_state gauge_step is invalid")
-            else:
-                raise RuntimeError("checkpoint optimizer_state has incomplete gauge slots")
-            for name in tensor_slots:
-                value = state[name]
-                if (not isinstance(value, torch.Tensor)
-                        or value.shape != parameter.shape
-                        or value.dtype != parameter.dtype
-                        or value.layout != parameter.layout
-                        or not bool(torch.isfinite(value).all())):
-                    raise RuntimeError(
-                        f"checkpoint optimizer_state {name} is incompatible with its parameter")
-        elif bool(group.get("omega", False)):
-            dirty = state.get("omega_dirty")
-            if (keys != {"omega_dirty"} or not isinstance(dirty, torch.Tensor)
-                    or dirty.dtype != torch.bool or dirty.shape != (parameter.shape[0],)):
-                raise RuntimeError("checkpoint optimizer_state omega_dirty is invalid")
         else:
             raise RuntimeError("checkpoint optimizer_state contains unsupported parameter slots")
     return saved_state
@@ -1667,23 +1653,28 @@ def _preflight_best_selection(
 def _preflight_resume_config(
     saved_config: object,
     cfg:          VFE3Config,
-) -> Tuple[Mapping[str, object], List[str]]:
+) -> Tuple[SerializedConfigMigration, List[str]]:
     """Validate serialized config keys and compute deterministic drift before any live mutation."""
     if not isinstance(saved_config, Mapping):
         raise RuntimeError("checkpoint config must be a mapping when cfg is supplied")
     if any(not isinstance(key, str) for key in saved_config):
         raise RuntimeError("checkpoint config keys must be strings")
-    known = {field.name for field in fields(VFE3Config)}
-    unknown = sorted(set(saved_config) - known)
-    if unknown:
-        raise RuntimeError(f"checkpoint config contains unknown field(s) {unknown}")
+    try:
+        migration = migrate_serialized_config(
+            saved_config,
+            source="checkpoint resume config",
+            strict_unknown=True,
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    effective = asdict(migration.config)
     current = asdict(cfg)
     drift = sorted(
-        key for key in (set(saved_config) | set(current))
+        key for key in (set(effective) | set(current))
         if key not in ("resume_from", "trust_resume_checkpoint")
-        and saved_config.get(key) != current.get(key)
+        and effective.get(key) != current.get(key)
     )
-    return saved_config, drift
+    return migration, drift
 
 
 def load_checkpoint(
@@ -1837,6 +1828,36 @@ def load_checkpoint(
                 f"{expected_steps_per_epoch} steps per epoch")
     saved_model_state = _validate_checkpoint_model_state(
         ckpt.get("model_state"), model.state_dict(), checkpoint_path)
+    saved_config = None
+    config_drift: List[str] = []
+    resume_cfg = cfg if cfg is not None else (artifacts.cfg if artifacts is not None else None)
+    config_migration: Optional[SerializedConfigMigration] = None
+    if resume_cfg is not None:
+        config_migration, config_drift = _preflight_resume_config(
+            ckpt.get("config"), resume_cfg,
+        )
+    elif optimizer is not None:
+        raw_checkpoint_config = ckpt.get("config")
+        if not isinstance(raw_checkpoint_config, Mapping):
+            raise RuntimeError("checkpoint config must be a mapping when optimizer is supplied")
+        if any(not isinstance(key, str) for key in raw_checkpoint_config):
+            raise RuntimeError("checkpoint config keys must be strings")
+        try:
+            config_migration = migrate_serialized_config(
+                raw_checkpoint_config,
+                source="checkpoint optimizer resume config",
+                strict_unknown=True,
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+    if config_migration is not None:
+        saved_config = config_migration.raw_config
+        if optimizer is not None and config_migration.legacy_stateful_phi_optimizer:
+            raise RuntimeError(
+                "checkpoint stateful phi optimizer is incompatible with the current stateless "
+                "phi update runtime; restart from model weights/current config without restoring "
+                "the retired optimizer state"
+            )
     saved_optimizer_state = None
     successful_updates = None
     if optimizer is not None:
@@ -1881,14 +1902,6 @@ def load_checkpoint(
         expected_code_identity,
         expected_selection_data_identity,
     )
-    saved_config = None
-    config_drift: List[str] = []
-    resume_cfg = cfg if cfg is not None else (artifacts.cfg if artifacts is not None else None)
-    if resume_cfg is not None:
-        saved_config, config_drift = _preflight_resume_config(
-            ckpt.get("config"), resume_cfg,
-        )
-
     model.load_state_dict(saved_model_state)
     if optimizer is not None:
         fresh = [{k: v for k, v in group.items() if k != "params"}

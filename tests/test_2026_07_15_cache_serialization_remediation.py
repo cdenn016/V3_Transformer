@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from sigma_gate_measure import load_model_from_checkpoint
-from vfe3.config import VFE3Config, config_from_serialized
+from vfe3.config import VFE3Config, config_from_serialized, migrate_serialized_config
 from vfe3.inference.belief_cache import (
     cache_supported,
     rollout_predictive_state_cached,
@@ -106,6 +106,27 @@ def test_config_deserialization_rejects_ambiguous_boolean_strings(serialized: st
         config_from_serialized(
             {"skip_belief_sigma_update": serialized},
             source="audit probe",
+        )
+
+
+def test_retired_phi_boolean_uses_the_same_exact_serialized_boolean_rules() -> None:
+    disabled = migrate_serialized_config(
+        {"m_phi_natural_grad": "False"},
+        source="legacy cache artifact",
+    )
+    enabled = migrate_serialized_config(
+        {"m_phi_natural_grad": "TRUE"},
+        source="legacy cache artifact",
+    )
+
+    assert disabled.config.m_phi_update_mode == "adamw"
+    assert disabled.legacy_stateful_phi_optimizer is False
+    assert enabled.config.m_phi_update_mode == "adamw"
+    assert enabled.legacy_stateful_phi_optimizer is True
+    with pytest.raises(ValueError, match="m_phi_natural_grad"):
+        migrate_serialized_config(
+            {"m_phi_natural_grad": " false "},
+            source="legacy cache artifact",
         )
 
 

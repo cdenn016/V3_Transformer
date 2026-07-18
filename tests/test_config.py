@@ -1,10 +1,16 @@
 from collections.abc import MutableMapping
-from dataclasses import fields
+from dataclasses import FrozenInstanceError, asdict, fields
 
 import pytest
 import torch
 
-from vfe3.config import VFE3Config, config_from_serialized
+from vfe3.config import (
+    SerializedConfigMigration,
+    VFE3Config,
+    _RETIRED_PHI_CONFIG_FIELDS,
+    config_from_serialized,
+    migrate_serialized_config,
+)
 
 
 _MISSING = object()
@@ -288,6 +294,161 @@ def test_config_from_serialized_restores_policy_term_tuple_from_json():
         source="config.json",
     )
 
+    assert cfg.policy_score_terms == ("risk", "ambiguity")
+
+
+def test_serialized_phi_config_migration_returns_frozen_typed_provenance_copy():
+    payload = {
+        "vocab_size": 17,
+        "m_phi_natural_grad": "TRUE",
+        "m_gauge_momentum": 0.9,
+        "m_gauge_update_rule": "adam",
+    }
+
+    migration = migrate_serialized_config(payload, source="legacy checkpoint")
+
+    assert isinstance(migration, SerializedConfigMigration)
+    assert migration.config.m_phi_update_mode == "adamw"
+    assert migration.raw_config == payload
+    assert migration.raw_config is not payload
+    assert migration.consumed_retired_keys == _RETIRED_PHI_CONFIG_FIELDS
+    assert migration.legacy_stateful_phi_optimizer is True
+    payload["vocab_size"] = 99
+    assert migration.raw_config["vocab_size"] == 17
+    with pytest.raises(FrozenInstanceError):
+        migration.legacy_stateful_phi_optimizer = False
+
+
+@pytest.mark.parametrize(
+    ("legacy_value", "parameterization", "expected_legacy_stateful"),
+    [
+        (False, "phi", False),
+        ("false", "omega_direct", False),
+        (True, "phi", True),
+    ],
+)
+def test_serialized_phi_config_migration_maps_legacy_boolean_to_adamw(
+    legacy_value,
+    parameterization,
+    expected_legacy_stateful,
+):
+    source_cfg = (
+        VFE3Config(
+            embed_dim=4,
+            n_heads=1,
+            gauge_group="glk",
+            gauge_parameterization="omega_direct",
+            family="gaussian_full",
+            decode_mode="full",
+            use_head_mixer=False,
+            pos_phi="none",
+            e_phi_lr=0.0,
+        )
+        if parameterization == "omega_direct"
+        else VFE3Config()
+    )
+    payload = asdict(source_cfg)
+    payload.pop("m_phi_update_mode")
+    payload["m_phi_natural_grad"] = legacy_value
+
+    migration = migrate_serialized_config(payload, source="legacy checkpoint")
+
+    assert migration.config.m_phi_update_mode == "adamw"
+    assert migration.config.gauge_parameterization == parameterization
+    assert migration.legacy_stateful_phi_optimizer is expected_legacy_stateful
+    assert "m_phi_natural_grad" in migration.consumed_retired_keys
+
+
+@pytest.mark.parametrize(
+    ("legacy_value", "new_mode"),
+    [
+        (False, "pullback_group"),
+        (True, "adamw"),
+        (True, "pullback_group"),
+    ],
+)
+def test_serialized_phi_config_migration_rejects_old_new_conflicts(
+    legacy_value,
+    new_mode,
+):
+    payload = {
+        "m_phi_natural_grad": legacy_value,
+        "m_phi_update_mode": new_mode,
+    }
+
+    with pytest.raises(ValueError, match="conflict"):
+        migrate_serialized_config(payload, source="conflicting checkpoint")
+
+
+def test_serialized_phi_config_migration_accepts_compatible_false_and_inert_retired_keys():
+    compatible = migrate_serialized_config(
+        {"m_phi_natural_grad": False, "m_phi_update_mode": "adamw"},
+        source="compatible checkpoint",
+    )
+    pullback_payload = asdict(_valid_pullback_config())
+    pullback_payload.update(m_gauge_momentum=0.25, m_gauge_update_rule="heavy_ball")
+    pullback = migrate_serialized_config(
+        pullback_payload,
+        source="current checkpoint with retired provenance",
+    )
+
+    assert compatible.config.m_phi_update_mode == "adamw"
+    assert compatible.legacy_stateful_phi_optimizer is False
+    assert pullback.config.m_phi_update_mode == "pullback_group"
+    assert pullback.consumed_retired_keys == frozenset({
+        "m_gauge_momentum", "m_gauge_update_rule",
+    })
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("m_phi_natural_grad", 1),
+        ("m_phi_natural_grad", "yes"),
+        ("m_gauge_momentum", True),
+        ("m_gauge_momentum", float("nan")),
+        ("m_gauge_momentum", float("inf")),
+        ("m_gauge_update_rule", "sgd"),
+    ],
+)
+def test_serialized_phi_config_migration_validates_retired_values(field, value):
+    with pytest.raises(ValueError, match=field):
+        migrate_serialized_config({field: value}, source="invalid legacy checkpoint")
+
+
+def test_serialized_phi_config_migration_strict_unknown_only_allows_retired_fields():
+    migration = migrate_serialized_config(
+        {
+            "m_phi_natural_grad": False,
+            "m_gauge_momentum": 0.9,
+            "m_gauge_update_rule": "heavy_ball",
+        },
+        source="strict legacy checkpoint",
+        strict_unknown=True,
+    )
+    assert migration.consumed_retired_keys == _RETIRED_PHI_CONFIG_FIELDS
+
+    with pytest.raises(ValueError, match="unknown field"):
+        migrate_serialized_config(
+            {"a_field_from_the_future": 1},
+            source="newer checkpoint",
+            strict_unknown=True,
+        )
+
+
+def test_config_from_serialized_remains_config_only_compatibility_wrapper():
+    with pytest.warns(UserWarning, match="unrelated_legacy_field"):
+        cfg = config_from_serialized(
+            {
+                "m_phi_natural_grad": False,
+                "unrelated_legacy_field": "ignored",
+                "policy_score_terms": ["risk", "ambiguity"],
+            },
+            source="legacy config.json",
+        )
+
+    assert isinstance(cfg, VFE3Config)
+    assert cfg.m_phi_update_mode == "adamw"
     assert cfg.policy_score_terms == ("risk", "ambiguity")
 
 
@@ -579,7 +740,7 @@ def test_tied_block_glk_rejects_pullback_per_block():
     """Audit 2026-07-12 N14: 'pullback_per_block' needs the SAME per-block generator partition as
     'killing_per_block' and is identically undefined under tied_block_glk's shared kron(I_n, gl(d))
     generators -- but only the killing variant was rejected at construction, so the pairing the
-    config itself recommends under m_phi_natural_grad crashed opaquely at the first E-step /
+    config itself recommended under the retired stateful phi mode crashed opaquely at the first E-step /
     optimizer step ("generator not supported in a single irrep block"). Reject both per-block
     modes at config time, mirroring the so_n/sp_n irrep-tower guard; the ambient 'pullback'
     (full-basis metric, no partition needed) stays accepted."""

@@ -14,6 +14,7 @@ optimizer momentum (exp_avg/exp_avg_sq), or the scheduler's ``last_epoch``.
 """
 
 import json
+import hashlib
 import math
 from dataclasses import asdict
 from enum import IntEnum
@@ -513,35 +514,278 @@ def test_resume_matches_uninterrupted_run(tmp_path):
         torch.testing.assert_close(a, c, atol=1e-6, rtol=1e-5)  # bit-equivalent continuation
 
 
-def test_resume_matches_uninterrupted_run_geometric_mstep(tmp_path):
-    r"""Resume equivalence for the GEOMETRIC M-step optimizer (m_phi_natural_grad=True).
+def _pullback_resume_cfg(**overrides) -> VFE3Config:
+    values = {
+        "checkpoint_interval": 2,
+        "m_phi_lr": 0.05,
+        "m_phi_update_mode": "pullback_group",
+        "phi_precond_mode": "pullback_per_block",
+        "transport_chart_max_norm": 6.0,
+        "pos_phi": "none",
+    }
+    values.update(overrides)
+    return _cfg(**values)
 
-    This branch develops the gauge-geometric M-step, whose GaugeManifoldAdamW keeps a
-    heavy-ball ``gauge_mom`` buffer in ``self.state[p]``. Resume restores the optimizer via the
-    inherited ``state_dict``/``load_state_dict``; this pins that ``gauge_mom`` actually round-trips
-    (a dropped buffer would silently restore wrong gauge momentum and diverge here)."""
-    cfg = _cfg(checkpoint_interval=2, m_phi_natural_grad=True, m_phi_lr=0.05,
-               phi_precond_mode="pullback_per_block")            # the documented geometric gauge M-step
+
+def _rewrite_checkpoint_phi_config(
+    checkpoint: Path,
+    legacy_value: bool,
+) -> dict:
+    bundle = torch.load(checkpoint, weights_only=True)
+    bundle["config"].pop("m_phi_update_mode")
+    bundle["config"]["m_phi_natural_grad"] = legacy_value
+    bundle["config"]["m_gauge_momentum"] = 0.9
+    bundle["config"]["m_gauge_update_rule"] = "heavy_ball"
+    torch.save(bundle, checkpoint)
+    return bundle
+
+
+def test_pullback_group_resume_is_step_exact_and_has_no_phi_optimizer_slots(tmp_path):
+    cfg = _pullback_resume_cfg()
 
     torch.manual_seed(0)
-    model_a = VFEModel(cfg)
-    phi0 = model_a.prior_bank.phi_embed.detach().clone()
-    train(model_a, _const_loader(), cfg, n_steps=4)
-    final_a = _params(model_a)
-    assert not torch.equal(phi0, model_a.prior_bank.phi_embed)   # the gauge frame actually moved (non-vacuous)
+    uninterrupted = VFEModel(cfg)
+    phi_initial = uninterrupted.prior_bank.phi_embed.detach().clone()
+    train(uninterrupted, _sequential_loader(), cfg, n_steps=4)
+    final_uninterrupted = _params(uninterrupted)
+    assert not torch.equal(phi_initial, uninterrupted.prior_bank.phi_embed)
 
     torch.manual_seed(0)
-    model_b = VFEModel(cfg)
-    art = RunArtifacts(tmp_path / "run", cfg, model_b)
-    train(model_b, _const_loader(), cfg, n_steps=2, artifacts=art)
-    ckpt = tmp_path / "run" / "checkpoints" / "step_2.pt"
-    opt_state = torch.load(ckpt, weights_only=False)["optimizer_state"]
-    assert any("gauge_mom" in s for s in opt_state["state"].values())   # the buffer was actually saved
+    partial = VFEModel(cfg)
+    artifacts = RunArtifacts(tmp_path / "pullback", cfg, partial)
+    train(partial, _sequential_loader(), cfg, n_steps=2, artifacts=artifacts)
+    checkpoint = artifacts.ckpt_dir / "step_2.pt"
+    bundle = torch.load(checkpoint, weights_only=True)
+    optimizer_state = bundle["optimizer_state"]
+    phi_ids = {
+        parameter_id
+        for group in optimizer_state["param_groups"]
+        if group.get("pullback_group", False)
+        for parameter_id in group["params"]
+    }
+    assert phi_ids
+    assert all(not optimizer_state["state"].get(parameter_id) for parameter_id in phi_ids)
+    assert all(
+        not any(str(key).startswith("gauge_") for key in slot)
+        for slot in optimizer_state["state"].values()
+    )
 
-    model_c = VFEModel(cfg)
-    train(model_c, _const_loader(), cfg, n_steps=4, resume_from=ckpt)
-    for a, c in zip(final_a, _params(model_c)):
-        torch.testing.assert_close(a, c, atol=1e-6, rtol=1e-5)   # gauge-momentum round-trips correctly
+    resumed = VFEModel(cfg)
+    train(resumed, _sequential_loader(), cfg, n_steps=4, resume_from=checkpoint)
+    for expected, actual in zip(final_uninterrupted, _params(resumed)):
+        torch.testing.assert_close(expected, actual, atol=1e-6, rtol=1e-5)
+
+
+def test_legacy_false_phi_adamw_resume_remains_step_exact(tmp_path):
+    cfg = _cfg(checkpoint_interval=2, m_phi_lr=0.05)
+
+    torch.manual_seed(0)
+    uninterrupted = VFEModel(cfg)
+    train(uninterrupted, _sequential_loader(), cfg, n_steps=4)
+    final_uninterrupted = _params(uninterrupted)
+
+    torch.manual_seed(0)
+    partial = VFEModel(cfg)
+    artifacts = RunArtifacts(tmp_path / "legacy-adamw", cfg, partial)
+    train(partial, _sequential_loader(), cfg, n_steps=2, artifacts=artifacts)
+    checkpoint = artifacts.ckpt_dir / "step_2.pt"
+    _rewrite_checkpoint_phi_config(checkpoint, False)
+
+    resumed = VFEModel(cfg)
+    train(resumed, _sequential_loader(), cfg, n_steps=4, resume_from=checkpoint)
+    for expected, actual in zip(final_uninterrupted, _params(resumed)):
+        torch.testing.assert_close(expected, actual, atol=1e-6, rtol=1e-5)
+
+
+def test_legacy_false_omega_direct_resume_preserves_extra_state_and_is_step_exact(tmp_path):
+    cfg = _cfg(
+        checkpoint_interval=2,
+        embed_dim=4,
+        n_heads=1,
+        gauge_group="glk",
+        gauge_parameterization="omega_direct",
+        family="gaussian_full",
+        decode_mode="full",
+        use_prior_bank=True,
+        use_head_mixer=False,
+        pos_phi="none",
+        e_phi_lr=0.0,
+        m_phi_lr=0.05,
+    )
+
+    def omega_step(model, optimizer, scale):
+        omega = model.prior_bank.omega_embed
+        gradient = torch.zeros_like(omega)
+        gradient[0].reshape(-1)[:4] = scale * torch.tensor(
+            [0.5, -0.25, 0.125, 0.375],
+            dtype=gradient.dtype,
+        )
+        omega.grad = gradient
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+    torch.manual_seed(0)
+    uninterrupted = VFEModel(cfg)
+    uninterrupted_optimizer = build_optimizer(uninterrupted, cfg)
+    omega_step(uninterrupted, uninterrupted_optimizer, 1.0)
+    omega_step(uninterrupted, uninterrupted_optimizer, 0.5)
+    final_uninterrupted = _params(uninterrupted)
+
+    torch.manual_seed(0)
+    partial = VFEModel(cfg)
+    partial_optimizer = build_optimizer(partial, cfg)
+    omega_step(partial, partial_optimizer, 1.0)
+    artifacts = RunArtifacts(tmp_path / "legacy-omega", cfg, partial)
+    checkpoint = artifacts.save_checkpoint(1, partial, partial_optimizer, cfg)
+    bundle = _rewrite_checkpoint_phi_config(checkpoint, False)
+    assert bundle["optimizer_state"]["optimizer_extra"]["omega_step"] == 0
+    assert bundle["optimizer_state"]["optimizer_extra"]["omega_dirty_format"] == 1
+    assert any(
+        "omega_dirty" in slot and bool(slot["omega_dirty"].any())
+        for slot in bundle["optimizer_state"]["state"].values()
+    )
+
+    resumed = VFEModel(cfg)
+    resumed_optimizer = build_optimizer(resumed, cfg)
+    load_checkpoint(checkpoint, resumed, resumed_optimizer, cfg=cfg, restore_rng=False)
+    omega_step(resumed, resumed_optimizer, 0.5)
+    for expected, actual in zip(final_uninterrupted, _params(resumed)):
+        torch.testing.assert_close(expected, actual, atol=1e-6, rtol=1e-5)
+
+
+def test_legacy_true_optimizer_resume_rejects_before_any_mutation(tmp_path):
+    saved_cfg = _pullback_resume_cfg(m_phi_update_mode="adamw")
+    source = VFEModel(saved_cfg)
+    source_optimizer = build_optimizer(source, saved_cfg)
+    source_scaler = torch.amp.GradScaler(device="cpu", enabled=True, init_scale=8.0)
+    checkpoint = RunArtifacts(tmp_path / "legacy-stateful", saved_cfg, source).save_checkpoint(
+        0,
+        source,
+        source_optimizer,
+        saved_cfg,
+        scaler=source_scaler,
+    )
+    bundle = _rewrite_checkpoint_phi_config(checkpoint, True)
+    bundle["optimizer_state"]["unexpected_topology"] = "must not be inspected first"
+    torch.save(bundle, checkpoint)
+
+    active_cfg = _pullback_resume_cfg()
+    target = VFEModel(active_cfg)
+    target_optimizer = build_optimizer(target, active_cfg)
+    target_scaler = torch.amp.GradScaler(device="cpu", enabled=True, init_scale=16.0)
+    cursor = {"sentinel": "unchanged"}
+    metropolis_generator = torch.Generator().manual_seed(123)
+    model_before = _params(target)
+    optimizer_state_count_before = len(target_optimizer.state)
+    optimizer_parameters_before = [
+        tuple(group["params"]) for group in target_optimizer.param_groups
+    ]
+    optimizer_clocks_before = [
+        group.get("successful_updates") for group in target_optimizer.param_groups
+    ]
+    scaler_before = target_scaler.state_dict()
+    generator_before = metropolis_generator.get_state().clone()
+    torch.manual_seed(999)
+    rng_before = torch.get_rng_state().clone()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        load_checkpoint(
+            checkpoint,
+            target,
+            target_optimizer,
+            scaler=target_scaler,
+            cfg=active_cfg,
+            metropolis_generator=metropolis_generator,
+            data_state=cursor,
+        )
+
+    message = str(exc_info.value)
+    assert "stateful phi optimizer is incompatible" in message
+    assert "restart from model weights/current config" in message
+    for expected, actual in zip(model_before, _params(target)):
+        assert torch.equal(expected, actual)
+    assert len(target_optimizer.state) == optimizer_state_count_before
+    assert all(
+        len(group["params"]) == len(expected)
+        and all(actual is original for actual, original in zip(group["params"], expected))
+        for group, expected in zip(target_optimizer.param_groups, optimizer_parameters_before)
+    )
+    assert [
+        group.get("successful_updates") for group in target_optimizer.param_groups
+    ] == optimizer_clocks_before
+    assert target_scaler.state_dict() == scaler_before
+    assert torch.equal(metropolis_generator.get_state(), generator_before)
+    assert torch.equal(torch.get_rng_state(), rng_before)
+    assert cursor == {"sentinel": "unchanged"}
+
+
+def test_legacy_true_weight_only_load_remains_allowed(tmp_path):
+    saved_cfg = _pullback_resume_cfg(m_phi_update_mode="adamw")
+    source = VFEModel(saved_cfg)
+    with torch.no_grad():
+        source.prior_bank.mu_embed.add_(0.5)
+    checkpoint = RunArtifacts(tmp_path / "legacy-weights", saved_cfg, source).save_checkpoint(
+        0,
+        source,
+        build_optimizer(source, saved_cfg),
+        saved_cfg,
+    )
+    _rewrite_checkpoint_phi_config(checkpoint, True)
+
+    active_cfg = _pullback_resume_cfg()
+    target = VFEModel(active_cfg)
+    with pytest.warns(UserWarning, match="resume config drift"):
+        load_checkpoint(checkpoint, target, cfg=active_cfg, restore_rng=False)
+
+    for expected, actual in zip(_params(source), _params(target)):
+        assert torch.equal(expected, actual)
+
+
+@pytest.mark.parametrize(
+    "legacy_slot",
+    [
+        {"gauge_mom": "tensor"},
+        {"gauge_m": "tensor", "gauge_v": "tensor", "gauge_step": 0},
+    ],
+)
+def test_pullback_group_resume_rejects_retired_phi_optimizer_slots(tmp_path, legacy_slot):
+    cfg = _pullback_resume_cfg()
+    source = VFEModel(cfg)
+    optimizer = build_optimizer(source, cfg)
+    checkpoint = RunArtifacts(tmp_path / "retired-slots", cfg, source).save_checkpoint(
+        0, source, optimizer, cfg,
+    )
+    bundle = torch.load(checkpoint, weights_only=True)
+    group = next(
+        group for group in bundle["optimizer_state"]["param_groups"]
+        if group.get("pullback_group", False)
+    )
+    parameter_id = group["params"][0]
+    parameter = next(
+        parameter
+        for live_group in optimizer.param_groups
+        if live_group.get("pullback_group", False)
+        for parameter in live_group["params"]
+    )
+    slot = {
+        key: (torch.zeros_like(parameter) if value == "tensor" else value)
+        for key, value in legacy_slot.items()
+    }
+    bundle["optimizer_state"]["state"][parameter_id] = slot
+    ids = sorted([
+        parameter_id_ for parameter_id_, state in bundle["optimizer_state"]["state"].items()
+        if state
+    ])
+    encoded = json.dumps(ids, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    bundle["optimizer_populated_slot_manifest"] = {
+        "parameter_ids": ids,
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+    torch.save(bundle, checkpoint)
+
+    target = VFEModel(cfg)
+    with pytest.raises(RuntimeError, match="unsupported parameter slots"):
+        load_checkpoint(checkpoint, target, build_optimizer(target, cfg), cfg=cfg)
 
 
 def _shuffled_loader(seq_len: int = 8, bs: int = 4, n: int = 480,

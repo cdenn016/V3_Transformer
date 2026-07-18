@@ -33,13 +33,13 @@ Run on the GPU (the iterative E-step is slow on CPU); it auto-uses CUDA when ava
 import hashlib
 import io
 import json
-from dataclasses import fields
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping, Optional, Tuple
 
 import torch
 
-from vfe3.config import VFE3Config, config_from_serialized
+from vfe3.config import VFE3Config, config_from_serialized, migrate_serialized_config
 from vfe3.data.datasets import tiktoken_encoding_name
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import _write_json_atomic, semantic_config_fingerprint
@@ -183,21 +183,16 @@ def _bound_config(
     if not isinstance(config, Mapping):
         raise ValueError(f"checkpoint {source} has no embedded config mapping")
     config_dict = dict(config)
-    known_fields = {field.name for field in fields(VFE3Config)}
-    unknown_fields = sorted(
-        repr(key) for key in config_dict
-        if type(key) is not str or key not in known_fields
-    )
-    if unknown_fields:
-        raise ValueError(
-            f"checkpoint {source} contains unknown config field(s) {unknown_fields}; "
-            "generation cannot prove how those fields affected the saved weights"
-        )
     computed = semantic_config_fingerprint(config_dict)
     stored = payload.get("config_fingerprint")
     if stored is not None and stored != computed:
         raise ValueError(f"checkpoint {source} has a config fingerprint mismatch")
-    return config_dict, computed
+    migration = migrate_serialized_config(
+        config_dict,
+        source=f"checkpoint {source}",
+        strict_unknown=True,
+    )
+    return asdict(migration.config), computed
 
 
 def _state_dicts_equal(

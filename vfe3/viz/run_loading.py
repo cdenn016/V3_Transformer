@@ -6,7 +6,7 @@ from typing import Mapping
 
 import torch
 
-from vfe3.config import VFE3Config, config_from_serialized
+from vfe3.config import VFE3Config, config_from_serialized, migrate_serialized_config
 from vfe3.run_artifacts import _selection_semantic_config, semantic_config_fingerprint
 
 
@@ -16,7 +16,12 @@ def load_run_config(run_dir: Path) -> 'tuple[VFE3Config, str]':
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, Mapping) or not isinstance(data.get("config"), Mapping):
         raise ValueError(f"run metadata {path} has no config mapping")
-    cfg = config_from_serialized(data["config"], source=str(path))
+    raw_config = data["config"]
+    stored_fingerprint = data.get("config_fingerprint")
+    if (stored_fingerprint is not None
+            and stored_fingerprint != semantic_config_fingerprint(raw_config)):
+        raise ValueError(f"run metadata {path} has a config fingerprint mismatch")
+    cfg = config_from_serialized(raw_config, source=str(path))
     dataset = data.get("dataset", "")
     if not isinstance(dataset, str):
         raise ValueError(f"run metadata {path} has a non-string dataset")
@@ -40,7 +45,11 @@ def load_best_model_state(
         raise ValueError(f"best checkpoint {path} has no embedded config mapping")
     if payload["config_fingerprint"] != semantic_config_fingerprint(embedded):
         raise ValueError(f"best checkpoint {path} has a config fingerprint mismatch")
-    embedded_cfg = config_from_serialized(embedded, source=f"{path} embedded config")
+    embedded_cfg = migrate_serialized_config(
+        embedded,
+        source=f"{path} embedded config",
+        strict_unknown=True,
+    ).config
     if _selection_semantic_config(embedded_cfg) != _selection_semantic_config(cfg):
         raise ValueError(f"best checkpoint {path} has a semantic config mismatch with config.json")
     model_state = payload["model_state"]
