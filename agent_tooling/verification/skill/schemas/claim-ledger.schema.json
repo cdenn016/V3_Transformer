@@ -3,16 +3,17 @@
   "title": "Verification claim ledger",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "artifact_revision", "claims"],
+  "required": ["schema_version", "mode", "artifact_revision", "claims"],
   "properties": {
     "schema_version": {"const": "1.0"},
+    "mode": {"enum": ["triage", "closure"]},
     "artifact_revision": {"type": "string", "minLength": 1},
     "claims": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["id", "domain", "statement", "severity", "state", "artifact_revision", "criteria", "evidence", "counterevidence", "verifiers", "open_obligations", "evidence_invalidated"],
+        "required": ["id", "domain", "statement", "severity", "state", "artifact_revision", "criteria", "views", "evidence", "counterevidence", "verifiers", "open_obligations", "evidence_invalidated"],
         "properties": {
           "id": {"type": "string", "minLength": 1},
           "domain": {"enum": ["code", "experiment", "mathematics", "evidence", "research", "source", "general"]},
@@ -21,6 +22,7 @@
           "state": {"enum": ["CANDIDATE", "LLM_SUPPORTED", "EVIDENCE_VERIFIED", "REFUTED", "INCONCLUSIVE"]},
           "artifact_revision": {"type": "string", "minLength": 1},
           "criteria": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["name", "score"], "properties": {"name": {"type": "string", "minLength": 1}, "score": {"type": "number", "minimum": 0, "maximum": 20}}}},
+          "views": {"type": "object", "additionalProperties": false, "required": ["calibration_kind", "unresolved_disagreement", "comparison", "scores"], "properties": {"calibration_kind": {"type": "string", "minLength": 1}, "unresolved_disagreement": {"type": "boolean"}, "comparison": {"type": "object", "additionalProperties": false, "required": ["method", "candidate_count", "orders"], "properties": {"method": {"enum": ["pairwise", "pivot_tournament"]}, "candidate_count": {"type": "integer", "minimum": 2}, "orders": {"type": "array", "items": {"type": "string", "minLength": 1}}}}, "scores": {"type": "array", "minItems": 2, "items": {"type": "object", "additionalProperties": false, "required": ["view_id", "criteria"], "properties": {"view_id": {"type": "string", "minLength": 1}, "criteria": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["name", "score"], "properties": {"name": {"type": "string", "minLength": 1}, "score": {"type": "number", "minimum": 0, "maximum": 20}}}}}}}}},
           "evidence": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["kind", "location", "artifact_revision"], "properties": {"kind": {"enum": ["llm_judgment", "mechanical", "reproduced_output", "derivation", "formal_proof", "numerical", "primary_source", "reproduced_source"]}, "location": {"type": "string", "minLength": 1}, "artifact_revision": {"type": "string", "minLength": 1}}}},
           "counterevidence": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["kind", "location", "artifact_revision", "supports"], "properties": {"kind": {"enum": ["llm_judgment", "mechanical", "reproduced_output", "derivation", "formal_proof", "numerical", "primary_source", "reproduced_source"]}, "location": {"type": "string", "minLength": 1}, "artifact_revision": {"type": "string", "minLength": 1}, "supports": {"type": "boolean"}}}},
           "verifiers": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["role"], "properties": {"role": {"type": "string", "minLength": 1}}}},

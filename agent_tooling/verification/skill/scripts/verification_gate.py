@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
 
 
 CLAIM_STATES = frozenset({"CANDIDATE", "LLM_SUPPORTED", "EVIDENCE_VERIFIED", "REFUTED", "INCONCLUSIVE"})
+MODES = frozenset({"triage", "closure"})
 DOMAINS = frozenset({"code", "experiment", "mathematics", "evidence", "research", "source", "general"})
 SEVERITIES = frozenset({"low", "medium", "high", "critical"})
 EVIDENCE_KINDS = frozenset(
@@ -25,7 +27,7 @@ EVIDENCE_KINDS = frozenset(
     }
 )
 
-_ROOT_FIELDS = frozenset({"schema_version", "artifact_revision", "claims"})
+_ROOT_FIELDS = frozenset({"schema_version", "mode", "artifact_revision", "claims"})
 _CLAIM_FIELDS = frozenset(
     {
         "id",
@@ -35,6 +37,7 @@ _CLAIM_FIELDS = frozenset(
         "state",
         "artifact_revision",
         "criteria",
+        "views",
         "evidence",
         "counterevidence",
         "verifiers",
@@ -46,6 +49,11 @@ _EVIDENCE_FIELDS = frozenset({"kind", "location", "artifact_revision"})
 _COUNTEREVIDENCE_FIELDS = frozenset({"kind", "location", "artifact_revision", "supports"})
 _CRITERION_FIELDS = frozenset({"name", "score"})
 _VERIFIER_FIELDS = frozenset({"role"})
+_VIEW_FIELDS = frozenset({"calibration_kind", "unresolved_disagreement", "comparison", "scores"})
+_VIEW_COMPARISON_FIELDS = frozenset({"method", "candidate_count", "orders"})
+_VIEW_SCORE_FIELDS = frozenset({"view_id", "criteria"})
+
+GATE_COMMAND_TOKEN = "{{VERIFICATION_GATE_COMMAND}}"
 
 
 def _as_dict(value: object) -> dict[str, object] | None:
@@ -54,6 +62,25 @@ def _as_dict(value: object) -> dict[str, object] | None:
 
 def _nonempty_string(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def render_skill_markdown(skill_root: Path) -> str:
+    """Render the source skill template for an installed skill directory.
+
+    Task 3 copies the skill before calling this seam, so the gate command names
+    the installed absolute script path rather than a repository-relative path.
+    """
+
+    root = skill_root.resolve()
+    template_path = root / "SKILL.md"
+    gate_path = root / "scripts" / "verification_gate.py"
+    template = template_path.read_text(encoding="utf-8")
+    if GATE_COMMAND_TOKEN not in template:
+        raise ValueError("skill template has no verification gate command token")
+    if not gate_path.is_file():
+        raise FileNotFoundError(gate_path)
+    command = f'"{Path(sys.executable).resolve()}" "{gate_path}"'
+    return template.replace(GATE_COMMAND_TOKEN, command)
 
 
 def _field_errors(prefix: str, value: dict[str, object], fields: frozenset[str]) -> list[str]:
@@ -78,7 +105,99 @@ def _refutation_evidence(domain: str) -> frozenset[str]:
         return frozenset({"mechanical", "reproduced_output"})
     if domain == "mathematics":
         return frozenset({"derivation", "formal_proof"})
-    return frozenset({"primary_source", "reproduced_output"})
+    return frozenset({"primary_source", "reproduced_source"})
+
+
+def _score_is_valid(value: object) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and 0 <= value <= 20
+
+
+def _validate_views(
+    prefix:              str,
+    value:               object,
+    aggregate_criteria:  dict[str, float],
+) -> tuple[list[str], bool]:
+    """Validate auditable independent views and their criterion aggregation."""
+
+    errors: list[str] = []
+    views = _as_dict(value)
+    if views is None:
+        return [f"{prefix}: views must be an object"], False
+    errors.extend(_field_errors(f"{prefix}: views", views, _VIEW_FIELDS))
+    calibration_kind = views.get("calibration_kind")
+    if not _nonempty_string(calibration_kind):
+        errors.append(f"{prefix}: views calibration_kind must be a nonempty string")
+    unresolved = views.get("unresolved_disagreement")
+    if not isinstance(unresolved, bool):
+        errors.append(f"{prefix}: views unresolved_disagreement must be a boolean")
+
+    comparison = _as_dict(views.get("comparison"))
+    if comparison is None:
+        errors.append(f"{prefix}: views comparison must be an object")
+    else:
+        errors.extend(_field_errors(f"{prefix}: views comparison", comparison, _VIEW_COMPARISON_FIELDS))
+        method = comparison.get("method")
+        candidate_count = comparison.get("candidate_count")
+        orders = comparison.get("orders")
+        if method not in {"pairwise", "pivot_tournament"}:
+            errors.append(f"{prefix}: views comparison method must be pairwise or pivot_tournament")
+        if isinstance(candidate_count, bool) or not isinstance(candidate_count, int) or candidate_count < 2:
+            errors.append(f"{prefix}: views comparison candidate_count must be an integer of at least 2")
+        if not isinstance(orders, list) or any(not _nonempty_string(item) for item in orders):
+            errors.append(f"{prefix}: views comparison orders must be a list of nonempty strings")
+        elif candidate_count == 2 and method == "pairwise" and not {"AB", "BA"}.issubset(set(orders)):
+            errors.append(f"{prefix}: two-candidate pairwise comparison requires AB and BA orders")
+        if isinstance(candidate_count, int) and not isinstance(candidate_count, bool) and candidate_count > 4 and method != "pivot_tournament":
+            errors.append(f"{prefix}: more than four candidates require pivot_tournament")
+
+    score_records = views.get("scores")
+    per_view_criteria: list[dict[str, float]] = []
+    view_ids: list[str] = []
+    if not isinstance(score_records, list) or len(score_records) < 2:
+        errors.append(f"{prefix}: views scores must contain at least two views")
+    else:
+        for index, item in enumerate(score_records):
+            record = _as_dict(item)
+            item_prefix = f"{prefix}: views scores[{index}]"
+            if record is None:
+                errors.append(f"{item_prefix} must be an object")
+                continue
+            errors.extend(_field_errors(item_prefix, record, _VIEW_SCORE_FIELDS))
+            view_id = record.get("view_id")
+            if not _nonempty_string(view_id):
+                errors.append(f"{item_prefix}: view_id must be a nonempty string")
+            else:
+                view_ids.append(str(view_id))
+            criteria = record.get("criteria")
+            current: dict[str, float] = {}
+            if not isinstance(criteria, list):
+                errors.append(f"{item_prefix}: criteria must be a list")
+            else:
+                for criterion_index, criterion_value in enumerate(criteria):
+                    criterion = _as_dict(criterion_value)
+                    criterion_prefix = f"{item_prefix}: criteria[{criterion_index}]"
+                    if criterion is None:
+                        errors.append(f"{criterion_prefix} must be an object")
+                        continue
+                    errors.extend(_field_errors(criterion_prefix, criterion, _CRITERION_FIELDS))
+                    name = criterion.get("name")
+                    score = criterion.get("score")
+                    if not _nonempty_string(name):
+                        errors.append(f"{criterion_prefix}: name must be a nonempty string")
+                    elif _score_is_valid(score):
+                        current[str(name)] = float(score)
+                    else:
+                        errors.append(f"{criterion_prefix}: score must be a number from 0 to 20")
+            per_view_criteria.append(current)
+    if len(view_ids) != len(set(view_ids)):
+        errors.append(f"{prefix}: views must contain unique view IDs")
+    for name, aggregate_score in aggregate_criteria.items():
+        values = [criteria.get(name) for criteria in per_view_criteria]
+        if len(values) < 2 or any(score is None for score in values):
+            errors.append(f"{prefix}: every view must score aggregate criterion '{name}'")
+        elif not math.isclose(aggregate_score, sum(values) / len(values), rel_tol=0.0, abs_tol=1e-9):
+            errors.append(f"{prefix}: aggregate criterion '{name}' does not equal mean view score")
+    return errors, unresolved is True
 
 
 def validate_ledger(data: dict[str, object]) -> list[str]:
@@ -96,6 +215,9 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
     errors = _field_errors("ledger", root, _ROOT_FIELDS)
     if root.get("schema_version") != "1.0":
         errors.append("ledger: schema_version must be '1.0'")
+    mode = root.get("mode")
+    if mode not in MODES:
+        errors.append("ledger: mode must be triage or closure")
     revision = root.get("artifact_revision")
     if not _nonempty_string(revision):
         errors.append("ledger: artifact_revision must be a nonempty string")
@@ -140,6 +262,7 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
         if not isinstance(claim.get("evidence_invalidated"), bool):
             errors.append(f"{prefix}: evidence_invalidated must be a boolean")
 
+        aggregate_criteria: dict[str, float] = {}
         criteria = claim.get("criteria")
         if not isinstance(criteria, list):
             errors.append(f"{prefix}: criteria must be a list")
@@ -154,8 +277,13 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                 if not _nonempty_string(criterion.get("name")):
                     errors.append(f"{item_prefix}: name must be a nonempty string")
                 score = criterion.get("score")
-                if isinstance(score, bool) or not isinstance(score, (int, float)) or not 0 <= score <= 20:
+                if not _score_is_valid(score):
                     errors.append(f"{item_prefix}: score must be a number from 0 to 20")
+                elif _nonempty_string(criterion.get("name")):
+                    aggregate_criteria[str(criterion["name"])] = float(score)
+
+        view_errors, unresolved_disagreement = _validate_views(prefix, claim.get("views"), aggregate_criteria)
+        errors.extend(view_errors)
 
         evidence_kinds: set[str] = set()
         evidence = claim.get("evidence")
@@ -239,22 +367,34 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
         if state in {"EVIDENCE_VERIFIED", "REFUTED"} and isinstance(obligations, list) and obligations:
             errors.append(f"{prefix}: closed claims may not retain open obligations")
         if state == "EVIDENCE_VERIFIED":
+            if mode == "closure" and unresolved_disagreement:
+                errors.append(f"{prefix}: unresolved disagreement in closure mode requires INCONCLUSIVE")
             if claim.get("evidence_invalidated") is True:
                 errors.append(f"{prefix}: invalidated evidence cannot support EVIDENCE_VERIFIED")
             if isinstance(domain, str) and domain in DOMAINS:
                 eligible = _closure_evidence(domain)
                 if not evidence_kinds.intersection(eligible):
                     required = " or ".join(sorted(eligible))
-                    errors.append(f"{prefix}: EVIDENCE_VERIFIED {domain} claims require {required} evidence")
+                    if mode == "closure":
+                        errors.append(f"{prefix}: closure mode requires INCONCLUSIVE when EVIDENCE_VERIFIED {domain} claims lack {required} evidence")
+                    else:
+                        errors.append(f"{prefix}: EVIDENCE_VERIFIED {domain} claims require {required} evidence")
         if state == "REFUTED" and isinstance(domain, str) and domain in DOMAINS:
+            if mode == "closure" and unresolved_disagreement:
+                errors.append(f"{prefix}: unresolved disagreement in closure mode requires INCONCLUSIVE")
             eligible = _refutation_evidence(domain)
             if not counterevidence_kinds.intersection(eligible):
                 required = " or ".join(sorted(eligible))
-                errors.append(f"{prefix}: REFUTED {domain} claims require current {required} counterevidence with supports false")
+                if mode == "closure":
+                    errors.append(f"{prefix}: closure mode requires INCONCLUSIVE when REFUTED {domain} claims lack current {required} counterevidence with supports false")
+                else:
+                    errors.append(f"{prefix}: REFUTED {domain} claims require current {required} counterevidence with supports false")
         if severity in {"high", "critical"} and state in {"EVIDENCE_VERIFIED", "REFUTED"}:
             for required_role in ("verifier-skeptic", "verifier-adjudicator"):
                 if required_role not in roles:
                     errors.append(f"{prefix}: {severity} closure requires {required_role}")
+        if mode == "closure" and state in {"CANDIDATE", "LLM_SUPPORTED"}:
+            errors.append(f"{prefix}: closure mode requires INCONCLUSIVE instead of {state}")
 
     return errors
 
@@ -332,8 +472,8 @@ def run_hook(payload: dict[str, object]) -> tuple[int, dict[str, object] | None]
     return 0, None
 
 
-def _candidate_ledger() -> dict[str, object]:
-    return {"schema_version": "1.0", "artifact_revision": "UNSPECIFIED", "claims": []}
+def _candidate_ledger(mode: str) -> dict[str, object]:
+    return {"schema_version": "1.0", "mode": mode, "artifact_revision": "UNSPECIFIED", "claims": []}
 
 
 def _command_start(args: argparse.Namespace) -> int:
@@ -347,7 +487,7 @@ def _command_start(args: argparse.Namespace) -> int:
         print("verification activation or ledger already exists", file=sys.stderr)
         return 2
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    ledger_path.write_text(json.dumps(_candidate_ledger(), indent=2) + "\n", encoding="utf-8")
+    ledger_path.write_text(json.dumps(_candidate_ledger(args.mode), indent=2) + "\n", encoding="utf-8")
     marker.write_text(json.dumps({"ledger": ledger_path.relative_to(cwd).as_posix()}, indent=2) + "\n", encoding="utf-8")
     print(ledger_path.relative_to(cwd).as_posix())
     return 0
@@ -392,6 +532,7 @@ def main(argv: list[str] | None = None) -> int:
     start_parser = subparsers.add_parser("start", help="create an active candidate ledger")
     start_parser.add_argument("--cwd", default=".")
     start_parser.add_argument("--ledger", default=".verification/ledger.json")
+    start_parser.add_argument("--mode", choices=sorted(MODES), default="closure")
     validate_parser = subparsers.add_parser("validate", help="validate a ledger file")
     validate_parser.add_argument("ledger")
     subparsers.add_parser("hook", help="read Stop-hook JSON from standard input")

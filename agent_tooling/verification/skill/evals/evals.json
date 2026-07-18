@@ -47,12 +47,12 @@
     },
     {
       "id": 5,
-      "prompt": "Close a high-severity code claim using a passing test log from the previous commit.",
-      "expected_output": "The stale evidence prevents closure and the high-severity claim receives skeptic and adjudicator review.",
+      "prompt": "Close a high-severity code claim using stale passing test output from the previous commit.",
+      "expected_output": "The stale evidence prevents closure; if fresh evidence later permits closure, the high-severity claim requires skeptic and adjudicator review.",
       "files": [],
       "expectations": [
         "Detects artifact revision mismatch as stale evidence.",
-        "Requires verifier-skeptic and verifier-adjudicator for high closure.",
+        "Requires verifier-skeptic and verifier-adjudicator if fresh evidence later permits high-severity closure.",
         "Does not upgrade stale evidence to evidence verified."
       ]
     },
@@ -63,7 +63,7 @@
       "files": [],
       "expectations": [
         "Begins with two views and adaptively escalates for critical disagreement.",
-        "Reverses A/B order or uses a balanced pivot tournament when applicable.",
+        "Requires A/B reversal for the two-reviewer comparison.",
         "Uses INCONCLUSIVE rather than majority-vote acceptance."
       ]
     }

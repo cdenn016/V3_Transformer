@@ -6,7 +6,7 @@ import copy
 import json
 from pathlib import Path
 
-from agent_tooling.verification.skill.scripts.verification_gate import run_hook, validate_ledger
+from agent_tooling.verification.skill.scripts.verification_gate import main, run_hook, validate_ledger
 
 
 def valid_code_claim() -> dict[str, object]:
@@ -18,6 +18,15 @@ def valid_code_claim() -> dict[str, object]:
         "state": "EVIDENCE_VERIFIED",
         "artifact_revision": "abc123",
         "criteria": [{"name": "reachability", "score": 20}],
+        "views": {
+            "calibration_kind": "independent_0_20",
+            "unresolved_disagreement": False,
+            "comparison": {"method": "pairwise", "candidate_count": 2, "orders": ["AB", "BA"]},
+            "scores": [
+                {"view_id": "code-a", "criteria": [{"name": "reachability", "score": 20}]},
+                {"view_id": "code-b", "criteria": [{"name": "reachability", "score": 20}]},
+            ],
+        },
         "evidence": [
             {
                 "kind": "mechanical",
@@ -35,6 +44,7 @@ def valid_code_claim() -> dict[str, object]:
 def valid_ledger() -> dict[str, object]:
     return {
         "schema_version": "1.0",
+        "mode": "closure",
         "artifact_revision": "abc123",
         "claims": [valid_code_claim()],
     }
@@ -105,6 +115,117 @@ def test_inconclusive_claim_requires_open_obligation() -> None:
     errors = validate_ledger(ledger)
 
     assert any("CODE-001" in error and "open obligation" in error for error in errors)
+
+
+def test_closure_mode_rejects_intermediate_states() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["state"] = "LLM_SUPPORTED"
+
+    errors = validate_ledger(ledger)
+
+    assert any("CODE-001" in error and "closure mode" in error for error in errors)
+
+
+def test_closure_mode_requires_inconclusive_for_unresolved_disagreement() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    views = claim["views"]
+    assert isinstance(views, dict)
+    views["unresolved_disagreement"] = True
+
+    errors = validate_ledger(ledger)
+
+    assert any("CODE-001" in error and "unresolved disagreement" in error and "INCONCLUSIVE" in error for error in errors)
+
+
+def test_triage_mode_allows_a_candidate_with_auditable_views() -> None:
+    ledger = valid_ledger()
+    ledger["mode"] = "triage"
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["state"] = "CANDIDATE"
+    claim["evidence"] = []
+
+    assert validate_ledger(ledger) == []
+
+
+def test_start_defaults_to_a_closure_ledger(tmp_path: Path) -> None:
+    assert main(["start", "--cwd", str(tmp_path)]) == 0
+
+    ledger = json.loads((tmp_path / ".verification" / "ledger.json").read_text(encoding="utf-8"))
+
+    assert ledger["mode"] == "closure"
+
+
+def test_duplicate_view_ids_are_rejected() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    views = claim["views"]
+    assert isinstance(views, dict)
+    scores = views["scores"]
+    assert isinstance(scores, list)
+    second = scores[1]
+    assert isinstance(second, dict)
+    second["view_id"] = "code-a"
+
+    errors = validate_ledger(ledger)
+
+    assert any("CODE-001" in error and "unique view IDs" in error for error in errors)
+
+
+def test_view_scores_must_reconstruct_aggregate_criterion_score() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    views = claim["views"]
+    assert isinstance(views, dict)
+    scores = views["scores"]
+    assert isinstance(scores, list)
+    first = scores[0]
+    assert isinstance(first, dict)
+    criteria = first["criteria"]
+    assert isinstance(criteria, list)
+    criterion = criteria[0]
+    assert isinstance(criterion, dict)
+    criterion["score"] = 10
+
+    errors = validate_ledger(ledger)
+
+    assert any("CODE-001" in error and "does not equal mean view score" in error for error in errors)
+
+
+def test_two_candidate_pairwise_view_requires_reversed_order() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    views = claim["views"]
+    assert isinstance(views, dict)
+    comparison = views["comparison"]
+    assert isinstance(comparison, dict)
+    comparison["orders"] = ["AB"]
+
+    errors = validate_ledger(ledger)
+
+    assert any("CODE-001" in error and "AB and BA" in error for error in errors)
+
+
+def test_more_than_four_candidates_requires_a_pivot_tournament() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    views = claim["views"]
+    assert isinstance(views, dict)
+    comparison = views["comparison"]
+    assert isinstance(comparison, dict)
+    comparison["candidate_count"] = 5
+
+    errors = validate_ledger(ledger)
+
+    assert any("CODE-001" in error and "pivot_tournament" in error for error in errors)
 
 
 def test_errors_are_reported_in_claim_id_order() -> None:
@@ -215,7 +336,7 @@ def refuted_code_ledger(counterevidence: list[dict[str, object]]) -> dict[str, o
 def test_refuted_code_claim_requires_counterevidence() -> None:
     errors = validate_ledger(refuted_code_ledger([]))
 
-    assert any("CODE-001" in error and "REFUTED code claims require" in error for error in errors)
+    assert any("CODE-001" in error and "requires INCONCLUSIVE" in error for error in errors)
 
 
 def test_refuted_code_claim_rejects_llm_only_counterevidence() -> None:
@@ -225,7 +346,7 @@ def test_refuted_code_claim_rejects_llm_only_counterevidence() -> None:
         )
     )
 
-    assert any("CODE-001" in error and "REFUTED code claims require" in error for error in errors)
+    assert any("CODE-001" in error and "requires INCONCLUSIVE" in error for error in errors)
 
 
 def test_refuted_code_claim_rejects_stale_counterevidence() -> None:
@@ -245,7 +366,7 @@ def test_refuted_code_claim_rejects_wrong_polarity_counterevidence() -> None:
         )
     )
 
-    assert any("CODE-001" in error and "REFUTED code claims require" in error for error in errors)
+    assert any("CODE-001" in error and "requires INCONCLUSIVE" in error for error in errors)
 
 
 def test_refuted_code_claim_accepts_current_mechanical_counterevidence() -> None:
@@ -256,3 +377,14 @@ def test_refuted_code_claim_accepts_current_mechanical_counterevidence() -> None
     )
 
     assert errors == []
+
+
+def test_refuted_source_claim_accepts_reproduced_source_counterevidence() -> None:
+    ledger = refuted_code_ledger(
+        [{"kind": "reproduced_source", "location": "sources/reproduction.md", "artifact_revision": "abc123", "supports": False}]
+    )
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["domain"] = "source"
+
+    assert validate_ledger(ledger) == []
