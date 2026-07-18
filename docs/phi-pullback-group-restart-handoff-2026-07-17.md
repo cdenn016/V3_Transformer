@@ -32,13 +32,19 @@ are zero new failure IDs. The changed phi preconditioner, optimizer, and
 generation-migration matrix records 133 tests with zero failures, errors, or
 skips on both CPU and the RTX 5090 CUDA interpreter.
 
+The complete reviewed implementation and evidence are committed locally as
+`84c5333`. The task worktree is clean.
+
 ## Remaining lifecycle work
 
-Review the complete staged diff, commit all intended source, tests, benchmark,
-JSON, and documentation, then re-fetch and inspect `origin/main`. Remote
-publication was previously denied because the GitHub destination was not
-verified as trusted or private. Do not bypass that policy. If publication is
-permitted, push the task branch, merge and push `main`, fast-forward the live
-checkout only if its status proves user WIP cannot be overwritten, and remove
-only this task worktree and local task branch. If publication remains blocked,
-retain the task worktree and branch and report the exact blocker.
+A fresh fetch found `origin/main` at `d7cb434`, two documentation-only commits
+beyond this task's base. GitHub reports `cdenn016/V3_Transformer` as public, so
+publication remains blocked by the unverified-public-destination policy. No
+push or merge was attempted. If publication is later authorized, integrate
+`origin/main`, rerun any affected verification, push the task branch, merge and
+push `main`, and remove only this task worktree and local task branch.
+
+The live `main` checkout is already at `d7cb434` but contains user-owned edits
+to `scaling.py` and `train_vfe3.py` plus seven user-owned deletions under
+`vfe3_scaling_results/grow_K_GL10`. Do not alter those paths. The separate
+m-phi investigation worktree is clean and must remain intact.
