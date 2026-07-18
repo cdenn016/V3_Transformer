@@ -1015,7 +1015,7 @@ def _validate_optimizer_state(
         for parameter_id, parameter in zip(saved_ids, live_parameters):
             if type(parameter_id) is not int or parameter_id in parameter_by_id:
                 raise RuntimeError("checkpoint optimizer_state parameter ids are invalid")
-            parameter_by_id[parameter_id] = (parameter, saved_group)
+            parameter_by_id[parameter_id] = (parameter, live_group)
 
     for parameter_id, state in saved_slots.items():
         if type(parameter_id) is not int or parameter_id not in parameter_by_id:
@@ -1037,9 +1037,11 @@ def _validate_optimizer_state(
                     or dirty.dtype != torch.bool or dirty.shape != (parameter.shape[0],)):
                 raise RuntimeError("checkpoint optimizer_state omega_dirty is invalid")
         elif keys & {"step", "exp_avg", "exp_avg_sq", "max_exp_avg_sq"}:
-            required = {"step", "exp_avg", "exp_avg_sq"}
-            if not required.issubset(keys):
-                raise RuntimeError("checkpoint optimizer_state has incomplete AdamW slots")
+            expected_keys = {"step", "exp_avg", "exp_avg_sq"}
+            if bool(group.get("amsgrad", False)):
+                expected_keys.add("max_exp_avg_sq")
+            if keys != expected_keys:
+                raise RuntimeError("checkpoint optimizer_state has an invalid AdamW slot schema")
             step = state["step"]
             expected_step_device = (
                 parameter.device
@@ -1061,8 +1063,6 @@ def _validate_optimizer_state(
                 raise RuntimeError("checkpoint optimizer_state AdamW step is invalid")
             tensor_slots = ["exp_avg", "exp_avg_sq"]
             if bool(group.get("amsgrad", False)):
-                if "max_exp_avg_sq" not in state:
-                    raise RuntimeError("checkpoint optimizer_state is missing max_exp_avg_sq")
                 tensor_slots.append("max_exp_avg_sq")
             for name in tensor_slots:
                 value = state[name]

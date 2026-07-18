@@ -788,6 +788,95 @@ def test_pullback_group_resume_rejects_retired_phi_optimizer_slots(tmp_path, leg
         load_checkpoint(checkpoint, target, build_optimizer(target, cfg), cfg=cfg)
 
 
+def _refresh_optimizer_slot_manifest(bundle: dict) -> None:
+    ids = sorted([
+        parameter_id for parameter_id, state in bundle["optimizer_state"]["state"].items()
+        if state
+    ])
+    encoded = json.dumps(ids, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    bundle["optimizer_populated_slot_manifest"] = {
+        "parameter_ids": ids,
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def test_live_pullback_group_rejects_adam_slot_when_saved_tag_is_removed(tmp_path):
+    cfg = _pullback_resume_cfg()
+    source = VFEModel(cfg)
+    source_optimizer = build_optimizer(source, cfg)
+    checkpoint = RunArtifacts(tmp_path / "forged-pullback-tag", cfg, source).save_checkpoint(
+        0, source, source_optimizer, cfg,
+    )
+    bundle = torch.load(checkpoint, weights_only=True)
+    saved_group = next(
+        group for group in bundle["optimizer_state"]["param_groups"]
+        if group.get("pullback_group", False)
+    )
+    parameter_id = saved_group["params"][0]
+    parameter = next(
+        parameter
+        for group in source_optimizer.param_groups
+        if group.get("pullback_group", False)
+        for parameter in group["params"]
+    )
+    saved_group.pop("pullback_group")
+    bundle["optimizer_state"]["state"][parameter_id] = {
+        "step": torch.tensor(0.0),
+        "exp_avg": torch.zeros_like(parameter),
+        "exp_avg_sq": torch.zeros_like(parameter),
+    }
+    _refresh_optimizer_slot_manifest(bundle)
+    torch.save(bundle, checkpoint)
+
+    target = VFEModel(cfg)
+    with pytest.raises(RuntimeError, match="pullback-group parameter"):
+        load_checkpoint(checkpoint, target, build_optimizer(target, cfg), cfg=cfg)
+
+
+@pytest.mark.parametrize(
+    "retired_key",
+    ["gauge_mom", "gauge_m", "gauge_v", "gauge_step"],
+)
+def test_live_adamw_group_rejects_valid_slot_with_retired_extra_key(tmp_path, retired_key):
+    cfg, _, checkpoint = _populated_optimizer_checkpoint(tmp_path)
+    bundle = torch.load(checkpoint, weights_only=True)
+    slot = next(
+        state for state in bundle["optimizer_state"]["state"].values()
+        if set(state) == {"step", "exp_avg", "exp_avg_sq"}
+    )
+    slot[retired_key] = (
+        0 if retired_key == "gauge_step" else torch.zeros_like(slot["exp_avg"])
+    )
+    torch.save(bundle, checkpoint)
+
+    target = VFEModel(cfg)
+    with pytest.raises(RuntimeError, match="AdamW slot schema"):
+        load_checkpoint(checkpoint, target, build_optimizer(target, cfg), cfg=cfg)
+
+
+def test_live_adamw_group_rejects_omega_dirty_when_saved_tag_is_forged(tmp_path):
+    cfg = _cfg()
+    source = VFEModel(cfg)
+    source_optimizer = build_optimizer(source, cfg)
+    checkpoint = RunArtifacts(tmp_path / "forged-omega-tag", cfg, source).save_checkpoint(
+        0, source, source_optimizer, cfg,
+    )
+    bundle = torch.load(checkpoint, weights_only=True)
+    saved_group = bundle["optimizer_state"]["param_groups"][0]
+    parameter_id = saved_group["params"][0]
+    parameter = source_optimizer.param_groups[0]["params"][0]
+    saved_group["omega"] = True
+    bundle["optimizer_state"]["state"][parameter_id] = {
+        "omega_dirty": torch.zeros(parameter.shape[0], dtype=torch.bool),
+    }
+    _refresh_optimizer_slot_manifest(bundle)
+    torch.save(bundle, checkpoint)
+
+    target = VFEModel(cfg)
+    with pytest.raises(RuntimeError, match="unsupported parameter slots"):
+        load_checkpoint(checkpoint, target, build_optimizer(target, cfg), cfg=cfg)
+
+
 def _shuffled_loader(seq_len: int = 8, bs: int = 4, n: int = 480,
                       data_seed: int = 123, loader_seed: int = 0) -> DataLoader:
     # NONCONSTANT random stream + shuffle=True (RandomSampler): distinct windows, so the batch
