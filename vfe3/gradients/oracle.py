@@ -66,6 +66,7 @@ def _transport_to_float(
             rope=omega.rope.float(),
             on_cov=omega.on_cov,
             on_value=omega.on_value,
+            same_frame_flat_cocycle=omega.same_frame_flat_cocycle,
         )
     raise TypeError(f"unsupported transport type {type(omega).__name__!r}")
 

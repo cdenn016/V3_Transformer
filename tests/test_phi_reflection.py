@@ -95,6 +95,37 @@ def test_reflection_fold_matches_R_Omega_R_and_flips_det(group_name, group_kw):
     assert torch.equal(_dense_omega(none), Om_base)
 
 
+def test_reflection_certificate_preserves_only_implicit_same_table() -> None:
+    from vfe3.geometry.groups import get_group
+    from vfe3.geometry.transport import FactoredTransport, transport_mean
+    from vfe3.inference.e_step import _apply_reflection, build_belief_transport
+
+    group = get_group("block_glk")(4, 2)
+    phi = torch.zeros(1, 3, group.generators.shape[0])
+    base = build_belief_transport(phi, group, transport_mode="flat")
+    assert isinstance(base, FactoredTransport)
+    query_sign = torch.tensor([[1.0, -1.0, 1.0]])
+    key_sign = torch.tensor([[-1.0, -1.0, 1.0]])
+
+    implicit = _apply_reflection(base, query_sign)
+    explicit_equal = _apply_reflection(
+        base, query_sign, key_reflection=query_sign.clone(),
+    )
+    mismatched = _apply_reflection(base, query_sign, key_reflection=key_sign)
+
+    assert implicit.same_frame_flat_cocycle
+    assert not explicit_equal.same_frame_flat_cocycle
+    assert not mismatched.same_frame_flat_cocycle
+
+    mu = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4) + 1.0
+    self_links = torch.arange(mu.shape[-2])
+    assert torch.equal(transport_mean(implicit, mu)[:, self_links, self_links], mu)
+    raw_key = torch.einsum("...jlp,...jp->...jl", mismatched.exp_neg_phi, mu)
+    expected = torch.einsum("...ikl,...jl->...ijk", mismatched.exp_phi, raw_key)
+    assert torch.equal(transport_mean(mismatched, mu), expected)
+    assert not torch.equal(expected[:, self_links, self_links], mu)
+
+
 def test_nonflat_oracle_transport_threads_reflection() -> None:
     from vfe3.belief import BeliefState
     from vfe3.geometry.groups import get_group

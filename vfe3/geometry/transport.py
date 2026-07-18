@@ -235,12 +235,18 @@ class RopeTransport:
     honor the rotation (the score path); the value path transports on ``base`` directly.
     """
 
-    base:     'torch.Tensor | DirectLinkTransport | FactoredTransport | CompactFactoredTransport'
-    rope:     torch.Tensor                        # (N, K, K) block-diagonal orthogonal rotation
-    on_cov:   bool = False
-    on_value: bool = True                         # False -> value aggregation uses the UN-rotated base (RoPE Q/K only)
+    base:                    'torch.Tensor | DirectLinkTransport | FactoredTransport | CompactFactoredTransport'
+    rope:                    torch.Tensor  # (N, K, K) block-diagonal orthogonal rotation
+    on_cov:                  bool = False
+    on_value:                bool = True   # False -> value aggregation uses the UN-rotated base (RoPE Q/K only)
+    same_frame_flat_cocycle: bool = False  # trusted same-table RoPE around an already certified base
 
     def __post_init__(self) -> None:
+        if type(self.same_frame_flat_cocycle) is not bool:
+            raise ValueError(
+                "same_frame_flat_cocycle must be a bool, got "
+                f"{type(self.same_frame_flat_cocycle).__name__}: "
+                f"{self.same_frame_flat_cocycle!r}")
         if isinstance(self.base, DirectLinkTransport):
             if self.base.exp_phi is None:
                 n_query = self.base.exp_link.shape[-4]
@@ -1690,7 +1696,10 @@ def _certifies_same_frame_flat_cocycle(
     if isinstance(omega, (CompactFactoredTransport, FactoredTransport)):
         return omega.same_frame_flat_cocycle
     if isinstance(omega, RopeTransport):
-        return _certifies_same_frame_flat_cocycle(omega.base)
+        return (
+            omega.same_frame_flat_cocycle
+            and _certifies_same_frame_flat_cocycle(omega.base)
+        )
     return False
 
 
@@ -1825,7 +1834,7 @@ def transport_covariance(
             rotated = CompactFactoredTransport(
                 exp_blocks, inv_blocks, omega.base.K,
                 mean_per_head=omega.base.mean_per_head,
-                same_frame_flat_cocycle=omega.base.same_frame_flat_cocycle)
+                same_frame_flat_cocycle=omega.same_frame_flat_cocycle)
             return transport_covariance(rotated, sigma, diagonal_out=diagonal_out)
         # Other full-gauge bases use the established rotated dense operator.
         out = transport_covariance(_rope_dense_omega(omega.base, omega.rope), sigma,

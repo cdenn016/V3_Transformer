@@ -965,7 +965,9 @@ def numerical_health(
     fam = get_family(cfg.family)
     if rope is not None:
         rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                   on_value=cfg.rope_on_value)
+                                   on_value=cfg.rope_on_value,
+                                   same_frame_flat_cocycle=getattr(
+                                       omega, "same_frame_flat_cocycle", False))
         mu_t    = transport_mean(rope_omega, out.mu)
         sigma_t = fam.transport_dispersion(out.sigma, rope_omega)
     else:
@@ -1064,7 +1066,9 @@ def converged_state(
         fam = get_family(cfg.family)
         if rope is not None:
             rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                       on_value=cfg.rope_on_value)
+                                       on_value=cfg.rope_on_value,
+                                       same_frame_flat_cocycle=getattr(
+                                           omega, "same_frame_flat_cocycle", False))
             mu_t    = transport_mean(rope_omega, out.mu)
             sigma_t = fam.transport_dispersion(out.sigma, rope_omega)
         else:
@@ -1169,7 +1173,9 @@ def attention_entropy_cov_gap(
         )
         if rope is not None:
             omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                  on_value=cfg.rope_on_value)
+                                  on_value=cfg.rope_on_value,
+                                  same_frame_flat_cocycle=getattr(
+                                      omega, "same_frame_flat_cocycle", False))
     kw = dict(                                                    # the oracle's free-energy knob bag
         tau=attention_tau(model.effective_kappa_beta(dev), model.group.irrep_dims),
         renyi_order=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,

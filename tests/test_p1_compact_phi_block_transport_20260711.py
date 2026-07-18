@@ -16,6 +16,7 @@ from vfe3.geometry.lie_ops import (
     register_compose,
 )
 from vfe3.geometry.retraction import retract_phi
+from vfe3.geometry.rope import build_rope_rotation
 from vfe3.geometry.transport import (
     CompactFactoredTransport,
     FactoredTransport,
@@ -349,7 +350,10 @@ def test_same_frame_certificate_survives_supported_compositions() -> None:
         transport_mode="flat",
         reflection=torch.tensor([[1.0, -1.0, 1.0]]),
     )
-    rope_matrix, _ = torch.linalg.qr(torch.randn(1, 3, 4, 4))
+    rope_matrix = build_rope_rotation(
+        torch.arange(3), group.irrep_dims,
+        base=100.0, device=phi.device, dtype=phi.dtype,
+    )
     wrapped = build_belief_transport(
         phi,
         group,
@@ -371,6 +375,8 @@ def test_same_frame_certificate_survives_supported_compositions() -> None:
     assert oracle_module._transport_to_float(dense_vertex).same_frame_flat_cocycle
     assert reflected.same_frame_flat_cocycle
     assert wrapped.base.same_frame_flat_cocycle
+    assert wrapped.same_frame_flat_cocycle
+    assert oracle_module._transport_to_float(wrapped).same_frame_flat_cocycle
 
     mu = torch.randn(1, 3, 4)
     sigma = torch.rand(1, 3, 4) + 0.5
@@ -380,6 +386,60 @@ def test_same_frame_certificate_survives_supported_compositions() -> None:
         transport_covariance(wrapped, sigma, diagonal_out=True)[:, self_links, self_links],
         sigma,
     )
+
+
+@pytest.mark.parametrize("rope_kind", ["nonorthogonal", "non_block"])
+def test_direct_rope_wrapper_fails_closed_for_untrusted_rotation(rope_kind: str) -> None:
+    group = get_group("block_glk")(4, 2)
+    phi = torch.zeros(1, 3, group.generators.shape[0])
+    base = build_belief_transport(
+        phi,
+        group,
+        transport_mode="flat",
+        compact_phi_block_transport=True,
+    )
+    assert isinstance(base, CompactFactoredTransport)
+    assert base.same_frame_flat_cocycle
+
+    rope = torch.eye(4).expand(1, 3, 4, 4).clone()
+    if rope_kind == "nonorthogonal":
+        rope[..., 0, 0] = 2.0
+    else:
+        rope[..., 0, 2] = 0.5
+    wrapped = RopeTransport(base=base, rope=rope, on_cov=True)
+    mu = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4) + 1.0
+    pre_rotated = torch.einsum("...jlk,...jl->...jk", rope, mu)
+    expected_mean = torch.einsum(
+        "...ikl,...ijl->...ijk", rope, transport_mean(base, pre_rotated),
+    )
+    self_links = torch.arange(mu.shape[-2])
+
+    assert not wrapped.same_frame_flat_cocycle
+    assert torch.equal(transport_mean(wrapped, mu), expected_mean)
+    assert not torch.equal(expected_mean[:, self_links, self_links], mu)
+
+    if rope_kind == "nonorthogonal":
+        sigma = torch.eye(4).expand(1, 3, 4, 4).clone()
+        self_operator = rope @ rope.transpose(-1, -2)
+        expected_self = self_operator @ sigma @ self_operator.transpose(-1, -2)
+        covariance = transport_covariance(wrapped, sigma, diagonal_out=False)
+        assert torch.equal(covariance[:, self_links, self_links], expected_self)
+
+
+def test_self_link_certificates_reject_non_boolean_values() -> None:
+    dense = torch.eye(4).expand(1, 3, 4, 4).clone()
+    blocks = torch.eye(2).expand(1, 3, 2, 2, 2).clone()
+    with pytest.raises(ValueError, match="same_frame_flat_cocycle must be a bool"):
+        FactoredTransport(dense, dense, [2, 2], same_frame_flat_cocycle=1)
+    with pytest.raises(ValueError, match="same_frame_flat_cocycle must be a bool"):
+        CompactFactoredTransport(blocks, blocks, 4, same_frame_flat_cocycle=1)
+    base = FactoredTransport(dense, dense, [2, 2], same_frame_flat_cocycle=True)
+    with pytest.raises(ValueError, match="same_frame_flat_cocycle must be a bool"):
+        RopeTransport(
+            base=base,
+            rope=dense,
+            same_frame_flat_cocycle=1,
+        )
 
 
 @pytest.mark.parametrize("mean_per_head", [False, True])

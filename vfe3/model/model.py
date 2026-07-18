@@ -2509,7 +2509,9 @@ class VFEModel(nn.Module):
         if rope is not None:
             rope_omega = RopeTransport(
                 base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                on_value=cfg.rope_on_value)
+                on_value=cfg.rope_on_value,
+                same_frame_flat_cocycle=getattr(
+                    omega, "same_frame_flat_cocycle", False))
             mu_t = transport_mean(rope_omega, belief.mu)
             sigma_t = fam.transport_dispersion(belief.sigma, rope_omega)
         else:
@@ -2736,7 +2738,9 @@ class VFEModel(nn.Module):
         mu_tv = sigma_tv = None
         if rope is not None:
             rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                       on_value=cfg.rope_on_value)
+                                       on_value=cfg.rope_on_value,
+                                       same_frame_flat_cocycle=getattr(
+                                           omega, "same_frame_flat_cocycle", False))
             mu_t    = transport_mean(rope_omega, out.mu)             # (N, N, K)
             sigma_t = fam.transport_dispersion(out.sigma, rope_omega) # (N, N, K)
             if not cfg.rope_on_value:
@@ -3196,7 +3200,9 @@ class VFEModel(nn.Module):
             omega = self._diagnostic_transport(belief)
             if rope is not None:
                 rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                           on_value=cfg.rope_on_value)
+                                           on_value=cfg.rope_on_value,
+                                           same_frame_flat_cocycle=getattr(
+                                               omega, "same_frame_flat_cocycle", False))
                 mu_t    = transport_mean(rope_omega, belief.mu)          # (N, N, K)
                 sigma_t = fam.transport_dispersion(belief.sigma, rope_omega) # (N, N, K)
             else:
@@ -3328,7 +3334,9 @@ class VFEModel(nn.Module):
             mu_tv = sigma_tv = None
             if rope is not None:
                 rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                           on_value=cfg.rope_on_value)
+                                           on_value=cfg.rope_on_value,
+                                           same_frame_flat_cocycle=getattr(
+                                               omega, "same_frame_flat_cocycle", False))
                 mu_t    = transport_mean(rope_omega, belief.mu)
                 sigma_t = fam.transport_dispersion(belief.sigma, rope_omega)
                 if not cfg.rope_on_value:

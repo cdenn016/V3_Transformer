@@ -225,7 +225,8 @@ def _apply_reflection(
     Every downstream mean transport (Omega mu) and covariance sandwich (Omega Sigma Omega^T) is then
     correct with no further change.
     """
-    key_reflection = reflection if key_reflection is None else key_reflection
+    shared_reflection = key_reflection is None
+    key_reflection = reflection if shared_reflection else key_reflection
     if isinstance(built, DirectLinkTransport):
         if built.exp_phi is None:
             K = built.exp_link.shape[-1]
@@ -254,7 +255,14 @@ def _apply_reflection(
         exp_neg_phi = built.exp_neg_phi.clone()                                # (..., N, K, K)
         exp_phi[..., 0, :]     *= reflection[..., :, None]                     # R_i: negate row 0 by s_i
         exp_neg_phi[..., :, 0] *= key_reflection[..., :, None]                 # (.) R_j: negate col 0 by s_j
-        return dataclasses.replace(built, exp_phi=exp_phi, exp_neg_phi=exp_neg_phi)
+        return dataclasses.replace(
+            built,
+            exp_phi=exp_phi,
+            exp_neg_phi=exp_neg_phi,
+            same_frame_flat_cocycle=(
+                built.same_frame_flat_cocycle and shared_reflection
+            ),
+        )
     omega = built.clone()                                                      # (..., i, j, K, K) dense
     omega[..., 0, :] *= reflection[..., :, None, None]                         # R_i: row 0 by s_i (over j)
     omega[..., :, 0] *= key_reflection[..., None, :, None]                     # (.) R_j: col 0 by s_j (over i)
@@ -366,7 +374,16 @@ def build_belief_transport(
         built = _apply_reflection(built, reflection)
     if rope is None:
         return built
-    return RopeTransport(base=built, rope=rope, on_cov=rope_on_cov, on_value=rope_on_value)
+    return RopeTransport(
+        base=built,
+        rope=rope,
+        on_cov=rope_on_cov,
+        on_value=rope_on_value,
+        same_frame_flat_cocycle=(
+            isinstance(built, (CompactFactoredTransport, FactoredTransport))
+            and built.same_frame_flat_cocycle
+        ),
+    )
 
 
 def _transport_qk(
