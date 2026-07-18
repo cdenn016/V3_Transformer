@@ -36,11 +36,6 @@ transport_module = importlib.import_module("vfe3.geometry.transport")
 viz_extract_module = importlib.import_module("vfe3.viz.extract")
 
 
-def test_compact_phi_block_transport_defaults_off_and_accepts_opt_in() -> None:
-    assert VFE3Config().compact_phi_block_transport is False
-    assert VFE3Config(compact_phi_block_transport=True).compact_phi_block_transport is True
-
-
 def test_dense_and_compact_bch_keep_float32_under_cpu_autocast(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -520,7 +515,7 @@ def test_compact_phi_block_transport_keeps_bch_retraction_packed_and_matches_vjp
     ("route", "expected"),
     [("eligible", True), ("nonflat", False), ("reflection", False)],
 )
-def test_model_threads_compact_toggle_into_live_phi_bch_retraction(
+def test_model_threads_automatic_route_into_live_phi_bch_retraction(
     monkeypatch: pytest.MonkeyPatch,
     route:       str,
     expected:    bool,
@@ -535,7 +530,6 @@ def test_model_threads_compact_toggle_into_live_phi_bch_retraction(
         "e_phi_lr": 0.01,
         "phi_retract_mode": "bch",
         "pos_phi": "none",
-        "compact_phi_block_transport": True,
     }
     if route == "nonflat":
         values["transport_mode"] = "regime_ii"
@@ -615,7 +609,6 @@ def test_model_gates_packed_bch_to_eligible_transport_route(
         "n_layers": 1,
         "n_e_steps": 1,
         "e_phi_lr": 0.0,
-        "compact_phi_block_transport": True,
     }
     if route == "omega_direct":
         values["gauge_parameterization"] = "omega_direct"
@@ -699,7 +692,7 @@ def test_compact_phi_block_transport_leaves_ineligible_routes_legacy(route: str)
     assert not isinstance(transport, CompactFactoredTransport)
 
 
-def _tiny_two_channel_config(compact: bool) -> VFE3Config:
+def _tiny_two_channel_config() -> VFE3Config:
     return VFE3Config(
         vocab_size=9,
         embed_dim=4,
@@ -714,17 +707,13 @@ def _tiny_two_channel_config(compact: bool) -> VFE3Config:
         lambda_h=1.0,
         lambda_gamma=0.75,
         share_refine_s_transport=True,
-        transport_mean_per_head=True,
-        compact_phi_block_transport=compact,
     )
 
 
-@pytest.mark.parametrize("compact", [False, True])
-def test_gamma_energy_forwards_transport_mean_per_head_for_both_factor_layouts(
+def test_gamma_energy_forwards_transport_mean_per_head(
     monkeypatch: pytest.MonkeyPatch,
-    compact:     bool,
 ) -> None:
-    model = VFEModel(_tiny_two_channel_config(compact)).eval()
+    model = VFEModel(_tiny_two_channel_config()).eval()
     token_ids = torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.long)
     phi = model.prior_bank.encode(token_ids).phi
     seen: list[object] = []
@@ -747,14 +736,15 @@ def test_compact_phi_block_transport_reaches_shared_and_gamma_model_paths(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch.manual_seed(13)
-    legacy_model = VFEModel(_tiny_two_channel_config(False)).eval()
-    compact_model = VFEModel(_tiny_two_channel_config(True)).eval()
-    compact_model.load_state_dict(legacy_model.state_dict())
+    dense_model = VFEModel(_tiny_two_channel_config()).eval()
+    compact_model = VFEModel(_tiny_two_channel_config()).eval()
+    compact_model.load_state_dict(dense_model.state_dict())
+    monkeypatch.setattr(dense_model, "_compact_phi_blocks_enabled", lambda: False)
     token_ids = torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.long)
     targets = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
 
-    legacy_logits, legacy_loss, _ = legacy_model(token_ids, targets)
-    legacy_grad, = torch.autograd.grad(legacy_loss, legacy_model.prior_bank.phi_embed)
+    dense_logits, dense_loss, _ = dense_model(token_ids, targets)
+    dense_grad, = torch.autograd.grad(dense_loss, dense_model.prior_bank.phi_embed)
 
     seen: list[object] = []
     original = e_step_module.build_belief_transport
@@ -771,6 +761,6 @@ def test_compact_phi_block_transport_reaches_shared_and_gamma_model_paths(
     compact_model._gamma_energy(token_ids, encoded_phi)
 
     assert sum(isinstance(item, CompactFactoredTransport) for item in seen) >= 2
-    assert torch.allclose(compact_logits, legacy_logits, atol=2e-5, rtol=1e-5)
-    assert torch.allclose(compact_loss, legacy_loss, atol=2e-5, rtol=1e-5)
-    assert torch.allclose(compact_grad, legacy_grad, atol=5e-5, rtol=1e-5)
+    assert torch.allclose(compact_logits, dense_logits, atol=2e-5, rtol=1e-5)
+    assert torch.allclose(compact_loss, dense_loss, atol=2e-5, rtol=1e-5)
+    assert torch.allclose(compact_grad, dense_grad, atol=5e-5, rtol=1e-5)

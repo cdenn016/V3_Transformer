@@ -91,9 +91,10 @@ def test_compact_diagnostics_keep_pairwise_transport_factored(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch.manual_seed(17)
-    dense_model = VFEModel(_tiny_config(compact_phi_block_transport=False)).eval()
-    compact_model = VFEModel(_tiny_config(compact_phi_block_transport=True)).eval()
+    dense_model = VFEModel(_tiny_config()).eval()
+    compact_model = VFEModel(_tiny_config()).eval()
     compact_model.load_state_dict(dense_model.state_dict())
+    monkeypatch.setattr(dense_model, "_compact_phi_blocks_enabled", lambda: False)
     token_ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
 
     dense_snapshot = dense_model.build_diagnostic_snapshot(token_ids)
@@ -136,9 +137,10 @@ def test_compact_trace_fallback_keeps_free_energy_transport_factored(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch.manual_seed(23)
-    dense_model = VFEModel(_tiny_config(compact_phi_block_transport=False)).eval()
-    compact_model = VFEModel(_tiny_config(compact_phi_block_transport=True)).eval()
+    dense_model = VFEModel(_tiny_config()).eval()
+    compact_model = VFEModel(_tiny_config()).eval()
     compact_model.load_state_dict(dense_model.state_dict())
+    monkeypatch.setattr(dense_model, "_compact_phi_blocks_enabled", lambda: False)
     token_ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
     expected = extract.e_step_belief_trace(dense_model, token_ids, n_iter=2)
 
@@ -161,9 +163,10 @@ def test_compact_report_fallbacks_keep_transport_factored_end_to_end(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     torch.manual_seed(29)
-    dense_model = VFEModel(_tiny_config(compact_phi_block_transport=False)).eval()
-    compact_model = VFEModel(_tiny_config(compact_phi_block_transport=True)).eval()
+    dense_model = VFEModel(_tiny_config()).eval()
+    compact_model = VFEModel(_tiny_config()).eval()
     compact_model.load_state_dict(dense_model.state_dict())
+    monkeypatch.setattr(dense_model, "_compact_phi_blocks_enabled", lambda: False)
     token_ids = torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
 
     expected_maps = dense_model.attention_maps(token_ids)

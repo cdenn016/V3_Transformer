@@ -25,70 +25,28 @@ _TOKEN_IDS = torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.long)
 
 def _tiny_two_channel_config(
     *,
-    e_step_update:           str           = "gradient",
-    reuse_pairwise_kl_stats: 'bool | None' = None,
+    e_step_update: str = "gradient",
 ) -> VFE3Config:
-    values: dict[str, object] = {
-        "vocab_size": 9,
-        "embed_dim": 4,
-        "n_heads": 2,
-        "max_seq_len": 5,
-        "n_layers": 1,
-        "n_e_steps": 1,
-        "e_phi_lr": 0.0,
-        "use_prior_bank": True,
-        "prior_source": "model_channel",
-        "s_e_step": True,
-        "lambda_h": 1.0,
-        "lambda_gamma": 0.75,
-        "e_step_update": e_step_update,
-    }
-    if reuse_pairwise_kl_stats is not None:
-        values["reuse_pairwise_kl_stats"] = reuse_pairwise_kl_stats
-    return VFE3Config(**values)
+    return VFE3Config(
+        vocab_size=9,
+        embed_dim=4,
+        n_heads=2,
+        max_seq_len=5,
+        n_layers=1,
+        n_e_steps=1,
+        e_phi_lr=0.0,
+        use_prior_bank=True,
+        prior_source="model_channel",
+        s_e_step=True,
+        lambda_h=1.0,
+        lambda_gamma=0.75,
+        e_step_update=e_step_update,
+    )
 
 
 def _build_model(cfg: VFE3Config) -> VFEModel:
     torch.manual_seed(13)
     return VFEModel(cfg).eval()
-
-
-def test_p3_toggle_defaults_off_and_is_opt_in() -> None:
-    assert VFE3Config().reuse_pairwise_kl_stats is False
-    assert VFE3Config(reuse_pairwise_kl_stats=True).reuse_pairwise_kl_stats is True
-
-
-def test_p3_default_and_explicit_false_are_bit_identical() -> None:
-    default_model = _build_model(_tiny_two_channel_config())
-    false_model = _build_model(_tiny_two_channel_config(reuse_pairwise_kl_stats=False))
-    false_model.load_state_dict(default_model.state_dict())
-
-    with torch.no_grad():
-        default_logits = default_model(_TOKEN_IDS)
-        false_logits = false_model(_TOKEN_IDS)
-
-    assert torch.equal(default_logits, false_logits)
-
-
-def test_p3_disabled_route_cannot_reach_future_helper(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _future_p3_helper_forbidden(*args: object, **kwargs: object) -> object:
-        raise AssertionError("the P3 statistics helper must be unreachable while its toggle is off")
-
-    # Task 2 will add this helper to the kernels module. ``raising=False`` keeps this Task 1
-    # routing gate executable before that seam exists, while the same monkeypatch becomes a
-    # fail-loud route guard as soon as the helper is introduced.
-    monkeypatch.setattr(
-        kernels_module,
-        "diagonal_kl_pair_stats",
-        _future_p3_helper_forbidden,
-        raising=False,
-    )
-
-    model = _build_model(_tiny_two_channel_config(reuse_pairwise_kl_stats=False))
-    with torch.no_grad():
-        logits = model(_TOKEN_IDS)
-
-    assert logits.shape == (1, 5, 9)
 
 
 @pytest.mark.parametrize(
@@ -98,7 +56,7 @@ def test_p3_disabled_route_cannot_reach_future_helper(monkeypatch: pytest.Monkey
         pytest.param("mm_exact", "mm_exact_update", id="mm_exact"),
     ],
 )
-def test_p3_enabled_forwards_true_to_q_and_s_consumers(
+def test_p3_production_forwards_true_to_q_and_s_consumers(
     monkeypatch:   pytest.MonkeyPatch,
     e_step_update: str,
     consumer_name: str,
@@ -106,25 +64,19 @@ def test_p3_enabled_forwards_true_to_q_and_s_consumers(
     original_consumer = getattr(e_step_module, consumer_name)
     seen: list[tuple[object, object]] = []
 
-    def _capture_then_run_legacy(*args: object, **kwargs: object) -> object:
+    def _capture_then_run(*args: object, **kwargs: object) -> object:
         seen.append((kwargs.pop("reuse_pairwise_kl_stats", None), kwargs.get("lambda_beta")))
         return original_consumer(*args, **kwargs)
 
-    # Patch the names imported by e_step_iteration, not the registry module. The wrapper removes
-    # only Task 1's future keyword, then delegates the complete call to the current real consumer.
-    monkeypatch.setattr(e_step_module, consumer_name, _capture_then_run_legacy)
+    # Patch the names imported by e_step_iteration, not the registry module.
+    monkeypatch.setattr(e_step_module, consumer_name, _capture_then_run)
 
-    model = _build_model(
-        _tiny_two_channel_config(
-            e_step_update=e_step_update,
-            reuse_pairwise_kl_stats=True,
-        )
-    )
+    model = _build_model(_tiny_two_channel_config(e_step_update=e_step_update))
     with torch.no_grad():
         logits = model(_TOKEN_IDS)
 
     # _refine_s runs first with lambda_gamma=0.75; the belief q iteration follows with
-    # lambda_beta=1.0. Both must receive the enabled control.
+    # lambda_beta=1.0. Both receive the production control.
     assert seen == [(True, 0.75), (True, 1.0)]
     assert torch.isfinite(logits).all()
 

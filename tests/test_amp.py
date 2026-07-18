@@ -119,9 +119,7 @@ def test_bf16_head_mixer_validation_diagnostics_run_in_fp32():
     r"""A bf16 head-mixer forward must leave the off-graph diagnostic replay in fp32."""
     model = _tiny_model(
         amp_dtype="bf16",
-        compact_phi_block_transport=True,
         gauge_group="block_glk",
-        transport_mean_per_head=True,
         use_head_mixer=True,
     )
     tok = torch.randint(0, 20, (2, 5))

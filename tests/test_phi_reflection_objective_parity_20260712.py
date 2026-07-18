@@ -489,7 +489,7 @@ def _scorer_F(m, belief, context, *, mode) -> float:
             connection_L=getattr(m, "connection_L", None),
             cocycle_relaxation=cfg.cocycle_relaxation, link_alpha=cfg.link_alpha,
             link_soft_cap=cfg.link_soft_cap, clamp_monitor=cfg.transport_clamp_monitor,
-            transport_mean_per_head=cfg.transport_mean_per_head, rope=context.rope,
+            transport_mean_per_head=True, rope=context.rope,
             rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
             exp_fp64_mode=cfg.exp_fp64_mode, exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
         )

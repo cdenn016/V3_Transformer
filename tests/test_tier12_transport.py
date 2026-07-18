@@ -1,6 +1,8 @@
-r"""Tier-1 transport perf toggles (2026-07-05): per-head transport_mean
-(cfg.transport_mean_per_head) and the norm-keyed float64 island of stable_matrix_exp_pair
-(cfg.exp_fp64_mode / cfg.exp_fp64_norm_threshold).
+r"""Tier-1 transport production behavior and numerical parity oracles (2026-07-05).
+
+Production requests per-head transport-mean contraction. The retained low-level false-valued
+path is a dense-versus-factored parity oracle. The norm-keyed float64 island of
+stable_matrix_exp_pair remains controlled by cfg.exp_fp64_mode / cfg.exp_fp64_norm_threshold.
 
 Pins: (a) the per-head factored mean equals the dense-K mean to fp32 reassociation (allclose
 atol 1e-6), including the RoPE-wrapped route; (b) 'norm' mode with an unreachable threshold is

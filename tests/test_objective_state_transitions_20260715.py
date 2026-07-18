@@ -111,7 +111,7 @@ def _belief_only_metropolis_energy(
             link_alpha=cfg.link_alpha,
             link_soft_cap=cfg.link_soft_cap,
             clamp_monitor=cfg.transport_clamp_monitor,
-            transport_mean_per_head=cfg.transport_mean_per_head,
+            transport_mean_per_head=True,
             rope=context.rope,
             rope_on_cov=cfg.rope_full_gauge,
             rope_on_value=cfg.rope_on_value,
