@@ -952,8 +952,8 @@ class VFEModel(nn.Module):
         estep_grad_out: Optional[EStepGradientOutput] = None,   # diag out-param: E-step belief-grad norms (forwarded)
     ) -> 'Tuple[BeliefState, Optional[torch.Tensor]]':
         r"""Run the belief pipeline and return the converged belief q* (post final_norm), optionally
-        with the decoded logits. This is the single belief-production seam shared by ``forward``,
-        ``generate`` (via the policy layer) and the EFE scorer.
+        with the decoded logits. This is the single belief-production seam used by ``forward`` and,
+        through it, the ordinary autoregressive sampler in ``generate``.
 
         Factors the (previously inline) sequence q_i(0) = p_i = encode(token) -> phi <- pos_phi ->
         (optional s-refine) -> precision-bias fold -> vfe_stack (L blocks of E-step belief descent) ->
