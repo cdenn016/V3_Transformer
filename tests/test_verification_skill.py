@@ -230,6 +230,9 @@ def test_skill_documents_revision_binding_candidates_and_terminal_adjudication()
         "result location",
         "evidence_invalidated",
         "structured `verifier-adjudicator`",
+        "exactly one structured `verifier-adjudicator`",
+        "current domain-eligible supporting evidence ID",
+        "current domain-eligible `supports: false` counterevidence ID",
     ):
         assert phrase in text
 
@@ -243,6 +246,18 @@ def test_schema_encodes_provenance_and_structured_verifier_records() -> None:
     assert "criteria" not in claim_schema["required"]
     assert "views" not in claim_schema["required"]
     assert any("if" in rule and "then" in rule for rule in claim_schema["allOf"])
+    assert "[Uu][Nn][Ss][Pp][Ee][Cc][Ii][Ff][Ii][Ee][Dd]" in serialized
+
+
+def test_contract_requires_recursive_revalidation_and_exact_adjudication() -> None:
+    contract = (SKILL_ROOT / "references" / "contract.md").read_text(encoding="utf-8")
+    for phrase in (
+        "recursive Stop-hook invocation revalidates",
+        "exactly one structured `verifier-adjudicator`",
+        "current domain-eligible supporting evidence ID",
+        "current domain-eligible `supports: false` counterevidence ID",
+    ):
+        assert phrase in contract
 
 
 def test_adjudicator_agent_emits_view_and_result_provenance() -> None:
@@ -252,6 +267,13 @@ def test_adjudicator_agent_emits_view_and_result_provenance() -> None:
     required = spec["output"]["required"]
     for field in ("result", "view_ids", "evidence_ids", "result_location"):
         assert field in required
+    instructions = spec["instructions"]
+    for phrase in (
+        "exactly one structured result",
+        "current domain-eligible supporting evidence ID",
+        "current domain-eligible supports:false counterevidence ID",
+    ):
+        assert phrase in instructions
 
 
 def test_eval_corpus_contains_six_required_behavioral_cases() -> None:
@@ -268,3 +290,4 @@ def test_eval_corpus_contains_six_required_behavioral_cases() -> None:
     assert "tournament" not in json.dumps(disagreement_case).lower()
     assert "stable evidence ids" in corpus
     assert "structured adjudicator" in corpus
+    assert "current domain-eligible" in corpus

@@ -538,6 +538,7 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
         )
         evidence_kinds: set[str] = set()
         known_evidence_ids: set[str] = set()
+        eligible_supporting_evidence_ids: set[str] = set()
         evidence = claim.get("evidence")
         if not isinstance(evidence, list):
             errors.append(f"{prefix}: evidence must be a list")
@@ -550,12 +551,14 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                     continue
                 errors.extend(_field_errors(item_prefix, entry, _EVIDENCE_FIELDS))
                 evidence_id = entry.get("id")
+                evidence_id_text: str | None = None
                 if not _nonempty_string(evidence_id):
                     errors.append(f"{item_prefix}: id must be a nonempty string")
                 elif str(evidence_id) in known_evidence_ids:
                     errors.append(f"{item_prefix}: evidence ID must be unique across evidence and counterevidence")
                 else:
-                    known_evidence_ids.add(str(evidence_id))
+                    evidence_id_text = str(evidence_id)
+                    known_evidence_ids.add(evidence_id_text)
                 kind = entry.get("kind")
                 if kind not in EVIDENCE_KINDS:
                     errors.append(f"{item_prefix}: kind must be one of {', '.join(sorted(EVIDENCE_KINDS))}")
@@ -564,13 +567,23 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                 evidence_revision = entry.get("artifact_revision")
                 if not _nonempty_string(evidence_revision):
                     errors.append(f"{item_prefix}: artifact_revision must be a nonempty string")
+                elif _placeholder_revision(evidence_revision):
+                    errors.append(f"{item_prefix}: placeholder artifact_revision is not permitted")
                 elif _nonempty_string(revision) and evidence_revision != revision:
                     if not invalidated_history_allowed:
                         errors.append(f"{prefix}: stale evidence at evidence[{evidence_index}]")
                 elif kind in EVIDENCE_KINDS:
                     evidence_kinds.add(str(kind))
+                    if (
+                        evidence_id_text is not None
+                        and isinstance(domain, str)
+                        and domain in DOMAINS
+                        and kind in _closure_evidence(domain)
+                    ):
+                        eligible_supporting_evidence_ids.add(evidence_id_text)
 
         counterevidence_kinds: set[str] = set()
+        eligible_refuting_counterevidence_ids: set[str] = set()
         counterevidence = claim.get("counterevidence")
         if not isinstance(counterevidence, list):
             errors.append(f"{prefix}: counterevidence must be a list")
@@ -583,12 +596,14 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                     continue
                 errors.extend(_field_errors(item_prefix, entry, _COUNTEREVIDENCE_FIELDS))
                 evidence_id = entry.get("id")
+                evidence_id_text = None
                 if not _nonempty_string(evidence_id):
                     errors.append(f"{item_prefix}: id must be a nonempty string")
                 elif str(evidence_id) in known_evidence_ids:
                     errors.append(f"{item_prefix}: evidence ID must be unique across evidence and counterevidence")
                 else:
-                    known_evidence_ids.add(str(evidence_id))
+                    evidence_id_text = str(evidence_id)
+                    known_evidence_ids.add(evidence_id_text)
                 kind = entry.get("kind")
                 supports = entry.get("supports")
                 if kind not in EVIDENCE_KINDS:
@@ -598,16 +613,26 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                 counterevidence_revision = entry.get("artifact_revision")
                 if not _nonempty_string(counterevidence_revision):
                     errors.append(f"{item_prefix}: artifact_revision must be a nonempty string")
+                elif _placeholder_revision(counterevidence_revision):
+                    errors.append(f"{item_prefix}: placeholder artifact_revision is not permitted")
                 elif _nonempty_string(revision) and counterevidence_revision != revision:
                     if not invalidated_history_allowed:
                         errors.append(f"{prefix}: stale counterevidence at counterevidence[{counterevidence_index}]")
                 elif kind in EVIDENCE_KINDS and supports is False:
                     counterevidence_kinds.add(str(kind))
+                    if (
+                        evidence_id_text is not None
+                        and isinstance(domain, str)
+                        and domain in DOMAINS
+                        and kind in _refutation_evidence(domain)
+                    ):
+                        eligible_refuting_counterevidence_ids.add(evidence_id_text)
                 if not isinstance(supports, bool):
                     errors.append(f"{item_prefix}: supports must be a boolean")
 
         roles: set[str] = set()
         structured_roles: set[str] = set()
+        structured_verifiers: list[dict[str, object]] = []
         verifiers = claim.get("verifiers")
         if not isinstance(verifiers, list):
             errors.append(f"{prefix}: verifiers must be a list")
@@ -675,6 +700,7 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                     and _nonempty_string(result_location)
                 ):
                     structured_roles.add(str(role))
+                    structured_verifiers.append(verifier)
 
         obligations = claim.get("open_obligations")
         if not isinstance(obligations, list):
@@ -712,24 +738,39 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                 else:
                     errors.append(f"{prefix}: REFUTED {domain} claims require current {required} counterevidence with supports false")
         if state in {"EVIDENCE_VERIFIED", "REFUTED", "INCONCLUSIVE"}:
-            if "verifier-adjudicator" not in structured_roles:
-                errors.append(f"{prefix}: terminal state requires a structured verifier-adjudicator result")
+            adjudicators = [
+                verifier
+                for verifier in verifiers if isinstance(verifier, dict) and verifier.get("role") == "verifier-adjudicator"
+            ] if isinstance(verifiers, list) else []
+            structured_adjudicators = [
+                verifier for verifier in structured_verifiers if verifier.get("role") == "verifier-adjudicator"
+            ]
+            if len(adjudicators) != 1 or len(structured_adjudicators) != 1:
+                errors.append(f"{prefix}: terminal state requires exactly one structured verifier-adjudicator result")
             expected_result = {
                 "EVIDENCE_VERIFIED": "support",
                 "REFUTED": "refute",
                 "INCONCLUSIVE": "abstain",
             }[state]
-            adjudicators = [
-                verifier
-                for verifier in verifiers if isinstance(verifier, dict) and verifier.get("role") == "verifier-adjudicator"
-            ] if isinstance(verifiers, list) else []
-            if adjudicators and not any(verifier.get("result") == expected_result for verifier in adjudicators):
+            if len(adjudicators) == 1 and adjudicators[0].get("result") != expected_result:
                 errors.append(f"{prefix}: verifier-adjudicator result must be {expected_result} for {state}")
-            if state in {"EVIDENCE_VERIFIED", "REFUTED"} and not any(
-                isinstance(verifier.get("evidence_ids"), list) and bool(verifier["evidence_ids"])
-                for verifier in adjudicators
+            linked_evidence_ids = {
+                str(evidence_id)
+                for evidence_id in adjudicators[0].get("evidence_ids", [])
+                if _nonempty_string(evidence_id)
+            } if len(adjudicators) == 1 and isinstance(adjudicators[0].get("evidence_ids"), list) else set()
+            if state == "EVIDENCE_VERIFIED" and not linked_evidence_ids.intersection(
+                eligible_supporting_evidence_ids
             ):
-                errors.append(f"{prefix}: verifier-adjudicator must link at least one evidence ID for {state}")
+                errors.append(
+                    f"{prefix}: verifier-adjudicator must link a current domain-eligible supporting evidence ID"
+                )
+            if state == "REFUTED" and not linked_evidence_ids.intersection(
+                eligible_refuting_counterevidence_ids
+            ):
+                errors.append(
+                    f"{prefix}: verifier-adjudicator must link a current domain-eligible supports:false counterevidence ID"
+                )
         if severity in {"high", "critical"} and state in {"EVIDENCE_VERIFIED", "REFUTED"}:
             skeptic_has_evidence_link = any(
                 isinstance(verifier, dict)
@@ -792,17 +833,48 @@ def _run_git(cwd: Path, *arguments: str) -> bytes:
     return completed.stdout
 
 
-def _safe_git_path(cwd: Path, raw_path: bytes) -> tuple[Path | None, str | None]:
+def _path_key(path: PurePosixPath) -> str:
+    text = path.as_posix()
+    return text.casefold() if os.name == "nt" else text
+
+
+def _canonical_exclusion_keys(cwd: Path, excluded_paths: frozenset[Path] | None) -> frozenset[str]:
+    keys: set[str] = set()
+    for excluded_path in excluded_paths or frozenset():
+        candidate = excluded_path if excluded_path.is_absolute() else cwd / excluded_path
+        resolved = candidate.resolve()
+        try:
+            relative = resolved.relative_to(cwd)
+        except ValueError as exc:
+            raise RuntimeError("artifact exclusion path must remain inside the verification cwd") from exc
+        if relative == Path("."):
+            raise RuntimeError("artifact exclusion path may not be the verification cwd")
+        keys.add(_path_key(PurePosixPath(relative.as_posix())))
+    return frozenset(keys)
+
+
+def _safe_git_path(
+    cwd:            Path,
+    raw_path:       bytes,
+    exclusion_keys: frozenset[str],
+) -> tuple[Path | None, str | None]:
     path_text = os.fsdecode(raw_path).replace("\\", "/")
     pure_path = PurePosixPath(path_text)
     if pure_path.is_absolute() or ".." in pure_path.parts:
         return None, "Git reported a path outside the verification cwd"
     if not pure_path.parts or pure_path.parts[0] in {".git", ".verification"}:
         return None, None
+    if _path_key(pure_path) in exclusion_keys:
+        return None, None
     return cwd.joinpath(*pure_path.parts), None
 
 
-def capture_artifact_revision(cwd: Path) -> str:
+def capture_artifact_revision(
+    cwd: Path,
+
+    *,
+    excluded_paths: frozenset[Path] | None = None,
+) -> str:
     """Capture HEAD plus index and repository-file content without following symlinks."""
 
     cwd = cwd.resolve()
@@ -814,6 +886,7 @@ def capture_artifact_revision(cwd: Path) -> str:
     head = os.fsdecode(_run_git(cwd, "rev-parse", "--verify", "HEAD")).strip()
     if not head:
         raise RuntimeError("Git worktree has no concrete HEAD revision")
+    exclusion_keys = _canonical_exclusion_keys(cwd, excluded_paths)
 
     digest = hashlib.sha256()
     digest.update(b"verification-artifact-v1\0")
@@ -824,7 +897,7 @@ def capture_artifact_revision(cwd: Path) -> str:
     for record in sorted(item for item in stage_records if item):
         separator = record.find(b"\t")
         raw_path = record[separator + 1 :] if separator >= 0 else b""
-        local_path, path_error = _safe_git_path(cwd, raw_path)
+        local_path, path_error = _safe_git_path(cwd, raw_path, exclusion_keys)
         if path_error is not None:
             raise RuntimeError(path_error)
         if local_path is None:
@@ -837,7 +910,7 @@ def capture_artifact_revision(cwd: Path) -> str:
         _run_git(cwd, "ls-files", "--cached", "--others", "--exclude-standard", "-z").split(b"\0")
     )
     for raw_path in sorted(item for item in worktree_paths if item):
-        local_path, path_error = _safe_git_path(cwd, raw_path)
+        local_path, path_error = _safe_git_path(cwd, raw_path, exclusion_keys)
         if path_error is not None:
             raise RuntimeError(path_error)
         if local_path is None:
@@ -876,6 +949,9 @@ def _binding_error(
     active_ledger_path, path_error = _resolve_under_cwd(cwd, activation.get("ledger"))
     if path_error is not None or active_ledger_path is None:
         return path_error or "invalid activation ledger path"
+    canonical_reference = active_ledger_path.relative_to(cwd).as_posix()
+    if activation.get("ledger") != canonical_reference:
+        return "activation marker ledger must be a canonical contained path"
     if active_ledger_path != ledger_path.resolve():
         return "validated ledger does not match activation marker ledger"
     activation_revision = activation.get("artifact_revision")
@@ -885,7 +961,7 @@ def _binding_error(
     if ledger_revision != activation_revision:
         return "ledger artifact_revision does not match activation artifact_revision"
     try:
-        live_revision = capture_artifact_revision(cwd)
+        live_revision = capture_artifact_revision(cwd, excluded_paths=frozenset({active_ledger_path}))
     except RuntimeError as exc:
         return f"cannot capture live artifact revision: {exc}"
     if live_revision != activation_revision:
@@ -919,8 +995,6 @@ def run_hook(payload: dict[str, object]) -> tuple[int, dict[str, object] | None]
     stop_hook_active = payload.get("stop_hook_active")
     if not isinstance(stop_hook_active, bool):
         return _block("hook payload stop_hook_active must be a boolean")
-    if stop_hook_active:
-        return 0, None
     raw_ledger = activation_data.get("ledger")
     ledger_path, path_error = _resolve_under_cwd(cwd, raw_ledger)
     if path_error is not None or ledger_path is None:
@@ -954,11 +1028,6 @@ def _candidate_ledger(mode: str, artifact_revision: str) -> dict[str, object]:
 
 def _command_start(args: argparse.Namespace) -> int:
     cwd = Path(args.cwd).resolve()
-    try:
-        artifact_revision = capture_artifact_revision(cwd)
-    except RuntimeError as exc:
-        print(f"cannot start verification: {exc}", file=sys.stderr)
-        return 2
     ledger_path, error = _resolve_under_cwd(cwd, args.ledger)
     if error is not None or ledger_path is None:
         print(error or "invalid ledger path", file=sys.stderr)
@@ -966,6 +1035,14 @@ def _command_start(args: argparse.Namespace) -> int:
     marker = cwd / ".verification" / "active.json"
     if ledger_path.exists() or marker.exists():
         print("verification activation or ledger already exists", file=sys.stderr)
+        return 2
+    try:
+        artifact_revision = capture_artifact_revision(
+            cwd,
+            excluded_paths=frozenset({ledger_path}),
+        )
+    except RuntimeError as exc:
+        print(f"cannot start verification: {exc}", file=sys.stderr)
         return 2
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
     marker.parent.mkdir(parents=True, exist_ok=True)

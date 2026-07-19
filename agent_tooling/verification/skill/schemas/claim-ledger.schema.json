@@ -8,6 +8,7 @@
     "revision": {
       "type": "string",
       "minLength": 1,
+      "pattern": "^(?!\\s*(?:[Uu][Nn][Ss][Pp][Ee][Cc][Ii][Ff][Ii][Ee][Dd]|[Uu][Nn][Kk][Nn][Oo][Ww][Nn]|<?[Pp][Ll][Aa][Cc][Ee][Hh][Oo][Ll][Dd][Ee][Rr]>?|[Tt][Bb][Dd]|[Tt][Oo][Dd][Oo]|[Nn][Oo][Nn][Ee]|[Nn][Uu][Ll][Ll]|[Nn]/[Aa])\\s*$).*\\S.*$",
       "not": {
         "enum": ["UNSPECIFIED", "UNKNOWN", "PLACEHOLDER", "<PLACEHOLDER>", "TBD", "TODO", "NONE", "NULL", "N/A"]
       }
@@ -215,7 +216,9 @@
                       {"$ref": "#/$defs/verifier"},
                       {"properties": {"role": {"const": "verifier-adjudicator"}}}
                     ]
-                  }
+                  },
+                  "minContains": 1,
+                  "maxContains": 1
                 }
               }
             }

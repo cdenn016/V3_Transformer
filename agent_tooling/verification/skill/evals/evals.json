@@ -9,7 +9,7 @@
       "expectations": [
         "Starts and validates the verification ledger.",
         "Requires current mechanical or reproduced-output evidence for code closure.",
-        "Records stable evidence IDs and a structured adjudicator result linked to the views, evidence, and result location.",
+        "Records stable evidence IDs and exactly one structured adjudicator result linked to the views, a current domain-eligible evidence ID, and the result location.",
         "Names the validated ledger in the final response."
       ]
     },

@@ -260,6 +260,96 @@ def test_adjudicator_result_must_link_known_views_evidence_and_location() -> Non
     assert any("result_location" in error for error in errors)
 
 
+def test_terminal_claim_requires_exactly_one_adjudicator_record() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["verifiers"].append(verifier_record("verifier-adjudicator", result="refute"))
+
+    assert any("exactly one structured verifier-adjudicator" in error for error in validate_ledger(ledger))
+
+
+def test_verified_adjudicator_must_link_current_domain_eligible_supporting_evidence() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["evidence"].append(
+        {
+            "id": "evidence-llm-1",
+            "kind": "llm_judgment",
+            "location": "agent-output.md",
+            "artifact_revision": "abc123",
+        }
+    )
+    adjudicator = next(item for item in claim["verifiers"] if item["role"] == "verifier-adjudicator")
+    adjudicator["evidence_ids"] = ["evidence-llm-1"]
+
+    assert any(
+        "current domain-eligible supporting evidence ID" in error for error in validate_ledger(ledger)
+    )
+
+
+@pytest.mark.parametrize("bad_link_kind", ("llm", "opposite_polarity"))
+def test_refuted_adjudicator_must_link_current_eligible_negative_counterevidence(bad_link_kind: str) -> None:
+    ledger = refuted_code_ledger(
+        [
+            {
+                "id": "counter-valid",
+                "kind": "mechanical",
+                "location": "tests/test_parser.py",
+                "artifact_revision": "abc123",
+                "supports": False,
+            }
+        ]
+    )
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    bad_entry = {
+        "id": "counter-bad",
+        "kind": "llm_judgment" if bad_link_kind == "llm" else "mechanical",
+        "location": "counter-output.json",
+        "artifact_revision": "abc123",
+        "supports": False if bad_link_kind == "llm" else True,
+    }
+    claim["counterevidence"].append(bad_entry)
+    adjudicator = next(item for item in claim["verifiers"] if item["role"] == "verifier-adjudicator")
+    adjudicator["evidence_ids"] = ["counter-bad"]
+
+    assert any(
+        "current domain-eligible supports:false counterevidence ID" in error
+        for error in validate_ledger(ledger)
+    )
+
+
+@pytest.mark.parametrize("entry_kind", ("evidence", "counterevidence"))
+def test_invalidated_history_still_rejects_placeholder_entry_revisions(entry_kind: str) -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["state"] = "INCONCLUSIVE"
+    claim["open_obligations"] = ["Reproduce evidence for the current artifact."]
+    claim["evidence_invalidated"] = True
+    adjudicator = next(item for item in claim["verifiers"] if item["role"] == "verifier-adjudicator")
+    adjudicator["result"] = "abstain"
+    if entry_kind == "evidence":
+        claim["evidence"][0]["artifact_revision"] = "unspecified"
+    else:
+        claim["counterevidence"] = [
+            {
+                "id": "counter-placeholder",
+                "kind": "mechanical",
+                "location": "old-output.txt",
+                "artifact_revision": "placeholder",
+                "supports": False,
+            }
+        ]
+
+    assert any(
+        f"{entry_kind}[0]" in error and "placeholder artifact_revision" in error
+        for error in validate_ledger(ledger)
+    )
+
+
 def test_llm_only_code_claim_cannot_be_evidence_verified() -> None:
     ledger = valid_ledger()
     claim = ledger["claims"][0]
@@ -870,9 +960,12 @@ def test_duplicate_claim_ids_are_rejected() -> None:
     assert any("ledger: duplicate claim ID 'CODE-001'" == error for error in validate_ledger(ledger))
 
 
-def activate(tmp_path: Path, ledger: dict[str, object], ledger_name: str = "ledger.json") -> Path:
+def activate(
+    tmp_path:         Path,
+    ledger:           dict[str, object],
+    ledger_reference: str = ".verification/ledger.json",
+) -> Path:
     initialize_git_repository(tmp_path)
-    ledger_reference = f".verification/{ledger_name}"
     assert main(["start", "--cwd", str(tmp_path), "--ledger", ledger_reference]) == 0
     verification_dir = tmp_path / ".verification"
     ledger_path = tmp_path / ledger_reference
@@ -899,16 +992,49 @@ def test_inactive_directory_passes() -> None:
     assert response is None
 
 
-def test_active_recursive_stop_does_not_loop_or_remove_activation(tmp_path: Path) -> None:
-    started_valid_ledger(tmp_path)
+@pytest.mark.parametrize("failure_kind", ("invalid", "stale"))
+def test_active_recursive_stop_remains_fail_closed(tmp_path: Path, failure_kind: str) -> None:
+    if failure_kind == "invalid":
+        ledger = valid_ledger()
+        claim = ledger["claims"][0]
+        assert isinstance(claim, dict)
+        claim["evidence"] = []
+        activate(tmp_path, ledger)
+    else:
+        started_valid_ledger(tmp_path)
+        (tmp_path / "artifact.txt").write_text("changed artifact\n", encoding="utf-8")
 
-    exit_code, response = run_hook(
+    _, first_response = run_hook(
+        {"cwd": str(tmp_path), "stop_hook_active": False, "last_assistant_message": ".verification/ledger.json"}
+    )
+
+    exit_code, recursive_response = run_hook(
         {"cwd": str(tmp_path), "stop_hook_active": True, "last_assistant_message": "User interrupted."}
     )
 
+    assert first_response is not None
+    assert first_response["decision"] == "block"
     assert exit_code == 0
-    assert response is None
+    assert recursive_response is not None
+    assert recursive_response["decision"] == "block"
     assert (tmp_path / ".verification" / "active.json").is_file()
+
+
+def test_active_recursive_stop_passes_after_ledger_and_reference_are_valid(tmp_path: Path) -> None:
+    started_valid_ledger(tmp_path)
+    _, first_response = run_hook(
+        {"cwd": str(tmp_path), "stop_hook_active": False, "last_assistant_message": "Work is complete."}
+    )
+
+    exit_code, recursive_response = run_hook(
+        {"cwd": str(tmp_path), "stop_hook_active": True, "last_assistant_message": ".verification/ledger.json"}
+    )
+
+    assert first_response is not None
+    assert first_response["decision"] == "block"
+    assert exit_code == 0
+    assert recursive_response is None
+    assert not (tmp_path / ".verification" / "active.json").exists()
 
 
 def test_active_hook_rejects_nonboolean_recursion_marker(tmp_path: Path) -> None:
@@ -944,6 +1070,22 @@ def test_active_hook_blocks_worktree_changes_after_activation(tmp_path: Path, ch
 
     _, response = run_hook(
         {"cwd": str(tmp_path), "stop_hook_active": False, "last_assistant_message": "Ledger: .verification/ledger.json"}
+    )
+
+    assert response is not None
+    assert response["decision"] == "block"
+    assert "live artifact changed" in response["reason"]
+
+
+def test_active_hook_blocks_a_staged_index_change_with_original_worktree_content(tmp_path: Path) -> None:
+    started_valid_ledger(tmp_path)
+    artifact = tmp_path / "artifact.txt"
+    artifact.write_text("staged artifact\n", encoding="utf-8")
+    subprocess.run(["git", "add", "artifact.txt"], cwd=tmp_path, check=True)
+    artifact.write_text("initial artifact\n", encoding="utf-8")
+
+    _, response = run_hook(
+        {"cwd": str(tmp_path), "stop_hook_active": False, "last_assistant_message": ".verification/ledger.json"}
     )
 
     assert response is not None
@@ -1016,6 +1158,34 @@ def test_active_hook_blocks_activation_ledger_revision_mismatch(tmp_path: Path) 
     assert response is not None
     assert response["decision"] == "block"
     assert "activation artifact_revision" in response["reason"]
+
+
+def test_custom_active_ledger_validates_and_passes_unchanged(tmp_path: Path) -> None:
+    ledger_reference = "artifacts/nested/ledger.json"
+    ledger_path = activate(tmp_path, valid_ledger(), ledger_reference)
+
+    assert main(["validate", str(ledger_path), "--cwd", str(tmp_path)]) == 0
+    exit_code, response = run_hook(
+        {"cwd": str(tmp_path), "stop_hook_active": False, "last_assistant_message": ledger_reference}
+    )
+
+    assert exit_code == 0
+    assert response is None
+    assert not (tmp_path / ".verification" / "active.json").exists()
+
+
+def test_custom_active_ledger_exclusion_does_not_cover_sibling_files(tmp_path: Path) -> None:
+    ledger_reference = "artifacts/nested/ledger.json"
+    activate(tmp_path, valid_ledger(), ledger_reference)
+    (tmp_path / "artifacts" / "nested" / "result.json").write_text("{}\n", encoding="utf-8")
+
+    _, response = run_hook(
+        {"cwd": str(tmp_path), "stop_hook_active": False, "last_assistant_message": ledger_reference}
+    )
+
+    assert response is not None
+    assert response["decision"] == "block"
+    assert "live artifact changed" in response["reason"]
 
 
 def test_active_invalid_ledger_blocks(tmp_path: Path) -> None:
