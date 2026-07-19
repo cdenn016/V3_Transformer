@@ -1,0 +1,751 @@
+"""Behavioral tests for cross-platform verification-control installation."""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tomllib
+from argparse import Namespace
+from pathlib import Path
+
+import pytest
+import yaml
+
+import agent_tooling.verification.install as install_module
+from agent_tooling.verification.install import (
+    AGENT_ROLES,
+    BLOCK_MARKERS,
+    GATE_STOP_STATUS_MESSAGE,
+    effective_instructions,
+    _is_python_executable,
+    render_claude_agent,
+    render_codex_agent,
+    install,
+    upsert_marked_block,
+)
+
+
+REPOSITORY_ROOT = Path(__file__).parents[1]
+SKILL_SOURCE = REPOSITORY_ROOT / "agent_tooling" / "verification" / "skill"
+
+
+def _source_root(tmp_path: Path) -> Path:
+    source = tmp_path / "source"
+    agents = source / "agents"
+    blocks = source / "blocks"
+    agents.mkdir(parents=True)
+    blocks.mkdir()
+    shutil.copytree(SKILL_SOURCE, source / "skill")
+    for role in AGENT_ROLES:
+        output = None
+        if role == "verifier-adjudicator":
+            output = {
+                "required": [
+                    "claim_id",
+                    "ledger_state",
+                    "result",
+                    "rationale",
+                    "view_ids",
+                    "evidence_ids",
+                    "result_location",
+                    "open_obligations",
+                    "validator_errors",
+                ],
+                "ledger_state": ["EVIDENCE_VERIFIED", "REFUTED", "INCONCLUSIVE"],
+            }
+        (agents / f"{role}.json").write_text(
+            json.dumps(
+                {
+                    "name": role,
+                    "description": f"Neutral {role} verification role.",
+                    "instructions": f"Neutral body for {role}.\nReturn structured support, refute, or abstain.",
+                    **({"output": output} if output is not None else {}),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    for filename, marker in BLOCK_MARKERS.items():
+        (blocks / filename).write_text(
+            f"<!-- BEGIN {marker} -->\n{filename} policy body\n<!-- END {marker} -->\n",
+            encoding="utf-8",
+        )
+    return source
+
+
+def _args(tmp_path: Path, *, project: bool = True) -> Namespace:
+    claude_home = tmp_path / "claude"
+    codex_home = tmp_path / "codex"
+    claude_home.mkdir()
+    codex_home.mkdir()
+    (claude_home / "CLAUDE.md").write_text("Claude preface\n", encoding="utf-8")
+    (codex_home / "AGENTS.md").write_text("Codex preface\n", encoding="utf-8")
+    (claude_home / "settings.json").write_text(
+        json.dumps({"theme": "dark", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo keep"}]}]}}),
+        encoding="utf-8",
+    )
+    (codex_home / "hooks.json").write_text(
+        json.dumps({"other": {"enabled": True}, "hooks": {"Stop": [{"command": "echo keep"}]}}),
+        encoding="utf-8",
+    )
+    (claude_home / "agents").mkdir()
+    (claude_home / "agents" / "unrelated.md").write_text("keep\n", encoding="utf-8")
+    (codex_home / "agents").mkdir()
+    (codex_home / "agents" / "unrelated.toml").write_text('name = "keep"\n', encoding="utf-8")
+    (claude_home / "skills").mkdir()
+    (claude_home / "skills" / "unrelated.txt").write_text("keep\n", encoding="utf-8")
+    (codex_home / "skills").mkdir()
+    (codex_home / "skills" / "unrelated.txt").write_text("keep\n", encoding="utf-8")
+    for home, label in ((claude_home, "Claude"), (codex_home, "Codex")):
+        deep_audit = home / "skills" / "deep-audit"
+        deep_audit.mkdir()
+        (deep_audit / "SKILL.md").write_text(f"{label} deep-audit preface\n", encoding="utf-8")
+    project_root: Path | None = None
+    if project:
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        (project_root / "CLAUDE.md").write_text("Project Claude preface\n", encoding="utf-8")
+        (project_root / "AGENTS.md").write_text("Project Codex preface\n", encoding="utf-8")
+    return Namespace(
+        source_root=_source_root(tmp_path),
+        claude_home=claude_home,
+        codex_home=codex_home,
+        project_root=project_root,
+        shell="powershell",
+    )
+
+
+def _claude_instruction(text: str) -> str:
+    assert text.startswith("---\n")
+    _, body = text[len("---\n"):].split("\n---\n", 1)
+    return body[1:] if body.startswith("\n") else body
+
+
+def _claude_frontmatter(text: str) -> dict[str, object]:
+    assert text.startswith("---\n")
+    frontmatter, _ = text[len("---\n"):].split("\n---\n", 1)
+    value = yaml.safe_load(frontmatter)
+    assert isinstance(value, dict)
+    return value
+
+
+def _tree_bytes(root: Path) -> dict[Path, bytes]:
+    return {path.relative_to(root): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
+def _stop_commands(data: dict[str, object]) -> list[str]:
+    return [handler["command"] for handler in _stop_handlers(data) if isinstance(handler.get("command"), str)]
+
+
+def _stop_handlers(data: dict[str, object]) -> list[dict[str, object]]:
+    handlers_out: list[dict[str, object]] = []
+    for entry in data["hooks"]["Stop"]:  # type: ignore[index]
+        if not isinstance(entry, dict):
+            continue
+        handlers = entry.get("hooks", [entry])
+        if not isinstance(handlers, list):
+            continue
+        for handler in handlers:
+            if isinstance(handler, dict):
+                handlers_out.append(handler)
+    return handlers_out
+
+
+def _symlink_or_skip(link: Path, target: Path, *, target_is_directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as exc:
+        if os.name == "nt" and target_is_directory:
+            junction = subprocess.run(
+                ["cmd.exe", "/c", "mklink", "/J", str(link), str(target)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if junction.returncode == 0:
+                return
+        pytest.skip(f"standard symlinks are unavailable on this platform: {exc}")
+
+
+def test_renderers_share_identical_neutral_instruction_bodies() -> None:
+    spec = {"name": "verifier-code", "description": "Code verifier.", "instructions": "Line one.\nLine two."}
+
+    claude = render_claude_agent(spec)
+    codex = render_codex_agent(spec)
+
+    assert _claude_instruction(claude) == spec["instructions"] + "\n"
+    assert _claude_instruction(claude) == effective_instructions(spec) + "\n"
+    assert tomllib.loads(codex)["instructions"] == effective_instructions(spec)
+    assert tomllib.loads(codex)["name"] == "verifier-code"
+
+
+def test_renderers_round_trip_adversarial_frontmatter_and_unicode() -> None:
+    spec = {
+        "name": "verifier: code # \U0001f680",
+        "description": "colon: value\n# hash --- \\\"quote\\\" \\ path \U0001f4a1",
+        "instructions": "line: value\n# literal\n---\n\\\"quotes\\\" and \\ slash \U0001f600",
+        "tools": ["read: source", "#search", "---", "\\path\\\U0001f680"],
+    }
+
+    claude = render_claude_agent(spec)
+    codex = render_codex_agent(spec)
+
+    claude_frontmatter = _claude_frontmatter(claude)
+    codex_data = tomllib.loads(codex)
+    for field in ("name", "description", "tools"):
+        assert claude_frontmatter[field] == spec[field]
+        assert codex_data[field] == spec[field]
+    assert _claude_instruction(claude) == effective_instructions(spec) + "\n"
+    assert codex_data["instructions"] == effective_instructions(spec)
+    assert "\\ud83d" not in codex
+
+
+def test_upsert_marked_block_replaces_only_the_named_region() -> None:
+    text = "before\n<!-- BEGIN selected -->\nold\n<!-- END selected -->\nafter\n"
+
+    result = upsert_marked_block(text, "selected", "new\n")
+
+    assert result == "before\n<!-- BEGIN selected -->\nnew\n<!-- END selected -->\nafter\n"
+    assert upsert_marked_block("before\n", "selected", "new\n").endswith("<!-- END selected -->\n")
+
+
+def test_install_renders_six_agents_preserves_existing_surfaces_and_is_idempotent(tmp_path: Path) -> None:
+    args = _args(tmp_path)
+
+    install(args)
+
+    for role in AGENT_ROLES:
+        spec = json.loads((args.source_root / "agents" / f"{role}.json").read_text(encoding="utf-8"))
+        claude_text = (args.claude_home / "agents" / f"{role}.md").read_text(encoding="utf-8")
+        codex_text = (args.codex_home / "agents" / f"{role}.toml").read_text(encoding="utf-8")
+        expected = effective_instructions(spec)
+        assert _claude_instruction(claude_text) == expected + "\n"
+        assert tomllib.loads(codex_text)["instructions"] == expected
+    assert (args.claude_home / "agents" / "unrelated.md").read_text(encoding="utf-8") == "keep\n"
+    assert (args.codex_home / "agents" / "unrelated.toml").read_text(encoding="utf-8") == 'name = "keep"\n'
+    assert (args.claude_home / "skills" / "unrelated.txt").read_text(encoding="utf-8") == "keep\n"
+    assert (args.codex_home / "skills" / "unrelated.txt").read_text(encoding="utf-8") == "keep\n"
+    assert "Claude preface" in (args.claude_home / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "Codex preface" in (args.codex_home / "AGENTS.md").read_text(encoding="utf-8")
+    assert "project-policy.md policy body" in (args.project_root / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "project-policy.md policy body" in (args.project_root / "AGENTS.md").read_text(encoding="utf-8")
+    assert "deep-audit-integration.md policy body" not in (args.claude_home / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "deep-audit-integration.md policy body" not in (args.codex_home / "AGENTS.md").read_text(encoding="utf-8")
+    assert "deep-audit-integration.md policy body" in (args.claude_home / "skills" / "deep-audit" / "SKILL.md").read_text(encoding="utf-8")
+    assert "deep-audit-integration.md policy body" in (args.codex_home / "skills" / "deep-audit" / "SKILL.md").read_text(encoding="utf-8")
+    assert "global-policy.md policy body" in (args.claude_home / "CLAUDE.md").read_text(encoding="utf-8")
+    assert "global-policy.md policy body" in (args.codex_home / "AGENTS.md").read_text(encoding="utf-8")
+    assert "{{VERIFICATION_GATE_COMMAND}}" not in (args.claude_home / "skills" / "verification" / "SKILL.md").read_text(encoding="utf-8")
+    assert "{{VERIFICATION_GATE_COMMAND}}" not in (args.codex_home / "skills" / "verification" / "SKILL.md").read_text(encoding="utf-8")
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file() and ".pytest_cache" not in path.parts}
+
+    install(args)
+
+    after = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file() and ".pytest_cache" not in path.parts}
+    assert after == before
+
+
+def test_install_excludes_and_removes_only_verification_skill_cache_artifacts(tmp_path: Path) -> None:
+    args = _args(tmp_path, project=False)
+    source_cache = args.source_root / "skill" / "scripts" / "nested" / "__pycache__"
+    source_cache.mkdir(parents=True)
+    (source_cache / "source.cpython-314.pyc").write_bytes(b"source cache")
+    (args.source_root / "skill" / "references" / "source-only.pyc").write_bytes(b"source bytecode")
+    outside_cache_files: list[Path] = []
+    for home in (args.claude_home, args.codex_home):
+        installed_skill = home / "skills" / "verification"
+        stale_cache = installed_skill / "scripts" / "__pycache__"
+        stale_cache.mkdir(parents=True)
+        (stale_cache / "stale.cpython-314.pyc").write_bytes(b"stale cache")
+        (installed_skill / "stale.pyc").write_bytes(b"stale bytecode")
+        keep_file = installed_skill / "custom" / "keep.txt"
+        keep_file.parent.mkdir()
+        keep_file.write_text("preserve me\n", encoding="utf-8")
+        outside_cache = home / "skills" / "unrelated-skill" / "__pycache__" / "keep.pyc"
+        outside_cache.parent.mkdir(parents=True)
+        outside_cache.write_bytes(b"outside cache")
+        outside_cache_files.append(outside_cache)
+
+    install(args)
+
+    for home in (args.claude_home, args.codex_home):
+        installed_skill = home / "skills" / "verification"
+        assert not any(path.name == "__pycache__" for path in installed_skill.rglob("*"))
+        assert not any(path.suffix == ".pyc" for path in installed_skill.rglob("*"))
+        assert (installed_skill / "custom" / "keep.txt").read_text(encoding="utf-8") == "preserve me\n"
+    assert all(path.read_bytes() == b"outside cache" for path in outside_cache_files)
+    assert (source_cache / "source.cpython-314.pyc").read_bytes() == b"source cache"
+
+
+def test_install_migrates_deep_audit_block_from_globals_to_skills_and_is_idempotent(tmp_path: Path) -> None:
+    args = _args(tmp_path, project=False)
+    marker = BLOCK_MARKERS["deep-audit-integration.md"]
+    source_block = (args.source_root / "blocks" / "deep-audit-integration.md").read_text(encoding="utf-8")
+    global_paths = (args.claude_home / "CLAUDE.md", args.codex_home / "AGENTS.md")
+    deep_skill_paths = (
+        args.claude_home / "skills" / "deep-audit" / "SKILL.md",
+        args.codex_home / "skills" / "deep-audit" / "SKILL.md",
+    )
+    for path in global_paths:
+        path.write_text(path.read_text(encoding="utf-8") + source_block, encoding="utf-8")
+    for path in deep_skill_paths:
+        path.write_text(
+            f"preserved prefix\n<!-- BEGIN {marker} -->\nstale body\n<!-- END {marker} -->\npreserved suffix\n",
+            encoding="utf-8",
+        )
+
+    install(args)
+
+    for path in global_paths:
+        text = path.read_text(encoding="utf-8")
+        assert f"<!-- BEGIN {marker} -->" not in text
+        assert "preface" in text
+        assert text.count(f"<!-- BEGIN {BLOCK_MARKERS['global-policy.md']} -->") == 1
+    for path in deep_skill_paths:
+        text = path.read_text(encoding="utf-8")
+        assert text.count(f"<!-- BEGIN {marker} -->") == 1
+        assert "deep-audit-integration.md policy body" in text
+        assert "preserved prefix" in text
+        assert "preserved suffix" in text
+    before = {path: path.read_bytes() for path in (*global_paths, *deep_skill_paths)}
+
+    install(args)
+
+    assert {path: path.read_bytes() for path in before} == before
+
+
+@pytest.mark.parametrize("fault", ("missing-claude", "missing-codex", "unreadable-claude", "unreadable-codex"))
+def test_install_preflights_both_deep_audit_skills_before_destination_writes(tmp_path: Path, fault: str) -> None:
+    args = _args(tmp_path, project=True)
+    destinations = (args.claude_home, args.codex_home, args.project_root)
+    target_home = args.claude_home if fault.endswith("claude") else args.codex_home
+    target = target_home / "skills" / "deep-audit" / "SKILL.md"
+    if fault.startswith("missing"):
+        target.unlink()
+    else:
+        target.write_bytes(b"\xff\xfe\x00")
+    before = {root: _tree_bytes(root) for root in destinations if root is not None}
+
+    with pytest.raises((FileNotFoundError, UnicodeDecodeError, ValueError)):
+        install(args)
+
+    assert {root: _tree_bytes(root) for root in destinations if root is not None} == before
+
+
+def test_install_merges_exactly_one_gate_stop_handler_and_preserves_json_keys(tmp_path: Path) -> None:
+    args = _args(tmp_path, project=False)
+
+    install(args)
+
+    for path, preserved_key in ((args.claude_home / "settings.json", "theme"), (args.codex_home / "hooks.json", "other")):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert preserved_key in data
+        stop_entries = data["hooks"]["Stop"]
+        gate_entries = [entry for entry in stop_entries if "verification_gate.py" in json.dumps(entry)]
+        assert len(gate_entries) == 1
+        assert "hook" in json.dumps(gate_entries[0])
+
+
+def test_powershell_gate_command_executes_installed_gate_with_inactive_payload(tmp_path: Path) -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell is unavailable")
+    args = _args(tmp_path, project=False)
+
+    install(args)
+
+    data = json.loads((args.claude_home / "settings.json").read_text(encoding="utf-8"))
+    gate_handler = next(
+        handler
+        for handler in _stop_handlers(data)
+        if handler.get("statusMessage") == GATE_STOP_STATUS_MESSAGE
+    )
+    command = str(gate_handler["command"])
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        input=json.dumps({"cwd": str(tmp_path)}),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert command.startswith('& "')
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX shell execution requires a POSIX host")
+def test_posix_gate_command_executes_installed_gate_with_inactive_payload(tmp_path: Path) -> None:
+    shell = shutil.which("sh")
+    if shell is None:
+        pytest.skip("POSIX sh is unavailable")
+    args = _args(tmp_path, project=False)
+    args.shell = "posix"
+
+    install(args)
+
+    data = json.loads((args.claude_home / "settings.json").read_text(encoding="utf-8"))
+    gate_handler = next(
+        handler
+        for handler in _stop_handlers(data)
+        if handler.get("statusMessage") == GATE_STOP_STATUS_MESSAGE
+    )
+    result = subprocess.run(
+        [shell, "-c", str(gate_handler["command"])],
+        input=json.dumps({"cwd": str(tmp_path)}),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {}
+
+
+@pytest.mark.parametrize(("initial_shell", "current_shell"), (("powershell", "posix"), ("posix", "powershell")))
+def test_reinstall_with_different_shell_replaces_managed_handler_only(
+    tmp_path: Path,
+    initial_shell: str,
+    current_shell: str,
+) -> None:
+    args = _args(tmp_path, project=False)
+    args.shell = initial_shell
+    install(args)
+    false_positive = {
+        "type": "command",
+        "statusMessage": GATE_STOP_STATUS_MESSAGE,
+        "shell": initial_shell,
+        "command": "echo skills/verification/scripts/verification_gate.py hook",
+    }
+    for path in (args.claude_home / "settings.json", args.codex_home / "hooks.json"):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["hooks"]["Stop"].append({"hooks": [false_positive]})
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    args.shell = current_shell
+    install(args)
+
+    for path in (args.claude_home / "settings.json", args.codex_home / "hooks.json"):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        managed = [
+            handler
+            for handler in _stop_handlers(data)
+            if handler.get("statusMessage") == GATE_STOP_STATUS_MESSAGE
+            and handler.get("command") != false_positive["command"]
+        ]
+        assert len(managed) == 1
+        assert managed[0]["shell"] == current_shell
+        assert false_positive in _stop_handlers(data)
+
+
+def test_reinstall_migrates_legacy_powershell_handler_without_call_operator(tmp_path: Path) -> None:
+    args = _args(tmp_path, project=False)
+    install(args)
+    paths = (args.claude_home / "settings.json", args.codex_home / "hooks.json")
+    for path in paths:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        handler = next(
+            handler
+            for handler in _stop_handlers(data)
+            if handler.get("statusMessage") == GATE_STOP_STATUS_MESSAGE
+        )
+        handler["command"] = str(handler["command"]).removeprefix("& ")
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    install(args)
+
+    for path in paths:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        handlers = [
+            handler
+            for handler in _stop_handlers(data)
+            if handler.get("statusMessage") == GATE_STOP_STATUS_MESSAGE
+        ]
+        assert len(handlers) == 1
+        assert str(handlers[0]["command"]).startswith('& "')
+
+
+def test_install_replaces_stale_gate_handlers_after_home_move_and_preserves_unrelated_hooks(tmp_path: Path) -> None:
+    args = _args(tmp_path, project=False)
+    install(args)
+    old_claude = args.claude_home
+    old_codex = args.codex_home
+    new_claude = tmp_path / "moved claude"
+    new_codex = tmp_path / "moved codex"
+    shutil.move(str(old_claude), new_claude)
+    shutil.move(str(old_codex), new_codex)
+    false_positives_by_path: dict[Path, list[str]] = {}
+    for path, old_home in ((new_claude / "settings.json", old_claude), (new_codex / "hooks.json", old_codex)):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        old_gate = old_home / "skills" / "verification" / "scripts" / "verification_gate.py"
+        false_positive_commands = [
+            "echo verification_gate.py documentation",
+            f'& "{Path(sys.executable).resolve()}" "{old_gate.with_name("other_verification_gate.py")}" hook',
+            f'& "{Path(sys.executable).resolve()}" "{old_gate}" validate',
+            f'& "{Path(sys.executable).resolve()}" "{old_gate}" hook',
+        ]
+        data["hooks"]["Stop"].append(
+            {
+                "hooks": [
+                    {"type": "command", "command": "echo group keep"},
+                    {"type": "command", "command": false_positive_commands[0]},
+                    {"type": "command", "statusMessage": GATE_STOP_STATUS_MESSAGE, "shell": "powershell", "command": false_positive_commands[1]},
+                    {"type": "command", "statusMessage": GATE_STOP_STATUS_MESSAGE, "shell": "powershell", "command": false_positive_commands[2]},
+                    {"type": "command", "statusMessage": GATE_STOP_STATUS_MESSAGE, "shell": "posix", "command": false_positive_commands[3]},
+                ]
+            }
+        )
+        path.write_text(json.dumps(data), encoding="utf-8")
+        false_positives_by_path[path] = false_positive_commands
+    args.claude_home = new_claude
+    args.codex_home = new_codex
+
+    install(args)
+
+    for path, old_home, new_home, preserved_command in (
+        (new_claude / "settings.json", old_claude, new_claude, "echo keep"),
+        (new_codex / "hooks.json", old_codex, new_codex, "echo keep"),
+    ):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        old_command = f'& "{Path(sys.executable).resolve()}" "{(old_home / "skills" / "verification" / "scripts" / "verification_gate.py").resolve()}" hook'
+        expected = f'& "{Path(sys.executable).resolve()}" "{(new_home / "skills" / "verification" / "scripts" / "verification_gate.py").resolve()}" hook'
+        commands = _stop_commands(data)
+        stale_handlers = [
+            handler
+            for handler in _stop_handlers(data)
+            if handler.get("type") == "command"
+            and handler.get("statusMessage") == GATE_STOP_STATUS_MESSAGE
+            and handler.get("shell") == "powershell"
+            and handler.get("command") == old_command
+        ]
+        assert stale_handlers == []
+        assert commands.count(expected) == 1
+        assert preserved_command in commands
+        false_positive_commands = false_positives_by_path[path]
+        assert false_positive_commands == [command for command in commands if command in false_positive_commands]
+    before = {path: path.read_bytes() for path in (new_claude / "settings.json", new_codex / "hooks.json")}
+
+    install(args)
+
+    assert {path: path.read_bytes() for path in before} == before
+
+
+@pytest.mark.parametrize("basename", ("python", "python3", "python3.12", "python.exe", "python3.exe", "python3.12.exe"))
+def test_python_executable_predicate_accepts_standard_posix_and_windows_basenames(basename: str) -> None:
+    assert _is_python_executable(basename)
+
+
+@pytest.mark.parametrize("basename", ("pythonish", "pythonish.exe", "pypy3", "not-python.exe"))
+def test_python_executable_predicate_rejects_unrelated_basenames(basename: str) -> None:
+    assert not _is_python_executable(basename)
+
+
+def test_posix_install_with_python3_replaces_its_gate_and_is_hook_json_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    args = _args(tmp_path, project=False)
+    args.shell = "posix"
+    monkeypatch.setattr(install_module.sys, "executable", "/usr/bin/python3")
+
+    install(args)
+
+    for path in (args.claude_home / "settings.json", args.codex_home / "hooks.json"):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        gate_handlers = [
+            handler
+            for handler in _stop_handlers(data)
+            if handler.get("statusMessage") == GATE_STOP_STATUS_MESSAGE
+        ]
+        assert len(gate_handlers) == 1
+        handler = gate_handlers[0]
+        assert handler["shell"] == "posix"
+        assert str(handler["command"]).startswith("/usr/bin/python3 ")
+    before = {path: path.read_bytes() for path in (args.claude_home / "settings.json", args.codex_home / "hooks.json")}
+
+    install(args)
+
+    assert {path: path.read_bytes() for path in before} == before
+
+
+@pytest.mark.parametrize("bad_source", ("missing", "invalid-json"))
+def test_install_aborts_before_destination_writes_for_invalid_source(tmp_path: Path, bad_source: str) -> None:
+    args = _args(tmp_path, project=False)
+    target = args.claude_home / "CLAUDE.md"
+    before = target.read_bytes()
+    if bad_source == "missing":
+        (args.source_root / "agents" / "verifier-code.json").unlink()
+    else:
+        (args.source_root / "agents" / "verifier-code.json").write_text("{ invalid", encoding="utf-8")
+
+    with pytest.raises((FileNotFoundError, ValueError)):
+        install(args)
+
+    assert target.read_bytes() == before
+
+
+def test_install_aborts_before_destination_writes_for_invalid_destination_json(tmp_path: Path) -> None:
+    args = _args(tmp_path, project=False)
+    target = args.codex_home / "AGENTS.md"
+    before = target.read_bytes()
+    (args.codex_home / "hooks.json").write_text("{ invalid", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid JSON"):
+        install(args)
+
+    assert target.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "SKILL.md",
+        "scripts/verification_gate.py",
+        "schemas/claim-ledger.schema.json",
+        "evals/evals.json",
+        "references/contract.md",
+        "references/criteria-code.md",
+        "references/criteria-math.md",
+        "references/criteria-evidence.md",
+        "references/criteria-experiment.md",
+        "references/criteria-general.md",
+    ),
+)
+def test_install_preflights_every_required_skill_artifact_before_destination_writes(tmp_path: Path, relative_path: str) -> None:
+    args = _args(tmp_path)
+    destinations = (args.claude_home, args.codex_home, args.project_root)
+    before = {root: _tree_bytes(root) for root in destinations if root is not None}
+    (args.source_root / "skill" / relative_path).unlink()
+
+    with pytest.raises(FileNotFoundError):
+        install(args)
+
+    assert {root: _tree_bytes(root) for root in destinations if root is not None} == before
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ("corrupt-schema", "corrupt-evals", "wrong-schema-root", "wrong-evals-root", "missing-command", "missing-shell", "duplicate-command"),
+)
+def test_install_preflights_skill_content_before_destination_writes(tmp_path: Path, fault: str) -> None:
+    args = _args(tmp_path)
+    destinations = (args.claude_home, args.codex_home, args.project_root)
+    before = {root: _tree_bytes(root) for root in destinations if root is not None}
+    skill = args.source_root / "skill"
+    if fault == "corrupt-schema":
+        (skill / "schemas" / "claim-ledger.schema.json").write_text("{ invalid", encoding="utf-8")
+    elif fault == "corrupt-evals":
+        (skill / "evals" / "evals.json").write_text("{ invalid", encoding="utf-8")
+    elif fault == "wrong-schema-root":
+        (skill / "schemas" / "claim-ledger.schema.json").write_text("[]", encoding="utf-8")
+    elif fault == "wrong-evals-root":
+        (skill / "evals" / "evals.json").write_text("[]", encoding="utf-8")
+    else:
+        template_path = skill / "SKILL.md"
+        template = template_path.read_text(encoding="utf-8")
+        token = "{{VERIFICATION_GATE_COMMAND}}" if fault != "missing-shell" else "{{VERIFICATION_GATE_SHELL}}"
+        if fault == "duplicate-command":
+            template += token
+        else:
+            template = template.replace(token, "", 1)
+        template_path.write_text(template, encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        install(args)
+
+    assert {root: _tree_bytes(root) for root in destinations if root is not None} == before
+
+
+MANAGED_SYMLINK_SURFACES = (
+    "claude-skill-nested",
+    "codex-skill-nested",
+    *(f"claude-agent-{role}" for role in AGENT_ROLES),
+    *(f"codex-agent-{role}" for role in AGENT_ROLES),
+    "claude-global",
+    "codex-global",
+    "project-claude",
+    "project-codex",
+    "claude-hooks",
+    "codex-hooks",
+    "claude-deep-audit",
+    "codex-deep-audit",
+)
+
+
+@pytest.mark.parametrize("surface", MANAGED_SYMLINK_SURFACES)
+def test_install_rejects_managed_destination_symlinks_before_any_write(tmp_path: Path, surface: str) -> None:
+    args = _args(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("outside sentinel\n", encoding="utf-8")
+    if surface.endswith("skill-nested"):
+        home = args.claude_home if surface.startswith("claude") else args.codex_home
+        target = home / "skills" / "verification" / "references"
+        target.parent.mkdir(parents=True)
+        outside_references = outside / "references"
+        outside_references.mkdir()
+        sentinel = outside_references / "contract.md"
+        sentinel.write_text("outside sentinel\n", encoding="utf-8")
+        _symlink_or_skip(target, outside_references, target_is_directory=True)
+    else:
+        if surface.startswith("claude-agent-"):
+            role = surface.removeprefix("claude-agent-")
+            target = args.claude_home / "agents" / f"{role}.md"
+        elif surface.startswith("codex-agent-"):
+            role = surface.removeprefix("codex-agent-")
+            target = args.codex_home / "agents" / f"{role}.toml"
+        else:
+            target = {
+                "claude-global": args.claude_home / "CLAUDE.md",
+                "codex-global": args.codex_home / "AGENTS.md",
+                "project-claude": args.project_root / "CLAUDE.md",
+                "project-codex": args.project_root / "AGENTS.md",
+                "claude-hooks": args.claude_home / "settings.json",
+                "codex-hooks": args.codex_home / "hooks.json",
+                "claude-deep-audit": args.claude_home / "skills" / "deep-audit" / "SKILL.md",
+                "codex-deep-audit": args.codex_home / "skills" / "deep-audit" / "SKILL.md",
+            }[surface]
+        if target.exists():
+            target.unlink()
+        _symlink_or_skip(target, sentinel)
+    destination_roots = (args.claude_home, args.codex_home, args.project_root)
+    before = {root: _tree_bytes(root) for root in destination_roots}
+
+    with pytest.raises(ValueError, match="symlink|reparse"):
+        install(args)
+
+    assert {root: _tree_bytes(root) for root in destination_roots} == before
+    assert sentinel.read_text(encoding="utf-8") == "outside sentinel\n"
+
+
+def test_neutral_specs_enforce_structured_results_and_adjudicator_closure_abstention() -> None:
+    for role in AGENT_ROLES:
+        spec_path = REPOSITORY_ROOT / "agent_tooling" / "verification" / "agents" / f"{role}.json"
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        body = str(spec["instructions"])
+        if role == "verifier-adjudicator":
+            output = spec["output"]
+            assert output == {
+                "required": [
+                    "claim_id",
+                    "ledger_state",
+                    "result",
+                    "rationale",
+                    "view_ids",
+                    "evidence_ids",
+                    "result_location",
+                    "open_obligations",
+                    "validator_errors",
+                ],
+                "ledger_state": ["EVIDENCE_VERIFIED", "REFUTED", "INCONCLUSIVE"],
+            }
+            expected = effective_instructions(spec)
+            assert "Required output schema:" in expected
+            assert json.dumps(output, indent=2) in expected
+            assert _claude_instruction(render_claude_agent(spec)) == expected + "\n"
+            assert tomllib.loads(render_codex_agent(spec))["instructions"] == expected
+        else:
+            assert "support" in body and "refute" in body and "abstain" in body
+            assert "must not assign EVIDENCE_VERIFIED" in body
