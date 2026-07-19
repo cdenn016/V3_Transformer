@@ -43,7 +43,17 @@ def _source_root(tmp_path: Path) -> Path:
         output = None
         if role == "verifier-adjudicator":
             output = {
-                "required": ["claim_id", "ledger_state", "rationale", "evidence_ids", "open_obligations", "validator_errors"],
+                "required": [
+                    "claim_id",
+                    "ledger_state",
+                    "result",
+                    "rationale",
+                    "view_ids",
+                    "evidence_ids",
+                    "result_location",
+                    "open_obligations",
+                    "validator_errors",
+                ],
                 "ledger_state": ["EVIDENCE_VERIFIED", "REFUTED", "INCONCLUSIVE"],
             }
         (agents / f"{role}.json").write_text(
@@ -718,7 +728,17 @@ def test_neutral_specs_enforce_structured_results_and_adjudicator_closure_absten
         if role == "verifier-adjudicator":
             output = spec["output"]
             assert output == {
-                "required": ["claim_id", "ledger_state", "rationale", "evidence_ids", "open_obligations", "validator_errors"],
+                "required": [
+                    "claim_id",
+                    "ledger_state",
+                    "result",
+                    "rationale",
+                    "view_ids",
+                    "evidence_ids",
+                    "result_location",
+                    "open_obligations",
+                    "validator_errors",
+                ],
                 "ledger_state": ["EVIDENCE_VERIFIED", "REFUTED", "INCONCLUSIVE"],
             }
             expected = effective_instructions(spec)

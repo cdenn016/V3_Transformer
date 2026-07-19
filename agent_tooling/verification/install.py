@@ -45,7 +45,17 @@ SKILL_MANIFEST = (
     "references/criteria-general.md",
 )
 ADJUDICATOR_OUTPUT = {
-    "required": ["claim_id", "ledger_state", "rationale", "evidence_ids", "open_obligations", "validator_errors"],
+    "required": [
+        "claim_id",
+        "ledger_state",
+        "result",
+        "rationale",
+        "view_ids",
+        "evidence_ids",
+        "result_location",
+        "open_obligations",
+        "validator_errors",
+    ],
     "ledger_state": ["EVIDENCE_VERIFIED", "REFUTED", "INCONCLUSIVE"],
 }
 GATE_STOP_STATUS_MESSAGE = "Verification ledger gate"
