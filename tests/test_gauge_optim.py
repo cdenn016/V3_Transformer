@@ -171,8 +171,18 @@ def test_default_adamw_one_step_matches_recompute_dense_low_level_oracle(
         )
 
 
+@pytest.mark.parametrize(
+    ("e_step_update", "pos_rotation"),
+    [
+        pytest.param("gradient", "none", id="plain-gradient"),
+        pytest.param("gradient", "rope", id="rope-gradient"),
+        pytest.param("mm_exact", "rope", id="rope-mm-exact"),
+    ],
+)
 def test_single_head_forward_matches_recompute_dense_low_level_oracle(
     monkeypatch: pytest.MonkeyPatch,
+    e_step_update: str,
+    pos_rotation:  str,
 ) -> None:
     from vfe3.config import VFE3Config
     from vfe3.gradients import kernels as kernels_module
@@ -188,6 +198,8 @@ def test_single_head_forward_matches_recompute_dense_low_level_oracle(
         n_layers=1,
         n_e_steps=1,
         pos_phi="none",
+        pos_rotation=pos_rotation,
+        e_step_update=e_step_update,
     )
     production = VFEModel(cfg).eval()
     oracle = VFEModel(cfg).eval()

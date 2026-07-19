@@ -423,6 +423,51 @@ def test_dense_single_block_reuse_fails_closed_to_generic_pair_energy(
         assert torch.equal(actual_tensor, expected_tensor)
 
 
+@pytest.mark.parametrize("consumer", [belief_gradients, mm_exact_update])
+def test_uncertified_mixed_frame_factors_retain_pair_statistics_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+    consumer:    Callable,
+) -> None:
+    mu, sigma, mu_p, sigma_p, omega = _certified_consumer_inputs()
+    mixed_frame = dataclasses.replace(
+        omega,
+        exp_neg_phi=1.1 * omega.exp_neg_phi,
+        same_frame_flat_cocycle=False,
+    )
+    expected = consumer(
+        mu,
+        sigma,
+        mu_p,
+        sigma_p,
+        mixed_frame,
+        irrep_dims=[2, 2],
+        reuse_pairwise_kl_stats=False,
+    )
+    calls = 0
+    real_helper = diagonal_kl_pair_stats
+
+    def _counting_helper(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return real_helper(*args, **kwargs)
+
+    monkeypatch.setattr(kernels_module, "diagonal_kl_pair_stats", _counting_helper)
+    outputs = consumer(
+        mu,
+        sigma,
+        mu_p,
+        sigma_p,
+        mixed_frame,
+        irrep_dims=[2, 2],
+        reuse_pairwise_kl_stats=True,
+    )
+
+    assert calls == 1
+    assert all(torch.isfinite(output).all() for output in outputs)
+    for actual, reference in zip(outputs, expected):
+        torch.testing.assert_close(actual, reference, atol=1e-5, rtol=1e-6)
+
+
 def _filtering_call(
     inputs:            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 

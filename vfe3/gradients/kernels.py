@@ -301,6 +301,15 @@ def uses_kernel_route(
     )
 
 
+def _pairwise_stats_reuse_is_sound(
+    omega: 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport',
+) -> bool:
+    r"""Whether the effective transport representation may reuse diagonal-KL pair statistics."""
+    if isinstance(omega, RopeTransport):
+        return _pairwise_stats_reuse_is_sound(omega.base)
+    return not isinstance(omega, torch.Tensor)
+
+
 def belief_gradients(
     mu:           torch.Tensor,           # (N, K)
     sigma:        torch.Tensor,           # (N, K)
@@ -382,13 +391,12 @@ def belief_gradients(
     sd = self_divergence_for_alpha(fam(mu, sigma), fam(mu_p, sigma_p), alpha=1.0, kl_max=kl_max, eps=eps,
                                    divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
     pair_stats = None
-    # A dense tensor carries no structural same-frame certificate. On the single-block flat route,
-    # its numerically composed self links can make the float64 statistics reduction strictly
-    # positive where the generic float32 energy and derivative mask are exactly zero. Fail closed
-    # to the generic computation there; certified factored containers retain automatic reuse.
-    uncertified_dense_transport = isinstance(omega, torch.Tensor)
+    # A raw dense effective base carries no structural same-frame certificate, including through a
+    # RoPE wrapper. On the single-block flat route, its numerically composed self links can make the
+    # float64 statistics reduction strictly positive where the generic float32 energy and derivative
+    # mask are exactly zero. Fail closed there; factored effective bases retain automatic reuse.
     if (reuse_pairwise_kl_stats
-            and not uncertified_dense_transport
+            and _pairwise_stats_reuse_is_sound(omega)
             and all(tensor.dtype == torch.float32 for tensor in (mu, sigma, mu_t, sigma_t))):
         pair_stats = diagonal_kl_pair_stats(
             mu,
@@ -510,9 +518,8 @@ def mm_exact_update(
                                    divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
     pair_stats = None
     decoupled_value = isinstance(omega, RopeTransport) and not omega.on_value
-    uncertified_dense_transport = isinstance(omega, torch.Tensor)
     if (reuse_pairwise_kl_stats
-            and not uncertified_dense_transport
+            and _pairwise_stats_reuse_is_sound(omega)
             and family == "gaussian_diagonal"
             and divergence_family == "renyi"
             and not decoupled_value
