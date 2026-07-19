@@ -7,6 +7,7 @@ import json
 import re
 import shlex
 import shutil
+import stat
 import sys
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,7 @@ ADJUDICATOR_OUTPUT = {
 }
 GATE_STOP_STATUS_MESSAGE = "Verification ledger gate"
 _SKILL_TOKEN_COUNTS = {GATE_COMMAND_TOKEN: 2, GATE_SHELL_TOKEN: 2}
+_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 
 
 def _required_string(spec: dict[str, object], name: str) -> str:
@@ -235,6 +237,48 @@ def _verification_skill_root(home: Path, destination: Path) -> Path:
     return destination_resolved
 
 
+def _is_symlink_or_reparse(path: Path) -> bool:
+    try:
+        status = path.lstat()
+    except FileNotFoundError:
+        return False
+    return path.is_symlink() or bool(getattr(status, "st_file_attributes", 0) & _REPARSE_POINT)
+
+
+def _preflight_managed_destination(root: Path, destination: Path) -> None:
+    root_absolute = root.absolute()
+    destination_absolute = destination.absolute()
+    try:
+        relative = destination_absolute.relative_to(root_absolute)
+    except ValueError as exc:
+        raise ValueError(f"managed destination is outside its explicit root: {destination}") from exc
+    current = root_absolute
+    if _is_symlink_or_reparse(current):
+        raise ValueError(f"managed destination contains a symlink or reparse point: {current}")
+    for part in relative.parts:
+        current /= part
+        if _is_symlink_or_reparse(current):
+            raise ValueError(f"managed destination contains a symlink or reparse point: {current}")
+    root_resolved = root_absolute.resolve()
+    destination_resolved = destination_absolute.resolve()
+    try:
+        destination_resolved.relative_to(root_resolved)
+    except ValueError as exc:
+        raise ValueError(f"managed destination resolves outside its explicit root: {destination}") from exc
+
+
+def _preflight_skill_destination(source: Path, destination: Path, home: Path) -> None:
+    _preflight_managed_destination(home, destination)
+    for source_path in sorted(source.rglob("*")):
+        relative = source_path.relative_to(source)
+        if "__pycache__" in relative.parts or source_path.suffix == ".pyc":
+            continue
+        _preflight_managed_destination(home, destination / relative)
+    if destination.is_dir():
+        for existing_path in destination.rglob("*"):
+            _preflight_managed_destination(home, existing_path)
+
+
 def _clean_skill_caches(home: Path, destination: Path) -> None:
     root = _verification_skill_root(home, destination)
     cache_directories = sorted(
@@ -282,7 +326,7 @@ def _posix_hook_path(path: Path | str) -> str:
     text = str(path)
     if text.startswith("/"):
         return text
-    text = str(path.resolve()).replace("\\", "/")
+    text = str(Path(path).resolve()).replace("\\", "/")
     if len(text) >= 3 and text[1:3] == ":/":
         return f"/{text[0].lower()}{text[2:]}"
     return text
@@ -291,7 +335,7 @@ def _posix_hook_path(path: Path | str) -> str:
 def _gate_command(gate_path: Path, shell: str) -> str:
     if shell == "posix":
         return f"{shlex.quote(_posix_hook_path(sys.executable))} {shlex.quote(_posix_hook_path(gate_path))} hook"
-    return f'"{Path(sys.executable).resolve()}" "{gate_path.resolve()}" hook'
+    return f'& "{Path(sys.executable).resolve()}" "{gate_path.resolve()}" hook'
 
 
 def _gate_stop_handler(command: str, shell: str) -> dict[str, object]:
@@ -316,16 +360,21 @@ def _split_hook_command(command: str, shell: str) -> list[str] | None:
     try:
         if shell == "posix":
             return shlex.split(command, posix=True)
-        match = re.fullmatch(r'\s*"([^"]+)"\s+"([^"]+)"\s+(\S+)\s*', command)
+        match = re.fullmatch(r'\s*(?:&\s*)?"([^"]+)"\s+"([^"]+)"\s+(\S+)\s*', command)
         return list(match.groups()) if match is not None else None
     except ValueError:
         return None
 
 
-def _is_verification_handler(value: object, shell: str) -> bool:
+def _is_verification_handler(value: object) -> bool:
     if not isinstance(value, dict):
         return False
-    if value.get("type") != "command" or value.get("statusMessage") != GATE_STOP_STATUS_MESSAGE or value.get("shell") != shell:
+    shell = value.get("shell")
+    if (
+        value.get("type") != "command"
+        or value.get("statusMessage") != GATE_STOP_STATUS_MESSAGE
+        or shell not in {"powershell", "posix"}
+    ):
         return False
     command = value.get("command")
     if not isinstance(command, str):
@@ -337,7 +386,7 @@ def _is_verification_handler(value: object, shell: str) -> bool:
     return gate_path.endswith("skills/verification/scripts/verification_gate.py")
 
 
-def _remove_verification_handlers(stop: list[Any], shell: str) -> list[Any]:
+def _remove_verification_handlers(stop: list[Any]) -> list[Any]:
     retained: list[Any] = []
     for entry in stop:
         if not isinstance(entry, dict):
@@ -345,12 +394,12 @@ def _remove_verification_handlers(stop: list[Any], shell: str) -> list[Any]:
             continue
         handlers = entry.get("hooks")
         if isinstance(handlers, list):
-            remaining = [handler for handler in handlers if not _is_verification_handler(handler, shell)]
+            remaining = [handler for handler in handlers if not _is_verification_handler(handler)]
             if remaining:
                 updated = dict(entry)
                 updated["hooks"] = remaining
                 retained.append(updated)
-        elif not _is_verification_handler(entry, shell):
+        elif not _is_verification_handler(entry):
             retained.append(entry)
     return retained
 
@@ -363,7 +412,7 @@ def _install_stop_handler(settings: dict[str, Any], gate_path: Path, shell: str)
     if not isinstance(stop, list):
         raise ValueError("settings hooks.Stop must be a list")
     command = _gate_command(gate_path, shell)
-    stop[:] = _remove_verification_handlers(stop, shell)
+    stop[:] = _remove_verification_handlers(stop)
     stop.append(_gate_stop_handler(command, shell))
     return settings
 
@@ -409,6 +458,22 @@ def install(args: argparse.Namespace) -> None:
     codex_hooks_path = codex_home / "hooks.json"
     claude_deep_audit_path = claude_home / "skills" / "deep-audit" / "SKILL.md"
     codex_deep_audit_path = codex_home / "skills" / "deep-audit" / "SKILL.md"
+    claude_skill = claude_home / "skills" / "verification"
+    codex_skill = codex_home / "skills" / "verification"
+    _preflight_skill_destination(skill_source, claude_skill, claude_home)
+    _preflight_skill_destination(skill_source, codex_skill, codex_home)
+    _preflight_managed_destination(claude_home, claude_settings_path)
+    _preflight_managed_destination(codex_home, codex_hooks_path)
+    _preflight_managed_destination(claude_home, claude_home / "CLAUDE.md")
+    _preflight_managed_destination(codex_home, codex_home / "AGENTS.md")
+    _preflight_managed_destination(claude_home, claude_deep_audit_path)
+    _preflight_managed_destination(codex_home, codex_deep_audit_path)
+    for role in AGENT_ROLES:
+        _preflight_managed_destination(claude_home, claude_home / "agents" / f"{role}.md")
+        _preflight_managed_destination(codex_home, codex_home / "agents" / f"{role}.toml")
+    if project_root is not None:
+        _preflight_managed_destination(project_root, project_root / "CLAUDE.md")
+        _preflight_managed_destination(project_root, project_root / "AGENTS.md")
     claude_deep_audit = _read_required_text(claude_deep_audit_path)
     codex_deep_audit = _read_required_text(codex_deep_audit_path)
     claude_settings = _read_json(claude_settings_path)
@@ -418,8 +483,6 @@ def install(args: argparse.Namespace) -> None:
     project_claude = _read_text(project_root / "CLAUDE.md") if project_root is not None else ""
     project_codex = _read_text(project_root / "AGENTS.md") if project_root is not None else ""
 
-    claude_skill = claude_home / "skills" / "verification"
-    codex_skill = codex_home / "skills" / "verification"
     claude_settings = _install_stop_handler(claude_settings, claude_skill / "scripts" / "verification_gate.py", shell)
     codex_hooks = _install_stop_handler(codex_hooks, codex_skill / "scripts" / "verification_gate.py", shell)
     global_marker = BLOCK_MARKERS["global-policy.md"]

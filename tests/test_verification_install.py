@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
 import sys
 import tomllib
 from argparse import Namespace
@@ -141,6 +143,22 @@ def _stop_handlers(data: dict[str, object]) -> list[dict[str, object]]:
             if isinstance(handler, dict):
                 handlers_out.append(handler)
     return handlers_out
+
+
+def _symlink_or_skip(link: Path, target: Path, *, target_is_directory: bool = False) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as exc:
+        if os.name == "nt" and target_is_directory:
+            junction = subprocess.run(
+                ["cmd.exe", "/c", "mklink", "/J", str(link), str(target)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if junction.returncode == 0:
+                return
+        pytest.skip(f"standard symlinks are unavailable on this platform: {exc}")
 
 
 def test_renderers_share_identical_neutral_instruction_bodies() -> None:
@@ -322,6 +340,125 @@ def test_install_merges_exactly_one_gate_stop_handler_and_preserves_json_keys(tm
         assert "hook" in json.dumps(gate_entries[0])
 
 
+def test_powershell_gate_command_executes_installed_gate_with_inactive_payload(tmp_path: Path) -> None:
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell is unavailable")
+    args = _args(tmp_path, project=False)
+
+    install(args)
+
+    data = json.loads((args.claude_home / "settings.json").read_text(encoding="utf-8"))
+    gate_handler = next(
+        handler
+        for handler in _stop_handlers(data)
+        if handler.get("statusMessage") == GATE_STOP_STATUS_MESSAGE
+    )
+    command = str(gate_handler["command"])
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        input=json.dumps({"cwd": str(tmp_path)}),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert command.startswith('& "')
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX shell execution requires a POSIX host")
+def test_posix_gate_command_executes_installed_gate_with_inactive_payload(tmp_path: Path) -> None:
+    shell = shutil.which("sh")
+    if shell is None:
+        pytest.skip("POSIX sh is unavailable")
+    args = _args(tmp_path, project=False)
+    args.shell = "posix"
+
+    install(args)
+
+    data = json.loads((args.claude_home / "settings.json").read_text(encoding="utf-8"))
+    gate_handler = next(
+        handler
+        for handler in _stop_handlers(data)
+        if handler.get("statusMessage") == GATE_STOP_STATUS_MESSAGE
+    )
+    result = subprocess.run(
+        [shell, "-c", str(gate_handler["command"])],
+        input=json.dumps({"cwd": str(tmp_path)}),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {}
+
+
+@pytest.mark.parametrize(("initial_shell", "current_shell"), (("powershell", "posix"), ("posix", "powershell")))
+def test_reinstall_with_different_shell_replaces_managed_handler_only(
+    tmp_path: Path,
+    initial_shell: str,
+    current_shell: str,
+) -> None:
+    args = _args(tmp_path, project=False)
+    args.shell = initial_shell
+    install(args)
+    false_positive = {
+        "type": "command",
+        "statusMessage": GATE_STOP_STATUS_MESSAGE,
+        "shell": initial_shell,
+        "command": "echo skills/verification/scripts/verification_gate.py hook",
+    }
+    for path in (args.claude_home / "settings.json", args.codex_home / "hooks.json"):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["hooks"]["Stop"].append({"hooks": [false_positive]})
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    args.shell = current_shell
+    install(args)
+
+    for path in (args.claude_home / "settings.json", args.codex_home / "hooks.json"):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        managed = [
+            handler
+            for handler in _stop_handlers(data)
+            if handler.get("statusMessage") == GATE_STOP_STATUS_MESSAGE
+            and handler.get("command") != false_positive["command"]
+        ]
+        assert len(managed) == 1
+        assert managed[0]["shell"] == current_shell
+        assert false_positive in _stop_handlers(data)
+
+
+def test_reinstall_migrates_legacy_powershell_handler_without_call_operator(tmp_path: Path) -> None:
+    args = _args(tmp_path, project=False)
+    install(args)
+    paths = (args.claude_home / "settings.json", args.codex_home / "hooks.json")
+    for path in paths:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        handler = next(
+            handler
+            for handler in _stop_handlers(data)
+            if handler.get("statusMessage") == GATE_STOP_STATUS_MESSAGE
+        )
+        handler["command"] = str(handler["command"]).removeprefix("& ")
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+    install(args)
+
+    for path in paths:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        handlers = [
+            handler
+            for handler in _stop_handlers(data)
+            if handler.get("statusMessage") == GATE_STOP_STATUS_MESSAGE
+        ]
+        assert len(handlers) == 1
+        assert str(handlers[0]["command"]).startswith('& "')
+
+
 def test_install_replaces_stale_gate_handlers_after_home_move_and_preserves_unrelated_hooks(tmp_path: Path) -> None:
     args = _args(tmp_path, project=False)
     install(args)
@@ -337,9 +474,9 @@ def test_install_replaces_stale_gate_handlers_after_home_move_and_preserves_unre
         old_gate = old_home / "skills" / "verification" / "scripts" / "verification_gate.py"
         false_positive_commands = [
             "echo verification_gate.py documentation",
-            f'"{Path(sys.executable).resolve()}" "{old_gate.with_name("other_verification_gate.py")}" hook',
-            f'"{Path(sys.executable).resolve()}" "{old_gate}" validate',
-            f'"{Path(sys.executable).resolve()}" "{old_gate}" hook',
+            f'& "{Path(sys.executable).resolve()}" "{old_gate.with_name("other_verification_gate.py")}" hook',
+            f'& "{Path(sys.executable).resolve()}" "{old_gate}" validate',
+            f'& "{Path(sys.executable).resolve()}" "{old_gate}" hook',
         ]
         data["hooks"]["Stop"].append(
             {
@@ -364,8 +501,8 @@ def test_install_replaces_stale_gate_handlers_after_home_move_and_preserves_unre
         (new_codex / "hooks.json", old_codex, new_codex, "echo keep"),
     ):
         data = json.loads(path.read_text(encoding="utf-8"))
-        old_command = f'"{Path(sys.executable).resolve()}" "{(old_home / "skills" / "verification" / "scripts" / "verification_gate.py").resolve()}" hook'
-        expected = f'"{Path(sys.executable).resolve()}" "{(new_home / "skills" / "verification" / "scripts" / "verification_gate.py").resolve()}" hook'
+        old_command = f'& "{Path(sys.executable).resolve()}" "{(old_home / "skills" / "verification" / "scripts" / "verification_gate.py").resolve()}" hook'
+        expected = f'& "{Path(sys.executable).resolve()}" "{(new_home / "skills" / "verification" / "scripts" / "verification_gate.py").resolve()}" hook'
         commands = _stop_commands(data)
         stale_handlers = [
             handler
@@ -508,6 +645,69 @@ def test_install_preflights_skill_content_before_destination_writes(tmp_path: Pa
         install(args)
 
     assert {root: _tree_bytes(root) for root in destinations if root is not None} == before
+
+
+MANAGED_SYMLINK_SURFACES = (
+    "claude-skill-nested",
+    "codex-skill-nested",
+    *(f"claude-agent-{role}" for role in AGENT_ROLES),
+    *(f"codex-agent-{role}" for role in AGENT_ROLES),
+    "claude-global",
+    "codex-global",
+    "project-claude",
+    "project-codex",
+    "claude-hooks",
+    "codex-hooks",
+    "claude-deep-audit",
+    "codex-deep-audit",
+)
+
+
+@pytest.mark.parametrize("surface", MANAGED_SYMLINK_SURFACES)
+def test_install_rejects_managed_destination_symlinks_before_any_write(tmp_path: Path, surface: str) -> None:
+    args = _args(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("outside sentinel\n", encoding="utf-8")
+    if surface.endswith("skill-nested"):
+        home = args.claude_home if surface.startswith("claude") else args.codex_home
+        target = home / "skills" / "verification" / "references"
+        target.parent.mkdir(parents=True)
+        outside_references = outside / "references"
+        outside_references.mkdir()
+        sentinel = outside_references / "contract.md"
+        sentinel.write_text("outside sentinel\n", encoding="utf-8")
+        _symlink_or_skip(target, outside_references, target_is_directory=True)
+    else:
+        if surface.startswith("claude-agent-"):
+            role = surface.removeprefix("claude-agent-")
+            target = args.claude_home / "agents" / f"{role}.md"
+        elif surface.startswith("codex-agent-"):
+            role = surface.removeprefix("codex-agent-")
+            target = args.codex_home / "agents" / f"{role}.toml"
+        else:
+            target = {
+                "claude-global": args.claude_home / "CLAUDE.md",
+                "codex-global": args.codex_home / "AGENTS.md",
+                "project-claude": args.project_root / "CLAUDE.md",
+                "project-codex": args.project_root / "AGENTS.md",
+                "claude-hooks": args.claude_home / "settings.json",
+                "codex-hooks": args.codex_home / "hooks.json",
+                "claude-deep-audit": args.claude_home / "skills" / "deep-audit" / "SKILL.md",
+                "codex-deep-audit": args.codex_home / "skills" / "deep-audit" / "SKILL.md",
+            }[surface]
+        if target.exists():
+            target.unlink()
+        _symlink_or_skip(target, sentinel)
+    destination_roots = (args.claude_home, args.codex_home, args.project_root)
+    before = {root: _tree_bytes(root) for root in destination_roots}
+
+    with pytest.raises(ValueError, match="symlink|reparse"):
+        install(args)
+
+    assert {root: _tree_bytes(root) for root in destination_roots} == before
+    assert sentinel.read_text(encoding="utf-8") == "outside sentinel\n"
 
 
 def test_neutral_specs_enforce_structured_results_and_adjudicator_closure_abstention() -> None:
