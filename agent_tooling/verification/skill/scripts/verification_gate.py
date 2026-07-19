@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
 import shlex
+import stat
+import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -49,14 +53,20 @@ _CLAIM_FIELDS = frozenset(
         "evidence_invalidated",
     }
 )
-_EVIDENCE_FIELDS = frozenset({"kind", "location", "artifact_revision"})
-_COUNTEREVIDENCE_FIELDS = frozenset({"kind", "location", "artifact_revision", "supports"})
+_EVIDENCE_FIELDS = frozenset({"id", "kind", "location", "artifact_revision"})
+_COUNTEREVIDENCE_FIELDS = frozenset({"id", "kind", "location", "artifact_revision", "supports"})
 _CRITERION_FIELDS = frozenset({"name", "score"})
-_VERIFIER_FIELDS = frozenset({"role"})
+_VERIFIER_FIELDS = frozenset({"role", "view_ids", "result", "evidence_ids", "result_location"})
 _VIEW_FIELDS = frozenset({"calibration_kind", "unresolved_disagreement", "comparison", "scores"})
-_VIEW_COMPARISON_FIELDS = frozenset({"method", "candidate_count", "candidate_ids", "pivot_ids", "orders", "matches"})
+_VIEW_COMPARISON_FIELDS = frozenset(
+    {"method", "candidate_count", "candidate_ids", "candidate_descriptions", "pivot_ids", "orders", "matches"}
+)
 _VIEW_SCORE_FIELDS = frozenset({"view_id", "criteria"})
-_MATCH_FIELDS = frozenset({"left", "right"})
+_MATCH_FIELDS = frozenset({"left", "right", "view_id", "outcome", "criteria", "result_location"})
+_CANDIDATE_DESCRIPTION_FIELDS = frozenset({"id", "description"})
+_PLACEHOLDER_REVISIONS = frozenset(
+    {"UNSPECIFIED", "UNKNOWN", "PLACEHOLDER", "<PLACEHOLDER>", "TBD", "TODO", "NONE", "NULL", "N/A"}
+)
 
 GATE_COMMAND_TOKEN = "{{VERIFICATION_GATE_COMMAND}}"
 GATE_SHELL_TOKEN = "{{VERIFICATION_GATE_SHELL}}"
@@ -106,13 +116,23 @@ def render_skill_markdown(skill_root: Path, shell: str = "powershell") -> str:
     return template.replace(GATE_COMMAND_TOKEN, command).replace(GATE_SHELL_TOKEN, shell_label)
 
 
-def _field_errors(prefix: str, value: dict[str, object], fields: frozenset[str]) -> list[str]:
+def _field_errors(
+    prefix:   str,
+    value:    dict[str, object],
+    required: frozenset[str],
+    allowed:  frozenset[str] | None = None,
+) -> list[str]:
     errors: list[str] = []
-    for field in sorted(fields - value.keys()):
+    allowed_fields = required if allowed is None else allowed
+    for field in sorted(required - value.keys()):
         errors.append(f"{prefix}: missing required field '{field}'")
-    for field in sorted(value.keys() - fields):
+    for field in sorted(value.keys() - allowed_fields):
         errors.append(f"{prefix}: unexpected field '{field}'")
     return errors
+
+
+def _placeholder_revision(value: object) -> bool:
+    return not _nonempty_string(value) or str(value).strip().upper() in _PLACEHOLDER_REVISIONS
 
 
 def _closure_evidence(domain: str) -> frozenset[str]:
@@ -141,13 +161,13 @@ def _validate_views(
     aggregate_criteria:  dict[str, float],
     severity:            object,
     escalation_target:   object,
-) -> tuple[list[str], bool]:
+) -> tuple[list[str], bool, set[str]]:
     """Validate auditable independent views and their criterion aggregation."""
 
     errors: list[str] = []
     views = _as_dict(value)
     if views is None:
-        return [f"{prefix}: views must be an object"], False
+        return [f"{prefix}: views must be an object"], False, set()
     errors.extend(_field_errors(f"{prefix}: views", views, _VIEW_FIELDS))
     calibration_kind = views.get("calibration_kind")
     if not _nonempty_string(calibration_kind):
@@ -164,6 +184,7 @@ def _validate_views(
         method = comparison.get("method")
         candidate_count = comparison.get("candidate_count")
         candidate_ids = comparison.get("candidate_ids")
+        candidate_descriptions = comparison.get("candidate_descriptions")
         pivot_ids = comparison.get("pivot_ids")
         orders = comparison.get("orders")
         matches = comparison.get("matches")
@@ -180,6 +201,28 @@ def _validate_views(
                 errors.append(f"{prefix}: views comparison candidate_ids must be unique")
             if isinstance(candidate_count, int) and not isinstance(candidate_count, bool) and len(candidate_ids) != candidate_count:
                 errors.append(f"{prefix}: views comparison candidate_ids must match candidate_count")
+        description_ids: list[str] = []
+        if not isinstance(candidate_descriptions, list):
+            errors.append(f"{prefix}: views comparison candidate_descriptions must be a list")
+        else:
+            for index, item in enumerate(candidate_descriptions):
+                description = _as_dict(item)
+                item_prefix = f"{prefix}: views comparison candidate_descriptions[{index}]"
+                if description is None:
+                    errors.append(f"{item_prefix} must be an object")
+                    continue
+                errors.extend(_field_errors(item_prefix, description, _CANDIDATE_DESCRIPTION_FIELDS))
+                description_id = description.get("id")
+                if not _nonempty_string(description_id):
+                    errors.append(f"{item_prefix}: id must be a nonempty string")
+                else:
+                    description_ids.append(str(description_id))
+                if not _nonempty_string(description.get("description")):
+                    errors.append(f"{item_prefix}: description must be a nonempty string")
+            if len(description_ids) != len(set(description_ids)):
+                errors.append(f"{prefix}: views comparison candidate_descriptions IDs must be unique")
+            if set(description_ids) != candidate_set:
+                errors.append(f"{prefix}: views comparison candidate_descriptions must exactly describe candidate_ids")
         if not isinstance(pivot_ids, list) or any(not _nonempty_string(item) for item in pivot_ids):
             errors.append(f"{prefix}: views comparison pivot_ids must be a list of nonempty strings")
             pivot_set: set[str] = set()
@@ -212,6 +255,35 @@ def _validate_views(
                 if not _nonempty_string(left) or not _nonempty_string(right):
                     errors.append(f"{item_prefix}: left and right must be nonempty strings")
                     continue
+                if not _nonempty_string(match.get("view_id")):
+                    errors.append(f"{item_prefix}: view_id must be a nonempty string")
+                if match.get("outcome") not in {"left", "right", "tie", "inconclusive"}:
+                    errors.append(f"{item_prefix}: outcome must be left, right, tie, or inconclusive")
+                match_criteria = match.get("criteria")
+                match_names: list[str] = []
+                if not isinstance(match_criteria, list) or not match_criteria:
+                    errors.append(f"{item_prefix}: criteria must contain at least one criterion")
+                else:
+                    for criterion_index, criterion_value in enumerate(match_criteria):
+                        criterion = _as_dict(criterion_value)
+                        criterion_prefix = f"{item_prefix}: criteria[{criterion_index}]"
+                        if criterion is None:
+                            errors.append(f"{criterion_prefix} must be an object")
+                            continue
+                        errors.extend(_field_errors(criterion_prefix, criterion, _CRITERION_FIELDS))
+                        name = criterion.get("name")
+                        if not _nonempty_string(name):
+                            errors.append(f"{criterion_prefix}: name must be a nonempty string")
+                        else:
+                            match_names.append(str(name))
+                        if not _score_is_valid(criterion.get("score")):
+                            errors.append(f"{criterion_prefix}: score must be a number from 0 to 20")
+                    if len(match_names) != len(set(match_names)):
+                        errors.append(f"{item_prefix}: criterion names must be unique")
+                    if set(match_names) != set(aggregate_criteria):
+                        errors.append(f"{item_prefix}: criteria must exactly cover aggregate criteria")
+                if not _nonempty_string(match.get("result_location")):
+                    errors.append(f"{item_prefix}: result_location must be a nonempty string")
                 match_items.append(match)
         ordered_matches: set[tuple[str, str]] = set()
         valid_matches: set[tuple[str, str]] = set()
@@ -296,6 +368,14 @@ def _validate_views(
             per_view_criteria.append(current)
     if len(view_ids) != len(set(view_ids)):
         errors.append(f"{prefix}: views must contain unique view IDs")
+    known_view_ids = set(view_ids)
+    if comparison is not None and isinstance(comparison.get("matches"), list):
+        for index, item in enumerate(comparison["matches"]):
+            match = _as_dict(item)
+            if match is None or not _nonempty_string(match.get("view_id")):
+                continue
+            if str(match["view_id"]) not in known_view_ids:
+                errors.append(f"{prefix}: views comparison matches[{index}]: view_id must reference a known view")
     if escalation_target in {2, 4, 8} and len(set(view_ids)) != escalation_target:
         target_word = {2: "two", 4: "four", 8: "eight"}[escalation_target]
         errors.append(f"{prefix}: requires {target_word} unique views; actual count must equal escalation_target {escalation_target}")
@@ -309,7 +389,7 @@ def _validate_views(
             errors.append(f"{prefix}: aggregate criterion '{name}' does not equal mean view score")
     if aggregate_criteria and any(set(criteria) != set(aggregate_criteria) for criteria in per_view_criteria):
         errors.append(f"{prefix}: view criteria must exactly cover aggregate criteria")
-    return errors, unresolved is True
+    return errors, unresolved is True, known_view_ids
 
 
 def validate_ledger(data: dict[str, object]) -> list[str]:
@@ -333,6 +413,8 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
     revision = root.get("artifact_revision")
     if not _nonempty_string(revision):
         errors.append("ledger: artifact_revision must be a nonempty string")
+    elif _placeholder_revision(revision):
+        errors.append("ledger: placeholder artifact_revision is not permitted")
     claims_value = root.get("claims")
     if not isinstance(claims_value, list):
         return errors + ["ledger: claims must be a list"]
@@ -360,7 +442,11 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
             continue
         claim_id = claim.get("id")
         prefix = str(claim_id) if _nonempty_string(claim_id) else prefix
-        errors.extend(_field_errors(prefix, claim, _CLAIM_FIELDS))
+        state = claim.get("state")
+        required_claim_fields = _CLAIM_FIELDS
+        if state == "CANDIDATE":
+            required_claim_fields = _CLAIM_FIELDS - {"criteria", "views"}
+        errors.extend(_field_errors(prefix, claim, required_claim_fields, _CLAIM_FIELDS))
         if not _nonempty_string(claim_id):
             errors.append(f"{prefix}: id must be a nonempty string")
         domain = claim.get("domain")
@@ -384,12 +470,13 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
         escalation_target = claim.get("escalation_target")
         if isinstance(escalation_target, bool) or escalation_target not in {2, 4, 8}:
             errors.append(f"{prefix}: escalation_target must be 2, 4, or 8")
-        state = claim.get("state")
         if state not in CLAIM_STATES:
             errors.append(f"{prefix}: state must be one of {', '.join(sorted(CLAIM_STATES))}")
         claim_revision = claim.get("artifact_revision")
         if not _nonempty_string(claim_revision):
             errors.append(f"{prefix}: artifact_revision must be a nonempty string")
+        elif _placeholder_revision(claim_revision):
+            errors.append(f"{prefix}: placeholder artifact_revision is not permitted")
         elif _nonempty_string(revision) and claim_revision != revision:
             errors.append(f"{prefix}: artifact_revision does not match ledger artifact_revision")
         if not isinstance(claim.get("evidence_invalidated"), bool):
@@ -397,9 +484,12 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
 
         aggregate_criteria: dict[str, float] = {}
         criteria = claim.get("criteria")
-        if not isinstance(criteria, list):
+        if state == "CANDIDATE" and "criteria" not in claim:
+            criteria = None
+        elif not isinstance(criteria, list):
             errors.append(f"{prefix}: criteria must be a list")
         else:
+            assert isinstance(criteria, list)
             for criterion_index, value in enumerate(criteria):
                 criterion = _as_dict(value)
                 item_prefix = f"{prefix}: criteria[{criterion_index}]"
@@ -419,14 +509,17 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                     else:
                         aggregate_criteria[name] = float(score)
 
-        view_errors, unresolved_disagreement = _validate_views(
-            prefix,
-            claim.get("views"),
-            aggregate_criteria,
-            severity,
-            escalation_target,
-        )
-        errors.extend(view_errors)
+        known_view_ids: set[str] = set()
+        unresolved_disagreement = False
+        if not (state == "CANDIDATE" and "views" not in claim):
+            view_errors, unresolved_disagreement, known_view_ids = _validate_views(
+                prefix,
+                claim.get("views"),
+                aggregate_criteria,
+                severity,
+                escalation_target,
+            )
+            errors.extend(view_errors)
         if severity in {"high", "critical"} and "high_severity" not in trigger_set:
             errors.append(f"{prefix}: high and critical severity require high_severity in escalation_triggers")
         if unresolved_disagreement and "criterion_disagreement" not in trigger_set:
@@ -439,7 +532,12 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
         elif escalation_required and escalation_target not in {4, 8}:
             errors.append(f"{prefix}: escalation requires escalation_target 4 or 8")
 
+        invalidated_history_allowed = (
+            claim.get("evidence_invalidated") is True
+            and state in {"CANDIDATE", "LLM_SUPPORTED", "INCONCLUSIVE"}
+        )
         evidence_kinds: set[str] = set()
+        known_evidence_ids: set[str] = set()
         evidence = claim.get("evidence")
         if not isinstance(evidence, list):
             errors.append(f"{prefix}: evidence must be a list")
@@ -451,18 +549,26 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                     errors.append(f"{item_prefix} must be an object")
                     continue
                 errors.extend(_field_errors(item_prefix, entry, _EVIDENCE_FIELDS))
+                evidence_id = entry.get("id")
+                if not _nonempty_string(evidence_id):
+                    errors.append(f"{item_prefix}: id must be a nonempty string")
+                elif str(evidence_id) in known_evidence_ids:
+                    errors.append(f"{item_prefix}: evidence ID must be unique across evidence and counterevidence")
+                else:
+                    known_evidence_ids.add(str(evidence_id))
                 kind = entry.get("kind")
                 if kind not in EVIDENCE_KINDS:
                     errors.append(f"{item_prefix}: kind must be one of {', '.join(sorted(EVIDENCE_KINDS))}")
-                else:
-                    evidence_kinds.add(str(kind))
                 if not _nonempty_string(entry.get("location")):
                     errors.append(f"{item_prefix}: location must be a nonempty string")
                 evidence_revision = entry.get("artifact_revision")
                 if not _nonempty_string(evidence_revision):
                     errors.append(f"{item_prefix}: artifact_revision must be a nonempty string")
                 elif _nonempty_string(revision) and evidence_revision != revision:
-                    errors.append(f"{prefix}: stale evidence at evidence[{evidence_index}]")
+                    if not invalidated_history_allowed:
+                        errors.append(f"{prefix}: stale evidence at evidence[{evidence_index}]")
+                elif kind in EVIDENCE_KINDS:
+                    evidence_kinds.add(str(kind))
 
         counterevidence_kinds: set[str] = set()
         counterevidence = claim.get("counterevidence")
@@ -476,23 +582,32 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                     errors.append(f"{item_prefix} must be an object")
                     continue
                 errors.extend(_field_errors(item_prefix, entry, _COUNTEREVIDENCE_FIELDS))
+                evidence_id = entry.get("id")
+                if not _nonempty_string(evidence_id):
+                    errors.append(f"{item_prefix}: id must be a nonempty string")
+                elif str(evidence_id) in known_evidence_ids:
+                    errors.append(f"{item_prefix}: evidence ID must be unique across evidence and counterevidence")
+                else:
+                    known_evidence_ids.add(str(evidence_id))
                 kind = entry.get("kind")
                 supports = entry.get("supports")
                 if kind not in EVIDENCE_KINDS:
                     errors.append(f"{item_prefix}: kind must be one of {', '.join(sorted(EVIDENCE_KINDS))}")
-                elif supports is False:
-                    counterevidence_kinds.add(str(kind))
                 if not _nonempty_string(entry.get("location")):
                     errors.append(f"{item_prefix}: location must be a nonempty string")
                 counterevidence_revision = entry.get("artifact_revision")
                 if not _nonempty_string(counterevidence_revision):
                     errors.append(f"{item_prefix}: artifact_revision must be a nonempty string")
                 elif _nonempty_string(revision) and counterevidence_revision != revision:
-                    errors.append(f"{prefix}: stale counterevidence at counterevidence[{counterevidence_index}]")
+                    if not invalidated_history_allowed:
+                        errors.append(f"{prefix}: stale counterevidence at counterevidence[{counterevidence_index}]")
+                elif kind in EVIDENCE_KINDS and supports is False:
+                    counterevidence_kinds.add(str(kind))
                 if not isinstance(supports, bool):
                     errors.append(f"{item_prefix}: supports must be a boolean")
 
         roles: set[str] = set()
+        structured_roles: set[str] = set()
         verifiers = claim.get("verifiers")
         if not isinstance(verifiers, list):
             errors.append(f"{prefix}: verifiers must be a list")
@@ -509,6 +624,57 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                     errors.append(f"{item_prefix}: role must be a nonempty string")
                 else:
                     roles.add(str(role))
+                view_ids = verifier.get("view_ids")
+                verifier_view_ids: set[str] = set()
+                view_ids_valid = (
+                    isinstance(view_ids, list)
+                    and bool(view_ids)
+                    and all(_nonempty_string(item) for item in view_ids)
+                )
+                if not view_ids_valid:
+                    errors.append(f"{item_prefix}: view_ids must be a nonempty list of strings")
+                else:
+                    assert isinstance(view_ids, list)
+                    verifier_view_ids = {str(item) for item in view_ids}
+                    if len(verifier_view_ids) != len(view_ids):
+                        errors.append(f"{item_prefix}: view_ids must be unique")
+                        view_ids_valid = False
+                    unknown_view_ids = verifier_view_ids - known_view_ids
+                    if unknown_view_ids:
+                        errors.append(f"{item_prefix}: unknown view IDs: {', '.join(sorted(unknown_view_ids))}")
+                        view_ids_valid = False
+                result = verifier.get("result")
+                if result not in {"support", "refute", "abstain"}:
+                    errors.append(f"{item_prefix}: result must be support, refute, or abstain")
+                evidence_ids = verifier.get("evidence_ids")
+                verifier_evidence_ids: set[str] = set()
+                evidence_ids_valid = isinstance(evidence_ids, list) and all(
+                    _nonempty_string(item) for item in evidence_ids
+                )
+                if not evidence_ids_valid:
+                    errors.append(f"{item_prefix}: evidence_ids must be a list of strings")
+                else:
+                    assert isinstance(evidence_ids, list)
+                    verifier_evidence_ids = {str(item) for item in evidence_ids}
+                    if len(verifier_evidence_ids) != len(evidence_ids):
+                        errors.append(f"{item_prefix}: evidence_ids must be unique")
+                        evidence_ids_valid = False
+                    unknown_evidence_ids = verifier_evidence_ids - known_evidence_ids
+                    if unknown_evidence_ids:
+                        errors.append(f"{item_prefix}: unknown evidence IDs: {', '.join(sorted(unknown_evidence_ids))}")
+                        evidence_ids_valid = False
+                result_location = verifier.get("result_location")
+                if not _nonempty_string(result_location):
+                    errors.append(f"{item_prefix}: result_location must be a nonempty string")
+                if (
+                    _nonempty_string(role)
+                    and set(verifier) == _VERIFIER_FIELDS
+                    and view_ids_valid
+                    and result in {"support", "refute", "abstain"}
+                    and evidence_ids_valid
+                    and _nonempty_string(result_location)
+                ):
+                    structured_roles.add(str(role))
 
         obligations = claim.get("open_obligations")
         if not isinstance(obligations, list):
@@ -536,6 +702,8 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
         if state == "REFUTED" and isinstance(domain, str) and domain in DOMAINS:
             if mode == "closure" and unresolved_disagreement:
                 errors.append(f"{prefix}: unresolved disagreement in closure mode requires INCONCLUSIVE")
+            if claim.get("evidence_invalidated") is True:
+                errors.append(f"{prefix}: invalidated evidence cannot support REFUTED")
             eligible = _refutation_evidence(domain)
             if not counterevidence_kinds.intersection(eligible):
                 required = " or ".join(sorted(eligible))
@@ -543,10 +711,37 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                     errors.append(f"{prefix}: closure mode requires INCONCLUSIVE when REFUTED {domain} claims lack current {required} counterevidence with supports false")
                 else:
                     errors.append(f"{prefix}: REFUTED {domain} claims require current {required} counterevidence with supports false")
+        if state in {"EVIDENCE_VERIFIED", "REFUTED", "INCONCLUSIVE"}:
+            if "verifier-adjudicator" not in structured_roles:
+                errors.append(f"{prefix}: terminal state requires a structured verifier-adjudicator result")
+            expected_result = {
+                "EVIDENCE_VERIFIED": "support",
+                "REFUTED": "refute",
+                "INCONCLUSIVE": "abstain",
+            }[state]
+            adjudicators = [
+                verifier
+                for verifier in verifiers if isinstance(verifier, dict) and verifier.get("role") == "verifier-adjudicator"
+            ] if isinstance(verifiers, list) else []
+            if adjudicators and not any(verifier.get("result") == expected_result for verifier in adjudicators):
+                errors.append(f"{prefix}: verifier-adjudicator result must be {expected_result} for {state}")
+            if state in {"EVIDENCE_VERIFIED", "REFUTED"} and not any(
+                isinstance(verifier.get("evidence_ids"), list) and bool(verifier["evidence_ids"])
+                for verifier in adjudicators
+            ):
+                errors.append(f"{prefix}: verifier-adjudicator must link at least one evidence ID for {state}")
         if severity in {"high", "critical"} and state in {"EVIDENCE_VERIFIED", "REFUTED"}:
-            for required_role in ("verifier-skeptic", "verifier-adjudicator"):
-                if required_role not in roles:
-                    errors.append(f"{prefix}: {severity} closure requires {required_role}")
+            skeptic_has_evidence_link = any(
+                isinstance(verifier, dict)
+                and verifier.get("role") == "verifier-skeptic"
+                and isinstance(verifier.get("evidence_ids"), list)
+                and bool(verifier["evidence_ids"])
+                for verifier in verifiers
+            ) if isinstance(verifiers, list) else False
+            if "verifier-skeptic" not in structured_roles or not skeptic_has_evidence_link:
+                errors.append(f"{prefix}: {severity} closure requires structured verifier-skeptic linkage")
+            if "verifier-adjudicator" not in roles:
+                errors.append(f"{prefix}: {severity} closure requires verifier-adjudicator")
         if mode == "closure" and state in {"CANDIDATE", "LLM_SUPPORTED"}:
             errors.append(f"{prefix}: closure mode requires INCONCLUSIVE instead of {state}")
         if mode == "triage" and state in {"EVIDENCE_VERIFIED", "REFUTED"}:
@@ -581,6 +776,123 @@ def _message_references_ledger(message: object, cwd: Path, ledger_path: Path, ra
     return any(reference in normalized_message for reference in (raw_reference.replace("\\", "/"), relative, str(ledger_path).replace("\\", "/")))
 
 
+def _run_git(cwd: Path, *arguments: str) -> bytes:
+    try:
+        completed = subprocess.run(
+            ["git", *arguments],
+            cwd=cwd,
+            check=False,
+            capture_output=True,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"cannot execute Git: {exc}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.decode(errors="replace").strip()
+        raise RuntimeError(detail or f"Git command failed: git {' '.join(arguments)}")
+    return completed.stdout
+
+
+def _safe_git_path(cwd: Path, raw_path: bytes) -> tuple[Path | None, str | None]:
+    path_text = os.fsdecode(raw_path).replace("\\", "/")
+    pure_path = PurePosixPath(path_text)
+    if pure_path.is_absolute() or ".." in pure_path.parts:
+        return None, "Git reported a path outside the verification cwd"
+    if not pure_path.parts or pure_path.parts[0] in {".git", ".verification"}:
+        return None, None
+    return cwd.joinpath(*pure_path.parts), None
+
+
+def capture_artifact_revision(cwd: Path) -> str:
+    """Capture HEAD plus index and repository-file content without following symlinks."""
+
+    cwd = cwd.resolve()
+    if not cwd.is_dir():
+        raise RuntimeError("verification cwd must name an existing directory")
+    git_root = Path(os.fsdecode(_run_git(cwd, "rev-parse", "--show-toplevel")).strip()).resolve()
+    if git_root != cwd:
+        raise RuntimeError("verification cwd must be the root of a Git worktree")
+    head = os.fsdecode(_run_git(cwd, "rev-parse", "--verify", "HEAD")).strip()
+    if not head:
+        raise RuntimeError("Git worktree has no concrete HEAD revision")
+
+    digest = hashlib.sha256()
+    digest.update(b"verification-artifact-v1\0")
+    digest.update(head.encode("ascii", errors="strict"))
+    digest.update(b"\0")
+
+    stage_records = _run_git(cwd, "ls-files", "--stage", "-z").split(b"\0")
+    for record in sorted(item for item in stage_records if item):
+        separator = record.find(b"\t")
+        raw_path = record[separator + 1 :] if separator >= 0 else b""
+        local_path, path_error = _safe_git_path(cwd, raw_path)
+        if path_error is not None:
+            raise RuntimeError(path_error)
+        if local_path is None:
+            continue
+        digest.update(b"index\0")
+        digest.update(record)
+        digest.update(b"\0")
+
+    worktree_paths = set(
+        _run_git(cwd, "ls-files", "--cached", "--others", "--exclude-standard", "-z").split(b"\0")
+    )
+    for raw_path in sorted(item for item in worktree_paths if item):
+        local_path, path_error = _safe_git_path(cwd, raw_path)
+        if path_error is not None:
+            raise RuntimeError(path_error)
+        if local_path is None:
+            continue
+        digest.update(b"worktree\0")
+        digest.update(raw_path)
+        digest.update(b"\0")
+        try:
+            metadata = os.lstat(local_path)
+        except FileNotFoundError:
+            digest.update(b"missing\0")
+            continue
+        digest.update(str(metadata.st_mode).encode("ascii"))
+        digest.update(b"\0")
+        if stat.S_ISLNK(metadata.st_mode):
+            digest.update(b"symlink\0")
+            digest.update(os.fsencode(os.readlink(local_path)))
+            digest.update(b"\0")
+        elif stat.S_ISREG(metadata.st_mode):
+            digest.update(b"file\0")
+            with local_path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+            digest.update(b"\0")
+        else:
+            digest.update(b"other\0")
+    return f"git:{head}:sha256:{digest.hexdigest()}"
+
+
+def _binding_error(
+    cwd:         Path,
+    ledger_path: Path,
+    ledger:      dict[str, object],
+    activation:  dict[str, object],
+) -> str | None:
+    active_ledger_path, path_error = _resolve_under_cwd(cwd, activation.get("ledger"))
+    if path_error is not None or active_ledger_path is None:
+        return path_error or "invalid activation ledger path"
+    if active_ledger_path != ledger_path.resolve():
+        return "validated ledger does not match activation marker ledger"
+    activation_revision = activation.get("artifact_revision")
+    if _placeholder_revision(activation_revision):
+        return "activation artifact_revision must be a concrete revision"
+    ledger_revision = ledger.get("artifact_revision")
+    if ledger_revision != activation_revision:
+        return "ledger artifact_revision does not match activation artifact_revision"
+    try:
+        live_revision = capture_artifact_revision(cwd)
+    except RuntimeError as exc:
+        return f"cannot capture live artifact revision: {exc}"
+    if live_revision != activation_revision:
+        return "live artifact changed after verification activation"
+    return None
+
+
 def run_hook(payload: dict[str, object]) -> tuple[int, dict[str, object] | None]:
     """Validate the active ledger and return a Stop-hook decision.
 
@@ -604,6 +916,11 @@ def run_hook(payload: dict[str, object]) -> tuple[int, dict[str, object] | None]
     activation_data = _as_dict(activation)
     if activation_data is None:
         return _block("activation marker must be a JSON object")
+    stop_hook_active = payload.get("stop_hook_active")
+    if not isinstance(stop_hook_active, bool):
+        return _block("hook payload stop_hook_active must be a boolean")
+    if stop_hook_active:
+        return 0, None
     raw_ledger = activation_data.get("ledger")
     ledger_path, path_error = _resolve_under_cwd(cwd, raw_ledger)
     if path_error is not None or ledger_path is None:
@@ -616,6 +933,9 @@ def run_hook(payload: dict[str, object]) -> tuple[int, dict[str, object] | None]
         return _block(f"cannot read referenced ledger: {exc}")
     if not isinstance(ledger, dict):
         return _block("referenced ledger must be a JSON object")
+    binding_error = _binding_error(cwd, ledger_path, ledger, activation_data)
+    if binding_error is not None:
+        return _block(binding_error)
     errors = validate_ledger(ledger)
     if errors:
         return _block("; ".join(errors))
@@ -628,12 +948,17 @@ def run_hook(payload: dict[str, object]) -> tuple[int, dict[str, object] | None]
     return 0, None
 
 
-def _candidate_ledger(mode: str) -> dict[str, object]:
-    return {"schema_version": "1.0", "mode": mode, "artifact_revision": "UNSPECIFIED", "claims": []}
+def _candidate_ledger(mode: str, artifact_revision: str) -> dict[str, object]:
+    return {"schema_version": "1.0", "mode": mode, "artifact_revision": artifact_revision, "claims": []}
 
 
 def _command_start(args: argparse.Namespace) -> int:
     cwd = Path(args.cwd).resolve()
+    try:
+        artifact_revision = capture_artifact_revision(cwd)
+    except RuntimeError as exc:
+        print(f"cannot start verification: {exc}", file=sys.stderr)
+        return 2
     ledger_path, error = _resolve_under_cwd(cwd, args.ledger)
     if error is not None or ledger_path is None:
         print(error or "invalid ledger path", file=sys.stderr)
@@ -643,14 +968,36 @@ def _command_start(args: argparse.Namespace) -> int:
         print("verification activation or ledger already exists", file=sys.stderr)
         return 2
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    ledger_path.write_text(json.dumps(_candidate_ledger(args.mode), indent=2) + "\n", encoding="utf-8")
-    marker.write_text(json.dumps({"ledger": ledger_path.relative_to(cwd).as_posix()}, indent=2) + "\n", encoding="utf-8")
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    ledger_path.write_text(json.dumps(_candidate_ledger(args.mode, artifact_revision), indent=2) + "\n", encoding="utf-8")
+    marker.write_text(
+        json.dumps(
+            {
+                "ledger": ledger_path.relative_to(cwd).as_posix(),
+                "artifact_revision": artifact_revision,
+            },
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
     print(ledger_path.relative_to(cwd).as_posix())
     return 0
 
 
 def _command_validate(args: argparse.Namespace) -> int:
+    cwd = Path(args.cwd).resolve()
+    if not cwd.is_dir():
+        print("verification cwd must name an existing directory")
+        return 1
     path = Path(args.ledger)
+    if not path.is_absolute():
+        path = cwd / path
+    path = path.resolve()
+    try:
+        path.relative_to(cwd)
+    except ValueError:
+        print("ledger path traversal is not permitted")
+        return 1
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -658,6 +1005,22 @@ def _command_validate(args: argparse.Namespace) -> int:
         return 1
     if not isinstance(data, dict):
         print("ledger: expected an object")
+        return 1
+    marker = cwd / ".verification" / "active.json"
+    try:
+        activation = json.loads(marker.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        print("verification activation marker does not exist")
+        return 1
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"cannot read activation marker: {exc}")
+        return 1
+    if not isinstance(activation, dict):
+        print("activation marker must be a JSON object")
+        return 1
+    binding_error = _binding_error(cwd, path, data, activation)
+    if binding_error is not None:
+        print(binding_error)
         return 1
     errors = validate_ledger(data)
     if errors:
@@ -691,6 +1054,7 @@ def main(argv: list[str] | None = None) -> int:
     start_parser.add_argument("--mode", choices=sorted(MODES), default="closure")
     validate_parser = subparsers.add_parser("validate", help="validate a ledger file")
     validate_parser.add_argument("ledger")
+    validate_parser.add_argument("--cwd", default=".")
     subparsers.add_parser("hook", help="read Stop-hook JSON from standard input")
     args = parser.parse_args(argv)
     if args.command == "start":

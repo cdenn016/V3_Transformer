@@ -4,9 +4,39 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
 from pathlib import Path
 
+import pytest
+
 from agent_tooling.verification.skill.scripts.verification_gate import main, run_hook, validate_ledger
+
+
+def verifier_record(
+    role: str,
+    *,
+    result: str = "support",
+    view_ids: list[str] | None = None,
+    evidence_ids: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "role": role,
+        "view_ids": view_ids or ["code-a", "code-b"],
+        "result": result,
+        "evidence_ids": ["evidence-code-1"] if evidence_ids is None else evidence_ids,
+        "result_location": f".verification/results/{role}.json",
+    }
+
+
+def comparison_match(left: str, right: str, view_id: str, outcome: str = "left") -> dict[str, object]:
+    return {
+        "left": left,
+        "right": right,
+        "view_id": view_id,
+        "outcome": outcome,
+        "criteria": [{"name": "reachability", "score": 20}],
+        "result_location": f".verification/results/{view_id}-{left}-{right}.json",
+    }
 
 
 def valid_code_claim() -> dict[str, object]:
@@ -27,9 +57,16 @@ def valid_code_claim() -> dict[str, object]:
                 "method": "pairwise",
                 "candidate_count": 2,
                 "candidate_ids": ["A", "B"],
+                "candidate_descriptions": [
+                    {"id": "A", "description": "The claim is supported."},
+                    {"id": "B", "description": "The claim is not supported."},
+                ],
                 "pivot_ids": [],
                 "orders": ["AB", "BA"],
-                "matches": [{"left": "A", "right": "B"}, {"left": "B", "right": "A"}],
+                "matches": [
+                    comparison_match("A", "B", "code-a"),
+                    comparison_match("B", "A", "code-b", outcome="right"),
+                ],
             },
             "scores": [
                 {"view_id": "code-a", "criteria": [{"name": "reachability", "score": 20}]},
@@ -38,13 +75,14 @@ def valid_code_claim() -> dict[str, object]:
         },
         "evidence": [
             {
+                "id": "evidence-code-1",
                 "kind": "mechanical",
                 "location": "tests/test_parser.py::test_rejects_malformed",
                 "artifact_revision": "abc123",
             }
         ],
         "counterevidence": [],
-        "verifiers": [{"role": "verifier-code"}],
+        "verifiers": [verifier_record("verifier-code"), verifier_record("verifier-adjudicator")],
         "open_obligations": [],
         "evidence_invalidated": False,
     }
@@ -59,8 +97,167 @@ def valid_ledger() -> dict[str, object]:
     }
 
 
+def initialize_git_repository(path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "verification@example.invalid"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Verification Test"], cwd=path, check=True)
+    (path / "artifact.txt").write_text("initial artifact\n", encoding="utf-8")
+    (path / ".gitignore").write_text("ignored-artifact.txt\n", encoding="utf-8")
+    subprocess.run(["git", "add", "artifact.txt", ".gitignore"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial artifact"], cwd=path, check=True)
+
+
+def set_artifact_revision(ledger: dict[str, object], revision: str) -> None:
+    ledger["artifact_revision"] = revision
+    claims = ledger["claims"]
+    assert isinstance(claims, list)
+    for claim in claims:
+        assert isinstance(claim, dict)
+        claim["artifact_revision"] = revision
+        for field in ("evidence", "counterevidence"):
+            entries = claim[field]
+            assert isinstance(entries, list)
+            for entry in entries:
+                assert isinstance(entry, dict)
+                entry["artifact_revision"] = revision
+
+
 def test_mechanically_verified_code_claim_validates() -> None:
     assert validate_ledger(valid_ledger()) == []
+
+
+def test_closed_claim_rejects_placeholder_artifact_revision() -> None:
+    ledger = valid_ledger()
+    set_artifact_revision(ledger, "UNSPECIFIED")
+
+    errors = validate_ledger(ledger)
+
+    assert any("CODE-001" in error and "placeholder artifact_revision" in error for error in errors)
+
+
+def test_candidate_can_be_queued_without_scores_views_or_comparison() -> None:
+    ledger = valid_ledger()
+    ledger["mode"] = "triage"
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["state"] = "CANDIDATE"
+    claim.pop("criteria")
+    claim.pop("views")
+    claim["evidence"] = []
+    claim["counterevidence"] = []
+    claim["verifiers"] = []
+
+    assert validate_ledger(ledger) == []
+
+
+@pytest.mark.parametrize("field", ("id",))
+def test_evidence_requires_a_stable_id(field: str) -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    entry = claim["evidence"][0]
+    assert isinstance(entry, dict)
+    entry.pop(field)
+
+    assert any("evidence[0]" in error and field in error for error in validate_ledger(ledger))
+
+
+def test_comparison_requires_candidate_descriptions() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    views = claim["views"]
+    assert isinstance(views, dict)
+    comparison = views["comparison"]
+    assert isinstance(comparison, dict)
+    comparison.pop("candidate_descriptions")
+
+    assert any("candidate_descriptions" in error for error in validate_ledger(ledger))
+
+
+@pytest.mark.parametrize("field", ("view_id", "outcome", "criteria", "result_location"))
+def test_comparison_matches_require_result_provenance(field: str) -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    views = claim["views"]
+    assert isinstance(views, dict)
+    comparison = views["comparison"]
+    assert isinstance(comparison, dict)
+    match = comparison["matches"][0]
+    assert isinstance(match, dict)
+    match.pop(field)
+
+    assert any("matches[0]" in error and field in error for error in validate_ledger(ledger))
+
+
+@pytest.mark.parametrize("state", ("EVIDENCE_VERIFIED", "REFUTED"))
+def test_invalidated_evidence_blocks_both_closed_states(state: str) -> None:
+    ledger = valid_ledger() if state == "EVIDENCE_VERIFIED" else refuted_code_ledger(
+        [{"id": "counter-1", "kind": "mechanical", "location": "tests/test_parser.py", "artifact_revision": "abc123", "supports": False}]
+    )
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["evidence_invalidated"] = True
+
+    assert any("invalidated evidence" in error and state in error for error in validate_ledger(ledger))
+
+
+def test_stale_entries_remain_as_invalidated_inconclusive_audit_history() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["state"] = "INCONCLUSIVE"
+    claim["open_obligations"] = ["Reproduce evidence for the current artifact."]
+    claim["evidence_invalidated"] = True
+    claim["evidence"][0]["artifact_revision"] = "old-revision"
+    claim["counterevidence"] = [
+        {"id": "counter-old", "kind": "mechanical", "location": "old-output.txt", "artifact_revision": "old-revision", "supports": False}
+    ]
+    adjudicator = next(item for item in claim["verifiers"] if item["role"] == "verifier-adjudicator")
+    adjudicator["result"] = "abstain"
+    adjudicator["evidence_ids"] = ["evidence-code-1", "counter-old"]
+
+    errors = validate_ledger(ledger)
+
+    assert not any("stale evidence" in error or "stale counterevidence" in error for error in errors)
+    assert errors == []
+
+
+@pytest.mark.parametrize("state", ("EVIDENCE_VERIFIED", "REFUTED", "INCONCLUSIVE"))
+def test_terminal_states_require_a_structured_adjudicator_result(state: str) -> None:
+    if state == "REFUTED":
+        ledger = refuted_code_ledger(
+            [{"id": "counter-1", "kind": "mechanical", "location": "tests/test_parser.py", "artifact_revision": "abc123", "supports": False}]
+        )
+    else:
+        ledger = valid_ledger()
+        claim = ledger["claims"][0]
+        assert isinstance(claim, dict)
+        if state == "INCONCLUSIVE":
+            claim["state"] = state
+            claim["open_obligations"] = ["Resolve the claim."]
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["verifiers"] = [item for item in claim["verifiers"] if item["role"] != "verifier-adjudicator"]
+
+    assert any("structured verifier-adjudicator result" in error for error in validate_ledger(ledger))
+
+
+def test_adjudicator_result_must_link_known_views_evidence_and_location() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    adjudicator = next(item for item in claim["verifiers"] if item["role"] == "verifier-adjudicator")
+    adjudicator["view_ids"] = ["unknown-view"]
+    adjudicator["evidence_ids"] = ["unknown-evidence"]
+    adjudicator["result_location"] = ""
+
+    errors = validate_ledger(ledger)
+
+    assert any("unknown view IDs" in error for error in errors)
+    assert any("unknown evidence IDs" in error for error in errors)
+    assert any("result_location" in error for error in errors)
 
 
 def test_llm_only_code_claim_cannot_be_evidence_verified() -> None:
@@ -108,6 +305,7 @@ def test_high_claim_requires_skeptic_and_adjudicator() -> None:
     claim = ledger["claims"][0]
     assert isinstance(claim, dict)
     claim["severity"] = "high"
+    claim["verifiers"] = [verifier_record("verifier-code")]
 
     errors = validate_ledger(ledger)
 
@@ -157,6 +355,7 @@ def test_triage_mode_allows_a_candidate_with_auditable_views() -> None:
     assert isinstance(claim, dict)
     claim["state"] = "CANDIDATE"
     claim["evidence"] = []
+    claim["verifiers"] = []
 
     assert validate_ledger(ledger) == []
 
@@ -189,11 +388,37 @@ def test_ledger_requires_at_least_one_claim() -> None:
 
 
 def test_start_defaults_to_a_closure_ledger(tmp_path: Path) -> None:
+    initialize_git_repository(tmp_path)
     assert main(["start", "--cwd", str(tmp_path)]) == 0
 
     ledger = json.loads((tmp_path / ".verification" / "ledger.json").read_text(encoding="utf-8"))
+    activation = json.loads((tmp_path / ".verification" / "active.json").read_text(encoding="utf-8"))
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
     assert ledger["mode"] == "closure"
+    assert ledger["artifact_revision"].startswith(f"git:{head}:sha256:")
+    assert ledger["artifact_revision"] != "UNSPECIFIED"
+    assert activation["artifact_revision"] == ledger["artifact_revision"]
+
+
+def test_start_fails_closed_outside_a_git_worktree(tmp_path: Path) -> None:
+    assert main(["start", "--cwd", str(tmp_path)]) == 2
+    assert not (tmp_path / ".verification").exists()
+
+
+def test_start_with_custom_ledger_creates_ledger_and_activation_parents(tmp_path: Path) -> None:
+    initialize_git_repository(tmp_path)
+
+    assert main(["start", "--cwd", str(tmp_path), "--ledger", "artifacts/nested/ledger.json"]) == 0
+
+    assert (tmp_path / "artifacts" / "nested" / "ledger.json").is_file()
+    assert (tmp_path / ".verification" / "active.json").is_file()
 
 
 def test_duplicate_view_ids_are_rejected() -> None:
@@ -274,12 +499,16 @@ def test_two_to_four_candidates_require_a_pairwise_comparison() -> None:
         "method": "pivot_tournament",
         "candidate_count": 4,
         "candidate_ids": ["A", "B", "C", "D"],
+        "candidate_descriptions": [
+            {"id": candidate, "description": f"Candidate {candidate}."}
+            for candidate in ("A", "B", "C", "D")
+        ],
         "pivot_ids": ["A"],
         "orders": ["pivot_tournament"],
         "matches": [
-            {"left": "A", "right": "B"}, {"left": "B", "right": "A"},
-            {"left": "A", "right": "C"}, {"left": "C", "right": "A"},
-            {"left": "A", "right": "D"}, {"left": "D", "right": "A"},
+            comparison_match("A", "B", "code-a"), comparison_match("B", "A", "code-b"),
+            comparison_match("A", "C", "code-a"), comparison_match("C", "A", "code-b"),
+            comparison_match("A", "D", "code-a"), comparison_match("D", "A", "code-b"),
         ],
     }
 
@@ -293,7 +522,11 @@ def test_high_claim_requires_at_least_four_unique_views() -> None:
     claim["severity"] = "high"
     claim["escalation_triggers"] = ["high_severity"]
     claim["escalation_target"] = 4
-    claim["verifiers"] = [{"role": "verifier-code"}, {"role": "verifier-skeptic"}, {"role": "verifier-adjudicator"}]
+    claim["verifiers"] = [
+        verifier_record("verifier-code"),
+        verifier_record("verifier-skeptic"),
+        verifier_record("verifier-adjudicator"),
+    ]
 
     errors = validate_ledger(ledger)
 
@@ -307,7 +540,11 @@ def test_high_claim_accepts_four_unique_views_with_challenge_roles() -> None:
     claim["severity"] = "high"
     claim["escalation_triggers"] = ["high_severity"]
     claim["escalation_target"] = 4
-    claim["verifiers"] = [{"role": "verifier-code"}, {"role": "verifier-skeptic"}, {"role": "verifier-adjudicator"}]
+    claim["verifiers"] = [
+        verifier_record("verifier-code", view_ids=["code-a", "code-b", "code-c", "code-d"]),
+        verifier_record("verifier-skeptic", view_ids=["code-a", "code-b", "code-c", "code-d"]),
+        verifier_record("verifier-adjudicator", view_ids=["code-a", "code-b", "code-c", "code-d"]),
+    ]
     views = claim["views"]
     assert isinstance(views, dict)
     scores = views["scores"]
@@ -320,6 +557,36 @@ def test_high_claim_accepts_four_unique_views_with_challenge_roles() -> None:
     )
 
     assert validate_ledger(ledger) == []
+
+
+def test_high_closure_skeptic_must_link_current_evidence() -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["severity"] = "high"
+    claim["escalation_triggers"] = ["high_severity"]
+    claim["escalation_target"] = 4
+    claim["verifiers"] = [
+        verifier_record("verifier-code", view_ids=["code-a", "code-b", "code-c", "code-d"]),
+        verifier_record(
+            "verifier-skeptic",
+            view_ids=["code-a", "code-b", "code-c", "code-d"],
+            evidence_ids=[],
+        ),
+        verifier_record("verifier-adjudicator", view_ids=["code-a", "code-b", "code-c", "code-d"]),
+    ]
+    views = claim["views"]
+    assert isinstance(views, dict)
+    scores = views["scores"]
+    assert isinstance(scores, list)
+    scores.extend(
+        [
+            {"view_id": "code-c", "criteria": [{"name": "reachability", "score": 20}]},
+            {"view_id": "code-d", "criteria": [{"name": "reachability", "score": 20}]},
+        ]
+    )
+
+    assert any("structured verifier-skeptic linkage" in error for error in validate_ledger(ledger))
 
 
 def test_views_require_an_aggregate_criterion_and_nonempty_per_view_criteria() -> None:
@@ -363,13 +630,17 @@ def valid_pivot_tournament() -> dict[str, object]:
         "method": "pivot_tournament",
         "candidate_count": 5,
         "candidate_ids": ["A", "B", "C", "D", "E"],
+        "candidate_descriptions": [
+            {"id": candidate, "description": f"Candidate {candidate}."}
+            for candidate in ("A", "B", "C", "D", "E")
+        ],
         "pivot_ids": ["A"],
         "orders": ["pivot_tournament"],
         "matches": [
-            {"left": "A", "right": "B"}, {"left": "B", "right": "A"},
-            {"left": "A", "right": "C"}, {"left": "C", "right": "A"},
-            {"left": "A", "right": "D"}, {"left": "D", "right": "A"},
-            {"left": "A", "right": "E"}, {"left": "E", "right": "A"},
+            comparison_match("A", "B", "code-a"), comparison_match("B", "A", "code-b"),
+            comparison_match("A", "C", "code-a"), comparison_match("C", "A", "code-b"),
+            comparison_match("A", "D", "code-a"), comparison_match("D", "A", "code-b"),
+            comparison_match("A", "E", "code-a"), comparison_match("E", "A", "code-b"),
         ],
     }
 
@@ -600,14 +871,25 @@ def test_duplicate_claim_ids_are_rejected() -> None:
 
 
 def activate(tmp_path: Path, ledger: dict[str, object], ledger_name: str = "ledger.json") -> Path:
+    initialize_git_repository(tmp_path)
+    ledger_reference = f".verification/{ledger_name}"
+    assert main(["start", "--cwd", str(tmp_path), "--ledger", ledger_reference]) == 0
     verification_dir = tmp_path / ".verification"
-    verification_dir.mkdir()
-    ledger_path = verification_dir / ledger_name
+    ledger_path = tmp_path / ledger_reference
+    activation = json.loads((verification_dir / "active.json").read_text(encoding="utf-8"))
+    revision = activation["artifact_revision"]
+    assert isinstance(revision, str)
+    set_artifact_revision(ledger, revision)
     ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
-    (verification_dir / "active.json").write_text(
-        json.dumps({"ledger": f".verification/{ledger_name}"}), encoding="utf-8"
-    )
     return ledger_path
+
+
+def started_valid_ledger(tmp_path: Path) -> tuple[Path, str]:
+    ledger_path = activate(tmp_path, valid_ledger())
+    activation = json.loads((tmp_path / ".verification" / "active.json").read_text(encoding="utf-8"))
+    revision = activation["artifact_revision"]
+    assert isinstance(revision, str)
+    return ledger_path, revision
 
 
 def test_inactive_directory_passes() -> None:
@@ -615,6 +897,125 @@ def test_inactive_directory_passes() -> None:
 
     assert exit_code == 0
     assert response is None
+
+
+def test_active_recursive_stop_does_not_loop_or_remove_activation(tmp_path: Path) -> None:
+    started_valid_ledger(tmp_path)
+
+    exit_code, response = run_hook(
+        {"cwd": str(tmp_path), "stop_hook_active": True, "last_assistant_message": "User interrupted."}
+    )
+
+    assert exit_code == 0
+    assert response is None
+    assert (tmp_path / ".verification" / "active.json").is_file()
+
+
+def test_active_hook_rejects_nonboolean_recursion_marker(tmp_path: Path) -> None:
+    started_valid_ledger(tmp_path)
+
+    _, response = run_hook(
+        {"cwd": str(tmp_path), "stop_hook_active": "false", "last_assistant_message": ".verification/ledger.json"}
+    )
+
+    assert response is not None
+    assert response["decision"] == "block"
+    assert "stop_hook_active" in response["reason"]
+
+
+def test_active_valid_ledger_is_bound_to_unchanged_live_artifact(tmp_path: Path) -> None:
+    started_valid_ledger(tmp_path)
+
+    exit_code, response = run_hook(
+        {"cwd": str(tmp_path), "stop_hook_active": False, "last_assistant_message": "Ledger: .verification/ledger.json"}
+    )
+
+    assert exit_code == 0
+    assert response is None
+
+
+@pytest.mark.parametrize("change_kind", ("tracked", "untracked"))
+def test_active_hook_blocks_worktree_changes_after_activation(tmp_path: Path, change_kind: str) -> None:
+    started_valid_ledger(tmp_path)
+    if change_kind == "tracked":
+        (tmp_path / "artifact.txt").write_text("changed artifact\n", encoding="utf-8")
+    else:
+        (tmp_path / "new-artifact.txt").write_text("new artifact\n", encoding="utf-8")
+
+    _, response = run_hook(
+        {"cwd": str(tmp_path), "stop_hook_active": False, "last_assistant_message": "Ledger: .verification/ledger.json"}
+    )
+
+    assert response is not None
+    assert response["decision"] == "block"
+    assert "live artifact changed" in response["reason"]
+
+
+def test_active_hook_ignores_gitignored_cache_or_output_mutations(tmp_path: Path) -> None:
+    started_valid_ledger(tmp_path)
+    (tmp_path / "ignored-artifact.txt").write_text("generated output\n", encoding="utf-8")
+
+    exit_code, response = run_hook(
+        {"cwd": str(tmp_path), "stop_hook_active": False, "last_assistant_message": "Ledger: .verification/ledger.json"}
+    )
+
+    assert exit_code == 0
+    assert response is None
+
+
+def test_cli_validate_checks_live_artifact_binding(tmp_path: Path) -> None:
+    ledger_path, _ = started_valid_ledger(tmp_path)
+    assert main(["validate", str(ledger_path), "--cwd", str(tmp_path)]) == 0
+
+    (tmp_path / "artifact.txt").write_text("changed artifact\n", encoding="utf-8")
+
+    assert main(["validate", str(ledger_path), "--cwd", str(tmp_path)]) == 1
+
+
+def test_cli_validate_fails_closed_outside_a_git_worktree(tmp_path: Path) -> None:
+    verification_dir = tmp_path / ".verification"
+    verification_dir.mkdir()
+    ledger_path = verification_dir / "ledger.json"
+    ledger_path.write_text(json.dumps(valid_ledger()), encoding="utf-8")
+    (verification_dir / "active.json").write_text(
+        json.dumps({"ledger": ".verification/ledger.json", "artifact_revision": "abc123"}),
+        encoding="utf-8",
+    )
+
+    assert main(["validate", str(ledger_path), "--cwd", str(tmp_path)]) == 1
+
+
+def test_active_hook_fails_closed_outside_a_git_worktree(tmp_path: Path) -> None:
+    verification_dir = tmp_path / ".verification"
+    verification_dir.mkdir()
+    (verification_dir / "ledger.json").write_text(json.dumps(valid_ledger()), encoding="utf-8")
+    (verification_dir / "active.json").write_text(
+        json.dumps({"ledger": ".verification/ledger.json", "artifact_revision": "abc123"}),
+        encoding="utf-8",
+    )
+
+    _, response = run_hook(
+        {"cwd": str(tmp_path), "stop_hook_active": False, "last_assistant_message": ".verification/ledger.json"}
+    )
+
+    assert response is not None
+    assert response["decision"] == "block"
+    assert "git" in response["reason"].lower()
+
+
+def test_active_hook_blocks_activation_ledger_revision_mismatch(tmp_path: Path) -> None:
+    ledger_path, _ = started_valid_ledger(tmp_path)
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    set_artifact_revision(ledger, "sha256:" + "0" * 64)
+    ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
+
+    _, response = run_hook(
+        {"cwd": str(tmp_path), "stop_hook_active": False, "last_assistant_message": "Ledger: .verification/ledger.json"}
+    )
+
+    assert response is not None
+    assert response["decision"] == "block"
+    assert "activation artifact_revision" in response["reason"]
 
 
 def test_active_invalid_ledger_blocks(tmp_path: Path) -> None:
@@ -667,7 +1068,7 @@ def test_hook_rejects_ledger_path_traversal(tmp_path: Path) -> None:
     (verification_dir / "active.json").write_text(json.dumps({"ledger": "../outside.json"}), encoding="utf-8")
 
     exit_code, response = run_hook(
-        {"cwd": str(tmp_path), "stop_hook_active": True, "last_assistant_message": "../outside.json"}
+        {"cwd": str(tmp_path), "stop_hook_active": False, "last_assistant_message": "../outside.json"}
     )
 
     assert exit_code == 0
@@ -680,9 +1081,16 @@ def refuted_code_ledger(counterevidence: list[dict[str, object]]) -> dict[str, o
     ledger = valid_ledger()
     claim = ledger["claims"][0]
     assert isinstance(claim, dict)
+    for index, entry in enumerate(counterevidence):
+        entry.setdefault("id", f"counter-{index + 1}")
     claim["state"] = "REFUTED"
     claim["evidence"] = []
     claim["counterevidence"] = counterevidence
+    counterevidence_ids = [str(entry["id"]) for entry in counterevidence]
+    for verifier in claim["verifiers"]:
+        verifier["evidence_ids"] = counterevidence_ids
+    adjudicator = next(item for item in claim["verifiers"] if item["role"] == "verifier-adjudicator")
+    adjudicator["result"] = "refute"
     return ledger
 
 

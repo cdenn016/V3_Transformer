@@ -21,6 +21,78 @@ def _skill_body() -> str:
     return (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
 
 
+def _initialize_git_repository(path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "verification@example.invalid"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Verification Test"], cwd=path, check=True)
+    (path / "artifact.txt").write_text("artifact\n", encoding="utf-8")
+    subprocess.run(["git", "add", "artifact.txt"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-qm", "artifact"], cwd=path, check=True)
+
+
+def _rendered_claim(revision: str, claim_id: str, view_prefix: str) -> dict[str, object]:
+    evidence_id = f"{claim_id.lower()}-evidence"
+    view_ids = [f"{view_prefix}-a", f"{view_prefix}-b"]
+    return {
+        "id": claim_id,
+        "domain": "code",
+        "statement": "The installed gate executes.",
+        "severity": "low",
+        "state": "EVIDENCE_VERIFIED",
+        "artifact_revision": revision,
+        "criteria": [{"name": "execution", "score": 20}],
+        "escalation_triggers": [],
+        "escalation_target": 2,
+        "views": {
+            "calibration_kind": "independent_0_20",
+            "unresolved_disagreement": False,
+            "comparison": {
+                "method": "pairwise",
+                "candidate_count": 2,
+                "candidate_ids": ["A", "B"],
+                "candidate_descriptions": [
+                    {"id": "A", "description": "The execution claim is supported."},
+                    {"id": "B", "description": "The execution claim is not supported."},
+                ],
+                "pivot_ids": [],
+                "orders": ["AB", "BA"],
+                "matches": [
+                    {
+                        "left": "A", "right": "B", "view_id": view_ids[0], "outcome": "left",
+                        "criteria": [{"name": "execution", "score": 20}],
+                        "result_location": f".verification/results/{view_ids[0]}.json",
+                    },
+                    {
+                        "left": "B", "right": "A", "view_id": view_ids[1], "outcome": "right",
+                        "criteria": [{"name": "execution", "score": 20}],
+                        "result_location": f".verification/results/{view_ids[1]}.json",
+                    },
+                ],
+            },
+            "scores": [
+                {"view_id": view_ids[0], "criteria": [{"name": "execution", "score": 20}]},
+                {"view_id": view_ids[1], "criteria": [{"name": "execution", "score": 20}]},
+            ],
+        },
+        "evidence": [
+            {"id": evidence_id, "kind": "mechanical", "location": "render-test", "artifact_revision": revision}
+        ],
+        "counterevidence": [],
+        "verifiers": [
+            {
+                "role": "verifier-code", "view_ids": view_ids, "result": "support",
+                "evidence_ids": [evidence_id], "result_location": ".verification/results/code.json",
+            },
+            {
+                "role": "verifier-adjudicator", "view_ids": view_ids, "result": "support",
+                "evidence_ids": [evidence_id], "result_location": ".verification/results/adjudicator.json",
+            },
+        ],
+        "open_obligations": [],
+        "evidence_invalidated": False,
+    }
+
+
 def test_skill_frontmatter_has_only_the_installable_identity_fields() -> None:
     text = _skill_body()
     assert text.startswith("---\n")
@@ -34,7 +106,7 @@ def test_skill_frontmatter_has_only_the_installable_identity_fields() -> None:
 def test_skill_activates_the_gate_and_validates_the_named_ledger() -> None:
     text = _skill_body()
     assert "{{VERIFICATION_GATE_COMMAND}} start --cwd . --ledger .verification/ledger.json" in text
-    assert "{{VERIFICATION_GATE_COMMAND}} validate .verification/ledger.json" in text
+    assert "{{VERIFICATION_GATE_COMMAND}} validate .verification/ledger.json --cwd ." in text
     assert "final response" in text
     assert ".verification/ledger.json" in text
 
@@ -52,31 +124,21 @@ def test_copied_skill_renders_an_absolute_gate_command_for_an_unrelated_cwd(tmp_
 
     unrelated_cwd = tmp_path / "unrelated cwd"
     unrelated_cwd.mkdir()
+    _initialize_git_repository(unrelated_cwd)
     start_command = next(line.strip() for line in rendered.splitlines() if line.strip().endswith("--mode closure"))
-    validate_command = next(line.strip() for line in rendered.splitlines() if line.strip().endswith(".verification/ledger.json"))
+    validate_command = next(line.strip() for line in rendered.splitlines() if line.strip().endswith(".verification/ledger.json --cwd ."))
     expected_prefix = f'& "{Path(sys.executable).resolve()}" "{(installed_skill / "scripts" / "verification_gate.py").resolve()}"'
     assert start_command == f"{expected_prefix} start --cwd . --ledger .verification/ledger.json --mode closure"
-    assert validate_command == f"{expected_prefix} validate .verification/ledger.json"
+    assert validate_command == f"{expected_prefix} validate .verification/ledger.json --cwd ."
     result = subprocess.run(["powershell", "-NoProfile", "-Command", start_command], cwd=unrelated_cwd, check=False, capture_output=True, text=True)
 
     assert result.returncode == 0, result.stderr
     ledger_path = unrelated_cwd / ".verification" / "ledger.json"
     assert ledger_path.is_file()
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-    ledger["artifact_revision"] = "rendered"
-    ledger["claims"] = [
-        {
-            "id": "RENDER-001", "domain": "code", "statement": "The installed gate executes.", "severity": "low",
-            "state": "EVIDENCE_VERIFIED", "artifact_revision": "rendered", "criteria": [{"name": "execution", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
-            "views": {
-                "calibration_kind": "independent_0_20", "unresolved_disagreement": False,
-                "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["A", "B"], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "A", "right": "B"}, {"left": "B", "right": "A"}]},
-                "scores": [{"view_id": "render-a", "criteria": [{"name": "execution", "score": 20}]}, {"view_id": "render-b", "criteria": [{"name": "execution", "score": 20}]}],
-            },
-            "evidence": [{"kind": "mechanical", "location": "render-test", "artifact_revision": "rendered"}],
-            "counterevidence": [], "verifiers": [{"role": "verifier-code"}], "open_obligations": [], "evidence_invalidated": False,
-        }
-    ]
+    revision = ledger["artifact_revision"]
+    assert isinstance(revision, str)
+    ledger["claims"] = [_rendered_claim(revision, "RENDER-001", "render")]
     ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
     validate_result = subprocess.run(["powershell", "-NoProfile", "-Command", validate_command], cwd=unrelated_cwd, check=False, capture_output=True, text=True)
     assert validate_result.returncode == 0, validate_result.stdout
@@ -96,25 +158,19 @@ def test_copied_skill_renders_a_posix_command_for_git_bash(tmp_path: Path) -> No
     if bash_path is None:
         pytest.skip("No POSIX shell is available for rendered-command verification.")
     start_command = next(line.strip() for line in rendered.splitlines() if line.strip().endswith("--mode closure"))
-    validate_command = next(line.strip() for line in rendered.splitlines() if line.strip().endswith(".verification/ledger.json"))
+    validate_command = next(line.strip() for line in rendered.splitlines() if line.strip().endswith(".verification/ledger.json --cwd ."))
     assert not start_command.startswith("& ")
 
     unrelated_cwd = tmp_path / "unrelated posix cwd"
     unrelated_cwd.mkdir()
+    _initialize_git_repository(unrelated_cwd)
     start_result = subprocess.run([bash_path, "-lc", start_command], cwd=unrelated_cwd, check=False, capture_output=True, text=True)
     assert start_result.returncode == 0, start_result.stderr
     ledger_path = unrelated_cwd / ".verification" / "ledger.json"
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
-    ledger["artifact_revision"] = "rendered"
-    ledger["claims"] = [{
-        "id": "POSIX-001", "domain": "code", "statement": "The POSIX command executes.", "severity": "low",
-        "state": "EVIDENCE_VERIFIED", "artifact_revision": "rendered", "criteria": [{"name": "execution", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
-        "views": {"calibration_kind": "independent_0_20", "unresolved_disagreement": False,
-                  "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["A", "B"], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "A", "right": "B"}, {"left": "B", "right": "A"}]},
-                  "scores": [{"view_id": "posix-a", "criteria": [{"name": "execution", "score": 20}]}, {"view_id": "posix-b", "criteria": [{"name": "execution", "score": 20}]}]},
-        "evidence": [{"kind": "mechanical", "location": "render-test", "artifact_revision": "rendered"}],
-        "counterevidence": [], "verifiers": [{"role": "verifier-code"}], "open_obligations": [], "evidence_invalidated": False,
-    }]
+    revision = ledger["artifact_revision"]
+    assert isinstance(revision, str)
+    ledger["claims"] = [_rendered_claim(revision, "POSIX-001", "posix")]
     ledger_path.write_text(json.dumps(ledger), encoding="utf-8")
     validate_result = subprocess.run([bash_path, "-lc", validate_command], cwd=unrelated_cwd, check=False, capture_output=True, text=True)
     assert validate_result.returncode == 0, validate_result.stderr
@@ -164,6 +220,40 @@ def test_skill_requires_adaptive_views_reversed_order_and_abstention() -> None:
         assert phrase in text
 
 
+def test_skill_documents_revision_binding_candidates_and_terminal_adjudication() -> None:
+    text = _skill_body()
+    for phrase in (
+        "git:<HEAD>:sha256:<digest>",
+        "without fabricated criteria, views, or comparison results",
+        "stable `id`",
+        "candidate descriptions",
+        "result location",
+        "evidence_invalidated",
+        "structured `verifier-adjudicator`",
+    ):
+        assert phrase in text
+
+
+def test_schema_encodes_provenance_and_structured_verifier_records() -> None:
+    schema = json.loads((SKILL_ROOT / "schemas" / "claim-ledger.schema.json").read_text(encoding="utf-8"))
+    serialized = json.dumps(schema)
+    for field in ("candidate_descriptions", "view_id", "outcome", "criteria", "result_location", "evidence_ids"):
+        assert field in serialized
+    claim_schema = schema["properties"]["claims"]["items"]
+    assert "criteria" not in claim_schema["required"]
+    assert "views" not in claim_schema["required"]
+    assert any("if" in rule and "then" in rule for rule in claim_schema["allOf"])
+
+
+def test_adjudicator_agent_emits_view_and_result_provenance() -> None:
+    spec = json.loads(
+        (SKILL_ROOT.parent / "agents" / "verifier-adjudicator.json").read_text(encoding="utf-8")
+    )
+    required = spec["output"]["required"]
+    for field in ("result", "view_ids", "evidence_ids", "result_location"):
+        assert field in required
+
+
 def test_eval_corpus_contains_six_required_behavioral_cases() -> None:
     evaluations = json.loads((SKILL_ROOT / "evals" / "evals.json").read_text(encoding="utf-8"))
     cases = evaluations["evals"]
@@ -176,3 +266,5 @@ def test_eval_corpus_contains_six_required_behavioral_cases() -> None:
     assert "if fresh evidence later permits closure" in json.dumps(stale_case).lower()
     assert "a/b reversal" in json.dumps(disagreement_case).lower()
     assert "tournament" not in json.dumps(disagreement_case).lower()
+    assert "stable evidence ids" in corpus
+    assert "structured adjudicator" in corpus

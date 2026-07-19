@@ -9,6 +9,7 @@
       "expectations": [
         "Starts and validates the verification ledger.",
         "Requires current mechanical or reproduced-output evidence for code closure.",
+        "Records stable evidence IDs and a structured adjudicator result linked to the views, evidence, and result location.",
         "Names the validated ledger in the final response."
       ]
     },
@@ -52,6 +53,7 @@
       "files": [],
       "expectations": [
         "Detects artifact revision mismatch as stale evidence.",
+        "Marks retained stale history as evidence_invalidated and does not close either supporting or refuting states from it.",
         "Requires verifier-skeptic and verifier-adjudicator if fresh evidence later permits high-severity closure.",
         "Does not upgrade stale evidence to evidence verified."
       ]
@@ -64,6 +66,8 @@
       "expectations": [
         "Begins with two views and adaptively escalates for critical disagreement.",
         "Requires A/B reversal for the two-reviewer comparison.",
+        "Records candidate descriptions and match-level view, outcome, criterion, and result-location provenance.",
+        "Uses a structured adjudicator abstention linked to the known views and evidence IDs.",
         "Uses INCONCLUSIVE rather than majority-vote acceptance."
       ]
     }
