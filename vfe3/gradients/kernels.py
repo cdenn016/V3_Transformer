@@ -302,12 +302,18 @@ def uses_kernel_route(
 
 
 def _pairwise_stats_reuse_is_sound(
-    omega: 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport',
+    omega: object,
 ) -> bool:
     r"""Whether the effective transport representation may reuse diagonal-KL pair statistics."""
-    if isinstance(omega, RopeTransport):
-        return _pairwise_stats_reuse_is_sound(omega.base)
-    return not isinstance(omega, torch.Tensor)
+    current = omega
+    visited: set[int] = set()
+    while isinstance(current, RopeTransport):
+        identity = id(current)
+        if identity in visited:
+            return False
+        visited.add(identity)
+        current = current.base
+    return type(current) in (CompactFactoredTransport, DirectLinkTransport, FactoredTransport)
 
 
 def belief_gradients(

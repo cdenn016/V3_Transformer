@@ -13,7 +13,14 @@ from vfe3.config import VFE3Config
 from vfe3.families.base import get_family
 from vfe3.free_energy import (attention_weights, pairwise_energy, self_divergence_for_alpha)
 from vfe3.geometry.groups import get_group
-from vfe3.geometry.transport import FactoredTransport, transport_covariance, transport_mean
+from vfe3.geometry.transport import (
+    CompactFactoredTransport,
+    DirectLinkTransport,
+    FactoredTransport,
+    RopeTransport,
+    transport_covariance,
+    transport_mean,
+)
 from vfe3.gradients import kernels as kernels_module
 from vfe3.gradients.pairwise_stats import diagonal_kl_pair_stats
 from vfe3.gradients.kernels import belief_gradients, mm_exact_update
@@ -380,6 +387,74 @@ def _certified_consumer_inputs(
         same_frame_flat_cocycle=True,
     )
     return mu, sigma, mu_p, sigma_p, omega
+
+
+def _defensive_nested_rope_chain(terminal: object) -> RopeTransport:
+    """Assemble an otherwise constructor-forbidden nested wrapper for predicate defense tests."""
+    N, K = 3, 4
+    dense = torch.eye(K, dtype=torch.float32).expand(N, N, K, K).clone()
+    rope = torch.eye(K, dtype=torch.float32).expand(N, K, K).clone()
+    inner = RopeTransport(base=dense, rope=rope)
+    outer = RopeTransport(base=dense, rope=rope)
+    inner.base = terminal
+    outer.base = inner
+    return outer
+
+
+@pytest.mark.parametrize(
+    ("terminal_name", "expected"),
+    [
+        pytest.param("dense", False, id="nested-dense"),
+        pytest.param("factored", True, id="nested-factored"),
+        pytest.param("compact", True, id="nested-compact"),
+        pytest.param("direct_link", True, id="nested-direct-link"),
+        pytest.param("unknown", False, id="nested-unknown"),
+    ],
+)
+def test_pairwise_stats_reuse_predicate_fails_closed_after_nested_rope_unwrap(
+    terminal_name: str,
+    expected:      bool,
+) -> None:
+    _, _, _, _, factored = _certified_consumer_inputs()
+    N, K = factored.exp_phi.shape[-3], factored.exp_phi.shape[-1]
+    dense = torch.eye(K, dtype=torch.float32).expand(N, N, K, K).clone()
+    compact_group = get_group("block_glk")(K, 2)
+    compact = e_step_module.build_belief_transport(
+        torch.zeros(N, compact_group.generators.shape[0]),
+        compact_group,
+        transport_mode="flat",
+        compact_phi_block_transport=True,
+    )
+    assert isinstance(compact, CompactFactoredTransport)
+    direct_link = DirectLinkTransport(exp_link=dense)
+    terminals: dict[str, object] = {
+        "dense": dense,
+        "factored": factored,
+        "compact": compact,
+        "direct_link": direct_link,
+        "unknown": object(),
+    }
+
+    actual = kernels_module._pairwise_stats_reuse_is_sound(
+        _defensive_nested_rope_chain(terminals[terminal_name]))
+
+    assert actual is expected
+
+
+def test_pairwise_stats_reuse_predicate_rejects_one_node_rope_cycle() -> None:
+    wrapper = _defensive_nested_rope_chain(object())
+    wrapper.base = wrapper
+
+    assert kernels_module._pairwise_stats_reuse_is_sound(wrapper) is False
+
+
+def test_pairwise_stats_reuse_predicate_rejects_two_node_rope_cycle() -> None:
+    first = _defensive_nested_rope_chain(object())
+    second = _defensive_nested_rope_chain(object())
+    first.base = second
+    second.base = first
+
+    assert kernels_module._pairwise_stats_reuse_is_sound(first) is False
 
 
 @pytest.mark.parametrize("consumer", [belief_gradients, mm_exact_update])
