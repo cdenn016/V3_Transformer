@@ -9,6 +9,7 @@ Device-agnostic: default CPU; set VFE3_TEST_DEVICE=cuda for the GPU (conftest fi
 """
 
 import dataclasses
+import importlib
 import warnings
 
 import pytest
@@ -191,6 +192,33 @@ def test_randomize_off_loop_count_unchanged(device):
     _, traj = e_step(b0, mu_p, sigma_p, grp, n_iter=3, tau=1.5, e_phi_lr=0.0,
                      return_trajectory=True)
     assert len(traj) == 4                              # initial F + one per iteration
+
+
+def test_trajectory_free_energy_forwards_low_level_mean_transport_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    device:      torch.device,
+) -> None:
+    e_step_module = importlib.import_module("vfe3.inference.e_step")
+    b0, mu_p, sigma_p, group = _belief_and_prior(device)
+    seen: list[object] = []
+
+    def _capture_free_energy(*args: object, **kwargs: object) -> torch.Tensor:
+        seen.append(kwargs.get("transport_mean_per_head"))
+        return b0.mu.new_tensor(0.0)
+
+    monkeypatch.setattr(e_step_module, "free_energy_value", _capture_free_energy)
+    _, trajectory = e_step_module.e_step(
+        b0,
+        mu_p,
+        sigma_p,
+        group,
+        n_iter=0,
+        transport_mean_per_head=False,
+        return_trajectory=True,
+    )
+
+    assert trajectory == [0.0]
+    assert seen == [False]
 
 
 def test_randomized_depth_samples_t_when_training(device):

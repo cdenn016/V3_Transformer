@@ -576,7 +576,17 @@ def free_energy_value(
     if rope is not None:
         # Mirror the model path: R_i Omega_ij R_j^T on the means (and the covariance sandwich
         # under the full gauge). The Rope einsums are rank-agnostic, so no unsqueeze dance.
-        wrapped = RopeTransport(base=omega, rope=rope, on_cov=rope_on_cov, on_value=rope_on_value)
+        wrapped = RopeTransport(
+            base=omega,
+            rope=rope,
+            on_cov=rope_on_cov,
+            on_value=rope_on_value,
+            same_frame_flat_cocycle=(
+                keys is None
+                and isinstance(omega, (CompactFactoredTransport, FactoredTransport))
+                and omega.same_frame_flat_cocycle
+            ),
+        )
         mu_t = transport_mean(wrapped, key_belief.mu)
         sigma_t = fam.transport_dispersion(key_belief.sigma, wrapped)
         if not rope_on_value:
@@ -1326,7 +1336,7 @@ def e_step(
                                      rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
                                      gauge_parameterization=gauge_param_kw,
                                      compact_phi_block_transport=compact_phi_block_transport,
-                                     transport_mean_per_head=True,
+                                     transport_mean_per_head=transport_mean_per_head,
                                      transport_chart_max_norm=transport_chart_max_norm,
                                      transport_status=transport_status,
                                      **kwargs).detach()

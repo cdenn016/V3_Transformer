@@ -382,7 +382,13 @@ def belief_gradients(
     sd = self_divergence_for_alpha(fam(mu, sigma), fam(mu_p, sigma_p), alpha=1.0, kl_max=kl_max, eps=eps,
                                    divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
     pair_stats = None
+    # A dense tensor carries no structural same-frame certificate. On the single-block flat route,
+    # its numerically composed self links can make the float64 statistics reduction strictly
+    # positive where the generic float32 energy and derivative mask are exactly zero. Fail closed
+    # to the generic computation there; certified factored containers retain automatic reuse.
+    uncertified_dense_transport = isinstance(omega, torch.Tensor)
     if (reuse_pairwise_kl_stats
+            and not uncertified_dense_transport
             and all(tensor.dtype == torch.float32 for tensor in (mu, sigma, mu_t, sigma_t))):
         pair_stats = diagonal_kl_pair_stats(
             mu,
@@ -504,7 +510,9 @@ def mm_exact_update(
                                    divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
     pair_stats = None
     decoupled_value = isinstance(omega, RopeTransport) and not omega.on_value
+    uncertified_dense_transport = isinstance(omega, torch.Tensor)
     if (reuse_pairwise_kl_stats
+            and not uncertified_dense_transport
             and family == "gaussian_diagonal"
             and divergence_family == "renyi"
             and not decoupled_value

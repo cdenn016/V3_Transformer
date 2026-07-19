@@ -153,6 +153,7 @@ def test_default_adamw_one_step_matches_recompute_dense_low_level_oracle(
     def recompute_dense_e_step(*args: object, **kwargs: object) -> object:
         kwargs["reuse_pairwise_kl_stats"] = False
         kwargs["compact_phi_block_transport"] = False
+        kwargs["transport_mean_per_head"] = False
         return original_e_step(*args, **kwargs)
 
     monkeypatch.setattr(block_module, "e_step", recompute_dense_e_step)
@@ -168,6 +169,70 @@ def test_default_adamw_one_step_matches_recompute_dense_low_level_oracle(
             rtol=1e-6,
             msg=lambda message, name=name: f"{name}: {message}",
         )
+
+
+def test_single_head_forward_matches_recompute_dense_low_level_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vfe3.config import VFE3Config
+    from vfe3.gradients import kernels as kernels_module
+    from vfe3.model import block as block_module
+    from vfe3.model.model import VFEModel
+
+    torch.manual_seed(0)
+    cfg = VFE3Config(
+        vocab_size=8,
+        embed_dim=4,
+        n_heads=1,
+        max_seq_len=4,
+        n_layers=1,
+        n_e_steps=1,
+        pos_phi="none",
+    )
+    production = VFEModel(cfg).eval()
+    oracle = VFEModel(cfg).eval()
+    oracle.load_state_dict(production.state_dict())
+    tokens = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]], dtype=torch.long)
+    production_energies: list[torch.Tensor] = []
+    stats_calls: list[None] = []
+    original_pairwise_energy = kernels_module.pairwise_energy
+    original_pair_stats = kernels_module.diagonal_kl_pair_stats
+
+    def _capture_pairwise_energy(*args: object, **kwargs: object) -> torch.Tensor:
+        energy = original_pairwise_energy(*args, **kwargs)
+        production_energies.append(energy.detach().clone())
+        return energy
+
+    def _capture_pair_stats(*args: object, **kwargs: object) -> object:
+        stats_calls.append(None)
+        return original_pair_stats(*args, **kwargs)
+
+    monkeypatch.setattr(kernels_module, "pairwise_energy", _capture_pairwise_energy)
+    monkeypatch.setattr(kernels_module, "diagonal_kl_pair_stats", _capture_pair_stats)
+    with torch.no_grad():
+        production_logits = production(tokens)
+
+    assert stats_calls == []
+    assert len(production_energies) == 1
+    self_energy = production_energies[0].diagonal(dim1=-2, dim2=-1)
+    self_mask = ((self_energy > 0.0) & (self_energy < 100.0)).to(self_energy.dtype)
+    assert torch.equal(self_energy, torch.zeros_like(self_energy))
+    assert torch.equal(self_mask, torch.zeros_like(self_mask))
+
+    original_e_step = block_module.e_step
+
+    def recompute_dense_e_step(*args: object, **kwargs: object) -> object:
+        kwargs["reuse_pairwise_kl_stats"] = False
+        kwargs["compact_phi_block_transport"] = False
+        kwargs["transport_mean_per_head"] = False
+        return original_e_step(*args, **kwargs)
+
+    production_energies.clear()
+    monkeypatch.setattr(block_module, "e_step", recompute_dense_e_step)
+    with torch.no_grad():
+        oracle_logits = oracle(tokens)
+
+    assert torch.equal(production_logits, oracle_logits)
 
 
 @pytest.mark.parametrize("value", [-1, 1.5, True, False, "2", None])

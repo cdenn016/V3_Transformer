@@ -1,5 +1,9 @@
+import importlib
+
+import pytest
 import torch
 
+from vfe3.belief import BeliefState
 from vfe3.geometry.rope import build_rope_rotation, get_pos_rotation
 
 
@@ -72,6 +76,94 @@ def test_build_belief_transport_wraps_in_ropetransport_when_rope_set():
     # rope=None reproduces the plain build (no wrapper).
     plain = build_belief_transport(phi, g, transport_mode="flat")
     assert not isinstance(plain, RopeTransport)
+
+
+def _free_energy_rope_fixture() -> tuple[
+    BeliefState,
+    torch.Tensor,
+    torch.Tensor,
+    object,
+    torch.Tensor,
+]:
+    torch.manual_seed(5)
+    N, K, H = 5, 4, 2
+    group = get_group("block_glk")(K, H)
+    belief = BeliefState(
+        mu=0.1 * torch.randn(N, K),
+        sigma=torch.exp(torch.randn(N, K)),
+        phi=0.05 * torch.randn(N, group.generators.shape[0]),
+    )
+    mu_p = torch.zeros(N, K)
+    sigma_p = torch.ones(N, K)
+    rope = build_rope_rotation(
+        torch.arange(N),
+        group.irrep_dims,
+        base=10.0,
+        device=belief.mu.device,
+        dtype=belief.mu.dtype,
+    )
+    return belief, mu_p, sigma_p, group, rope
+
+
+def test_global_free_energy_rope_matches_certified_compact_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    e_step_module = importlib.import_module("vfe3.inference.e_step")
+    belief, mu_p, sigma_p, group, rope = _free_energy_rope_fixture()
+    kwargs = {
+        "tau": 1.3,
+        "rope": rope,
+        "rope_on_cov": True,
+        "compact_phi_block_transport": True,
+        "transport_mean_per_head": True,
+    }
+    actual = e_step_module.free_energy_value(belief, mu_p, sigma_p, group, **kwargs)
+    original_transport = e_step_module.RopeTransport
+
+    class _CertifiedRopeTransport(original_transport):
+        def __init__(self, *args: object, **inner_kwargs: object) -> None:
+            inner_kwargs["same_frame_flat_cocycle"] = True
+            super().__init__(*args, **inner_kwargs)
+
+    monkeypatch.setattr(e_step_module, "RopeTransport", _CertifiedRopeTransport)
+    expected = e_step_module.free_energy_value(belief, mu_p, sigma_p, group, **kwargs)
+
+    assert torch.equal(actual, expected)
+
+
+def test_free_energy_rope_certificate_is_global_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    e_step_module = importlib.import_module("vfe3.inference.e_step")
+    belief, mu_p, sigma_p, group, rope = _free_energy_rope_fixture()
+    original_transport = e_step_module.RopeTransport
+    certificates: list[object] = []
+
+    class _RecordingRopeTransport(original_transport):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            certificates.append(kwargs.get("same_frame_flat_cocycle"))
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(e_step_module, "RopeTransport", _RecordingRopeTransport)
+    kwargs = {
+        "tau": 1.3,
+        "rope": rope,
+        "rope_on_cov": True,
+        "compact_phi_block_transport": True,
+        "transport_mean_per_head": True,
+    }
+    e_step_module.free_energy_value(belief, mu_p, sigma_p, group, **kwargs)
+    frozen_keys = belief._replace(phi=belief.phi + 0.01)
+    e_step_module.free_energy_value(
+        belief,
+        mu_p,
+        sigma_p,
+        group,
+        keys=frozen_keys,
+        **kwargs,
+    )
+
+    assert certificates == [True, False]
 
 
 from vfe3.config import VFE3Config

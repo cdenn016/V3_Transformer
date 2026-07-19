@@ -13,7 +13,7 @@ from vfe3.config import VFE3Config
 from vfe3.families.base import get_family
 from vfe3.free_energy import (attention_weights, pairwise_energy, self_divergence_for_alpha)
 from vfe3.geometry.groups import get_group
-from vfe3.geometry.transport import transport_covariance, transport_mean
+from vfe3.geometry.transport import FactoredTransport, transport_covariance, transport_mean
 from vfe3.gradients import kernels as kernels_module
 from vfe3.gradients.pairwise_stats import diagonal_kl_pair_stats
 from vfe3.gradients.kernels import belief_gradients, mm_exact_update
@@ -340,6 +340,89 @@ def _consumer_inputs(
     return mu, sigma, mu_p, sigma_p, omega
 
 
+def _dense_single_block_inputs() -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """A flat GL(K) fixture whose generic self energies are exactly zero in float32."""
+    torch.manual_seed(2)
+    group = get_group("glk")(4)
+    phi = 0.05 * torch.randn(1, 4, group.generators.shape[0], dtype=torch.float32)
+    mu = torch.randn(1, 4, 4, dtype=torch.float32)
+    sigma = torch.rand(1, 4, 4, dtype=torch.float32) + 0.5
+    mu_p = torch.randn_like(mu)
+    sigma_p = torch.rand_like(sigma) + 0.5
+    omega = e_step_module.build_belief_transport(
+        phi,
+        group,
+        transport_mode="flat",
+        transport_mean_per_head=True,
+        compact_phi_block_transport=True,
+    )
+    assert isinstance(omega, torch.Tensor)
+    return mu, sigma, mu_p, sigma_p, omega
+
+
+def _certified_consumer_inputs(
+    *,
+    requires_grad: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, FactoredTransport]:
+    mu, sigma, mu_p, sigma_p, _ = _consumer_inputs(requires_grad=requires_grad)
+    N, K = mu.shape[-2:]
+    eye = torch.eye(K, dtype=mu.dtype).expand(N, K, K).clone()
+    omega = FactoredTransport(
+        exp_phi=eye,
+        exp_neg_phi=eye,
+        irrep_dims=[2, 2],
+        same_frame_flat_cocycle=True,
+    )
+    return mu, sigma, mu_p, sigma_p, omega
+
+
+@pytest.mark.parametrize("consumer", [belief_gradients, mm_exact_update])
+def test_dense_single_block_reuse_fails_closed_to_generic_pair_energy(
+    monkeypatch: pytest.MonkeyPatch,
+    consumer:    Callable,
+) -> None:
+    inputs = _dense_single_block_inputs()
+    generic_energies: list[torch.Tensor] = []
+    original_pairwise_energy = kernels_module.pairwise_energy
+
+    def _capture_pairwise_energy(*args: object, **kwargs: object) -> torch.Tensor:
+        energy = original_pairwise_energy(*args, **kwargs)
+        generic_energies.append(energy.detach().clone())
+        return energy
+
+    expected = consumer(
+        *inputs,
+        irrep_dims=[4],
+        reuse_pairwise_kl_stats=False,
+    )
+    generic_energies.clear()
+    monkeypatch.setattr(kernels_module, "pairwise_energy", _capture_pairwise_energy)
+
+    def _forbidden_dense_stats(*args: object, **kwargs: object) -> object:
+        raise AssertionError("uncertified dense transport must recompute generic pair energy")
+
+    monkeypatch.setattr(kernels_module, "diagonal_kl_pair_stats", _forbidden_dense_stats)
+    actual = consumer(
+        *inputs,
+        irrep_dims=[4],
+        reuse_pairwise_kl_stats=True,
+    )
+
+    assert len(generic_energies) == 1
+    self_energy = generic_energies[0].diagonal(dim1=-2, dim2=-1)
+    self_mask = ((self_energy > 0.0) & (self_energy < 100.0)).to(self_energy.dtype)
+    assert torch.equal(self_energy, torch.zeros_like(self_energy))
+    assert torch.equal(self_mask, torch.zeros_like(self_mask))
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        assert torch.equal(actual_tensor, expected_tensor)
+
+
 def _filtering_call(
     inputs:            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 
@@ -399,7 +482,7 @@ def _mm_call(
 
 
 def test_p3_causal_noself_prior_preserves_exact_hard_masks() -> None:
-    inputs = _consumer_inputs()
+    inputs = _certified_consumer_inputs()
     mu, sigma, _, _, omega = inputs
     log_prior = attention_log_prior(
         "causal_noself",
@@ -458,7 +541,7 @@ def test_p3_causal_noself_prior_preserves_exact_hard_masks() -> None:
 
 
 def test_p3_mm_frozen_sigma_is_exactly_equal_with_reuse() -> None:
-    inputs = _consumer_inputs()
+    inputs = _certified_consumer_inputs()
     _, sigma_star = _mm_call(
         inputs,
         lambda_twohop=0.7,
@@ -626,7 +709,7 @@ def _legacy_mm_reference(
 def test_p3_filtering_consumes_poisoned_statistics_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    inputs = _consumer_inputs()
+    inputs = _certified_consumer_inputs()
     reference = _filtering_call(
         inputs,
         lambda_twohop=0.7,
@@ -664,7 +747,7 @@ def test_p3_filtering_consumes_poisoned_statistics_once(
 def test_p3_mm_consumes_poisoned_statistics_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    inputs = _consumer_inputs()
+    inputs = _certified_consumer_inputs()
     reference = _mm_call(
         inputs,
         lambda_twohop=0.7,
@@ -884,7 +967,7 @@ def test_p3_filtering_kernel_rejects_asymmetric_optional_statistics(
 def test_p3_compiled_filtering_receives_statistics_kwargs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    inputs = _consumer_inputs()
+    inputs = _certified_consumer_inputs()
     expected = _filtering_call(
         inputs,
         lambda_twohop=0.7,
@@ -957,7 +1040,7 @@ def test_p3_filtering_on_matches_off_forward_and_vjp(
     lambda_twohop:     float,
     irrep_dims:        list[int] | None,
 ) -> None:
-    inputs = _consumer_inputs(requires_grad=True)
+    inputs = _certified_consumer_inputs(requires_grad=True)
     legacy = _legacy_filtering_reference(
         inputs,
         lambda_twohop=lambda_twohop,
@@ -1005,7 +1088,7 @@ def test_p3_mm_on_matches_off_forward_and_vjp(
     lambda_twohop:     float,
     irrep_dims:        list[int] | None,
 ) -> None:
-    inputs = _consumer_inputs(requires_grad=True)
+    inputs = _certified_consumer_inputs(requires_grad=True)
     legacy = _legacy_mm_reference(
         inputs,
         lambda_twohop=lambda_twohop,
@@ -1080,13 +1163,17 @@ def test_diagonal_kl_pair_stats_preserve_batched_head_layout_and_live_vjps() -> 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_p3_cuda_filtering_and_mm_reuse_smoke() -> None:
     device = torch.device("cuda")
-    mu, sigma, mu_p, sigma_p, omega = _consumer_inputs()
+    mu, sigma, mu_p, sigma_p, omega = _certified_consumer_inputs()
     inputs = (
         mu.to(device).detach().requires_grad_(True),
         sigma.to(device).detach().requires_grad_(True),
         mu_p.to(device).detach().requires_grad_(True),
         sigma_p.to(device).detach().requires_grad_(True),
-        omega.to(device),
+        dataclasses.replace(
+            omega,
+            exp_phi=omega.exp_phi.to(device),
+            exp_neg_phi=omega.exp_neg_phi.to(device),
+        ),
     )
     filtering = _filtering_call(
         inputs,

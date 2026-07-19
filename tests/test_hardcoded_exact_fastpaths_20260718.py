@@ -155,8 +155,13 @@ def test_compact_phi_route_is_automatic(
     assert model._compact_phi_blocks_enabled() is expected
 
 
-def test_diagnostic_free_energy_requests_per_head_mean_transport() -> None:
+def test_diagnostic_free_energy_forwards_per_head_mean_transport() -> None:
     assert _literal_true(_function_keyword_values(
         "vfe3/viz/extract.py", "_fe_kwargs", "transport_mean_per_head"))
-    assert _literal_true(_direct_call_keyword_values(
-        "vfe3/inference/e_step.py", "e_step", "free_energy_value", "transport_mean_per_head"))
+    values = _direct_call_keyword_values(
+        "vfe3/inference/e_step.py", "e_step", "free_energy_value", "transport_mean_per_head")
+    assert values
+    assert all(
+        isinstance(value, ast.Name) and value.id == "transport_mean_per_head"
+        for value in values
+    )
