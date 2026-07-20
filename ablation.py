@@ -1903,6 +1903,20 @@ def _parameter_match_selection(sweep_name: str) -> Dict[str, Any]:
     }
 
 
+def _sweep_output_scope(sweep_name: str) -> str:
+    """Return the direct output child for one logical sweep and parameter-budget invocation."""
+    sweep_name = _validated_sweep_name(sweep_name)
+    sweep = SWEEPS[sweep_name]
+    if "parameter_grid" not in sweep:
+        return sweep_name
+    target = _validated_target_n_params(CONFIG.get("target_n_params"))
+    tolerance = _validated_param_relative_deviation(
+        CONFIG.get("max_param_relative_deviation")
+    )
+    tolerance_text = format(tolerance, ".12g").replace(".", "p")
+    return f"{sweep_name}_N{target}_rtol{tolerance_text}"
+
+
 def validate_sweeps(sweep_names: List[str]) -> None:
     r"""Abort unless every named arm references real fields and constructs against the baseline.
 
@@ -2450,7 +2464,8 @@ def _cleanup() -> None:
 _CSV_COLUMNS = [
     "sweep", "label", "error_kind", "primary_val_ppl", "final_val_ppl",
     "final_val_ce", "final_val_bits_per_token", "final_val_bpc", "best_val_ppl", "final_train_loss",
-    "n_params", "head_mixer_compatibility", "head_mixer_gauge_compatible",
+    "n_params", "target_n_params", "param_difference", "param_relative_deviation",
+    "head_mixer_compatibility", "head_mixer_gauge_compatible",
     "on_gauge_pure_path",
     # opt-in per-cell converged-state diagnostics (S2; empty unless the sweep sets collect_diagnostics)
     "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in", "gauge_resid_out",
@@ -3559,8 +3574,19 @@ def run_sweep(
     sweep = SWEEPS[sweep_name]
     cell_seeds = _validated_sweep_seeds(sweep, seed)
     data_seed_override = _validated_data_seed_override()
-    sweep_dir = _prepare_owned_output_child(output_dir, sweep_name, role="ablation sweep")
-    runs = make_run_overrides(sweep_name)
+    sweep_scope = _sweep_output_scope(sweep_name)
+    sweep_dir = _prepare_owned_output_child(output_dir, sweep_scope, role="ablation sweep")
+    parameter_match = (
+        _parameter_match_selection(sweep_name)
+        if "parameter_grid" in sweep else None
+    )
+    runs = (
+        [
+            (str(record["label"]), dict(record["overrides"]))
+            for record in parameter_match["selected"]
+        ]
+        if parameter_match is not None else make_run_overrides(sweep_name)
+    )
     run_labels = [label for label, _overrides in runs]
     if any(not isinstance(label, str) or not label for label in run_labels):
         raise ValueError(f"sweep {sweep_name!r} has a non-string or empty label")
@@ -3581,6 +3607,17 @@ def run_sweep(
     multiseed = "seeds" in sweep
     cells = [((f"{label}__s{s}" if multiseed else label), overrides, s)
              for (label, overrides) in runs for s in cell_seeds]
+    parameter_record_by_label: Dict[str, Mapping[str, object]] = {}
+    if parameter_match is not None:
+        base_records = {
+            str(record["label"]): record
+            for record in parameter_match["selected"]
+        }
+        parameter_record_by_label = {
+            (f"{label}__s{cell_seed}" if multiseed else label): record
+            for label, record in base_records.items()
+            for cell_seed in cell_seeds
+        }
 
     report_metadata = {
         "paired_token_bootstrap": paired_token_bootstrap,
@@ -3593,6 +3630,7 @@ def run_sweep(
         "grid_y_values":          sweep.get("grid_y_values"),
         "grid_baseline":          (list(sweep["grid_baseline"])
                                    if sweep.get("grid_baseline") is not None else None),
+        "parameter_match":        _jsonable(parameter_match) if parameter_match is not None else None,
     }
     running_meta = {
         "sweep_name":              sweep_name,
@@ -3710,17 +3748,24 @@ def run_sweep(
             # missing or drifted val_token_nats.pt forbids reuse even when the contract still matches.
             if (_cell_dir_is_owned(sweep_dir, run_dir)
                     and _ablation_cell_owner_is_exact(
-                        run_dir, sweep_name, label, cell_seed)
+                        run_dir, sweep_scope, label, cell_seed)
                     and expected_contract is not None
                     and _cell_is_current(run_dir, expected_contract)
                     and _paired_token_artifact_is_current(run_dir, required=paired_token_bootstrap)):
                 print(f"\n--- {i + 1}/{len(cells)}: {label}  [CACHED] ---")
                 cached_result = json.loads(marker.read_text(encoding="utf-8"))
                 cached_result.update(expected_gauge_fields)
-                cached_result["sweep"] = sweep_name
+                cached_result["sweep"] = sweep_scope
                 cached_result["label"] = label
                 cached_result["seed"] = cell_seed
                 cached_result["overrides"] = _jsonable(overrides)
+                parameter_record = parameter_record_by_label.get(label)
+                if parameter_record is not None:
+                    cached_result.update({
+                        "target_n_params":          parameter_record["target_n_params"],
+                        "param_difference":         parameter_record["param_difference"],
+                        "param_relative_deviation": parameter_record["param_relative_deviation"],
+                    })
                 _write_json_atomic(marker, cached_result)
                 results.append(cached_result)
                 continue
@@ -3733,7 +3778,7 @@ def run_sweep(
             _start_owned_cell_generation(
                 sweep_dir,
                 run_dir,
-                sweep_name=sweep_name,
+                sweep_name=sweep_scope,
                 label=label,
                 seed=cell_seed,
             )
@@ -3767,6 +3812,20 @@ def run_sweep(
         result["label"] = label
         result["seed"] = int(cell_seed)
         result["overrides"] = _jsonable(overrides)
+        parameter_record = parameter_record_by_label.get(label)
+        if parameter_record is not None:
+            expected_n_params = int(parameter_record["n_params"])
+            if result.get("error_kind") is None and result.get("n_params") != expected_n_params:
+                result["error_kind"] = "parameter_count_drift"
+                result["error"] = (
+                    f"selected realized count was {expected_n_params}, but run_single built "
+                    f"{result.get('n_params')!r} parameters"
+                )
+            result.update({
+                "target_n_params":          parameter_record["target_n_params"],
+                "param_difference":         parameter_record["param_difference"],
+                "param_relative_deviation": parameter_record["param_relative_deviation"],
+            })
         result.update(expected_gauge_fields or {
             "head_mixer_compatibility":    "unavailable",
             "head_mixer_gauge_compatible": False,
@@ -3844,7 +3903,7 @@ def run_sweep(
             semantic_config_fingerprint(contract)
             if successful and contract is not None else None
         )
-        result["sweep"] = sweep_name
+        result["sweep"] = sweep_scope
         result["wall_time_s"] = time.perf_counter() - t0
 
         # Publish the contract atomically (same-dir tmp + os.replace) BEFORE the completion marker, so
@@ -4029,13 +4088,23 @@ def analyze_sweep(sweep_dir: Path) -> None:
     rows.sort(key=lambda r: r["_ppl"])
 
     print(f"\n{'=' * 70}\nANALYSIS: {sweep_dir.name}\n{'=' * 70}")
-    print(f"{'label':<34}{'val PPL':>12}{'params':>12}  gauge classification")
-    print("-" * 104)
+    parameter_matched = any(r.get("target_n_params") not in ("", None) for r in rows)
+    if parameter_matched:
+        print(f"{'label':<34}{'val PPL':>12}{'params':>12}{'budget dev':>12}  gauge classification")
+        print("-" * 116)
+    else:
+        print(f"{'label':<34}{'val PPL':>12}{'params':>12}  gauge classification")
+        print("-" * 104)
     for r in rows:
         ppl = "inf" if r["_ppl"] == float("inf") else f"{r['_ppl']:.3f}"
         params = f"{int(_as_float(r.get('n_params'))):,}" if r.get("n_params") not in ("", None) else "-"
         gauge = r.get("head_mixer_compatibility") or "unavailable"
-        print(f"{r['label']:<34}{ppl:>12}{params:>12}  {gauge}")
+        if parameter_matched:
+            relative = _as_float(r.get("param_relative_deviation"))
+            deviation = "-" if relative == float("inf") else f"{relative * 100:.2f}%"
+            print(f"{r['label']:<34}{ppl:>12}{params:>12}{deviation:>12}  {gauge}")
+        else:
+            print(f"{r['label']:<34}{ppl:>12}{params:>12}  {gauge}")
 
     finished = [r for r in rows if r["_ppl"] < float("inf")]
     if len(finished) > 1:
@@ -4989,8 +5058,9 @@ def main() -> int:
         )
         return 1
     for name in sweep_names:
-        if not _run_ablation_figures_isolated(output_dir, scope=name, invalidate=True):
-            failed_figure_scopes.append(f"{name}:invalidate")
+        sweep_scope = _sweep_output_scope(name)
+        if not _run_ablation_figures_isolated(output_dir, scope=sweep_scope, invalidate=True):
+            failed_figure_scopes.append(f"{sweep_scope}:invalidate")
             incomplete_sweeps.append(name)
             logger.error(
                 "could not invalidate prior %r figures; refusing to run beside stale output", name
@@ -4999,7 +5069,7 @@ def main() -> int:
         run_sweep(name, output_dir, dataset=CONFIG["dataset"], device=device,
                   seed=CONFIG["seed"], resume=CONFIG["resume"],
                   max_tokens=CONFIG["max_tokens"], max_steps=CONFIG["max_steps"])
-        sweep_dir = output_dir / name
+        sweep_dir = output_dir / sweep_scope
 
         try:
             meta = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8"))
@@ -5025,8 +5095,8 @@ def main() -> int:
             incomplete_sweeps.append(name)
             continue
         analyze_sweep(sweep_dir)                            # this sweep's numeric table (accumulated)
-        if not _run_ablation_figures_isolated(output_dir, scope=name):
-            failed_figure_scopes.append(f"{name}:render")
+        if not _run_ablation_figures_isolated(output_dir, scope=sweep_scope):
+            failed_figure_scopes.append(f"{sweep_scope}:render")
 
     # ---- after all sweeps: the cross-sweep comparison ----
     if current_cohort is not None:
