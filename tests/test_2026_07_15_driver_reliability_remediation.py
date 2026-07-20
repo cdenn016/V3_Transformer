@@ -161,9 +161,9 @@ def _write_scaling_run(
     (run_dir / "provenance.json").write_text(json.dumps({
         "seed": seed,
         **code_identity,
-        "train_data_sha256": "train",
-        "val_data_sha256": "val",
-        "test_data_sha256": "test",
+        "train_data_sha256": "1" * 64,
+        "val_data_sha256": "2" * 64,
+        "test_data_sha256": "3" * 64,
     }), encoding="utf-8")
     (run_dir / "scaling_cell.json").write_text(json.dumps(cell), encoding="utf-8")
 
@@ -181,23 +181,25 @@ def _drift_scaling_run_code_identity(run_dir: Path) -> None:
 def test_scaling_analysis_force_accept_code_identity_drift_is_narrow_and_auditable(
     tmp_path,
 ):
+    _write_scaling_run(tmp_path, "anchor", 2, 20, 1.9)
     _write_scaling_run(tmp_path, "small", 1, 10, 2.0)
     run_dir = tmp_path / "route" / "small" / "s1"
     _drift_scaling_run_code_identity(run_dir)
 
-    assert scaling_analysis.harvest(tmp_path) == []
+    strict_rows = scaling_analysis.harvest(tmp_path)
+    assert [row["label"] for row in strict_rows] == ["anchor"]
 
     rows = scaling_analysis.harvest(
         tmp_path,
         force_accept_code_identity_drift=True,
     )
 
-    assert len(rows) == 1
-    assert rows[0]["code_identity_forced"] is True
-    assert rows[0]["cell_git_dirty"] is False
-    assert rows[0]["cell_git_dirty_fingerprint"] is None
-    assert rows[0]["provenance_git_dirty"] is True
-    assert rows[0]["provenance_git_dirty_fingerprint"] == "observed-dirty-fingerprint"
+    assert len(rows) == 2
+    forced = next(row for row in rows if row["code_identity_forced"] is True)
+    assert forced["cell_git_dirty"] is False
+    assert forced["cell_git_dirty_fingerprint"] is None
+    assert forced["provenance_git_dirty"] is True
+    assert forced["provenance_git_dirty_fingerprint"] == "observed-dirty-fingerprint"
 
 
 @pytest.mark.parametrize(
@@ -205,6 +207,7 @@ def test_scaling_analysis_force_accept_code_identity_drift_is_narrow_and_auditab
     [
         ("provenance.json", "git_sha", "other"),
         ("provenance.json", "seed", 2),
+        ("provenance.json", "train_data_sha256", "changed"),
         ("summary.json", "test_ppl", 2.0),
         ("summary.json", "scaling_reuse_contract_sha256", "0" * 64),
     ],
@@ -224,6 +227,41 @@ def test_scaling_analysis_force_accept_code_identity_drift_keeps_other_checks_cl
         tmp_path,
         force_accept_code_identity_drift=True,
     ) == []
+
+
+def test_scaling_analysis_force_accept_code_identity_drift_rejects_config_corruption(
+    tmp_path,
+):
+    _write_scaling_run(tmp_path, "small", 1, 10, 2.0)
+    run_dir = tmp_path / "route" / "small" / "s1"
+    _drift_scaling_run_code_identity(run_dir)
+    config_path = run_dir / "config.json"
+    config_json = json.loads(config_path.read_text(encoding="utf-8"))
+    config_json["config"]["embed_dim"] = 999
+    config_path.write_text(json.dumps(config_json), encoding="utf-8")
+
+    assert scaling_analysis.harvest(
+        tmp_path,
+        force_accept_code_identity_drift=True,
+    ) == []
+
+
+def test_scaling_analysis_forced_row_requires_matching_strict_source_anchor(tmp_path):
+    _write_scaling_run(tmp_path, "anchor", 2, 20, 1.9)
+    _write_scaling_run(tmp_path, "small", 1, 10, 2.0)
+    run_dir = tmp_path / "route" / "small" / "s1"
+    _drift_scaling_run_code_identity(run_dir)
+    provenance_path = run_dir / "provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["train_data_sha256"] = "4" * 64
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    rows = scaling_analysis.harvest(
+        tmp_path,
+        force_accept_code_identity_drift=True,
+    )
+
+    assert [row["label"] for row in rows] == ["anchor"]
 
 
 def _complete_scaling_design(*, route: str = "route") -> dict[str, object]:
@@ -411,7 +449,8 @@ def test_scaling_analysis_forced_code_identity_design_includes_all_nine_runs(
     for label, n_params in labels:
         for seed in seeds:
             _write_scaling_run(tmp_path, label, seed, n_params, 2.0 + seed / 1000.0)
-            _drift_scaling_run_code_identity(tmp_path / "route" / label / f"s{seed}")
+            if label == "K64_h2" or (label == "K64_h4" and seed == 23):
+                _drift_scaling_run_code_identity(tmp_path / "route" / label / f"s{seed}")
     (tmp_path / "scaling_design.json").write_text(json.dumps({
         "schema_version": 1,
         "routes": ["route"],
@@ -445,29 +484,33 @@ def test_scaling_analysis_forced_code_identity_design_includes_all_nine_runs(
     assert summary["design"]["status"] == "complete"
     assert summary["design"]["manifest_status"] == "incomplete"
     assert summary["design"]["forced_code_identity_acceptance"] is True
-    assert summary["design"]["forced_row_count"] == 9
+    assert summary["design"]["forced_manifest_completion"] is True
+    assert summary["design"]["forced_row_count"] == 4
     assert summary["design"]["counts"] == {"complete": 9}
     assert summary["n_harvested_param_sizes"] == 3
     assert summary["n_fit_param_sizes"] == 3
     assert summary["n_distinct_param_sizes"] == 3
     assert summary["pooled_fit"] is not None
     assert "code_identity_forced" in summary["pooled_fit_confounds"]
-    assert summary["provenance"]["forced_code_identity_rows"] == 9
+    assert summary["provenance"]["forced_code_identity_rows"] == 4
     csv_rows = list(csv.DictReader(
         (tmp_path / "scaling_points.csv").read_text(encoding="utf-8").splitlines()
     ))
     assert len(csv_rows) == 9
-    assert {row["code_identity_forced"] for row in csv_rows} == {"True"}
+    assert {row["code_identity_forced"] for row in csv_rows} == {"False", "True"}
     assert {row["cell_git_dirty_fingerprint"] for row in csv_rows} == {""}
     assert {
         row["provenance_git_dirty_fingerprint"] for row in csv_rows
-    } == {"observed-dirty-fingerprint"}
+    } == {"", "observed-dirty-fingerprint"}
     assert "FORCED CODE-IDENTITY ACCEPTANCE" in capsys.readouterr().out
     report = (tmp_path / "SCALING_ANALYSIS.md").read_text(encoding="utf-8")
     assert "Forced code-identity acceptance" in report
+    assert "| route | label | seed | cell dirty | cell fingerprint | provenance dirty | provenance fingerprint |" in report
+    assert "| route | K64_h2 | 6 | False | (clean) | True | observed-dirty-fingerprint |" in report
 
 
 def test_scaling_analysis_force_does_not_complete_an_unrelated_manifest_error(tmp_path):
+    _write_scaling_run(tmp_path, "anchor", 2, 20, 1.9)
     _write_scaling_run(tmp_path, "small", 1, 10, 2.0)
     run_dir = tmp_path / "route" / "small" / "s1"
     _drift_scaling_run_code_identity(run_dir)
@@ -485,7 +528,9 @@ def test_scaling_analysis_force_does_not_complete_an_unrelated_manifest_error(tm
     )
 
     assert design["complete"] is False
-    assert design["forced_code_identity_acceptance"] is False
+    assert design["forced_code_identity_acceptance"] is True
+    assert design["forced_manifest_completion"] is False
+    assert design["forced_row_count"] == 1
 
 
 @pytest.mark.parametrize(

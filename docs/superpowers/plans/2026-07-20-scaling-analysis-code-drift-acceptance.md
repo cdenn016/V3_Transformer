@@ -13,6 +13,7 @@
 - `force_accept_code_identity_drift` is enabled in the checked-in analysis `CONFIG` for the requested current blocksize analysis.
 - The override may bypass only `git_dirty` or `git_dirty_fingerprint` disagreement when Git SHA agrees and both identities are structurally valid.
 - Dataset/source identities, schema, reuse digest, configuration digest, seed, and metric checks remain fail-closed.
+- Every forced row must match a strictly accepted peer on serialized train/validation/test source identities and provenance data digests.
 - Scaling generation, caching, resume logic, and training behavior remain unchanged.
 - Forced rows and their paired identities remain visible in persisted artifacts and human-readable output.
 - Tests follow red-green-refactor, and reported counts come from JUnit XML.
@@ -53,7 +54,7 @@ CONFIG: Dict[str, Any] = {
 }
 ```
 
-Validate both code-identity mappings structurally and require equal nonempty Git SHAs. In strict mode require exact `git_dirty` and fingerprint equality. In forced mode permit only those two fields to disagree and return both identities plus `code_identity_forced=True`. Pass the keyword from `harvest` and add stable audit columns to `_CSV_COLUMNS`.
+Validate both code-identity mappings structurally and require equal nonempty Git SHAs. In strict mode require exact `git_dirty` and fingerprint equality. In forced mode permit only those two fields to disagree and return both identities plus `code_identity_forced=True`. Retain a forced row only when a strictly accepted peer matches its three serialized source identities and three provenance data digests. Pass the keyword from `harvest` and add stable audit columns to `_CSV_COLUMNS`.
 
 - [ ] **Step 4: Run focused tests and verify GREEN**
 
@@ -147,4 +148,3 @@ Fast-forward the live `main` only if it preserves all pre-existing WIP. Run the 
 - [ ] **Step 7: Clean up the isolated worktree**
 
 After remote/local SHA verification, remove the temporary worktree and local task branch. Report final `git status --short`, including ownership of remaining live WIP.
-

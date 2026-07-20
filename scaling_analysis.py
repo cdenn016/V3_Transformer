@@ -30,7 +30,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 
 _CHILD_SENTINEL = "_VFE3_SCALING_ANALYSIS_CHILD"
@@ -152,6 +152,15 @@ def _canonical_json_sha256(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _is_sha256(value: object) -> bool:
+    """Whether ``value`` is one lowercase hexadecimal SHA-256 digest."""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def _validated_scaling_metrics(summary: Mapping[str, object]) -> Optional[Dict[str, object]]:
     """Return the complete internally consistent metric payload bound by a scaling summary."""
     scaling_point = summary.get("scaling_point")
@@ -266,6 +275,10 @@ def _validated_bound_scaling_run(
     )
     if code_identity_forced and not force_accept_code_identity_drift:
         return None
+    if (code_identity_forced
+            and not all(_is_sha256(provenance.get(field)) for field in (
+                "train_data_sha256", "val_data_sha256", "test_data_sha256"))):
+        return None
 
     sources = cell.get("data_sources")
     if not isinstance(sources, Mapping) or set(sources) != set(_SCALING_SOURCE_SPLITS):
@@ -359,6 +372,25 @@ def _observed_join_key(row: Mapping[str, Any]) -> Optional[Tuple[str, str, int]]
     return _exact_join_key(row)
 
 
+def _forced_row_matches_strict_source_anchor(
+    row:     Mapping[str, Any],
+    anchors: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Require a forced row's source records to match a strictly accepted peer cohort."""
+    source_fields = (
+        "train_source_identity",
+        "validation_source_identity",
+        "test_source_identity",
+        "train_data_sha256",
+        "val_data_sha256",
+        "test_data_sha256",
+    )
+    return any(
+        all(anchor.get(field) == row.get(field) for field in source_fields)
+        for anchor in anchors
+    )
+
+
 def harvest(
     input_dir: Path,
 
@@ -431,6 +463,13 @@ def harvest(
             "validation_source_identity": verified["validation_source_identity"],
             "test_source_identity": verified["test_source_identity"],
         })
+    if force_accept_code_identity_drift:
+        strict_anchors = [row for row in rows if row["code_identity_forced"] is False]
+        rows = [
+            row for row in rows
+            if row["code_identity_forced"] is False
+            or _forced_row_matches_strict_source_anchor(row, strict_anchors)
+        ]
     return rows
 
 
@@ -662,9 +701,10 @@ def _requested_design(
         "status": "complete" if complete else "incomplete" if schema_valid else "unverifiable_design",
         "manifest_status": top_status,
         "manifest_error": manifest_error,
-        "forced_code_identity_acceptance": forced_complete,
-        "forced_row_count": len(forced_rows) if forced_complete else 0,
-        "forced_rows": forced_rows if forced_complete else [],
+        "forced_code_identity_acceptance": bool(forced_rows),
+        "forced_manifest_completion": forced_complete,
+        "forced_row_count": len(forced_rows),
+        "forced_rows": forced_rows,
         "cells": cells,
         "counts": counts,
     }
@@ -1247,6 +1287,26 @@ def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
               f"- forced rows: {int(design.get('forced_row_count', 0))}",
               "- scope: dirty-worktree code identity only; all other artifact checks remained strict",
               "- interpretation: the fit spans code cohorts and is not provenance-clean", ""]
+        forced_rows = design.get("forced_rows") or []
+        if forced_rows:
+            L += [
+                "| route | label | seed | cell dirty | cell fingerprint | provenance dirty | provenance fingerprint |",
+                "|---|---|---:|---:|---|---:|---|",
+            ]
+            for row in sorted(
+                    forced_rows,
+                    key=lambda item: (str(item["route"]), str(item["label"]), int(item["seed"])),
+            ):
+                cell_fingerprint = row.get("cell_git_dirty_fingerprint") or "(clean)"
+                provenance_fingerprint = (
+                    row.get("provenance_git_dirty_fingerprint") or "(clean)"
+                )
+                L.append(
+                    f"| {row['route']} | {row['label']} | {row['seed']} | "
+                    f"{row.get('cell_git_dirty')} | {cell_fingerprint} | "
+                    f"{row.get('provenance_git_dirty')} | {provenance_fingerprint} |"
+                )
+            L.append("")
 
     provenance = summary.get("provenance") or {}
     if provenance:

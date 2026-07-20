@@ -20,7 +20,7 @@ The option affects analysis only. It does not change scaling-run caching, resume
 
 Strict mode continues to require exact agreement between the scaling-cell code identity and the run provenance identity.
 
-Forced mode may override only disagreement in `git_dirty` or `git_dirty_fingerprint` when both records otherwise contain well-formed code identities and the `git_sha` values agree. It must continue rejecting failures in the schema version, dataset binding, serialized configuration digest, reuse-contract digest, summary metrics, route/label/seed identity, Git SHA, and train/validation/test source identities.
+Forced mode may override only disagreement in `git_dirty` or `git_dirty_fingerprint` when both records otherwise contain well-formed code identities and the `git_sha` values agree. It must continue rejecting failures in the schema version, dataset binding, serialized configuration digest, reuse-contract digest, summary metrics, route/label/seed identity, Git SHA, and train/validation/test source identities. A forced row must also match at least one strictly accepted peer on all three serialized source identities and all three provenance data digests, so the override cannot create its own unanchored source cohort.
 
 An accepted row records whether code identity was forced, the cell-bound identity, and the provenance identity. These fields propagate to persisted analysis outputs so the override is auditable.
 
@@ -47,4 +47,3 @@ Tests will establish the behavior in this order:
 7. Disabled fitting reports harvested sizes instead of a false zero.
 
 Focused tests will run before the full repository suite. Test counts will come from JUnit XML.
-
