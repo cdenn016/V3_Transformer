@@ -4,13 +4,16 @@ Sweeps one (or several) ``VFE3Config`` field(s) around the operating point defin
 ``train_vfe3.py``. There is no CLI arg parsing (project policy): edit the ``CONFIG`` dict
 at the bottom, pick a sweep, then run ``python ablation.py``.
 
-Two sweep shapes are supported, both declared in the ``SWEEPS`` registry:
+Three sweep shapes are supported, all declared in the ``SWEEPS`` registry:
 
   * single-field  -- vary ONE field across an explicit ``values`` list or an arithmetic
     ``range = [start, stop, step]`` (one-at-a-time ablation around the baseline);
   * multi-arm     -- a ``configs`` list of named arms, each a dict of field overrides,
     for categorical comparisons whose arms differ in more than one field (e.g. a
     full-covariance arm that flips ``family`` and the per-coordinate alpha form together).
+  * parameter-grid -- a Cartesian ``parameter_grid`` whose valid candidates are counted
+    exactly and reduced to one closest configuration per embedding width under the click-run
+    target and relative-tolerance settings.
 
 The baseline is the self-contained ``BASELINE_CONFIG`` dict below -- a full ``VFE3Config`` toggle
 set kept deliberately separate from ``train_vfe3.py`` so an ablation can pin its own (fast)
@@ -550,6 +553,9 @@ BASELINE_CONFIG["kl_max"] = 8 * BASELINE_CONFIG["embed_dim"]
 #   baseline_value: Any                   the train_vfe3 value (for reference only)
 #   multi-arm form:
 #     configs       : [{label: str, <field>: <value>, ...}, ...]
+#   parameter-matched form:
+#     parameter_grid: {field: [v1, v2, ...], ...}
+#     match_by      : "embed_dim"
 #   optional, both forms:
 #     requires      : {field: value, ...}   prerequisite overrides merged into EVERY run of
 #                                            this sweep BEFORE the swept field, used to keep a
@@ -581,7 +587,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "structural width/head ablation at a matched realized-parameter budget",
         "match_by": "embed_dim",
         "parameter_grid": {
-            "embed_dim": [32, 40, 48, 64, 80, 96],
+            "embed_dim": [32, 40, 48, 60, 64, 80, 96],
             "n_heads": [4, 6, 8, 10, 12, 16],
         },
     },
@@ -1708,7 +1714,7 @@ _VFE3_FIELDS = {f.name for f in dataclass_fields(VFE3Config)}
 
 
 def _swept_field_names(sweep: Dict[str, Any]) -> List[str]:
-    r"""Every VFE3Config field a sweep touches: its ``param``/``configs`` keys and ``requires``."""
+    r"""Every VFE3Config field a sweep touches through its values, arms, grid, or requirements."""
     names: List[str] = list(sweep.get("requires", {}).keys())
     if "parameter_grid" in sweep:
         grid = sweep.get("parameter_grid")
