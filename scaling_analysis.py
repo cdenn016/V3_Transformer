@@ -434,7 +434,13 @@ def harvest(
     return rows
 
 
-def _requested_design(input_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _requested_design(
+    input_dir: Path,
+    rows:      List[Dict[str, Any]],
+
+    *,
+    force_accept_code_identity_drift: bool = False,
+) -> Dict[str, Any]:
     """Left-join the declared scaling cells to harvested results and classify every request."""
     path = input_dir / "scaling_design.json"
     selected_route: Optional[str] = None
@@ -620,17 +626,45 @@ def _requested_design(input_dir: Path, rows: List[Dict[str, Any]]) -> Dict[str, 
         and {route for route, _label in route_labels} == set(routes)
         and requested_keys == expected_keys
     )
-    complete = (
+    all_cells_complete = (
         schema_valid
-        and top_status in {"complete", "success"}
         and bool(cells)
         and counts.get("complete", 0) == len(cells)
     )
+    strict_complete = all_cells_complete and top_status in {"complete", "success"}
+    forced_rows = [
+        {
+            "route": row["route"],
+            "label": row["label"],
+            "seed": row["seed"],
+            "cell_git_dirty": row.get("cell_git_dirty"),
+            "cell_git_dirty_fingerprint": row.get("cell_git_dirty_fingerprint"),
+            "provenance_git_dirty": row.get("provenance_git_dirty"),
+            "provenance_git_dirty_fingerprint": row.get(
+                "provenance_git_dirty_fingerprint"
+            ),
+        }
+        for row in matched_rows.values()
+        if row.get("code_identity_forced") is True
+    ]
+    manifest_error = raw.get("error")
+    forced_complete = (
+        force_accept_code_identity_drift
+        and all_cells_complete
+        and top_status == "incomplete"
+        and manifest_error == "code identity drifted during the scaling invocation"
+        and bool(forced_rows)
+    )
+    complete = strict_complete or forced_complete
     return {
         "available": schema_valid,
         "complete": complete,
         "status": "complete" if complete else "incomplete" if schema_valid else "unverifiable_design",
         "manifest_status": top_status,
+        "manifest_error": manifest_error,
+        "forced_code_identity_acceptance": forced_complete,
+        "forced_row_count": len(forced_rows) if forced_complete else 0,
+        "forced_rows": forced_rows if forced_complete else [],
         "cells": cells,
         "counts": counts,
     }
@@ -678,6 +712,7 @@ def _analysis_provenance(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "test_data_sha256": sum(not (r.get("test_data_sha256") or r.get("data_sha256")) for r in rows),
     }
     mixed_corpus = any(len(sha_sets[key]) > 1 for key in sha_keys)
+    forced_rows = [row for row in rows if row.get("code_identity_forced") is True]
     return {
         **sha_sets,
         "git_sha": git_shas,
@@ -688,6 +723,12 @@ def _analysis_provenance(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "n_distinct_git_sha": len(git_shas),
         "mixed_corpus": mixed_corpus,
         "code_drift": len(git_shas) > 1,
+        "code_identity_forced": bool(forced_rows),
+        "forced_code_identity_rows": len(forced_rows),
+        "cell_dirty_fingerprints": _sorted_strings(rows, "cell_git_dirty_fingerprint"),
+        "provenance_dirty_fingerprints": _sorted_strings(
+            rows, "provenance_git_dirty_fingerprint"
+        ),
         "token_budgets": token_budgets,
         "n_distinct_token_budgets": len(token_budgets),
         "token_budget_varies": len(token_budgets) > 1,
@@ -709,6 +750,8 @@ def _pooled_status(
     reasons: List[str] = []
     if provenance.get("code_drift"):
         reasons.append("code_drift")
+    if provenance.get("code_identity_forced"):
+        reasons.append("code_identity_forced")
     if provenance.get("mixed_corpus"):
         reasons.append("mixed_corpus")
     if provenance.get("token_budget_varies"):
@@ -944,8 +987,16 @@ def analyze() -> None:
     if not input_dir.exists():
         raise FileNotFoundError(f"input_dir {input_dir} does not exist; run scaling.py first")
 
-    rows = harvest(input_dir)
-    design = _requested_design(input_dir, rows)
+    force_code_drift = CONFIG.get("force_accept_code_identity_drift") is True
+    rows = harvest(
+        input_dir,
+        force_accept_code_identity_drift=force_code_drift,
+    )
+    design = _requested_design(
+        input_dir,
+        rows,
+        force_accept_code_identity_drift=force_code_drift,
+    )
     if not rows and not design["available"]:
         print(f"No runs (with summary.json) under {input_dir}; run scaling.py first.")
         return
@@ -954,6 +1005,11 @@ def analyze() -> None:
     write_csv(rows, input_dir / "scaling_points.csv")
     print(f"\nVFE_3.0 scaling analysis\n  input:   {input_dir}\n  runs:    {len(rows)}"
           f"\n  csv:     {input_dir / 'scaling_points.csv'}")
+    if design.get("forced_code_identity_acceptance") is True:
+        print(
+            "\nWARNING: FORCED CODE-IDENTITY ACCEPTANCE is active for "
+            f"{design['forced_row_count']} run(s); the fit spans dirty-worktree code cohorts."
+        )
 
     allow_parameter_fit = design.get("complete") is True
     requested_keys = set()
@@ -1054,9 +1110,12 @@ def analyze() -> None:
         fit_weights = np.array([], dtype=float)
 
     # ---- L(N) power law + bootstrap exponent CI (pooled over the parameter routes) ----
-    n_distinct_param_sizes = len({float(p["n_params"]) for p in fit_param_points})
-    summary["n_distinct_param_sizes"] = n_distinct_param_sizes
-    if n_distinct_param_sizes >= 2:
+    n_harvested_param_sizes = len({float(p["n_params"]) for p in param_points})
+    n_fit_param_sizes = len({float(p["n_params"]) for p in fit_param_points})
+    summary["n_harvested_param_sizes"] = n_harvested_param_sizes
+    summary["n_fit_param_sizes"] = n_fit_param_sizes
+    summary["n_distinct_param_sizes"] = n_fit_param_sizes
+    if n_fit_param_sizes >= 2:
         from vfe3.viz.figures import _fit_power_law
         xs = np.array([p["n_params"] for p in fit_param_points], dtype=float)
         ys = np.array([p["ce_mean"] for p in fit_param_points], dtype=float)
@@ -1104,8 +1163,16 @@ def analyze() -> None:
                     }
                 else:
                     print(f"  {r:<14} (only {len(route_sizes)} distinct size; need >= 2 to fit)")
+    elif not allow_parameter_fit:
+        print(
+            f"\n({n_harvested_param_sizes} harvested parameter sizes; "
+            "fitting withheld (incomplete_design))"
+        )
     else:
-        print(f"\n(only {n_distinct_param_sizes} distinct parameter size present; add more sizes to fit L(N))")
+        print(
+            f"\n(only {n_fit_param_sizes} distinct parameter size present; "
+            "add more sizes to fit L(N))"
+        )
 
     if frontier.get("testable"):
         verdict = _frontier_verdict(frontier)
@@ -1174,6 +1241,13 @@ def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
          f"inference points: {summary.get('n_inference_points')})",
          f"- requested fit: {'E + A N^-alpha (offset)' if summary.get('with_offset') else 'A N^-alpha'}", ""]
 
+    design = summary.get("design") or {}
+    if design.get("forced_code_identity_acceptance") is True:
+        L += ["## Forced code-identity acceptance", "",
+              f"- forced rows: {int(design.get('forced_row_count', 0))}",
+              "- scope: dirty-worktree code identity only; all other artifact checks remained strict",
+              "- interpretation: the fit spans code cohorts and is not provenance-clean", ""]
+
     provenance = summary.get("provenance") or {}
     if provenance:
         def _values(key: str) -> str:
@@ -1188,6 +1262,10 @@ def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
               f"- legacy held-out data SHA-256 set: {_values('data_sha256')}",
               f"- token budgets: {_values('token_budgets')}",
               f"- code drift: {bool(provenance.get('code_drift'))}",
+              f"- forced code identity: {bool(provenance.get('code_identity_forced'))}",
+              f"- forced code-identity rows: {int(provenance.get('forced_code_identity_rows', 0))}",
+              f"- cell dirty fingerprints: {_values('cell_dirty_fingerprints')}",
+              f"- provenance dirty fingerprints: {_values('provenance_dirty_fingerprints')}",
               f"- mixed corpus: {bool(provenance.get('mixed_corpus'))}",
               f"- token-budget variation: {bool(provenance.get('token_budget_varies'))}",
               f"- missing identities: `{json.dumps(provenance.get('missing') or {}, sort_keys=True)}`",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import math
@@ -359,7 +360,9 @@ def test_scaling_declared_route_and_label_components_remain_valid() -> None:
     assert scaling._validated_scaling_routes(route_names) == route_names
 
 
-def test_scaling_analysis_refuses_survivor_only_fit_for_incomplete_design(tmp_path, monkeypatch):
+def test_scaling_analysis_refuses_survivor_only_fit_for_incomplete_design(
+    tmp_path, monkeypatch, capsys,
+):
     _write_scaling_run(tmp_path, "small", 1, 10, 2.0)
     _write_scaling_run(tmp_path, "large", 1, 20, 1.5)
     (tmp_path / "scaling_design.json").write_text(json.dumps({
@@ -380,6 +383,7 @@ def test_scaling_analysis_refuses_survivor_only_fit_for_incomplete_design(tmp_pa
     monkeypatch.setitem(scaling_analysis.CONFIG, "input_dir", str(tmp_path))
     monkeypatch.setitem(scaling_analysis.CONFIG, "with_offset", False)
     monkeypatch.setitem(scaling_analysis.CONFIG, "n_bootstrap", 0)
+    monkeypatch.setitem(scaling_analysis.CONFIG, "force_accept_code_identity_drift", False)
     figure_inputs = []
 
     def record_figure_inputs(param_points, infer_points, fig_dir, **kwargs):
@@ -396,6 +400,92 @@ def test_scaling_analysis_refuses_survivor_only_fit_for_incomplete_design(tmp_pa
     assert summary["pooled_fit"] is None
     assert summary["pooled_fit_status"] == "incomplete_design"
     assert figure_inputs == [([], [], None)]
+    assert "2 harvested parameter sizes; fitting withheld (incomplete_design)" in capsys.readouterr().out
+
+
+def test_scaling_analysis_forced_code_identity_design_includes_all_nine_runs(
+    tmp_path, monkeypatch, capsys,
+):
+    labels = (("K64_h8", 10), ("K64_h4", 20), ("K64_h2", 30))
+    seeds = (6, 64, 23)
+    for label, n_params in labels:
+        for seed in seeds:
+            _write_scaling_run(tmp_path, label, seed, n_params, 2.0 + seed / 1000.0)
+            _drift_scaling_run_code_identity(tmp_path / "route" / label / f"s{seed}")
+    (tmp_path / "scaling_design.json").write_text(json.dumps({
+        "schema_version": 1,
+        "routes": ["route"],
+        "seeds": list(seeds),
+        "status": "incomplete",
+        "error": "code identity drifted during the scaling invocation",
+        "cells": [
+            {
+                "route": "route",
+                "label": label,
+                "seed": seed,
+                "scale_knob": "embed_dim",
+                "run_dir": f"route/{label}/s{seed}",
+                "status": "complete",
+            }
+            for label, _n_params in labels
+            for seed in seeds
+        ],
+    }), encoding="utf-8")
+    monkeypatch.setitem(scaling_analysis.CONFIG, "input_dir", str(tmp_path))
+    monkeypatch.setitem(scaling_analysis.CONFIG, "with_offset", False)
+    monkeypatch.setitem(scaling_analysis.CONFIG, "n_bootstrap", 0)
+    monkeypatch.setitem(scaling_analysis.CONFIG, "force_accept_code_identity_drift", True)
+    monkeypatch.setattr(scaling_analysis, "_make_figures", lambda *args, **kwargs: None)
+
+    scaling_analysis.analyze()
+
+    summary = json.loads((tmp_path / "scaling_summary.json").read_text(encoding="utf-8"))
+    assert summary["n_runs"] == 9
+    assert summary["design"]["complete"] is True
+    assert summary["design"]["status"] == "complete"
+    assert summary["design"]["manifest_status"] == "incomplete"
+    assert summary["design"]["forced_code_identity_acceptance"] is True
+    assert summary["design"]["forced_row_count"] == 9
+    assert summary["design"]["counts"] == {"complete": 9}
+    assert summary["n_harvested_param_sizes"] == 3
+    assert summary["n_fit_param_sizes"] == 3
+    assert summary["n_distinct_param_sizes"] == 3
+    assert summary["pooled_fit"] is not None
+    assert "code_identity_forced" in summary["pooled_fit_confounds"]
+    assert summary["provenance"]["forced_code_identity_rows"] == 9
+    csv_rows = list(csv.DictReader(
+        (tmp_path / "scaling_points.csv").read_text(encoding="utf-8").splitlines()
+    ))
+    assert len(csv_rows) == 9
+    assert {row["code_identity_forced"] for row in csv_rows} == {"True"}
+    assert {row["cell_git_dirty_fingerprint"] for row in csv_rows} == {""}
+    assert {
+        row["provenance_git_dirty_fingerprint"] for row in csv_rows
+    } == {"observed-dirty-fingerprint"}
+    assert "FORCED CODE-IDENTITY ACCEPTANCE" in capsys.readouterr().out
+    report = (tmp_path / "SCALING_ANALYSIS.md").read_text(encoding="utf-8")
+    assert "Forced code-identity acceptance" in report
+
+
+def test_scaling_analysis_force_does_not_complete_an_unrelated_manifest_error(tmp_path):
+    _write_scaling_run(tmp_path, "small", 1, 10, 2.0)
+    run_dir = tmp_path / "route" / "small" / "s1"
+    _drift_scaling_run_code_identity(run_dir)
+    manifest = _complete_scaling_design()
+    manifest["status"] = "incomplete"
+    manifest["error"] = "data source identities drifted during the scaling invocation"
+    manifest["cells"] = [manifest["cells"][0]]
+    (tmp_path / "scaling_design.json").write_text(json.dumps(manifest), encoding="utf-8")
+    rows = scaling_analysis.harvest(tmp_path, force_accept_code_identity_drift=True)
+
+    design = scaling_analysis._requested_design(
+        tmp_path,
+        rows,
+        force_accept_code_identity_drift=True,
+    )
+
+    assert design["complete"] is False
+    assert design["forced_code_identity_acceptance"] is False
 
 
 @pytest.mark.parametrize(
