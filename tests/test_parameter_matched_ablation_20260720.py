@@ -182,6 +182,31 @@ class ParameterMatchedSelectionTests(unittest.TestCase):
         self.assertIn("embed_dim=20", str(caught.exception))
         self.assertIn("embed_dim=40", str(caught.exception))
 
+    def test_selector_reports_requested_width_with_no_valid_candidate(self) -> None:
+        sweep_name = "parameter_empty_width_fixture"
+        sweep = {
+            "description": "fixture",
+            "match_by": "embed_dim",
+            "parameter_grid": {
+                "embed_dim": [5, 20],
+                "n_heads": [2, 4],
+            },
+        }
+        with patch.dict(ablation.SWEEPS, {sweep_name: sweep}), patch.dict(
+            ablation.CONFIG,
+            {
+                "target_n_params": 100,
+                "max_param_relative_deviation": 0.0,
+            },
+        ), patch.object(
+            ablation,
+            "_realized_n_params_for_overrides",
+            return_value=100,
+        ):
+            with self.assertRaises(ValueError) as caught:
+                ablation._parameter_match_selection(sweep_name)
+        self.assertIn("embed_dim=5: no valid candidates", str(caught.exception))
+
 
 class ParameterMatchedRunnerTests(unittest.TestCase):
 
@@ -195,6 +220,114 @@ class ParameterMatchedRunnerTests(unittest.TestCase):
                 "parameter_matched_N30000000_rtol0p02",
             )
         self.assertEqual(ablation._sweep_output_scope("n_heads"), "n_heads")
+
+    def test_budget_scope_distinguishes_adjacent_float_tolerances(self) -> None:
+        with patch.dict(ablation.CONFIG, {
+            "target_n_params": 30_000_000,
+            "max_param_relative_deviation": 0.02,
+        }):
+            first = ablation._sweep_output_scope("parameter_matched")
+        with patch.dict(ablation.CONFIG, {
+            "target_n_params": 30_000_000,
+            "max_param_relative_deviation": 0.02000000000001,
+        }):
+            second = ablation._sweep_output_scope("parameter_matched")
+        self.assertNotEqual(first, second)
+
+    def test_parameter_matched_rows_are_not_parsed_as_a_numeric_single_field_axis(self) -> None:
+        rows = [{
+            "label": "embed_dim=40__n_heads=4",
+            "target_n_params": "30000000",
+        }]
+        self.assertIsNone(ablation._numeric_sweep_axis(rows))
+        self.assertEqual(
+            ablation._numeric_sweep_axis([{"label": "n_heads=4", "target_n_params": ""}]),
+            [4.0],
+        )
+
+    def test_setup_failure_publishes_incomplete_sweep_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(ablation.CONFIG, {
+            "target_n_params": 100,
+            "max_param_relative_deviation": 0.05,
+        }), patch.object(
+            ablation,
+            "_parameter_match_selection",
+            side_effect=ValueError("no matched widths"),
+        ):
+            result = ablation.run_sweep(
+                "parameter_matched",
+                Path(temporary),
+                dataset="wikitext-103",
+                device=None,
+                seed=6,
+                resume=False,
+            )
+            meta_path = Path(temporary) / "parameter_matched_N100_rtol0p05" / "sweep_meta.json"
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        self.assertEqual(result, [])
+        self.assertEqual(meta["status"], "incomplete")
+        self.assertIn("no matched widths", meta["error"])
+
+    def test_malformed_grid_publishes_incomplete_sweep_metadata(self) -> None:
+        sweep_name = "parameter_malformed_grid_fixture"
+        sweep = {
+            "description": "fixture",
+            "match_by": "embed_dim",
+            "parameter_grid": [1],
+        }
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            ablation.SWEEPS,
+            {sweep_name: sweep},
+        ), patch.dict(ablation.CONFIG, {
+            "target_n_params": 100,
+            "max_param_relative_deviation": 0.05,
+        }):
+            result = ablation.run_sweep(
+                sweep_name,
+                Path(temporary),
+                dataset="wikitext-103",
+                device=None,
+                seed=6,
+                resume=False,
+            )
+            meta_path = (
+                Path(temporary)
+                / f"{sweep_name}_N100_rtol0p05"
+                / "sweep_meta.json"
+            )
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        self.assertEqual(result, [])
+        self.assertEqual(meta["status"], "incomplete")
+        self.assertEqual(meta["parameter_match"]["parameter_grid"], [1])
+
+    def test_parameter_match_metadata_rejects_inconsistent_budget_math(self) -> None:
+        metadata = {
+            "target_n_params": 100,
+            "max_param_relative_deviation": 0.05,
+            "selected": [
+                {
+                    "label": "embed_dim=20__n_heads=4",
+                    "n_params": 101,
+                    "target_n_params": 100,
+                    "param_difference": 1,
+                    "param_relative_deviation": 0.01,
+                },
+                {
+                    "label": "embed_dim=40__n_heads=4",
+                    "n_params": 99,
+                    "target_n_params": 100,
+                    "param_difference": -1,
+                    "param_relative_deviation": 0.01,
+                },
+            ],
+        }
+        self.assertEqual(
+            set(ablation._parameter_records_by_label(metadata) or {}),
+            {"embed_dim=20__n_heads=4", "embed_dim=40__n_heads=4"},
+        )
+        metadata["selected"][0]["param_difference"] = 2
+        with self.assertRaisesRegex(ValueError, "inconsistent budget fields"):
+            ablation._parameter_records_by_label(metadata)
 
     def test_runner_persists_budget_metadata_without_training(self) -> None:
         selection = {
@@ -246,6 +379,7 @@ class ParameterMatchedRunnerTests(unittest.TestCase):
 
         def fake_run_single(label, overrides, run_dir, **kwargs):
             del overrides, kwargs
+            run_calls.append(label)
             selected = next(row for row in selection["selected"] if row["label"] == label)
             checkpoint = run_dir / "checkpoints" / "terminal.pt"
             checkpoint.parent.mkdir(parents=True, exist_ok=True)
@@ -261,6 +395,7 @@ class ParameterMatchedRunnerTests(unittest.TestCase):
                 "_loaded_data_sources": loaded_sources,
             }
 
+        run_calls = []
         with tempfile.TemporaryDirectory() as temporary:
             output_dir = Path(temporary)
             with patch.dict(ablation.CONFIG, {
@@ -318,6 +453,46 @@ class ParameterMatchedRunnerTests(unittest.TestCase):
                 [float(row["param_relative_deviation"]) for row in rows],
                 [0.01, 0.01],
             )
+
+            first = selection["selected"][0]
+            first_marker_path = scope / ablation._sanitize(first["label"]) / "ablation_result.json"
+            stale_marker = json.loads(first_marker_path.read_text(encoding="utf-8"))
+            stale_marker["n_params"] = 999
+            first_marker_path.write_text(json.dumps(stale_marker), encoding="utf-8")
+            admitted = ablation._collect_sweep_results(scope)
+            self.assertEqual([row["label"] for row in admitted], [selection["selected"][1]["label"]])
+
+            run_calls.clear()
+            with patch.dict(ablation.CONFIG, {
+                "target_n_params": 100,
+                "max_param_relative_deviation": 0.05,
+            }), patch.object(
+                ablation,
+                "_parameter_match_selection",
+                return_value=selection,
+            ), patch.object(
+                ablation,
+                "_git_code_identity",
+                return_value=code_identity,
+            ), patch.object(
+                ablation,
+                "cache_source_identity",
+                side_effect=source_identity,
+            ), patch.object(
+                ablation,
+                "run_single",
+                side_effect=fake_run_single,
+            ), patch.object(ablation, "_cleanup", return_value=None):
+                resumed = ablation.run_sweep(
+                    "parameter_matched",
+                    output_dir,
+                    dataset="wikitext-103",
+                    device=None,
+                    seed=6,
+                    resume=True,
+                )
+            self.assertEqual(run_calls, [first["label"]])
+            self.assertEqual(len(resumed), 2)
 
 
 if __name__ == "__main__":

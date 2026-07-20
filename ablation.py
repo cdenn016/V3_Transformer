@@ -1832,7 +1832,10 @@ def _parameter_match_selection(sweep_name: str) -> Dict[str, Any]:
     match_by = str(sweep.get("match_by"))
     candidates = _parameter_grid_overrides(sweep)
 
-    valid_by_width: Dict[object, List[Dict[str, Any]]] = {}
+    requested_widths = list(grid[match_by])
+    valid_by_width: Dict[object, List[Dict[str, Any]]] = {
+        width: [] for width in requested_widths
+    }
     rejected: List[Dict[str, Any]] = []
     for candidate_index, overrides in enumerate(candidates):
         label = _parameter_candidate_label(overrides, fields)
@@ -1861,8 +1864,10 @@ def _parameter_match_selection(sweep_name: str) -> Dict[str, Any]:
         valid_by_width.setdefault(overrides[match_by], []).append(record)
 
     selected: List[Dict[str, Any]] = []
-    closest_by_width: List[Dict[str, Any]] = []
+    closest_by_width: Dict[object, Dict[str, Any]] = {}
     for width, records in valid_by_width.items():
+        if not records:
+            continue
         closest = min(
             records,
             key=lambda record: (
@@ -1870,7 +1875,7 @@ def _parameter_match_selection(sweep_name: str) -> Dict[str, Any]:
                 record["candidate_index"],
             ),
         )
-        closest_by_width.append(closest)
+        closest_by_width[width] = closest
         if closest["param_relative_deviation"] <= tolerance:
             selected.append(closest)
         for record in records:
@@ -1884,11 +1889,15 @@ def _parameter_match_selection(sweep_name: str) -> Dict[str, Any]:
 
     if len(selected) < 2:
         details = "; ".join(
-            f"{match_by}={record['overrides'][match_by]}: "
-            f"n_params={record['n_params']:,}, "
-            f"relative_deviation={record['param_relative_deviation']:.6f}"
-            for record in closest_by_width
-        ) or "no valid candidates"
+            (
+                f"{match_by}={width}: n_params={closest_by_width[width]['n_params']:,}, "
+                "relative_deviation="
+                f"{closest_by_width[width]['param_relative_deviation']:.6f}"
+                if width in closest_by_width
+                else f"{match_by}={width}: no valid candidates"
+            )
+            for width in requested_widths
+        )
         raise ValueError(
             f"parameter-matched sweep retained {len(selected)} width(s), but at least 2 are "
             f"required within relative tolerance {tolerance:.6f}; closest rejected candidates: "
@@ -1919,8 +1928,67 @@ def _sweep_output_scope(sweep_name: str) -> str:
     tolerance = _validated_param_relative_deviation(
         CONFIG.get("max_param_relative_deviation")
     )
-    tolerance_text = format(tolerance, ".12g").replace(".", "p")
+    tolerance_text = repr(tolerance).replace(".", "p")
     return f"{sweep_name}_N{target}_rtol{tolerance_text}"
+
+
+def _parameter_budget_record_matches(
+    result: Mapping[str, object],
+    record: Mapping[str, object],
+) -> bool:
+    """Whether a persisted marker carries the exact selected parameter-budget identity."""
+    try:
+        return bool(
+            type(result.get("n_params")) is int
+            and result["n_params"] == record["n_params"]
+            and type(result.get("target_n_params")) is int
+            and result["target_n_params"] == record["target_n_params"]
+            and type(result.get("param_difference")) is int
+            and result["param_difference"] == record["param_difference"]
+            and type(result.get("param_relative_deviation")) is float
+            and result["param_relative_deviation"] == record["param_relative_deviation"]
+        )
+    except (KeyError, TypeError):
+        return False
+
+
+def _parameter_records_by_label(value: object) -> Optional[Dict[str, Mapping[str, object]]]:
+    """Validate and index the selected rows in optional sweep-level budget metadata."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValueError("parameter_match metadata must be a mapping or null")
+    target = _validated_target_n_params(value.get("target_n_params"))
+    tolerance = _validated_param_relative_deviation(
+        value.get("max_param_relative_deviation")
+    )
+    selected = value.get("selected")
+    if not isinstance(selected, list) or len(selected) < 2:
+        raise ValueError("parameter_match metadata must contain at least two selected rows")
+    records: Dict[str, Mapping[str, object]] = {}
+    for record in selected:
+        if not isinstance(record, Mapping):
+            raise ValueError("parameter_match selected rows must be mappings")
+        label = record.get("label")
+        if not isinstance(label, str) or not label or label in records:
+            raise ValueError("parameter_match selected labels must be unique non-empty strings")
+        if not _parameter_budget_record_matches(record, record):
+            raise ValueError(f"parameter_match selected row {label!r} has invalid budget fields")
+        n_params = record["n_params"]
+        difference = record["param_difference"]
+        relative_deviation = record["param_relative_deviation"]
+        if (
+            n_params <= 0
+            or record["target_n_params"] != target
+            or difference != n_params - target
+            or relative_deviation != abs(difference) / target
+            or relative_deviation > tolerance
+        ):
+            raise ValueError(
+                f"parameter_match selected row {label!r} has inconsistent budget fields"
+            )
+        records[label] = record
+    return records
 
 
 def validate_sweeps(sweep_names: List[str]) -> None:
@@ -3239,14 +3307,23 @@ def _collect_sweep_results(
     seed in the cohort's declared panel. Missing, malformed, fingerprint-mismatched, adjacent, or
     seed-incomplete contracts are excluded before CSV publication, plotting, or winner selection.
     """
+    try:
+        meta = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8"))
+    except Exception:
+        meta = None
     if aggregation_contract is None:
         try:
-            meta = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8"))
             aggregation_contract = meta["aggregation_contract"]
         except Exception:
             return []
     try:
         aggregation = _validated_sweep_aggregation_contract(aggregation_contract)
+    except (TypeError, ValueError):
+        return []
+    try:
+        parameter_records = _parameter_records_by_label(
+            meta.get("parameter_match") if isinstance(meta, Mapping) else None
+        )
     except (TypeError, ValueError):
         return []
 
@@ -3271,6 +3348,11 @@ def _collect_sweep_results(
                 or not _ablation_cell_owner_is_exact(
                     run_dir, sweep_dir.name, label, seed)):
             continue
+        if parameter_records is not None:
+            parameter_record = parameter_records.get(_base_label(label))
+            if (parameter_record is None
+                    or not _parameter_budget_record_matches(result, parameter_record)):
+                continue
         if result.get("status") != "success" or result.get("error_kind") is not None:
             continue
         try:
@@ -3582,10 +3664,42 @@ def run_sweep(
     data_seed_override = _validated_data_seed_override()
     sweep_scope = _sweep_output_scope(sweep_name)
     sweep_dir = _prepare_owned_output_child(output_dir, sweep_scope, role="ablation sweep")
-    parameter_match = (
-        _parameter_match_selection(sweep_name)
-        if "parameter_grid" in sweep else None
-    )
+    try:
+        parameter_match = (
+            _parameter_match_selection(sweep_name)
+            if "parameter_grid" in sweep else None
+        )
+    except (NotImplementedError, TypeError, ValueError) as exc:
+        error = f"parameter-matched sweep setup failed: {exc}"
+        logger.error("  [%s]", error)
+        _write_json_atomic(sweep_dir / "sweep_meta.json", {
+            "sweep_name":              sweep_name,
+            "description":             sweep["description"],
+            "n_runs":                  0,
+            "n_successful_requested":  0,
+            "failed_requested_labels": [],
+            "dataset":                 dataset,
+            "device":                  str(device),
+            "seed":                    seed,
+            "timestamp":               time.strftime("%Y-%m-%d %H:%M:%S"),
+            "status":                  "incomplete",
+            "error":                   error,
+            "aggregation_contract":    None,
+            "gauge_purity":            _gauge_purity_summary([]),
+            "parameter_match": {
+                "target_n_params": CONFIG.get("target_n_params"),
+                "max_param_relative_deviation": CONFIG.get(
+                    "max_param_relative_deviation"
+                ),
+                "match_by":       sweep.get("match_by"),
+                "parameter_grid": _jsonable(sweep.get("parameter_grid")),
+                "selected":       [],
+                "rejected":       [],
+                "error":          str(exc),
+            },
+        })
+        _write_sweep_csv(sweep_dir, [])
+        return []
     runs = (
         [
             (str(record["label"]), dict(record["overrides"]))
@@ -3749,17 +3863,31 @@ def run_sweep(
             logger.warning("  [contract unavailable -> reuse forbidden] %s", exc)
             expected_contract = None
         if resume and marker.exists():
+            try:
+                cached_result = json.loads(marker.read_text(encoding="utf-8"))
+            except Exception:
+                cached_result = None
+            parameter_record = parameter_record_by_label.get(label)
+            parameter_budget_current = (
+                parameter_record is None
+                or (
+                    isinstance(cached_result, Mapping)
+                    and _parameter_budget_record_matches(cached_result, parameter_record)
+                )
+            )
             # The contract binds the request (diagnostic_flags carries paired_token_bootstrap); a
             # separate post-contract validator binds the requested artifact's exact bytes/schema, so a
             # missing or drifted val_token_nats.pt forbids reuse even when the contract still matches.
-            if (_cell_dir_is_owned(sweep_dir, run_dir)
+            if (isinstance(cached_result, Mapping)
+                    and parameter_budget_current
+                    and _cell_dir_is_owned(sweep_dir, run_dir)
                     and _ablation_cell_owner_is_exact(
                         run_dir, sweep_scope, label, cell_seed)
                     and expected_contract is not None
                     and _cell_is_current(run_dir, expected_contract)
                     and _paired_token_artifact_is_current(run_dir, required=paired_token_bootstrap)):
                 print(f"\n--- {i + 1}/{len(cells)}: {label}  [CACHED] ---")
-                cached_result = json.loads(marker.read_text(encoding="utf-8"))
+                cached_result = dict(cached_result)
                 cached_result.update(expected_gauge_fields)
                 cached_result["sweep"] = sweep_scope
                 cached_result["label"] = label
@@ -4287,6 +4415,19 @@ def _save_ablation_figure(fig: Any, out: Path, sweep_dir: Path, plt: Any) -> Non
     plt.close(fig)
 
 
+def _numeric_sweep_axis(rows: Sequence[Mapping[str, object]]) -> Optional[List[float]]:
+    """Parse a single-field numeric axis, withholding compound parameter-budget labels."""
+    if any(row.get("target_n_params") not in ("", None) for row in rows):
+        return None
+    numeric: List[float] = []
+    for row in rows:
+        try:
+            numeric.append(float(str(row["label"]).split("=")[-1]))
+        except (KeyError, TypeError, ValueError):
+            return None
+    return numeric
+
+
 def _plot_one_sweep(sweep_dir: Path, fig_dir: Path) -> None:
     r"""Write ``figures/<sweep>.png`` from the sweep's ACCUMULATED CSV (so a tacked-on re-run shows
     every point). Numeric ``param=value`` labels -> line plot, x-sorted by value; categorical arms
@@ -4303,13 +4444,7 @@ def _plot_one_sweep(sweep_dir: Path, fig_dir: Path) -> None:
     ppls = [_as_float(r["primary_val_ppl"]) for r in rows]
 
     # Numeric param=value labels -> line plot; categorical arms -> sorted bar plot.
-    numeric: Optional[List[float]] = []
-    for lab in labels:
-        try:
-            numeric.append(float(str(lab).split("=")[-1]))
-        except ValueError:
-            numeric = None
-            break
+    numeric = _numeric_sweep_axis(rows)
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     if numeric is not None:
