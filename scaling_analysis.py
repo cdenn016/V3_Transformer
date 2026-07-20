@@ -89,10 +89,11 @@ INFERENCE_ROUTE = "inference"                                # flat-N routes, pl
 AXIS_ROUTES: Dict[str, str] = {"embed_dim": "grow_K", "n_heads": "blocksize", "n_layers": INFERENCE_ROUTE}
 
 CONFIG: Dict[str, Any] = {
-    "input_dir":   "vfe3_scaling_results",                 # scaling.py's output root and design manifest
-    "with_offset": True,                                   # headline fit: False -> A*N^-alpha; True -> E + A*N^-alpha
-    "n_bootstrap": 2000,                                    # nested (points x seeds) bootstrap for the exponent CI
-    "min_points":  2,                                       # a route needs this many sizes to get its own fit
+    "input_dir":                       "vfe3_scaling_results",  # scaling.py output root and design
+    "with_offset":                     True,                    # False -> A*N^-alpha; True -> E + A*N^-alpha
+    "n_bootstrap":                     2000,                    # nested points-by-seeds bootstrap
+    "min_points":                      2,                       # sizes required for a per-route fit
+    "force_accept_code_identity_drift": True,                  # analysis-only; all other checks stay strict
 }
 
 _CSV_COLUMNS = [
@@ -102,7 +103,9 @@ _CSV_COLUMNS = [
     "test_bits_per_token", "test_bpc",
     "estep_final_f_per_token", "best_val_ppl",
     "wall_time_s", "data_sha256", "train_data_sha256", "val_data_sha256", "test_data_sha256",
-    "git_sha",
+    "git_sha", "code_identity_forced",
+    "cell_git_dirty", "cell_git_dirty_fingerprint",
+    "provenance_git_dirty", "provenance_git_dirty_fingerprint",
 ]
 
 _ROUTE_NOTES = {
@@ -192,6 +195,9 @@ def _validated_bound_scaling_run(
     config_json: object,
     provenance: object,
     cell:       object,
+
+    *,
+    force_accept_code_identity_drift: bool = False,
 ) -> Optional[Dict[str, object]]:
     """Validate the schema-2 generation contract that binds one scaling cell to its summary."""
     if (run / "scaling_failure.json").exists():
@@ -227,14 +233,38 @@ def _validated_bound_scaling_run(
     git_sha = code_identity.get("git_sha")
     git_dirty = code_identity.get("git_dirty")
     dirty_fingerprint = code_identity.get("git_dirty_fingerprint")
-    if (not isinstance(git_sha, str)
-            or not git_sha
-            or type(git_dirty) is not bool
-            or (git_dirty and (not isinstance(dirty_fingerprint, str) or not dirty_fingerprint))
-            or (not git_dirty and dirty_fingerprint is not None)
-            or provenance.get("git_sha") != git_sha
-            or provenance.get("git_dirty") != git_dirty
-            or provenance.get("git_dirty_fingerprint") != dirty_fingerprint):
+    provenance_git_sha = provenance.get("git_sha")
+    provenance_git_dirty = provenance.get("git_dirty")
+    provenance_dirty_fingerprint = provenance.get("git_dirty_fingerprint")
+    cell_identity_valid = (
+        isinstance(git_sha, str)
+        and bool(git_sha)
+        and type(git_dirty) is bool
+        and (
+            (git_dirty and isinstance(dirty_fingerprint, str) and bool(dirty_fingerprint))
+            or (not git_dirty and dirty_fingerprint is None)
+        )
+    )
+    provenance_identity_valid = (
+        isinstance(provenance_git_sha, str)
+        and bool(provenance_git_sha)
+        and type(provenance_git_dirty) is bool
+        and (
+            (provenance_git_dirty
+             and isinstance(provenance_dirty_fingerprint, str)
+             and bool(provenance_dirty_fingerprint))
+            or (not provenance_git_dirty and provenance_dirty_fingerprint is None)
+        )
+    )
+    if (not cell_identity_valid
+            or not provenance_identity_valid
+            or provenance_git_sha != git_sha):
+        return None
+    code_identity_forced = (
+        provenance_git_dirty != git_dirty
+        or provenance_dirty_fingerprint != dirty_fingerprint
+    )
+    if code_identity_forced and not force_accept_code_identity_drift:
         return None
 
     sources = cell.get("data_sources")
@@ -275,6 +305,11 @@ def _validated_bound_scaling_run(
         "git_sha": git_sha,
         "git_dirty": git_dirty,
         "git_dirty_fingerprint": dirty_fingerprint,
+        "code_identity_forced": code_identity_forced,
+        "cell_git_dirty": git_dirty,
+        "cell_git_dirty_fingerprint": dirty_fingerprint,
+        "provenance_git_dirty": provenance_git_dirty,
+        "provenance_git_dirty_fingerprint": provenance_dirty_fingerprint,
         **{
             f"{split}_source_identity": source_identities[split]
             for split in _SCALING_SOURCE_SPLITS
@@ -324,7 +359,12 @@ def _observed_join_key(row: Mapping[str, Any]) -> Optional[Tuple[str, str, int]]
     return _exact_join_key(row)
 
 
-def harvest(input_dir: Path) -> List[Dict[str, Any]]:
+def harvest(
+    input_dir: Path,
+
+    *,
+    force_accept_code_identity_drift: bool = False,
+) -> List[Dict[str, Any]]:
     r"""One row per run directory (a dir containing ``summary.json``). Pulls the scaling point, the
     held-out test numbers, the structural config, the cell's route/scale_knob, and provenance."""
     rows: List[Dict[str, Any]] = []
@@ -338,7 +378,14 @@ def harvest(input_dir: Path) -> List[Dict[str, Any]]:
         cfg = cfgj.get("config", {}) if isinstance(cfgj, Mapping) else {}
         prov = _read_json(run / "provenance.json")
         cell = _read_json(run / "scaling_cell.json")
-        verified = _validated_bound_scaling_run(run, summ, cfgj, prov, cell)
+        verified = _validated_bound_scaling_run(
+            run,
+            summ,
+            cfgj,
+            prov,
+            cell,
+            force_accept_code_identity_drift=force_accept_code_identity_drift,
+        )
         if verified is None or not isinstance(sp, Mapping) or not isinstance(cfg, Mapping):
             continue
         rows.append({
@@ -375,6 +422,11 @@ def harvest(input_dir: Path) -> List[Dict[str, Any]]:
             "git_sha":     verified["git_sha"],
             "git_dirty":   verified["git_dirty"],
             "git_dirty_fingerprint": verified["git_dirty_fingerprint"],
+            "code_identity_forced": verified["code_identity_forced"],
+            "cell_git_dirty": verified["cell_git_dirty"],
+            "cell_git_dirty_fingerprint": verified["cell_git_dirty_fingerprint"],
+            "provenance_git_dirty": verified["provenance_git_dirty"],
+            "provenance_git_dirty_fingerprint": verified["provenance_git_dirty_fingerprint"],
             "train_source_identity": verified["train_source_identity"],
             "validation_source_identity": verified["validation_source_identity"],
             "test_source_identity": verified["test_source_identity"],

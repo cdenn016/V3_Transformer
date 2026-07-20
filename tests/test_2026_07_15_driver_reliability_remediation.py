@@ -167,6 +167,64 @@ def _write_scaling_run(
     (run_dir / "scaling_cell.json").write_text(json.dumps(cell), encoding="utf-8")
 
 
+def _drift_scaling_run_code_identity(run_dir: Path) -> None:
+    provenance_path = run_dir / "provenance.json"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance.update({
+        "git_dirty": True,
+        "git_dirty_fingerprint": "observed-dirty-fingerprint",
+    })
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+
+def test_scaling_analysis_force_accept_code_identity_drift_is_narrow_and_auditable(
+    tmp_path,
+):
+    _write_scaling_run(tmp_path, "small", 1, 10, 2.0)
+    run_dir = tmp_path / "route" / "small" / "s1"
+    _drift_scaling_run_code_identity(run_dir)
+
+    assert scaling_analysis.harvest(tmp_path) == []
+
+    rows = scaling_analysis.harvest(
+        tmp_path,
+        force_accept_code_identity_drift=True,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["code_identity_forced"] is True
+    assert rows[0]["cell_git_dirty"] is False
+    assert rows[0]["cell_git_dirty_fingerprint"] is None
+    assert rows[0]["provenance_git_dirty"] is True
+    assert rows[0]["provenance_git_dirty_fingerprint"] == "observed-dirty-fingerprint"
+
+
+@pytest.mark.parametrize(
+    ("artifact", "field", "value"),
+    [
+        ("provenance.json", "git_sha", "other"),
+        ("provenance.json", "seed", 2),
+        ("summary.json", "test_ppl", 2.0),
+        ("summary.json", "scaling_reuse_contract_sha256", "0" * 64),
+    ],
+)
+def test_scaling_analysis_force_accept_code_identity_drift_keeps_other_checks_closed(
+    tmp_path, artifact, field, value,
+):
+    _write_scaling_run(tmp_path, "small", 1, 10, 2.0)
+    run_dir = tmp_path / "route" / "small" / "s1"
+    _drift_scaling_run_code_identity(run_dir)
+    artifact_path = run_dir / artifact
+    payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    payload[field] = value
+    artifact_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert scaling_analysis.harvest(
+        tmp_path,
+        force_accept_code_identity_drift=True,
+    ) == []
+
+
 def _complete_scaling_design(*, route: str = "route") -> dict[str, object]:
     return {
         "schema_version": 1,
