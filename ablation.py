@@ -50,6 +50,7 @@ import copy
 import csv
 import gc
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -574,6 +575,15 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "n_heads": {  # n_heads=1 has no >=2 equal blocks -> disable the head mixer for a clean sweep
         "description": "number of gauge-irrep blocks / heads (divisors of embed_dim=20)",
         "param": "n_heads", "values": [1, 2, 4, 5], "requires": {"use_head_mixer": False},
+    },
+
+    "parameter_matched": {
+        "description": "structural width/head ablation at a matched realized-parameter budget",
+        "match_by": "embed_dim",
+        "parameter_grid": {
+            "embed_dim": [32, 40, 48, 64, 80, 96],
+            "n_heads": [4, 6, 8, 10, 12, 16],
+        },
     },
     
     
@@ -1679,6 +1689,11 @@ CONFIG: Dict[str, Any] = {
 
     "seed":        6,
 
+    # Used only by a sweep with a ``parameter_grid``. The selector retains one closest valid
+    # architecture per embed_dim and fails before training unless at least two widths fit.
+    "target_n_params":               30_000_000,
+    "max_param_relative_deviation": 0.02,
+
     # Skip cells that already wrote ablation_result.json (idempotent reruns / crash recovery).
     "resume":      True,
 
@@ -1695,7 +1710,11 @@ _VFE3_FIELDS = {f.name for f in dataclass_fields(VFE3Config)}
 def _swept_field_names(sweep: Dict[str, Any]) -> List[str]:
     r"""Every VFE3Config field a sweep touches: its ``param``/``configs`` keys and ``requires``."""
     names: List[str] = list(sweep.get("requires", {}).keys())
-    if "configs" in sweep:
+    if "parameter_grid" in sweep:
+        grid = sweep.get("parameter_grid")
+        if isinstance(grid, Mapping):
+            names.extend(str(field) for field in grid)
+    elif "configs" in sweep:
         for arm in sweep["configs"]:
             names.extend(k for k in arm if k != "label")
     elif "param" in sweep:
@@ -1711,6 +1730,177 @@ def _validated_sweep_name(value: object) -> str:
     if key in _RESERVED_SWEEP_KEYS:
         raise ValueError(f"sweep name is unsafe or reserved: {value!r}")
     return value
+
+
+def _validated_target_n_params(value: object) -> int:
+    """Return one exact positive learned-parameter target."""
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"target_n_params must be an exact positive integer, got {value!r}")
+    return value
+
+
+def _validated_param_relative_deviation(value: object) -> float:
+    """Return one finite relative parameter-budget tolerance in [0, 1)."""
+    if type(value) is not float or not math.isfinite(value) or not 0.0 <= value < 1.0:
+        raise ValueError(
+            "max_param_relative_deviation must be a finite float in [0, 1), "
+            f"got {value!r}"
+        )
+    return value
+
+
+def _parameter_grid_overrides(sweep: Mapping[str, object]) -> List[Dict[str, Any]]:
+    r"""Expand one declared parameter grid in stable order, deriving width-scaled ``kl_max``."""
+    grid = sweep.get("parameter_grid")
+    if not isinstance(grid, Mapping) or not grid:
+        raise ValueError("parameter-matched sweep needs a non-empty parameter_grid mapping")
+    match_by = sweep.get("match_by")
+    if match_by != "embed_dim":
+        raise ValueError(
+            "parameter-matched sweep currently requires match_by='embed_dim', "
+            f"got {match_by!r}"
+        )
+    if match_by not in grid:
+        raise ValueError("parameter_grid must include its match_by field 'embed_dim'")
+
+    fields: List[str] = []
+    value_lists: List[List[Any]] = []
+    for field, raw_values in grid.items():
+        if not isinstance(field, str) or field not in _VFE3_FIELDS:
+            raise ValueError(f"parameter_grid field is not a VFE3Config field: {field!r}")
+        if not isinstance(raw_values, (list, tuple)) or not raw_values:
+            raise ValueError(f"parameter_grid[{field!r}] must be a non-empty list or tuple")
+        values = list(raw_values)
+        serialized = [json.dumps(value, sort_keys=True, default=str) for value in values]
+        if len(serialized) != len(set(serialized)):
+            raise ValueError(f"parameter_grid[{field!r}] must not contain duplicate values")
+        fields.append(field)
+        value_lists.append(values)
+
+    requires = sweep.get("requires", {})
+    if not isinstance(requires, Mapping):
+        raise ValueError("parameter-matched sweep requires must be a mapping")
+    overrides: List[Dict[str, Any]] = []
+    for values in itertools.product(*value_lists):
+        candidate = dict(requires)
+        candidate.update(dict(zip(fields, values)))
+        if "embed_dim" in candidate and "kl_max" not in candidate:
+            embed_dim = candidate["embed_dim"]
+            if type(embed_dim) is not int:
+                raise ValueError(
+                    f"parameter_grid embed_dim must be an exact integer, got {embed_dim!r}"
+                )
+            candidate["kl_max"] = 8 * embed_dim
+        overrides.append(candidate)
+    return overrides
+
+
+def _realized_n_params_for_overrides(overrides: Mapping[str, object]) -> int:
+    """Construct one CPU model and return its exact realized learned-parameter count."""
+    cfg = VFE3Config(**_cell_cfg_dict(dict(overrides), seed=0))
+    model = VFEModel(cfg)
+    try:
+        return int(sum(parameter.numel() for parameter in model.parameters()))
+    finally:
+        del model
+        gc.collect()
+
+
+def _parameter_candidate_label(overrides: Mapping[str, object], fields: Sequence[str]) -> str:
+    """Return one deterministic, human-readable label in declared grid-field order."""
+    return "__".join(f"{field}={overrides[field]}" for field in fields)
+
+
+def _parameter_match_selection(sweep_name: str) -> Dict[str, Any]:
+    r"""Select one closest realized-parameter candidate per requested embedding width."""
+    sweep_name = _validated_sweep_name(sweep_name)
+    sweep = SWEEPS[sweep_name]
+    grid = sweep.get("parameter_grid")
+    if not isinstance(grid, Mapping):
+        raise ValueError(f"sweep {sweep_name!r} is not parameter matched")
+    target = _validated_target_n_params(CONFIG.get("target_n_params"))
+    tolerance = _validated_param_relative_deviation(
+        CONFIG.get("max_param_relative_deviation")
+    )
+    fields = [str(field) for field in grid]
+    match_by = str(sweep.get("match_by"))
+    candidates = _parameter_grid_overrides(sweep)
+
+    valid_by_width: Dict[object, List[Dict[str, Any]]] = {}
+    rejected: List[Dict[str, Any]] = []
+    for candidate_index, overrides in enumerate(candidates):
+        label = _parameter_candidate_label(overrides, fields)
+        try:
+            VFE3Config(**_cell_cfg_dict(overrides, seed=0))
+            n_params = _realized_n_params_for_overrides(overrides)
+        except (NotImplementedError, TypeError, ValueError) as exc:
+            rejected.append({
+                "label":      label,
+                "overrides":  _jsonable(overrides),
+                "reason":     "config",
+                "error":      str(exc),
+            })
+            continue
+        difference = n_params - target
+        relative_deviation = abs(difference) / target
+        record = {
+            "label":                    label,
+            "overrides":                _jsonable(overrides),
+            "n_params":                 n_params,
+            "target_n_params":          target,
+            "param_difference":         difference,
+            "param_relative_deviation": relative_deviation,
+            "candidate_index":          candidate_index,
+        }
+        valid_by_width.setdefault(overrides[match_by], []).append(record)
+
+    selected: List[Dict[str, Any]] = []
+    closest_by_width: List[Dict[str, Any]] = []
+    for width, records in valid_by_width.items():
+        closest = min(
+            records,
+            key=lambda record: (
+                record["param_relative_deviation"],
+                record["candidate_index"],
+            ),
+        )
+        closest_by_width.append(closest)
+        if closest["param_relative_deviation"] <= tolerance:
+            selected.append(closest)
+        for record in records:
+            if record is closest and record in selected:
+                continue
+            rejected.append({
+                **record,
+                "reason": ("outside_tolerance" if record is closest else "not_closest"),
+                "error":  None,
+            })
+
+    if len(selected) < 2:
+        details = "; ".join(
+            f"{match_by}={record['overrides'][match_by]}: "
+            f"n_params={record['n_params']:,}, "
+            f"relative_deviation={record['param_relative_deviation']:.6f}"
+            for record in closest_by_width
+        ) or "no valid candidates"
+        raise ValueError(
+            f"parameter-matched sweep retained {len(selected)} width(s), but at least 2 are "
+            f"required within relative tolerance {tolerance:.6f}; closest rejected candidates: "
+            f"{details}"
+        )
+
+    for record in selected:
+        record.pop("candidate_index", None)
+    for record in rejected:
+        record.pop("candidate_index", None)
+    return {
+        "target_n_params":                 target,
+        "max_param_relative_deviation":   tolerance,
+        "match_by":                        match_by,
+        "parameter_grid":                  _jsonable(dict(grid)),
+        "selected":                        selected,
+        "rejected":                        rejected,
+    }
 
 
 def validate_sweeps(sweep_names: List[str]) -> None:
@@ -1731,8 +1921,11 @@ def validate_sweeps(sweep_names: List[str]) -> None:
             raise ValueError(f"sweep names {prior!r} and {validated!r} alias on a portable filesystem")
         portable_names[key] = validated
         sweep = SWEEPS[name]
-        if "configs" not in sweep and "param" not in sweep:
-            raise ValueError(f"sweep {name!r} declares neither 'param'/'values' nor 'configs'")
+        if not any(key in sweep for key in ("configs", "param", "parameter_grid")):
+            raise ValueError(
+                f"sweep {name!r} declares none of 'param'/'values', 'configs', or "
+                "'parameter_grid'"
+            )
         for field in _swept_field_names(sweep):
             if field not in _VFE3_FIELDS:
                 offenders.append((name, field))
@@ -1744,6 +1937,21 @@ def validate_sweeps(sweep_names: List[str]) -> None:
         )
     construction_errors: List[Tuple[str, str, str]] = []
     for name in sweep_names:
+        if "parameter_grid" in SWEEPS[name]:
+            valid_candidates = 0
+            for index, overrides in enumerate(_parameter_grid_overrides(SWEEPS[name])):
+                try:
+                    VFE3Config(**{**BASELINE_CONFIG, **overrides})
+                    valid_candidates += 1
+                except (TypeError, ValueError):
+                    pass
+            if valid_candidates == 0:
+                construction_errors.append((
+                    name,
+                    "parameter_grid",
+                    "no candidate combination constructs a valid VFE3Config",
+                ))
+            continue
         runs = make_run_overrides(name)
         labels = [label for label, _overrides in runs]
         if any(not isinstance(label, str) or not label for label in labels):
@@ -1804,7 +2012,13 @@ def _sweep_values(sweep: Dict[str, Any]) -> List[Any]:
 
 
 def sweep_n_runs(sweep: Dict[str, Any]) -> int:
-    n_cells = len(sweep["configs"]) if "configs" in sweep else len(_sweep_values(sweep))
+    if "parameter_grid" in sweep:
+        name = next((key for key, value in SWEEPS.items() if value is sweep), None)
+        if name is None:
+            raise ValueError("parameter-matched sweep is not registered in SWEEPS")
+        n_cells = len(_parameter_match_selection(name)["selected"])
+    else:
+        n_cells = len(sweep["configs"]) if "configs" in sweep else len(_sweep_values(sweep))
     return n_cells * len(sweep.get("seeds") or [None])         # x seeds when the sweep is multi-seeded
 
 
@@ -1815,6 +2029,11 @@ def make_run_overrides(sweep_name: str) -> List[Tuple[str, Dict[str, Any]]]:
     first, then the swept field/arm), so the caller merges one dict onto the baseline.
     """
     sweep = SWEEPS[sweep_name]
+    if "parameter_grid" in sweep:
+        return [
+            (str(record["label"]), dict(record["overrides"]))
+            for record in _parameter_match_selection(sweep_name)["selected"]
+        ]
     requires = sweep.get("requires", {})
     runs: List[Tuple[str, Dict[str, Any]]] = []
     if "configs" in sweep:
