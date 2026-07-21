@@ -34,6 +34,10 @@ _VALID_OMEGA_REFLECTION    = ("off", "init_seed", "metropolis")
 _REFLECT_OK                = ("glk", "block_glk", "so_k")   # so_k: valid O(K) seed; gl: ambient seed valid
 
 
+class _ConfigTypeError(TypeError, ValueError):
+    """Configuration type error compatible with legacy ``ValueError`` callers."""
+
+
 def _cross_couplings_are_bracket_closed(
     cross_couplings: List[Tuple[int, int]],
 ) -> bool:
@@ -625,8 +629,10 @@ class VFE3Config:
     use_ema:                   bool  = False
     ema_decay:                 float = 0.999
 
-    eval_max_batches:          Optional[int] = None # cap the PERIODIC eval pass (None = full split; pure path)
-    generate_figures:          bool          = True         # run finalize-time publication probes and figures; False skips both
+    # Periodic-evaluation and finalization controls.
+    eval_max_batches:                      Optional[int] = None
+    evaluate_zero_e_steps_counterfactual:  bool          = False
+    generate_figures:                      bool          = True
 
     # Memory-guard override for full-vocabulary reporting inputs (audit 2026-07-01 F9): the two
     # extractors that materialize full (B, N, V) logits/probabilities are skipped above the guard,
@@ -764,6 +770,20 @@ class VFE3Config:
     skip_belief_sigma_update:  bool  = False
 
     def __post_init__(self) -> None:
+        for field in fields(self):
+            if field.type in (bool, int):
+                value = getattr(self, field.name)
+                if type(value) is not field.type:
+                    legacy_prefix = (
+                        "e_steps_min and e_steps_max must be integers; "
+                        if field.name in ("e_steps_min", "e_steps_max")
+                        else ""
+                    )
+                    raise _ConfigTypeError(
+                        f"{legacy_prefix}{field.name} must be a plain {field.type.__name__}, got "
+                        f"{type(value).__name__}: {value!r}"
+                    )
+
         # numerics
         if not (math.isfinite(self.eps) and self.eps > 0.0):
             raise ValueError(f"eps must be finite and positive, got {self.eps}")
@@ -967,9 +987,10 @@ class VFE3Config:
             for _entry in self.irrep_spec:
                 if (not isinstance(_entry, tuple) or len(_entry) != 2
                         or not isinstance(_entry[0], str)
-                        or not isinstance(_entry[1], int) or _entry[1] < 1):
+                        or type(_entry[1]) is not int or _entry[1] < 1):
                     raise ValueError(
-                        f"each irrep_spec entry must be a (label: str, mult: int >= 1) pair, "
+                        "each irrep_spec entry must be a "
+                        "(label: str, mult: plain int >= 1) pair, "
                         f"got {_entry!r}"
                     )
                 _d = irrep_dim(self.group_n, algebra=_algebra, label=_entry[0])
@@ -1755,6 +1776,15 @@ class VFE3Config:
             "m_phi_update_mode",
         )
         phi_update_policy = get_phi_update_policy(self.m_phi_update_mode)
+        if (
+            self.encode_mode == "per_token_additive"
+            and self.m_phi_update_mode == "pullback_group"
+        ):
+            raise ValueError(
+                "encode_mode='per_token_additive' is incompatible with "
+                "m_phi_update_mode='pullback_group' because the additive encoder does not "
+                "provide the group-chart state required by the pullback update"
+            )
         if phi_update_policy.requires_pullback_geometry:
             if self.gauge_parameterization != "phi":
                 raise ValueError(

@@ -608,6 +608,12 @@ def make_dataloader(
     ``train.evaluate`` is order-independent, but a dropped tail and a randomly-varying drawn subset
     are not -- see _select_loader). ``max_tokens`` is applied while loading; when supplied,
     ``vocab_size`` rejects cached ids that cannot index the model's vocabulary-sized tables."""
+    for name, value in (("shuffle", shuffle), ("drop_last", drop_last)):
+        if type(value) is not bool:
+            raise TypeError(
+                f"{name} must be a plain bool, got {type(value).__name__}: {value!r}"
+            )
+
     max_tokens = _validated_token_limit("max_tokens", max_tokens)
     tokens, source_identity = _load_identity_bound_tokens(
         dataset, split, cache_dir=cache_dir, limit=max_tokens)
