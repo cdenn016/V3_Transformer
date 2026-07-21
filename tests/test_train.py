@@ -897,7 +897,7 @@ def test_validation_finalizer_appends_to_existing_metrics_schema(tmp_path, monke
     art.log_metrics({"step": 1, "train_loss": 1.0, "train_ce": 1.0, "val_ce": float("nan"),
                      "val_ppl": float("nan"), "val_bits_per_token": float("nan"),
                      "val_bpc": float("nan"), "lr_mu": 0.01,
-                     "attn_entropy": 0.5})
+                     "attn_entropy": 0.5, "generalization_gap": 0.25})
     state = _make_terminal_state(model, cfg)
     finalize_validation_run(model, art, cfg, _terminal_val_loader(), losses=[1.0, 0.9],
                             terminal_state=state, device=torch.device("cpu"))
@@ -907,7 +907,10 @@ def test_validation_finalizer_appends_to_existing_metrics_schema(tmp_path, monke
     assert "attn_entropy" in rows[0]                                # original schema preserved
     assert rows[-1]["step"] == str(cfg.max_steps)                   # terminal row appended
     assert rows[-1]["val_ppl"] != ""                               # terminal validation recorded
-    assert rows[-1]["attn_entropy"] == ""                          # non-terminal column left blank
+    for stale_field in (
+        "train_loss", "train_ce", "lr_mu", "attn_entropy", "generalization_gap",
+    ):
+        assert rows[-1][stale_field] == ""                          # non-terminal columns left blank
 
 
 def test_terminal_callback_restores_cpu_and_cuda_rng(tmp_path, monkeypatch):

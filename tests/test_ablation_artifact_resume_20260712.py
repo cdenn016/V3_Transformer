@@ -64,6 +64,7 @@ def _write_marker(run_dir: Path, **updates) -> None:
         "label": "cell", "status": "success", "error_kind": None,
         "primary_val_ppl": 9.0, "final_val_ppl": 10.0, "seed": 6,
         "terminal_checkpoint": str(checkpoint),
+        **DIAG_FLAGS,
     }
     identity = ablation._terminal_checkpoint_identity(run_dir, marker)
     assert identity is not None
@@ -167,6 +168,59 @@ def test_cell_reuse_rejects_new_contract_paired_with_old_success_marker(
     (run_dir / "cell_contract.json").write_text(json.dumps(new_contract), encoding="utf-8")
 
     assert ablation._cell_is_current(run_dir, new_contract) is False
+
+
+@pytest.mark.parametrize("field", sorted(DIAG_FLAGS))
+def test_cell_reuse_rejects_missing_marker_diagnostic_flag(
+    field: str,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_dir, contract = _setup_cell(tmp_path, monkeypatch)
+    marker_path = run_dir / "ablation_result.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    del marker[field]
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    assert ablation._cell_is_current(run_dir, contract) is False
+
+
+@pytest.mark.parametrize(
+    ("field", "raw"),
+    (
+        ("collect_diagnostics", "false"),
+        ("collect_extrapolation", 0),
+        ("paired_token_bootstrap", 1),
+    ),
+)
+def test_cell_reuse_rejects_non_boolean_marker_diagnostic_flag(
+    field: str,
+    raw: object,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_dir, contract = _setup_cell(tmp_path, monkeypatch)
+    marker_path = run_dir / "ablation_result.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker[field] = raw
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    assert ablation._cell_is_current(run_dir, contract) is False
+
+
+@pytest.mark.parametrize("field", sorted(DIAG_FLAGS))
+def test_cell_reuse_rejects_marker_diagnostic_flag_disagreement(
+    field: str,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_dir, contract = _setup_cell(tmp_path, monkeypatch)
+    marker_path = run_dir / "ablation_result.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker[field] = not DIAG_FLAGS[field]
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+
+    assert ablation._cell_is_current(run_dir, contract) is False
 
 
 @pytest.mark.parametrize("raw", ([], [1, 1], [True], [1.5], ["1"], [-1]))
@@ -716,4 +770,5 @@ def test_run_single_terminal_merge_preserves_metadata_and_primary_val_ppl(tmp_pa
     assert len(rows) == 2
     assert set(rows[-1]) == set(rows[0])
     assert float(rows[-1]["val_ppl"]) == 100.0
-    assert rows[-1]["attn_entropy"] == rows[0]["attn_entropy"]
+    assert rows[-1]["train_loss"] == ""
+    assert rows[-1]["attn_entropy"] == ""

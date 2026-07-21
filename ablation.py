@@ -3450,6 +3450,18 @@ def _cell_is_current(
         return False
     if marker.get("status") != "success" or marker.get("error_kind") is not None:
         return False
+    try:
+        expected_diagnostic_flags = _validated_diagnostic_flags(
+            expected_contract["diagnostic_flags"]
+        )
+        marker_diagnostic_flags = _validated_diagnostic_flags({
+            key: marker[key]
+            for key in _SWEEP_DIAGNOSTIC_FLAG_KEYS
+        })
+    except (KeyError, TypeError, ValueError):
+        return False
+    if marker_diagnostic_flags != expected_diagnostic_flags:
+        return False
     expected_fingerprint = semantic_config_fingerprint(dict(expected_contract))
     if marker.get("cell_contract_fingerprint") != expected_fingerprint:
         return False

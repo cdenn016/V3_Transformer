@@ -399,7 +399,7 @@ def _write_marker(
             "status": "success", "primary_val_ppl": ppl, "final_val_ppl": ppl,
             "n_params": 1000, "seed": seed, "overrides": overrides,
             "cell_contract_fingerprint": ablation.semantic_config_fingerprint(contract),
-            "collect_diagnostics": False, "collect_extrapolation": False,
+            **aggregation["diagnostic_flags"],
             **checkpoint_fields,
             **gauge_fields,
         }),

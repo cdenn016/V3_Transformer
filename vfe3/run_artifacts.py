@@ -3132,30 +3132,34 @@ def finalize_validation_run(
         final_bits_per_token = float(metrics["bits_per_token"])
         final_bpc = (float(metrics["bpc"]) if metrics["bpc"] is not None else None)
 
-        # Terminal metrics row: an empty history adopts the terminal schema. An established training
-        # history retains its exact rectangular field set and latest diagnostic values while the
-        # terminal validation and loss fields are replaced below.
-        terminal_row = {
+        # Terminal metrics row: an empty history adopts the compact terminal schema. An established
+        # training history retains its exact rectangular field set, but every non-terminal field is
+        # blanked rather than republished under the terminal step.
+        terminal_validation_fields = {
             "step":       completed_step,
-            "train_loss": float(losses[-1]) if losses else float("nan"),
             "val_ce":     final_ce,
             "val_ppl":    final_ppl,
             "val_bits_per_token": final_bits_per_token,
             "val_bpc":    (final_bpc if final_bpc is not None else float("nan")),
         }
+        terminal_row = {
+            "train_loss": float(losses[-1]) if losses else float("nan"),
+            **terminal_validation_fields,
+        }
         if artifacts._fieldnames is not None:
             established_fields = list(artifacts._fieldnames)
-            missing_terminal_fields = sorted(set(terminal_row) - set(established_fields))
+            missing_terminal_fields = sorted(
+                set(terminal_validation_fields) - set(established_fields)
+            )
             if missing_terminal_fields:
                 raise ValueError(
                     "established metrics schema cannot represent terminal validation fields "
                     f"{missing_terminal_fields}"
                 )
-            previous_row = artifacts.history[-1] if artifacts.history else {}
             terminal_row = {
-                field: previous_row.get(field, float("nan"))
+                field: float("nan")
                 for field in established_fields
-            } | terminal_row
+            } | terminal_validation_fields
         # Run-wide best BEFORE the terminal save: primary is the better of the finite periodic best and
         # the final validation, so after maybe_save_best it equals the selected finite best.
         prior_best = artifacts.best_val_ppl
