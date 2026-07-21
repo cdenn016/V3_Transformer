@@ -34,9 +34,12 @@ from vfe3.geometry.transport import (
     DirectLinkTransport,
     FactoredTransport,
     RopeTransport,
+    TransportState,
     build_factored_transport,
     build_transport_from_element,
     get_transport,
+    get_transport_registration,
+    merge_legacy_transport_state,
     transport_mean,
 )
 from vfe3.gradients.kernels import belief_gradients, mm_exact_update, uses_kernel_route
@@ -83,14 +86,15 @@ def _transport(
     transport_mean_per_head: bool = False,       # omega-direct factored mean contracts per block
     materialize:            bool = True,         # compatibility/diagnostic boundary
 
-    validity_max_norm:      Optional[float]        = None,  # fail-closed pre-clamp chart bound
-    mu:                     Optional[torch.Tensor] = None,  # (N,K) or (B,N,K) means
-    sigma:                  Optional[torch.Tensor] = None,  # variances for covariant features
-    connection_W:           Optional[torch.Tensor] = None,  # learned bilinear connection
-    connection_M:           Optional[torch.Tensor] = None,  # learned covariant connection
-    connection_L:           Optional[torch.Tensor] = None,  # learned direct-link table
-    mu_key:                 Optional[torch.Tensor] = None,  # detached key-slot means
-    sigma_key:              Optional[torch.Tensor] = None,  # detached key-slot variances
+    validity_max_norm:      Optional[float]          = None,  # fail-closed pre-clamp chart bound
+    mu:                     Optional[torch.Tensor]   = None,  # (N,K) or (B,N,K) means
+    sigma:                  Optional[torch.Tensor]   = None,  # variances for covariant features
+    transport_state:        Optional[TransportState] = None,  # registry-owned trainable state
+    connection_W:           Optional[torch.Tensor]   = None,  # legacy learned bilinear connection
+    connection_M:           Optional[torch.Tensor]   = None,  # legacy learned covariant connection
+    connection_L:           Optional[torch.Tensor]   = None,  # legacy learned direct-link table
+    mu_key:                 Optional[torch.Tensor]   = None,  # detached key-slot means
+    sigma_key:              Optional[torch.Tensor]   = None,  # detached key-slot variances
     omega:                  'torch.Tensor | CompactBlockElement | None' = None,  # stored U_i
     reflection:             Optional[torch.Tensor] = None,  # per-token sign
     right_phi:              Optional[torch.Tensor] = None,  # exact right positional factor
@@ -111,6 +115,12 @@ def _transport(
     as a batch of one and stripped back to (N, N, K, K); a 3-D (B, N, n_gen) frame (the batched
     forward) flows straight through. ``mu``/``mu_key`` are unsqueezed to match so the builder always
     sees batched (B, N, K) means."""
+    transport_state = merge_legacy_transport_state(
+        transport_state,
+        connection_W=connection_W,
+        connection_M=connection_M,
+        connection_L=connection_L,
+    )
     if gauge_parameterization == "omega_direct":
         built = build_transport_from_element(
             omega, group, mean_per_head=transport_mean_per_head)
@@ -142,11 +152,11 @@ def _transport(
         sig_kb = sigma_key.unsqueeze(0) if sigma_key is not None else None
         omega = build(phi.unsqueeze(0), group, gauge_mode=gauge_mode, mu=mu_b, mu_key=mu_kb,
                       sigma=sig_b, sigma_key=sig_kb,
-                      connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
                       link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
                       exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                       cocycle_relaxation=cocycle_relaxation, materialize=False,
-                      validity_max_norm=validity_max_norm, exactness_out=exactness_out)["Omega"]
+                      validity_max_norm=validity_max_norm, exactness_out=exactness_out,
+                      **transport_state)["Omega"]
         # A batch-independent bare direct link has no batch axis. Ordinary dense builders return
         # (1,N,N,K,K), and a charted direct link has batch-of-one vertex factors, on this unbatched
         # compatibility/diagnostic path -> strip that batch-of-one while retaining the edge table.
@@ -161,11 +171,11 @@ def _transport(
     else:
         built = build(phi, group, gauge_mode=gauge_mode, mu=mu, mu_key=mu_key,
                       sigma=sigma, sigma_key=sigma_key,
-                      connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
                       link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
                       exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                       cocycle_relaxation=cocycle_relaxation, materialize=False,
-                      validity_max_norm=validity_max_norm, exactness_out=exactness_out)["Omega"]
+                      validity_max_norm=validity_max_norm, exactness_out=exactness_out,
+                      **transport_state)["Omega"]
     # Reflection fold (phi-reflection design sec 3): R_i Omega_ij R_j on the phi path. Direct-link
     # containers fold the signs into their optional vertex factors; dense transports retain the
     # established row/column scaling. None (default) is byte-identical. free_energy_value's global-F
@@ -293,6 +303,7 @@ def build_belief_transport(
     validity_max_norm:           Optional[float]                             = None,     # opt-in fail-closed pre-clamp chart bound
     mu:                          Optional[torch.Tensor]                      = None,     # regime_ii edge connection reads these
     sigma:                       Optional[torch.Tensor]                      = None,     # regime_ii_covariant features read these
+    transport_state:             Optional[TransportState]                    = None,     # registry-owned trainable state mapping
     connection_W:                Optional[torch.Tensor]                      = None,     # regime_ii learned bilinear connection
     connection_M:                Optional[torch.Tensor]                      = None,     # regime_ii_covariant learned covariant connection (Route B)
     connection_L:                Optional[torch.Tensor]                      = None,     # regime_ii_link* learned direct link
@@ -332,6 +343,12 @@ def build_belief_transport(
     dimension rule to the max clamped block norm; forwarded to the FLAT builders on both the fused
     and dense routes (the non-flat regime builders keep their own keying and swallow them).
     """
+    transport_state = merge_legacy_transport_state(
+        transport_state,
+        connection_W=connection_W,
+        connection_M=connection_M,
+        connection_L=connection_L,
+    )
     if gauge_parameterization == "omega_direct":
         # build_transport_from_element returns a compact/factored transport for equal-block groups
         # (block_glk) and a {'exp_phi','exp_neg_phi','Omega'} DICT for a single block (glk). The
@@ -361,7 +378,7 @@ def build_belief_transport(
                            mu_key=(mu_key if transport_mode in _TRANSPORT_NEEDS_MU else None),
                            sigma=(sigma if transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
                            sigma_key=(sigma_key if transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
-                           connection_W=connection_W, connection_M=connection_M, connection_L=connection_L,
+                           transport_state=transport_state,
                            link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
                            exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                            cocycle_relaxation=cocycle_relaxation, materialize=False,
@@ -465,12 +482,13 @@ def free_energy_value(
     link_soft_cap:             float = 6.0,            # HONORED for the global-F direct-link build (regime_ii_link*)
     clamp_monitor:             bool = False,           # HONORED for the global-F transport build (exp clamp diagnostic)
 
-    rope:                      Optional[torch.Tensor] = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
-    log_prior:                 Optional[torch.Tensor] = None,
-    connection_W:              Optional[torch.Tensor] = None,   # HONORED for the global-F transport build (regime_ii NN exception)
-    connection_M:              Optional[torch.Tensor] = None,   # HONORED for the global-F transport build (regime_ii_covariant, Route B)
-    connection_L:              Optional[torch.Tensor] = None,   # HONORED for the global-F transport build (regime_ii_link*)
-    keys:                      Optional[BeliefState]  = None,   # None -> global F; else keys frozen at `keys`
+    rope:                      Optional[torch.Tensor]   = None,   # (N, K, K) gauge-RoPE rotation (None -> off)
+    log_prior:                 Optional[torch.Tensor]   = None,
+    transport_state:           Optional[TransportState] = None,  # registry-owned trainable state mapping
+    connection_W:              Optional[torch.Tensor]   = None,   # legacy learned bilinear connection
+    connection_M:              Optional[torch.Tensor]   = None,   # legacy learned covariant connection
+    connection_L:              Optional[torch.Tensor]   = None,   # legacy learned direct-link table
+    keys:                      Optional[BeliefState]    = None,   # None -> global F; else keys frozen at `keys`
     transport_chart_max_norm:  Optional[float]        = None,   # fail-closed pre-clamp chart bound
     transport_status:          Optional[dict]         = None,   # run-sticky covariant-feature status
 ) -> torch.Tensor:                   # scalar F
@@ -501,6 +519,12 @@ def free_energy_value(
     identically to the model E-step (audit PB-12; the reflection/two-hop scorer reuses this evaluator,
     so its numerics match the active objective, not a default dim-keyed diagnostic).
     """
+    transport_state = merge_legacy_transport_state(
+        transport_state,
+        connection_W=connection_W,
+        connection_M=connection_M,
+        connection_L=connection_L,
+    )
     # keys=None -> global F (query = key = belief). keys given -> filtered F: the transport
     # Omega_ij uses the CURRENT query frame phi_i (belief) and the FROZEN key frame phi_j (keys),
     # and the transported key beliefs come from `keys`; only the key side is frozen.
@@ -518,9 +542,7 @@ def free_energy_value(
             "right_phi": belief.right_phi,
             "mu": (belief.mu if transport_mode in _TRANSPORT_NEEDS_MU else None),
             "sigma": (belief.sigma if transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
-            "connection_W": connection_W,
-            "connection_M": connection_M,
-            "connection_L": connection_L,
+            "transport_state": transport_state,
             "link_alpha": link_alpha,
             "link_soft_cap": link_soft_cap,
             "clamp_monitor": clamp_monitor,
@@ -657,15 +679,16 @@ def phi_alignment_loss(
     rope_on_cov:                   bool  = False,  # gauge-RoPE: rotate the covariance sandwich too
     rope_on_value:                 bool  = True,   # False -> value aggregation uses the un-rotated base
 
-    rope:         Optional[torch.Tensor] = None,      # (N,K,K) gauge-RoPE rotation (None -> off)
-    reflection:   Optional[torch.Tensor] = None,      # (N,) per-token sign s_i; None -> connected component
-    right_phi:    Optional[torch.Tensor] = None,      # exact right positional factor exp(Y)
-    log_prior:    Optional[torch.Tensor] = None,
-    connection_W: Optional[torch.Tensor] = None,      # learned regime_ii connection (held fixed here)
-    connection_M: Optional[torch.Tensor] = None,      # learned regime_ii_covariant connection (Route B; held fixed here)
-    connection_L: Optional[torch.Tensor] = None,      # learned regime_ii_link* direct link (held fixed here)
-    transport_chart_max_norm: Optional[float] = None, # fail-closed pre-clamp chart bound
-    transport_status:         Optional[dict]  = None, # run-sticky covariant-feature status
+    rope:                     Optional[torch.Tensor]   = None,  # (N,K,K) gauge-RoPE rotation (None -> off)
+    reflection:               Optional[torch.Tensor]   = None,  # (N,) per-token sign s_i; None -> connected component
+    right_phi:                Optional[torch.Tensor]   = None,  # exact right positional factor exp(Y)
+    log_prior:                Optional[torch.Tensor]   = None,
+    transport_state:          Optional[TransportState] = None,  # registry-owned trainable state mapping
+    connection_W:             Optional[torch.Tensor]   = None,  # legacy learned bilinear connection
+    connection_M:             Optional[torch.Tensor]   = None,  # legacy learned covariant connection
+    connection_L:             Optional[torch.Tensor]   = None,  # legacy learned direct-link table
+    transport_chart_max_norm: Optional[float]          = None,  # fail-closed pre-clamp chart bound
+    transport_status:         Optional[dict]           = None,  # run-sticky covariant-feature status
 ) -> torch.Tensor:
     r"""Canonical belief-coupling block as a function of phi (mu, sigma fixed), plus the
     gauge-frame penalty (manuscript Algorithm 1, line for nabla_phi F):
@@ -690,6 +713,12 @@ def phi_alignment_loss(
     energy; the summed energy follows the coupling term's value-gauge selection (the score energy on
     the coherent default, the base VALUE energy under the decoupled RoPE gauge).
     """
+    transport_state = merge_legacy_transport_state(
+        transport_state,
+        connection_W=connection_W,
+        connection_M=connection_M,
+        connection_L=connection_L,
+    )
     # Build Omega under the ACTIVE connection regime so the phi step descends the SAME objective as
     # the mu/sigma step. regime_ii reads the (fixed) belief means mu and the learned connection_W;
     # mu and connection_W are held constant w.r.t. the phi gradient (only phi varies). The
@@ -706,8 +735,7 @@ def phi_alignment_loss(
     omega = build_belief_transport(phi, group, transport_mode=transport_mode, mu=mu, sigma=sigma,
                                    reflection=reflection,
                                    right_phi=right_phi,
-                                   connection_W=connection_W, connection_M=connection_M,
-                                   connection_L=connection_L, link_alpha=link_alpha,
+                                   transport_state=transport_state, link_alpha=link_alpha,
                                    link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
                                    cocycle_relaxation=cocycle_relaxation,
                                    exp_fp64_mode=exp_fp64_mode,
@@ -811,6 +839,7 @@ def e_step_iteration(
     compact_phi_block_transport:   bool  = False,  # P1: packed canonical flat block_glk phi factors
 
     log_prior:                 Optional[torch.Tensor]        = None,
+    transport_state:           Optional[TransportState]      = None,   # registry-owned trainable state mapping
     connection_W:              Optional[torch.Tensor]        = None,   # learned bilinear connection for regime_ii (NN exception; None -> pure path)
     connection_M:              Optional[torch.Tensor]        = None,   # learned covariant connection for regime_ii_covariant (Route B; None -> pure path)
     connection_L:              Optional[torch.Tensor]        = None,   # learned direct link for regime_ii_link* (NN exception; None -> pure path)
@@ -837,6 +866,12 @@ def e_step_iteration(
     ``e_step_update='mm_exact'`` (kernel route only) replaces the mu/sigma gradient + retraction
     with the closed-form precision fusion at frozen beta (``mm_exact_update``), damped by
     ``mm_damping`` in natural coordinates; the phi sub-step is untouched either way."""
+    transport_state = merge_legacy_transport_state(
+        transport_state,
+        connection_W=connection_W,
+        connection_M=connection_M,
+        connection_L=connection_L,
+    )
     e_step_update = canonical_e_step_update(e_step_update)
     if gauge_parameterization == "omega_direct" and e_phi_lr != 0.0:
         raise ValueError(
@@ -855,16 +890,17 @@ def e_step_iteration(
     # the belief-gradient kernel / oracle consume opaquely through transport_mean / covariance;
     # single-block / cross-coupled groups keep the dense Omega exactly as before.
     #
-    # regime_ii (audit 2026-06-10 F1/F2): the mu-DEPENDENT Omega is NOT pre-built here. The hand
-    # kernel is the flat-transport gradient (it drops d Omega/d mu), so regime_ii always routes to
-    # the autograd oracle, and the oracle must rebuild the transport from its own differentiation
-    # leaves for the gradient VALUE to carry d Omega/d mu in every regime (train, eval, detached
-    # E-step). The builder closure below binds phi/W/rope and receives (mu_query, sigma_query,
+    # A registration whose Omega depends on mu or sigma is NOT pre-built here. The hand kernel is a
+    # frozen-transport gradient, so every belief-dependent registration routes to the autograd
+    # oracle, which must rebuild the transport from its own differentiation leaves for the gradient
+    # value to carry d Omega/d belief in every regime. The builder closure binds phi/state/rope and
+    # receives (mu_query, sigma_query,
     # mu_key, sigma_key) from the oracle -- the key slots are the oracle's detached keys under
     # filtering (query-side coordinate ascent) and the shared live leaves under smoothing (full
     # gradient). Pre-building here as well would only double the most expensive build in the
     # codebase.
-    if transport_mode in _TRANSPORT_NEEDS_MU:                       # mu-dependent Omega -> autograd oracle
+    transport_registration = get_transport_registration(transport_mode)
+    if transport_registration.needs_mu or transport_registration.needs_sigma:
         omega = None
 
         def _omega_builder(mu_q: torch.Tensor, sigma_q: torch.Tensor,
@@ -872,12 +908,12 @@ def e_step_iteration(
             return build_belief_transport(
                 belief.phi, group, transport_mode=transport_mode,
                 gauge_parameterization=gauge_parameterization, omega=belief.omega,
-                mu=mu_q, mu_key=mu_k, connection_W=connection_W,
+                mu=mu_q, mu_key=mu_k, transport_state=transport_state,
                 # regime_ii_covariant: the gauge-invariant features also read the belief variances;
                 # thread the ORACLE's sigma leaves (query slot live, key slot detached under
                 # filtering -- the same coordinate-ascent split as mu/mu_key) so autograd sees
                 # d Omega/d sigma on every path, not only the live unroll (audit 2026-07-01 C4).
-                sigma=sigma_q, sigma_key=sigma_k, connection_M=connection_M,
+                sigma=sigma_q, sigma_key=sigma_k,
                 reflection=belief.reflection,
                 cocycle_relaxation=cocycle_relaxation, clamp_monitor=clamp_monitor,
                 validity_max_norm=transport_chart_max_norm,
@@ -898,7 +934,7 @@ def e_step_iteration(
                 gauge_parameterization=gauge_parameterization, omega=belief.omega,
                 reflection=belief.reflection,   # phi-path reflection fold (None on the pure path -> byte-identical)
                 right_phi=belief.right_phi,
-                mu=belief.mu, connection_W=connection_W, connection_L=connection_L,
+                mu=belief.mu, transport_state=transport_state,
                 link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
                 cocycle_relaxation=cocycle_relaxation,
                 exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
@@ -1107,14 +1143,11 @@ def e_step_iteration(
                 rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
                 reflection=belief.reflection,
                 right_phi=belief.right_phi,
-                # INTENTIONAL asymmetry (audit 2026-06-09 D3): connection_W is detached here, so
-                # the learned Regime-II connection trains ONLY through the mu/sigma belief path,
-                # never through the phi-step autograd island (whose grad is a constant tangent to
-                # the outer graph anyway when create_graph=False). Removing the detach would leak
-                # second-order phi-step terms into connection_W's gradient.
-                connection_W=(connection_W.detach() if connection_W is not None else None),
-                connection_M=(connection_M.detach() if connection_M is not None else None),
-                connection_L=(connection_L.detach() if connection_L is not None else None),
+                # INTENTIONAL asymmetry (audit 2026-06-09 D3): registry-owned transport state is
+                # detached here, so it trains only through the mu/sigma belief path, never through
+                # the phi-step autograd island. Removing the detach would leak second-order phi-step
+                # terms into transport-state gradients.
+                transport_state={key: value.detach() for key, value in transport_state.items()},
                 link_alpha=link_alpha, link_soft_cap=link_soft_cap, clamp_monitor=clamp_monitor,
                 exp_fp64_mode=exp_fp64_mode,
                 exp_fp64_norm_threshold=exp_fp64_norm_threshold,
@@ -1150,9 +1183,7 @@ def e_step_iteration(
                     omega=belief.omega,
                     mu=mu,
                     sigma=sigma,
-                    connection_W=connection_W,
-                    connection_M=connection_M,
-                    connection_L=connection_L,
+                    transport_state=transport_state,
                     link_alpha=link_alpha,
                     link_soft_cap=link_soft_cap,
                     clamp_monitor=clamp_monitor,

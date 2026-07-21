@@ -10,14 +10,19 @@ gauge-RoPE folds a positional rotation into the transport via :class:`RopeTransp
 
 import math
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Mapping, Optional, Tuple
 
 import torch
+from torch import nn
 
 from vfe3.families.base import _logdet_chol
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.lie_ops import CompactBlockElement, _equal_diag_blocks
 from vfe3.numerics import safe_cholesky
+
+if TYPE_CHECKING:
+    from vfe3.config import VFE3Config
+
 
 @dataclass
 class FactoredTransport:
@@ -332,14 +337,40 @@ def _rope_dense_omega(
 class TransportRegistration:
     """A transport builder and every routing/reporting declaration attached to it."""
 
-    callable:          Callable[..., TransportDict]
-    needs_mu:          bool
-    needs_sigma:       bool
-    batch_independent: bool
-    covariance_class:  str
+    callable:                   Callable[..., TransportDict]
+    needs_mu:                   bool
+    needs_sigma:                bool
+    batch_independent:          bool
+    covariance_class:           str
+    state_builder:              'Optional[TransportStateBuilder]'
+    serialization_keys:         Tuple[str, ...]
+    offdiag_serialization_keys: Tuple[str, ...]
+
+
+TransportState = Mapping[str, torch.Tensor]
+TrainableTransportState = Dict[str, nn.Parameter]
+TransportStateBuilder = Callable[['VFE3Config', GaugeGroup], TrainableTransportState]
 
 
 _TRANSPORTS: Dict[str, TransportRegistration] = {}
+_TRANSPORT_BUILDER_RESERVED_STATE_KEYS = frozenset({
+    "phi",
+    "group",
+    "gauge_mode",
+    "mu",
+    "mu_key",
+    "sigma",
+    "sigma_key",
+    "link_alpha",
+    "link_soft_cap",
+    "clamp_monitor",
+    "exp_fp64_mode",
+    "exp_fp64_norm_threshold",
+    "cocycle_relaxation",
+    "materialize",
+    "validity_max_norm",
+    "exactness_out",
+})
 _TRANSPORT_NEEDS_MU:    set = set()   # regimes whose Omega builder reads the belief means mu
 _TRANSPORT_NEEDS_SIGMA: set = set()   # regimes whose Omega builder reads the belief covariance sigma
 _TRANSPORT_BATCH_INDEPENDENT: set = set()   # regimes whose Omega is the SAME for every sequence in the
@@ -352,11 +383,14 @@ def register_transport(
     name: str,
 
     *,
-    covariance_class:  str,
-    needs_mu:          bool = False,
-    needs_sigma:       bool = False,
-    batch_independent: bool = False,
-    override:          bool = False,
+    covariance_class:           str,
+    needs_mu:                   bool                              = False,
+    needs_sigma:                bool                              = False,
+    batch_independent:          bool                              = False,
+    override:                   bool                              = False,
+    state_builder:              'Optional[TransportStateBuilder]' = None,
+    serialization_keys:         Tuple[str, ...]                   = (),
+    offdiag_serialization_keys: Tuple[str, ...]                   = (),
 ) -> Callable:
     """Decorator registering a transport (connection-regime) builder under ``name``.
 
@@ -366,6 +400,15 @@ def register_transport(
     regime's Omega builder consumes, so callers feed mu/sigma by querying the registry rather than
     matching literal mode names. Declaring them here keeps the add-by-registering contract -- a new
     stateful regime advertises its requirements at registration, not at every call site.
+
+    ``state_builder`` optionally constructs the transport's complete trainable state from the active
+    config and gauge group. ``serialization_keys`` declares the stable top-level model parameter names
+    for that state. The model validates the builder result against this declaration and registers each
+    parameter directly under its declared name, preserving external checkpoint keys without a container
+    prefix. A stateful transport is therefore added entirely at registration; model and E-step routing
+    consume one generic mapping and require no transport-specific branch. The optional
+    ``offdiag_serialization_keys`` declaration identifies edge tables whose first two axes have a
+    meaningful off-diagonal norm; shape alone cannot distinguish them from square coefficient tables.
 
     ``batch_independent`` declares that the builder's ``Omega`` does NOT depend on the batch (it is a
     function of a model parameter only -- the bare direct link ``regime_ii_link``), so the builder
@@ -381,6 +424,22 @@ def register_transport(
     """
     if not isinstance(covariance_class, str) or not covariance_class:
         raise ValueError("transport covariance_class must be a nonempty string")
+    if state_builder is None and serialization_keys:
+        raise ValueError("transport serialization_keys require a state_builder")
+    if state_builder is not None and not serialization_keys:
+        raise ValueError("a transport state_builder requires declared serialization_keys")
+    if len(set(serialization_keys)) != len(serialization_keys):
+        raise ValueError("transport serialization_keys must be unique")
+    if any(not isinstance(key, str) or not key or "." in key for key in serialization_keys):
+        raise ValueError("transport serialization_keys must be nonempty top-level parameter names")
+    reserved_state_keys = set(serialization_keys) & _TRANSPORT_BUILDER_RESERVED_STATE_KEYS
+    if reserved_state_keys:
+        raise ValueError(
+            "transport serialization_keys contain reserved transport-builder keyword(s): "
+            f"{sorted(reserved_state_keys)}"
+        )
+    if not set(offdiag_serialization_keys).issubset(serialization_keys):
+        raise ValueError("transport offdiag_serialization_keys must be declared serialization_keys")
 
     def _wrap(fn: Callable[..., TransportDict]) -> Callable[..., TransportDict]:
         if name in _TRANSPORTS and not override:
@@ -391,6 +450,9 @@ def register_transport(
             needs_sigma=needs_sigma,
             batch_independent=batch_independent,
             covariance_class=covariance_class,
+            state_builder=state_builder,
+            serialization_keys=serialization_keys,
+            offdiag_serialization_keys=offdiag_serialization_keys,
         )
         _TRANSPORTS[name] = registration
         # Compatibility views for existing hot-path membership checks. Their values are derived only
@@ -418,6 +480,69 @@ def get_transport_registration(name: str) -> TransportRegistration:
 def get_transport(name: str) -> Callable[..., TransportDict]:
     """Return the registered transport builder (KeyError-with-available-list if absent)."""
     return get_transport_registration(name).callable
+
+
+def merge_legacy_transport_state(
+    transport_state: Optional[TransportState]  = None,
+
+    *,
+    connection_W:  Optional[torch.Tensor] = None,
+    connection_M:  Optional[torch.Tensor] = None,
+    connection_L:  Optional[torch.Tensor] = None,
+) -> Dict[str, torch.Tensor]:
+    r"""Normalize the legacy direct-connection API into one generic state mapping.
+
+    New model code passes only ``transport_state``. The named arguments remain a compatibility
+    boundary for external callers written before registry-owned state; a conflicting duplicate is
+    rejected instead of silently choosing one tensor.
+    """
+    merged = dict(transport_state or {})
+    legacy = {
+        "connection_W": connection_W,
+        "connection_M": connection_M,
+        "connection_L": connection_L,
+    }
+    for key, value in legacy.items():
+        if value is None:
+            continue
+        if key in merged and merged[key] is not value:
+            raise ValueError(f"transport state {key!r} was provided through both APIs")
+        merged[key] = value
+    return merged
+
+
+def _build_regime_ii_state(
+    cfg:   'VFE3Config',
+    group: GaugeGroup,
+) -> TrainableTransportState:
+    r"""Zero-init bilinear connection ``W^a in R^(K x K)`` for curved Regime II."""
+    n_gen = group.generators.shape[0]
+    return {
+        "connection_W": nn.Parameter(torch.zeros(n_gen, cfg.embed_dim, cfg.embed_dim)),
+    }
+
+
+def _build_regime_ii_covariant_state(
+    cfg:   'VFE3Config',
+    group: GaugeGroup,
+) -> TrainableTransportState:
+    r"""Zero-init invariant-feature coefficients ``M^a_f`` for covariant Regime II."""
+    del cfg
+    n_gen = group.generators.shape[0]
+    return {
+        "connection_M": nn.Parameter(torch.zeros(n_gen, 3)),
+    }
+
+
+def _build_regime_ii_link_state(
+    cfg:   'VFE3Config',
+    group: GaugeGroup,
+) -> TrainableTransportState:
+    r"""Zero-init direct-link coordinates ``A_ij^a`` shared by both link transports."""
+    n_gen = group.generators.shape[0]
+    return {
+        "connection_L": nn.Parameter(torch.zeros(cfg.max_seq_len, cfg.max_seq_len, n_gen)),
+    }
 
 
 def gauge_invariant_edge_features(
@@ -560,6 +685,8 @@ def _build_flat(
     "regime_ii",
     covariance_class="gauge-fixed (non-covariant)",
     needs_mu=True,
+    state_builder=_build_regime_ii_state,
+    serialization_keys=("connection_W",),
 )
 def _build_regime_ii(
     phi:                torch.Tensor,             # (B, N, n_gen) gauge frames
@@ -748,6 +875,8 @@ def _regime_ii_query_chunk(
     covariance_class="covariant",
     needs_mu=True,
     needs_sigma=True,
+    state_builder=_build_regime_ii_covariant_state,
+    serialization_keys=("connection_M",),
 )
 def _build_regime_ii_covariant(
     phi:                torch.Tensor,             # (B, N, n_gen) gauge frames
@@ -973,6 +1102,9 @@ def _direct_link_edge_exp(
     "regime_ii_link",
     covariance_class="gauge-fixed",
     batch_independent=True,
+    state_builder=_build_regime_ii_link_state,
+    serialization_keys=("connection_L",),
+    offdiag_serialization_keys=("connection_L",),
 )
 def _build_regime_ii_link(
     phi:                torch.Tensor,             # (B, N, n_gen) gauge frames (IGNORED: bare link reads only connection_L)
@@ -1034,7 +1166,13 @@ def _build_regime_ii_link(
     return {"exp_phi": None, "exp_neg_phi": None, "Omega": omega}
 
 
-@register_transport("regime_ii_link_charted", covariance_class="covariant")
+@register_transport(
+    "regime_ii_link_charted",
+    covariance_class="covariant",
+    state_builder=_build_regime_ii_link_state,
+    serialization_keys=("connection_L",),
+    offdiag_serialization_keys=("connection_L",),
+)
 def _build_regime_ii_link_charted(
     phi:                torch.Tensor,             # (B, N, n_gen) gauge frames
     group:              GaugeGroup,               # supplies generators, skew flag, irrep_dims

@@ -16,8 +16,15 @@ from vfe3.alpha_i import alpha_gradient_coefficient, alpha_is_per_coord
 from vfe3.families.base import get_family
 from vfe3.families.gaussian import diag_kl_unclamped, diag_kl_unclamped_per_coord
 from vfe3.free_energy import attention_weights, pairwise_energy, self_divergence_for_alpha
-from vfe3.geometry.transport import (CompactFactoredTransport, DirectLinkTransport, FactoredTransport,
-                                      RopeTransport, transport_covariance, transport_mean)
+from vfe3.geometry.transport import (
+    CompactFactoredTransport,
+    DirectLinkTransport,
+    FactoredTransport,
+    RopeTransport,
+    get_transport_registration,
+    transport_covariance,
+    transport_mean,
+)
 from vfe3.gradients.oracle import belief_gradients_autograd
 from vfe3.gradients.pairwise_stats import diagonal_kl_pair_stats
 
@@ -276,12 +283,11 @@ def uses_kernel_route(
     E-step's unroll-truncation warning, the config-time freeze warning) cannot drift from the
     dispatch below.
 
-    ``transport_mode='regime_ii'`` excludes the kernel (audit 2026-06-10 F1): the hand kernel is
-    the FLAT-transport gradient -- it treats the transported keys (Omega mu_j, Omega Sigma_j
-    Omega^T) as constants in mu, but the regime_ii Omega depends on mu through
-    delta_ij = mu_i^T W^a mu_j, so the kernel would silently descend a frozen-Omega objective.
-    regime_ii routes to the autograd oracle, which rebuilds Omega from its differentiation
-    leaves (``omega_builder``) and therefore carries the d Omega/d mu term.
+    A registration that declares ``needs_mu`` or ``needs_sigma`` excludes the kernel (audit
+    2026-06-10 F1): the hand kernel treats transported keys as constants in the belief variables,
+    so it would silently omit the derivative of a belief-dependent transport. Such registrations
+    route to the autograd oracle, which rebuilds Omega from its differentiation leaves through
+    ``omega_builder``.
 
     ``decoupled_value_gauge`` (RopeTransport.on_value=False) likewise excludes the kernel: with the
     attention gauge and value gauge factored apart (GL(K)_attention.tex:1909), beta is the softmax of
@@ -289,13 +295,15 @@ def uses_kernel_route(
     longer that sum's stationary point and the closed-form envelope kernel (which assumes it is) does
     not apply. The oracle differentiates the decoupled F directly and carries the extra d beta/d mu
     term."""
+    transport_registration = get_transport_registration(transport_mode)
     return (
         gradient_mode == "filtering"
         and family == "gaussian_diagonal"
         and divergence_family == "renyi"
         and abs(renyi_order - 1.0) < 1e-9
         and include_attention_entropy
-        and transport_mode not in ("regime_ii", "regime_ii_covariant")
+        and not transport_registration.needs_mu
+        and not transport_registration.needs_sigma
         and not decoupled_value_gauge
         and has_kernel(family)
     )
@@ -342,12 +350,12 @@ def belief_gradients(
     family:                    str  = "gaussian_diagonal",
     divergence_family:         str  = "renyi",
     lambda_alpha_mode:         str  = "constant",
-    transport_mode:            str  = "flat",  # 'regime_ii' excludes the kernel (mu-dependent Omega)
+    transport_mode:            str  = "flat",  # registry metadata excludes belief-dependent Omega
     value:                     float = 1.0,
 
     irrep_dims:                Optional[List[int]]    = None,
     log_prior:                 Optional[torch.Tensor] = None,
-    omega_builder:             Optional[Callable]     = None,   # (mu_q, sigma_q, mu_k, sigma_k) -> transport (regime_ii oracle rebuild)
+    omega_builder:             Optional[Callable]     = None,   # belief-leaf transport rebuild for the oracle
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Belief gradient: hand kernel for filtering+gaussian_diagonal+KL+canonical+flat, else oracle.
 
@@ -358,9 +366,9 @@ def belief_gradients(
     ``irrep_dims`` (when more than one block) makes attention PER HEAD: the energy/beta carry a
     head axis and the per-coordinate beta the kernel consumes is head h's weight on coordinate k.
 
-    ``transport_mode='regime_ii'`` always routes to the ORACLE (audit 2026-06-10 F1: the kernel is
-    the flat-transport gradient and would drop d Omega/d mu); the caller supplies ``omega_builder``
-    so the oracle rebuilds the mu-dependent transport from its differentiation leaves.
+    Any transport registration that declares ``needs_mu`` or ``needs_sigma`` routes to the oracle:
+    the caller supplies ``omega_builder`` so the oracle rebuilds the belief-dependent transport from
+    its differentiation leaves.
     """
     # Value-gauge decoupling (RopeTransport.on_value=False) breaks beta's stationarity for the
     # coupling sum, so the closed-form kernel does not apply -- route to the oracle (which builds the

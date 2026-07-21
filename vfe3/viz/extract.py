@@ -308,9 +308,7 @@ def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -
         e_q_mu_lr=cfg.e_q_mu_lr, e_q_sigma_lr=cfg.e_q_sigma_lr, e_phi_lr=cfg.e_phi_lr,
         lambda_beta=cfg.lambda_beta,
         gauge_parameterization=cfg.gauge_parameterization,
-        connection_W=getattr(model, "connection_W", None),
-        connection_M=getattr(model, "connection_M", None),
-        connection_L=getattr(model, "connection_L", None),
+        transport_state=model.transport_state,
         compact_phi_block_transport=model._compact_phi_blocks_enabled(),
         transport_mean_per_head=True,
         exp_fp64_mode=cfg.exp_fp64_mode,
@@ -336,9 +334,7 @@ def _fe_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor] = No
         tau=attention_tau(model.effective_kappa_beta(_model_device(model)), model.group.irrep_dims),
         lambda_beta=cfg.lambda_beta,
         gauge_parameterization=cfg.gauge_parameterization,
-        connection_W=getattr(model, "connection_W", None),
-        connection_M=getattr(model, "connection_M", None),
-        connection_L=getattr(model, "connection_L", None),
+        transport_state=model.transport_state,
         compact_phi_block_transport=model._compact_phi_blocks_enabled(),
         transport_mean_per_head=True,
         transport_chart_max_norm=cfg.transport_chart_max_norm,
@@ -516,9 +512,7 @@ def belief_ce_bank(
                 head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,
                 lambda_beta=cfg.lambda_beta,
                 kappa_beta_override=model.effective_kappa_beta(device),   # learned tau, not init (audit M1)
-                connection_W=getattr(model, "connection_W", None),
-                connection_M=getattr(model, "connection_M", None),
-                connection_L=getattr(model, "connection_L", None),
+                transport_state=model.transport_state,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
                 gauge_parameterization=cfg.gauge_parameterization,
             )
@@ -656,9 +650,7 @@ def belief_bank(
                 head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,   # replay the trained
                 lambda_beta=cfg.lambda_beta,  # model
                 kappa_beta_override=model.effective_kappa_beta(device),   # learned tau, not init (audit M1)
-                connection_W=getattr(model, "connection_W", None),
-                connection_M=getattr(model, "connection_M", None),
-                connection_L=getattr(model, "connection_L", None),
+                transport_state=model.transport_state,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
                 gauge_parameterization=cfg.gauge_parameterization,
             )
@@ -896,9 +888,7 @@ def across_layer_belief_trace(
                 belief, mu_p, sigma_p, model.group, cfg, log_prior=log_prior,
                 block_norm=model.block_norm, head_mixer=model.head_mixer,
                 cg_coupling=model.cg_coupling,                       # replay the trained model
-                lambda_beta=cfg.lambda_beta, connection_W=getattr(model, "connection_W", None),
-                connection_M=getattr(model, "connection_M", None),
-                connection_L=getattr(model, "connection_L", None),
+                lambda_beta=cfg.lambda_beta, transport_state=model.transport_state,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
                 gauge_parameterization=cfg.gauge_parameterization,
             )
@@ -1047,9 +1037,7 @@ def converged_state(
                 head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,
                 lambda_beta=cfg.lambda_beta,
                 kappa_beta_override=model.effective_kappa_beta(belief.mu.device),
-                connection_W=getattr(model, "connection_W", None),
-                connection_M=getattr(model, "connection_M", None),
-                connection_L=getattr(model, "connection_L", None),
+                transport_state=model.transport_state,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
                 capture=cap,
                 gauge_parameterization=cfg.gauge_parameterization,
@@ -1169,9 +1157,7 @@ def attention_entropy_cov_gap(
             right_phi=out.right_phi,
             mu=(out.mu if cfg.transport_mode in _TRANSPORT_NEEDS_MU else None),
             sigma=(out.sigma if cfg.transport_mode in _TRANSPORT_NEEDS_SIGMA else None),
-            connection_W=getattr(model, "connection_W", None),
-            connection_M=getattr(model, "connection_M", None),
-            connection_L=getattr(model, "connection_L", None),
+            transport_state=model.transport_state,
             link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
             cocycle_relaxation=cfg.cocycle_relaxation,
         )

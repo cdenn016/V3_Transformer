@@ -1121,6 +1121,7 @@ class VFE3Config:
         # config <- transport <- groups import cycle (matching the retraction pattern below).
         from vfe3.geometry.transport import _TRANSPORTS
         _require(self.transport_mode, tuple(sorted(_TRANSPORTS)), "transport_mode")
+        transport_registration = _TRANSPORTS[self.transport_mode]
         from vfe3.geometry.lie_ops import _OMEGA_RETRACTIONS
         _require(
             self.omega_retract_mode,
@@ -2275,15 +2276,14 @@ class VFE3Config:
         # at the MODEL level -- VFEModel.__init__, keyed on the EFFECTIVE estimator -- so it is left out
         # of this config-level predicate to keep the default config silent here.)
         if self.e_step_gradient in ("straight_through", "detach") and (
-            self.transport_mode in ("regime_ii", "regime_ii_covariant", "regime_ii_link", "regime_ii_link_charted")
+            transport_registration.state_builder is not None
             or (self.learnable_r and self.r_update_mode == "gradient" and self.s_e_step)
         ):
             import warnings
             warnings.warn(
                 f"e_step_gradient={self.e_step_gradient!r} severs the per-iteration E-step tangent, so a "
-                "learnable parameter that enters the loss only through it (connection_W under "
-                "transport_mode='regime_ii', r_mu/r_sigma_log under "
-                "learnable_r+r_update_mode='gradient'+s_e_step) "
+                "learnable parameter that enters the loss only through it (registry-owned transport "
+                "state, or r_mu/r_sigma_log under learnable_r+r_update_mode='gradient'+s_e_step) "
                 "receives NO gradient and stays frozen. Use e_step_gradient='unroll' (the default) to "
                 "train these.",
                 UserWarning,
@@ -2296,22 +2296,29 @@ class VFE3Config:
         # gradient_mode=='filtering' AND family=='gaussian_diagonal' AND divergence_family=='renyi' AND
         # renyi_order==1.0 AND include_attention_entropy (verified against gradients.kernels.use_kernel);
         # any other combination routes to the oracle. When it does and an E-step-only learnable param is
-        # active (transport_mode='regime_ii' / pos_phi='learned'), that param receives NO gradient
+        # active (registry-owned transport state / pos_phi='learned'), that param receives NO gradient
         # through the detached oracle. Warn
         # (non-breaking); oracle_unroll_grad=True restores the differentiable oracle gradient.
-        # transport_mode='regime_ii' ALWAYS routes to the oracle (audit 2026-06-10 F1: the kernel
-        # is the flat-transport gradient and drops d Omega/d mu), regardless of the kernel-family
-        # predicate below -- so connection_W training requires oracle_unroll_grad=True on every
-        # regime_ii config.
+        # A transport that declares a belief dependency always routes to the oracle (audit 2026-06-10
+        # F1: the kernel treats Omega as fixed and drops d Omega/d belief), regardless of the remaining
+        # kernel-family predicate.
         # The decoupled value gauge (pos_rotation='rope' + rope_on_value=False) also forces the oracle
         # route -- uses_kernel_route gates on `and not decoupled_value_gauge` (kernels.py) -- so the
         # freeze warning must include it or it silently misses a frozen E-step param there (r2 id2).
-        # AUTO-ENABLE the differentiable oracle for the non-flat regimes (2026-06-18): the learned
-        # connection (connection_W / connection_M) enters the loss ONLY through the unrolled E-step,
-        # so it needs oracle_unroll_grad=True to receive a gradient. Enable it here rather than only
-        # warning the user to set it. Inert under e_step_gradient != 'unroll' / detach_e_step (where
-        # the E-step tangent is severed regardless -- those paths keep their own freeze warnings).
-        if self.transport_mode in ("regime_ii", "regime_ii_covariant") and not self.oracle_unroll_grad:
+        # AUTO-ENABLE the differentiable oracle for registry-owned state whose transport depends on
+        # the current belief. That state enters the loss only through the unrolled E-step and the
+        # closed-form kernel omits d Omega/d belief, so the oracle must retain its graph. This metadata
+        # predicate preserves the existing Regime-II behavior and applies to a newly registered mode
+        # without another central name branch.
+        _stateful_transport = transport_registration.state_builder is not None
+        _belief_dependent_transport = (
+            transport_registration.needs_mu or transport_registration.needs_sigma
+        )
+        if (
+            _stateful_transport
+            and _belief_dependent_transport
+            and not self.oracle_unroll_grad
+        ):
             self.oracle_unroll_grad = True
             # Warn on the coercion (audit 2026-07-05 m13): this was the only __post_init__ coercion
             # that did not announce itself (gauge_transport and use_head_mixer coercions both warn),
@@ -2325,27 +2332,27 @@ class VFE3Config:
                 UserWarning,
                 stacklevel=2,
             )
-        _routes_to_oracle = (
-            self.transport_mode in ("regime_ii", "regime_ii_covariant")
-            or (self.pos_rotation == "rope" and not self.rope_on_value)
-            or not (
-                self.gradient_mode == "filtering"
-                and self.family == "gaussian_diagonal"
-                and self.divergence_family == "renyi"
-                and self.renyi_order == 1.0
-                and self.include_attention_entropy
-            )
+        from vfe3.gradients.kernels import uses_kernel_route
+        _routes_to_oracle = not uses_kernel_route(
+            renyi_order=self.renyi_order,
+            gradient_mode=self.gradient_mode,
+            family=self.family,
+            divergence_family=self.divergence_family,
+            include_attention_entropy=self.include_attention_entropy,
+            transport_mode=self.transport_mode,
+            decoupled_value_gauge=(self.pos_rotation == "rope" and not self.rope_on_value),
         )
-        # Direct-link modes (regime_ii_link / regime_ii_link_charted): belief-independent and
-        # kernel-eligible on the canonical knobs, so the closed-form kernel carries dF/dconnection_L
-        # with no oracle (and oracle_unroll_grad stays False on the default operating point). On a
+        # Stateful belief-independent registrations are kernel-eligible on the canonical knobs, so
+        # the closed-form kernel carries their parameter gradient with no oracle (and
+        # oracle_unroll_grad stays False on the default operating point). On a
         # NON-kernel-eligible config (_routes_to_oracle True: gaussian_full, smoothing, renyi != 1,
         # non-renyi, entropy off, or the decoupled value gauge) the belief gradient routes to the
-        # DETACHED oracle and connection_L would freeze at identity/flat; auto-enable the differentiable
+        # DETACHED oracle and transport state would freeze; auto-enable the differentiable
         # oracle there. Inert under detach/straight_through (which keep their own freeze warning above).
-        # Kept OUT of the unconditional regime_ii rule so the canonical kernel path is untouched.
+        # Kept out of the belief-dependent rule so the canonical kernel path is untouched.
         if (
-            self.transport_mode in ("regime_ii_link", "regime_ii_link_charted")
+            _stateful_transport
+            and not _belief_dependent_transport
             and not self.oracle_unroll_grad
             and _routes_to_oracle
         ):
@@ -2353,8 +2360,9 @@ class VFE3Config:
             import warnings
             warnings.warn(                                   # announce the coercion (audit 2026-07-05 m13)
                 f"transport_mode={self.transport_mode!r} on a non-kernel-eligible config: "
-                f"oracle_unroll_grad auto-enabled (False -> True) so connection_L does not freeze "
-                f"through the detached oracle; set oracle_unroll_grad=True in your config to "
+                f"oracle_unroll_grad auto-enabled (False -> True) so registry-owned transport state "
+                f"does not freeze through the detached oracle; set oracle_unroll_grad=True in your "
+                f"config to "
                 f"acknowledge (and silence this warning).",
                 UserWarning,
                 stacklevel=2,
@@ -2364,7 +2372,7 @@ class VFE3Config:
             and not self.oracle_unroll_grad
             and _routes_to_oracle
             and (
-                self.transport_mode in ("regime_ii", "regime_ii_covariant")
+                _stateful_transport
                 or (self.learnable_r and self.r_update_mode == "gradient" and self.s_e_step)
                 or self.pos_phi == "learned"
                 or self.s_frame_mode == "phi_tilde"
@@ -2388,7 +2396,7 @@ class VFE3Config:
                 "gradient_mode='filtering' + family='gaussian_diagonal' + divergence_family='renyi' + "
                 "renyi_order=1.0 + include_attention_entropy=True), which returns a DETACHED tangent while "
                 "oracle_unroll_grad=False. A learnable parameter that enters the loss only through the "
-                "E-step tangent (connection_W under transport_mode='regime_ii', r_mu/r_sigma_log under "
+                "E-step tangent (registry-owned transport state, r_mu/r_sigma_log under "
                 "learnable_r+r_update_mode='gradient'+s_e_step, pos_phi_free under pos_phi='learned', "
                 "s_phi_embed/s_pos_phi_free under s_frame_mode='phi_tilde', "
                 "t5_bias under t5_learnable_bias with an active t5_relative_bias channel, "
@@ -2482,7 +2490,8 @@ class VFE3Config:
                 raise ValueError(
                     "e_step_update='mm_exact' is kernel-route only (gradient_mode='filtering' + "
                     "family='gaussian_diagonal' + divergence_family='renyi' + renyi_order=1.0 + "
-                    "include_attention_entropy=True, flat transport, coupled value gauge); this "
+                    "include_attention_entropy=True, belief-independent transport, coupled value "
+                    "gauge); this "
                     "config routes the belief gradient to the autograd oracle."
                 )
             if not (0.0 < self.mm_damping <= 1.0):

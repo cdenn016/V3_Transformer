@@ -33,8 +33,16 @@ from vfe3.geometry.groups import GaugeGroup, get_group
 from vfe3.geometry.lie_ops import CompactBlockElement, project_phi_to_slk
 from vfe3.geometry.norms import get_norm
 from vfe3.geometry.rope import get_pos_rotation
-from vfe3.geometry.transport import (CompactFactoredTransport, DirectLinkTransport, FactoredTransport, RopeTransport,
-                                     _TRANSPORT_NEEDS_MU, _TRANSPORT_NEEDS_SIGMA)
+from vfe3.geometry.transport import (
+    _TRANSPORT_NEEDS_MU,
+    _TRANSPORT_NEEDS_SIGMA,
+    CompactFactoredTransport,
+    DirectLinkTransport,
+    FactoredTransport,
+    RopeTransport,
+    TransportState,
+    get_transport_registration,
+)
 from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.block import _as_coeff, vfe_block
 from vfe3.model.model_frame import resolve_model_frame
@@ -363,67 +371,39 @@ class VFEModel(nn.Module):
                 "trains path_weights).",
                 stacklevel=2,
             )
-        # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): the LEARNED bilinear edge connection
-        # W for Regime-II (non-flat) transport. When transport_mode='regime_ii', create connection_W
-        # as a trainable nn.Parameter of shape (n_gen, K, K); the edge connection is
-        # delta_ij^a = cocycle_relaxation * (mu_i^T W^a mu_j) (transport._build_regime_ii). Init ZERO
-        # -> delta = 0 -> exp(0) = I -> Omega = exp(phi_i)exp(-phi_j) (the flat cocycle), so a
-        # regime_ii model is flat at init to fp32 tolerance (atol 1e-6 pinned; NOT bit-exact -- the
-        # zero-tensor W takes the generic einsum path to keep d Omega/d W alive; audit 2026-06-10
-        # F11). For the default flat (pure no-NN) regime the parameter is NOT created (no
-        # connection_W attribute), so the default path is param-free here.
-        if cfg.transport_mode == "regime_ii":
-            self.connection_W = nn.Parameter(torch.zeros(n_gen, cfg.embed_dim, cfg.embed_dim))
-            if cfg.detach_e_step:
-                # Footgun (mirrors use_prior_bank): connection_W enters the loss ONLY
-                # through the E-step belief updates, but detach_e_step wraps the E-step in no_grad,
-                # so connection_W receives NO gradient and stays frozen at its zero init (the flat
-                # cocycle). Set detach_e_step=False to train the learned connection.
-                import warnings
-                warnings.warn(
-                    "transport_mode='regime_ii' with detach_e_step=True freezes connection_W: the "
-                    "learned edge connection enters the loss only through the E-step, which the "
-                    "detached (no_grad) E-step severs, so connection_W.grad is None and the transport "
-                    "stays flat. Set detach_e_step=False to train the Regime-II connection.",
-                    stacklevel=2,
+        # Optional trainable transport state is owned by the selected registry record. Parameters are
+        # registered directly on this module under the record's declared serialization keys: this
+        # preserves the established top-level checkpoint names while the model remains independent of
+        # every concrete transport and state name. The flat registration has no builder, so the pure
+        # path constructs no trainable transport state.
+        transport_registration = get_transport_registration(cfg.transport_mode)
+        self._transport_state_keys = transport_registration.serialization_keys
+        self._transport_offdiag_state_keys = transport_registration.offdiag_serialization_keys
+        if transport_registration.state_builder is not None:
+            built_state = transport_registration.state_builder(cfg, self.group)
+            if set(built_state) != set(self._transport_state_keys):
+                raise ValueError(
+                    f"transport {cfg.transport_mode!r} state builder returned keys "
+                    f"{tuple(built_state)!r}; declared serialization keys are "
+                    f"{self._transport_state_keys!r}"
                 )
-        # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): the LEARNED gauge-COVARIANT (Route B)
-        # Regime-II connection M. delta_ij^a = cocycle_relaxation * sum_f M^a_f I^f_ij, with I^f the
-        # GAUGE-INVARIANT (Mahalanobis, trace, log-det) features of the (query, transported-key)
-        # belief pair (transport._build_regime_ii_covariant). Unlike connection_W (gauge-invariant
-        # ONLY at W=0), the transport stays gauge-covariant (Omega_ij -> g_i Omega_ij g_j^{-1}) for
-        # ANY M. Shape (n_gen, 3); init ZERO -> delta=0 -> flat cocycle at init (fp32; the generic
-        # path keeps d Omega/d M alive). NOT created on the flat / regime_ii paths (param-free).
-        if cfg.transport_mode == "regime_ii_covariant":
-            self.connection_M = nn.Parameter(torch.zeros(n_gen, 3))
+            if len({id(parameter) for parameter in built_state.values()}) != len(built_state):
+                raise ValueError(f"transport {cfg.transport_mode!r} state parameters must be unique")
+            for state_key in self._transport_state_keys:
+                parameter = built_state[state_key]
+                if not isinstance(parameter, nn.Parameter):
+                    raise TypeError(
+                        f"transport {cfg.transport_mode!r} state {state_key!r} must be an nn.Parameter, "
+                        f"got {type(parameter).__name__}"
+                    )
+                self.register_parameter(state_key, parameter)
             if cfg.detach_e_step:
                 import warnings
                 warnings.warn(
-                    "transport_mode='regime_ii_covariant' with detach_e_step=True freezes connection_M: "
-                    "the learned edge connection enters the loss only through the E-step, which the "
-                    "detached (no_grad) E-step severs, so connection_M.grad is None and the transport "
-                    "stays flat. Set detach_e_step=False to train the Route-B connection.",
-                    stacklevel=2,
-                )
-        # NEURAL-NETWORK EXCEPTION (sanctioned, default-off): the LEARNED DIRECT LINK connection_L.
-        # Both direct-link modes -- 'regime_ii_link' (bare: Omega_ij = exp(link_alpha A_ij . G)) and
-        # 'regime_ii_link_charted' (charted: exp(phi_i) exp(A) exp(-phi_j)) -- read the SAME learned
-        # table A = connection_L of shape (max_seq_len, max_seq_len, n_gen). Init ZERO -> the bare link
-        # is identity links and the charted link is the flat cocycle, so a link model is flat-equivalent
-        # at init to fp32 tolerance (the zero table takes the generic exp path to keep
-        # d Omega/d connection_L alive). NOT created on any other transport_mode (the path is param-free).
-        if cfg.transport_mode in ("regime_ii_link", "regime_ii_link_charted"):
-            self.connection_L = nn.Parameter(torch.zeros(cfg.max_seq_len, cfg.max_seq_len, n_gen))
-            if cfg.detach_e_step:
-                # Footgun (mirrors connection_W / connection_M): connection_L enters the loss ONLY
-                # through the E-step belief updates, so the detached (no_grad) E-step freezes it at its
-                # zero init (the flat/identity transport). Set detach_e_step=False to train the link.
-                import warnings
-                warnings.warn(
-                    f"transport_mode={cfg.transport_mode!r} with detach_e_step=True freezes "
-                    "connection_L: the learned direct link enters the loss only through the E-step, "
-                    "which the detached (no_grad) E-step severs, so connection_L.grad is None and the "
-                    "transport stays flat. Set detach_e_step=False to train the direct link.",
+                    f"transport_mode={cfg.transport_mode!r} with detach_e_step=True freezes trainable "
+                    f"transport state {self._transport_state_keys!r}: that state enters the loss only "
+                    "through the E-step, which the detached (no_grad) path severs. Set "
+                    "detach_e_step=False to train the transport state.",
                     stacklevel=2,
                 )
         if (not cfg.use_prior_bank) and cfg.detach_e_step:
@@ -786,20 +766,28 @@ class VFEModel(nn.Module):
         p = getattr(self, "log_kappa_gamma", None)
         return torch.exp(p).to(device) if p is not None else _as_coeff(self.cfg.kappa_gamma, device)
 
-    def _model_channel_connection_kwargs(self) -> dict:
+    @property
+    def transport_state(self) -> TransportState:
+        r"""Live trainable state declared by the selected transport registration.
+
+        The mapping is rebuilt from top-level registered parameters on every access. This preserves
+        stable checkpoint names and follows parameter replacement performed by ``Module._apply`` when
+        the model moves across devices or dtypes.
+        """
+        return {key: getattr(self, key) for key in self._transport_state_keys}
+
+    def _model_channel_transport_kwargs(self) -> dict:
         r"""The connection-law knob bag the model channel SHARES with the belief channel (PB-11):
-        the active learned connections (``connection_W``/``M``/``L``, all None on the flat pure path)
-        plus the link/cocycle/clamp controls. Threaded into BOTH :meth:`_refine_s`'s E-step and
+        the active registry-owned transport state (empty on the flat pure path) plus the
+        link/cocycle/clamp controls. Threaded into BOTH :meth:`_refine_s`'s E-step and
         :meth:`_gamma_energy`'s transport build so the s-fiber transports under the SAME connection
-        the belief E-step uses, instead of an isolated flat cocycle. On the flat pure path every
-        connection is None and the controls are their inert defaults, so the call is byte-identical.
+        the belief E-step uses, instead of an isolated flat cocycle. On the flat pure path the state
+        mapping is empty and the controls are their inert defaults, so the call is byte-identical.
         The per-mode decision of WHICH belief tensors (s_mu/s_sigma) feed the builder is made by the
         caller from the transport-registration metadata, not here."""
         cfg = self.cfg
         return dict(
-            connection_W=getattr(self, "connection_W", None),
-            connection_M=getattr(self, "connection_M", None),
-            connection_L=getattr(self, "connection_L", None),
+            transport_state=self.transport_state,
             link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
             cocycle_relaxation=cfg.cocycle_relaxation,
             clamp_monitor=cfg.transport_clamp_monitor,
@@ -887,7 +875,7 @@ class VFEModel(nn.Module):
             spd_retract_mode=cfg.spd_retract_mode,
             # SHARED connection regime for the s-channel (PB-11): the model channel refines under
             # cfg.transport_mode with the SAME learned connection the belief E-step uses, threaded via
-            # _model_channel_connection_kwargs. The stateful regime_ii/covariant Omega is rebuilt each
+            # _model_channel_transport_kwargs. The stateful regime_ii/covariant Omega is rebuilt each
             # iteration from the CHANNEL-LOCAL s means/covariances (e_step reads belief.mu/sigma, which
             # here are s_mu/s_sigma), not the belief means; the link modes read only connection_L. phi0
             # is still held fixed (e_phi_lr=0). Flat -> every connection None == the byte-identical pure
@@ -895,7 +883,7 @@ class VFEModel(nn.Module):
             # so a non-flat mode never receives a flat prebuilt transport.
             transport_mode=cfg.transport_mode,
             gauge_parameterization=cfg.gauge_parameterization,
-            **self._model_channel_connection_kwargs(),
+            **self._model_channel_transport_kwargs(),
             e_step_gradient=e_step_gradient,
             oracle_unroll_grad=cfg.oracle_unroll_grad,
             # The s-channel E-step shares the active per-head transport numerics with the belief
@@ -1009,18 +997,9 @@ class VFEModel(nn.Module):
         # per-sample result (pinned by tests/test_perf_equivalence.py::test_batched_forward_equals_per_sample).
         # lambda_beta: the belief-coupling weight (the constant cfg.lambda_beta).
         lambda_beta = self.cfg.lambda_beta
-        # connection_W: the learned bilinear Regime-II edge connection (a sanctioned NN exception)
-        # when transport_mode='regime_ii', else None (the flat pure path). Threaded through the
-        # E-step so the loss backpropagates to it; getattr keeps the flat path's call
-        # identical (None forwards a defaulted kwarg the flat builder ignores).
-        connection_W = getattr(self, "connection_W", None)
-        # connection_M: the learned gauge-COVARIANT (Route B) Regime-II connection when
-        # transport_mode='regime_ii_covariant', else None (flat / regime_ii pure paths). Threaded
-        # through the E-step like connection_W so the loss backpropagates to it.
-        connection_M = getattr(self, "connection_M", None)
-        # connection_L: the learned DIRECT LINK for regime_ii_link / regime_ii_link_charted, else None.
-        # Threaded through the E-step like connection_W (link_alpha/link_soft_cap come from cfg in the block).
-        connection_L = getattr(self, "connection_L", None)
+        # The registry-owned mapping is the complete trainable transport state. It is empty for the
+        # flat pure path and reaches every registered builder without a mode or state-name branch.
+        transport_state = self.transport_state
         # E-step backward estimator. The EFFECTIVE mode reconciles the legacy detach_e_step bool
         # with e_step_gradient (cfg.effective_e_step_gradient): 'detach' wraps the whole E-step in
         # no_grad (the legacy detach_e_step=True path); 'unroll' (default) and 'straight_through'
@@ -1119,8 +1098,7 @@ class VFEModel(nn.Module):
                 log_prior=log_prior, block_norm=self.block_norm,
                 head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
                 lambda_beta=lambda_beta,
-                connection_W=connection_W, connection_M=connection_M,
-                connection_L=connection_L,
+                transport_state=transport_state,
                 e_step_gradient=e_step_gradient,
                 rope=rope, rope_on_cov=self.cfg.rope_full_gauge,
                 rope_on_value=self.cfg.rope_on_value, training=training,
@@ -1277,9 +1255,7 @@ class VFEModel(nn.Module):
                 lambda_alpha_mode=cfg.lambda_alpha_mode,
                 gauge_parameterization=gp, log_prior=log_prior,
                 transport_mode=cfg.transport_mode,
-                connection_W=getattr(self, "connection_W", None),
-                connection_M=getattr(self, "connection_M", None),
-                connection_L=getattr(self, "connection_L", None),
+                transport_state=self.transport_state,
                 cocycle_relaxation=cfg.cocycle_relaxation,
                 link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
                 clamp_monitor=cfg.transport_clamp_monitor,
@@ -1882,7 +1858,7 @@ class VFEModel(nn.Module):
                                        rope_on_value=cfg.rope_on_value,
                                        validity_max_norm=cfg.transport_chart_max_norm,
                                        exactness_out=self._transport_status,
-                                       **self._model_channel_connection_kwargs())
+                                       **self._model_channel_transport_kwargs())
         s_mu_t = transport_mean(omega, s_mu)                         # (B, N, N, K)
         # diagonal_out resolves the diagonal (B,N,K) vs full (B,N,K,K) sandwich EXACTLY as the belief
         # channel does (gradients/kernels.py, oracle.py: diagonal_out=(sigma.dim()==mu.dim())). This is
@@ -2135,9 +2111,7 @@ class VFEModel(nn.Module):
             log_prior=log_prior, block_norm=self.block_norm,
             head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
             lambda_beta=self.cfg.lambda_beta,
-            connection_W=getattr(self, "connection_W", None),
-            connection_M=getattr(self, "connection_M", None),
-            connection_L=getattr(self, "connection_L", None),
+            transport_state=self.transport_state,
             rope=rope, rope_on_cov=self.cfg.rope_full_gauge, rope_on_value=self.cfg.rope_on_value,
             transport_status=self._transport_status,
             gauge_parameterization=self.cfg.gauge_parameterization,
@@ -2465,9 +2439,7 @@ class VFEModel(nn.Module):
             "transport_mode": cfg.transport_mode,
             "mu": (belief.mu if cfg.transport_mode in _REGIME_NEEDS_MU else None),
             "sigma": (belief.sigma if cfg.transport_mode in _REGIME_NEEDS_SIGMA else None),
-            "connection_W": getattr(self, "connection_W", None),
-            "connection_M": getattr(self, "connection_M", None),
-            "connection_L": getattr(self, "connection_L", None),
+            "transport_state": self.transport_state,
             "link_alpha": cfg.link_alpha,
             "link_soft_cap": cfg.link_soft_cap,
             "clamp_monitor": cfg.transport_clamp_monitor,
@@ -2700,9 +2672,7 @@ class VFEModel(nn.Module):
                 log_prior=log_prior, block_norm=self.block_norm,
                 head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
                 lambda_beta=cfg.lambda_beta,
-                connection_W=getattr(self, "connection_W", None),
-                connection_M=getattr(self, "connection_M", None),
-                connection_L=getattr(self, "connection_L", None),
+                transport_state=self.transport_state,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge,
                 rope_on_value=cfg.rope_on_value,
                 capture=cap,
@@ -3091,19 +3061,18 @@ class VFEModel(nn.Module):
         d["attn_entropy_min"]             = float(head_min.min())
         d["attn_entropy_collapsed_heads"] = float((head_min < _LOG2).float().sum())
 
-        # Equivariance-break order parameters (CONDITIONAL columns, mirroring lambda_beta): present
-        # only when the breaking toggle is on, so the per-run CSV stays rectangular.
-        _cW = getattr(self, "connection_W", None)
-        if _cW is not None:                                          # transport_mode='regime_ii'
-            d["connection_w_norm"] = float(torch.linalg.norm(_cW.detach()))
-        _cM = getattr(self, "connection_M", None)
-        if _cM is not None:                                          # transport_mode='regime_ii_covariant'
-            d["connection_m_norm"] = float(torch.linalg.norm(_cM.detach()))
-        _cL = getattr(self, "connection_L", None)
-        if _cL is not None:                                          # transport_mode='regime_ii_link' / '_charted'
-            d["connection_l_norm"]         = float(torch.linalg.norm(_cL.detach()))
-            d["connection_l_offdiag_norm"] = float(torch.linalg.norm(
-                _cL.detach()[~torch.eye(_cL.shape[0], dtype=torch.bool, device=_cL.device)]))
+        # Registry-owned transport order parameters (conditional columns, mirroring lambda_beta).
+        # Lowercasing the stable serialization key preserves the established W/M/L metric names and
+        # gives newly registered state a model-level norm diagnostic without a central name branch.
+        # Only registrations that declare edge-table topology emit an off-diagonal norm.
+        for state_key, parameter in self.transport_state.items():
+            metric_key = state_key.lower()
+            detached = parameter.detach()
+            d[f"{metric_key}_norm"] = float(torch.linalg.norm(detached))
+            if state_key in self._transport_offdiag_state_keys:
+                off_diagonal = ~torch.eye(
+                    detached.shape[0], dtype=torch.bool, device=detached.device)
+                d[f"{metric_key}_offdiag_norm"] = float(torch.linalg.norm(detached[off_diagonal]))
         _hm = getattr(self, "head_mixer", None)
         if _hm is not None and hasattr(_hm, "mixer_deltas"):        # use_head_mixer=True
             d["head_mixer_drift"] = max(
@@ -3181,9 +3150,7 @@ class VFEModel(nn.Module):
                 block_norm=self.block_norm,
                 head_mixer=self.head_mixer,                            # replay the mixer too (audit 2026-06-09 overnight F32)
                 lambda_beta=cfg.lambda_beta,
-                connection_W=getattr(self, "connection_W", None),
-                connection_M=getattr(self, "connection_M", None),     # learned covariant (Route B) connection
-                connection_L=getattr(self, "connection_L", None),     # learned direct link
+                transport_state=self.transport_state,
                 cg_coupling=self.cg_coupling,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge,            # match forward: converge WITH rope
                 rope_on_value=cfg.rope_on_value,
@@ -3315,9 +3282,7 @@ class VFEModel(nn.Module):
                     belief, mu_p, sigma_p, self.group, cfg, log_prior=log_prior,
                     block_norm=self.block_norm, head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
                     lambda_beta=cfg.lambda_beta,
-                    connection_W=getattr(self, "connection_W", None),
-                    connection_M=getattr(self, "connection_M", None),
-                    connection_L=getattr(self, "connection_L", None),
+                    transport_state=self.transport_state,
                     rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
                     transport_status=self._transport_status,
                     gauge_parameterization=cfg.gauge_parameterization,

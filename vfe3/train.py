@@ -190,9 +190,9 @@ def build_optimizer(
     never updated (freely training an unanchored r alongside s would collapse KL(s||r)->0). Under
     ``cfg.learnable_r=True`` it is un-frozen and grouped here (mean@``m_p_mu_lr``, log-scale@``m_p_sigma_lr``,
     like the s tables) so it trains as an empirical-Bayes centroid.
-    The learned MODEL-level parameters are grouped likewise when their toggle is on: the Regime-II
-    edge connection ``connection_W`` (transport_mode='regime_ii') at ``m_phi_lr`` (a gauge-connection
-    scale) -- so those sanctioned-NN-exception toggles train rather than tripping the coverage guard.
+    Registry-owned trainable transport state is grouped at ``m_phi_lr`` (a gauge-connection scale),
+    so a newly registered stateful transport trains without a parameter-name branch while the exact
+    model-parameter coverage guard remains fail-closed.
     """
     pb = model.prior_bank
     # The selected policy contributes metadata only to stored phi-factor groups. An empty AdamW
@@ -292,21 +292,12 @@ def build_optimizer(
             # not capacity; decaying it corrupts the m-projection). requires_grad follows learnable_r
             # like the diagonal centroid, so this group exists exactly when r is an optimizer leaf.
             groups.append({"params": [pb.r_sigma_lower], "lr": cfg.m_p_sigma_lr, "weight_decay": 0.0, "role": "sigma"})
-    if getattr(model, "connection_W", None) is not None:        # transport_mode='regime_ii' learned
-        w_group = {"params": [model.connection_W], "lr": cfg.m_phi_lr, "role": "phi"}   # connection -> gauge LR
-        if cfg.connection_weight_decay is not None:             # dedicated connection-norm ceiling
-            w_group["weight_decay"] = cfg.connection_weight_decay   # (audit 2026-06-10 F9); None ->
-        groups.append(w_group)                                  # inherit the global weight_decay
-    if getattr(model, "connection_M", None) is not None:        # transport_mode='regime_ii_covariant' (Route B)
-        m_group = {"params": [model.connection_M], "lr": cfg.m_phi_lr, "role": "phi"}   # connection -> gauge LR
-        if cfg.connection_weight_decay is not None:             # shares the connection-norm ceiling
-            m_group["weight_decay"] = cfg.connection_weight_decay
-        groups.append(m_group)
-    if getattr(model, "connection_L", None) is not None:        # transport_mode='regime_ii_link' / '_charted'
-        l_group = {"params": [model.connection_L], "lr": cfg.m_phi_lr, "role": "phi"}   # direct link -> gauge LR
-        if cfg.connection_weight_decay is not None:             # shares the connection-norm ceiling
-            l_group["weight_decay"] = cfg.connection_weight_decay
-        groups.append(l_group)
+    transport_parameters = list(model.transport_state.values())
+    if transport_parameters:
+        transport_group = {"params": transport_parameters, "lr": cfg.m_phi_lr, "role": "phi"}
+        if cfg.connection_weight_decay is not None:
+            transport_group["weight_decay"] = cfg.connection_weight_decay
+        groups.append(transport_group)
     if getattr(model, "t5_bias", None) is not None:             # t5_learnable_bias=True relative-position bias
         # weight_decay=0: the per-bucket T5 bias b_{i-j} is a relative-position PRIOR shaping the
         # attention pi, not capacity; L2-decaying it toward zero biases the prior toward a flat/uniform
