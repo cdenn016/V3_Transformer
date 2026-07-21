@@ -392,7 +392,8 @@ def cached_token_count(
 
     binp = cache_path(dataset, split, suffix="bin", cache_dir=cache_dir)
     if binp.exists():
-        meta, _ = _binary_cache_metadata(binp)
+        resolved, _meta_path, _provenance_path = _resolved_binary_cache_paths(binp)
+        meta, _ = _binary_cache_metadata(resolved)
         return int(meta["n_tokens"])
 
     raise FileNotFoundError(

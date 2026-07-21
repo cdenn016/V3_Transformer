@@ -1,5 +1,6 @@
 """Regression coverage for immutable binary-token cache source binding."""
 
+import errno
 import hashlib
 import json
 from pathlib import Path
@@ -29,6 +30,18 @@ def _write_binary_cache(
         encoding="utf-8",
     )
     return payload
+
+
+def _create_symlink_or_skip(
+    link:    Path,
+    target:  Path,
+) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        if exc.winerror == 1314 or exc.errno in (errno.EACCES, errno.EPERM):
+            pytest.skip(f"platform denies symlink creation: {exc}")
+        raise
 
 
 def test_uncapped_binary_cache_is_owned_after_identity_binding(tmp_path: Path) -> None:
@@ -63,10 +76,7 @@ def test_symlinked_binary_cache_uses_one_resolved_sidecar_family(tmp_path: Path)
     target_payload = _write_binary_cache(tmp_path / "target", list(range(6)))
     link_payload = datasets.cache_path(_DATASET, "train", suffix="bin", cache_dir=tmp_path)
     link_payload.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        link_payload.symlink_to(target_payload)
-    except OSError as exc:
-        pytest.skip(f"platform denies symlink creation: {exc}")
+    _create_symlink_or_skip(link_payload, target_payload)
     Path(str(link_payload) + ".meta.json").write_text(
         json.dumps({"n_tokens": 12, "dtype": "int16"}),
         encoding="utf-8",
@@ -80,3 +90,35 @@ def test_symlinked_binary_cache_uses_one_resolved_sidecar_family(tmp_path: Path)
     assert identity["meta_sha256"] == hashlib.sha256(target_meta.read_bytes()).hexdigest()
     assert loaded.dtype == torch.int32
     assert loaded.tolist() == list(range(6))
+
+
+def test_cached_token_count_uses_resolved_payload_sidecar(
+    tmp_path:     Path,
+    monkeypatch:  pytest.MonkeyPatch,
+) -> None:
+    target_payload = _write_binary_cache(tmp_path / "target", list(range(6)))
+    requested_root = tmp_path / "requested"
+    requested_payload = datasets.cache_path(
+        _DATASET,
+        "train",
+        suffix="bin",
+        cache_dir=requested_root,
+    )
+    requested_payload.parent.mkdir(parents=True, exist_ok=True)
+    np.arange(12, dtype=np.int16).tofile(requested_payload)
+    Path(str(requested_payload) + ".meta.json").write_text(
+        json.dumps({"n_tokens": 12, "dtype": "int16"}),
+        encoding="utf-8",
+    )
+
+    def resolved_paths(source: Path) -> tuple[Path, Path, Path]:
+        assert source == requested_payload
+        return (
+            target_payload,
+            Path(str(target_payload) + ".meta.json"),
+            Path(str(target_payload) + ".provenance.json"),
+        )
+
+    monkeypatch.setattr(datasets, "_resolved_binary_cache_paths", resolved_paths)
+
+    assert datasets.cached_token_count(_DATASET, "train", cache_dir=requested_root) == 6
