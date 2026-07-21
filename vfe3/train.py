@@ -857,7 +857,11 @@ def evaluate(
             if max_batches is not None and i + 1 >= max_batches:
                 break               # draw exactly max_batches (process-then-break; no extra pull)
         total_nats_value, total_tok_value = torch.stack((total_nats, total_tok)).cpu().tolist()
-        ce = total_nats_value / max(total_tok_value, 1.0)
+        if total_tok_value == 0.0:
+            raise ValueError(
+                "evaluation produced no non-ignored target tokens; metrics are undefined"
+            )
+        ce = total_nats_value / total_tok_value
     finally:
         if was_training:
             model.train()

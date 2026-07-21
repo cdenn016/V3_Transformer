@@ -1243,6 +1243,11 @@ def e_step(
     detaches the belief at the boundary (truncated backprop); ``e_step_halt_tol`` breaks the eval
     loop when the mean configured-family KL(q^t || q^{t-1}) drops below tol. The explicit
     ``training`` flag keeps detached training under ``torch.no_grad`` distinct from evaluation."""
+    if type(e_steps_backprop_last) is not int or e_steps_backprop_last < 0:
+        raise ValueError(
+            "e_steps_backprop_last must be a non-negative plain int, got "
+            f"{type(e_steps_backprop_last).__name__}: {e_steps_backprop_last!r}"
+        )
     traj: List[float] = []
 
     # Hoist the flat transport when phi is frozen across iterations (e_phi_lr==0).  On the flat

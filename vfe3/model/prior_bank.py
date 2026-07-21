@@ -818,6 +818,20 @@ class PriorBank(nn.Module):
             logits = logits + self._unigram_bias()                       # same seam as decode()
         return logits
 
+    def _validate_fused_ce_targets(
+        self,
+        targets: torch.Tensor,           # (B, N) next-token ids
+
+        *,
+        ignore_index: int = -100,
+    ) -> None:
+        """Reject nonignored targets outside the vocabulary before fused CE reduction."""
+        counted = targets != ignore_index
+        invalid = counted & ((targets < 0) | (targets >= self.vocab_size))
+        if bool(invalid.any()):
+            invalid_target = int(targets[invalid][0].item())
+            raise IndexError(f"Target {invalid_target} is out of bounds.")
+
     def decode_ce_diagonal_chunked(
         self,
         mu_q:    torch.Tensor,           # (B, N, K) posterior means
@@ -855,6 +869,7 @@ class PriorBank(nn.Module):
         (the streamed total logsumexp, already computed for the CE) -- the guard keeps 0.0
         byte-identical to the pre-kwarg path.
         """
+        self._validate_fused_ce_targets(targets, ignore_index=ignore_index)
         tau_eff = self._tau_eff(tau)
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size
@@ -991,6 +1006,7 @@ class PriorBank(nn.Module):
         chunk-slice add and the z_loss_weight term follow ``decode_ce_diagonal_chunked`` exactly
         (see there); both default OFF / byte-identical.
         """
+        self._validate_fused_ce_targets(targets, ignore_index=ignore_index)
         tau_eff = self._tau_eff(tau)
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size
@@ -1087,6 +1103,7 @@ class PriorBank(nn.Module):
         mu_q, W, and b) match the dense path exactly. The unigram-prior chunk-slice add and the
         z_loss_weight term follow ``decode_ce_diagonal_chunked`` (see there); both default OFF.
         """
+        self._validate_fused_ce_targets(targets, ignore_index=ignore_index)
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size
         W = self.output_proj_weight                                        # (V, K)
@@ -1163,6 +1180,7 @@ class PriorBank(nn.Module):
         chunk-slice add and the z_loss_weight term follow ``decode_ce_diagonal_chunked`` (see
         there); both default OFF.
         """
+        self._validate_fused_ce_targets(targets, ignore_index=ignore_index)
         tau_eff = self._tau_eff(tau)
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size
@@ -1246,6 +1264,7 @@ class PriorBank(nn.Module):
         ``family`` decode -> cross-entropy. The unigram-prior chunk-slice add and the z_loss_weight
         term follow ``decode_ce_diagonal_chunked`` (see there); both default OFF.
         """
+        self._validate_fused_ce_targets(targets, ignore_index=ignore_index)
         tau_eff = self._tau_eff(tau)
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
         V = self.vocab_size

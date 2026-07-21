@@ -648,10 +648,9 @@ def test_grad_clip_signature_preserves_terminal_callback():
     assert isinstance(captured["state"], TrainingTerminalState)
 
 
-def test_attention_map_replay_failure_does_not_kill_training(tmp_path, monkeypatch, caplog):
-    r"""F11 (audit 2026-07-01): the attention/gamma map replays are argument expressions evaluated
-    in the CALLER, outside the save helpers' internal try/except -- a replay error must be caught
-    by the caller-side guard (warn + continue), never abort training."""
+def test_attention_diagnostic_failure_does_not_kill_training(tmp_path, monkeypatch, caplog):
+    r"""F11 (audit 2026-07-01): a held-out attention diagnostic failure must be caught by the
+    caller-side guard (warn + continue), never abort training."""
     cfg = VFE3Config(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
                      n_e_steps=1, e_phi_lr=0.0, m_phi_lr=0.0, warmup_steps=1, max_steps=2)
     torch.manual_seed(0)
@@ -666,7 +665,7 @@ def test_attention_map_replay_failure_does_not_kill_training(tmp_path, monkeypat
         losses = train(model, _periodic_loader(seed=0), cfg, n_steps=2, eval_interval=1,
                        val_loader=_periodic_loader(seed=1), artifacts=art)
     assert len(losses) == 2                                     # train() completed despite the failure
-    assert any("attention-map replay failed" in r.getMessage() for r in caplog.records)
+    assert any("validation diagnostics failed" in r.getMessage() for r in caplog.records)
 
 
 def test_val_diagnostics_failure_resets_to_nan(tmp_path, monkeypatch):
@@ -679,14 +678,22 @@ def test_val_diagnostics_failure_resets_to_nan(tmp_path, monkeypatch):
     torch.manual_seed(0)
     model = VFEModel(cfg)
     calls = {"n": 0}
+    original_val_diagnostics = vt._val_diagnostics
 
     def _flaky(*a, **k):
         calls["n"] += 1
         if calls["n"] == 1:
-            return {
+            current = original_val_diagnostics(*a, **k)
+            metrics = dict(current.metrics)
+            metrics.update({
                 "val_inner_alignment_energy_total": 1.23,
                 "val_free_energy_total": 1.23,
-            }                                                    # eval 1: a fresh probe value
+            })
+            return vt.ValidationDiagnostics(
+                metrics,
+                current.token_ids,
+                current.snapshot,
+            )                                                    # eval 1: a fresh probe value
         raise RuntimeError("diagnostics boom")                  # eval 2: replay failure
 
     monkeypatch.setattr(vt, "_val_diagnostics", _flaky)
