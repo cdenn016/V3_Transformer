@@ -32,6 +32,64 @@ from vfe3.run_artifacts import (
 )
 
 
+def _required_finalize_string(request: Mapping[str, object], field: str) -> str:
+    """Return one required nonempty JSON string from a finalize request."""
+    value = request.get(field)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"finalize figure {field} must be a non-empty string")
+    return value
+
+
+def _nullable_finalize_string(request: Mapping[str, object], field: str) -> str | None:
+    """Return one nullable JSON string from a finalize request."""
+    value = request.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"finalize figure {field} must be a non-empty string or null")
+    return value
+
+
+def _validated_finalize_request(
+    request: Mapping[str, object],
+) -> tuple[str, List[float] | None, bool, str | None, str | None, str, int, bool]:
+    """Validate the exact JSON fields emitted by ``_run_figures_isolated``."""
+    run_dir = _required_finalize_string(request, "run_dir")
+    losses_value = request.get("losses")
+    if losses_value is None:
+        losses = None
+    elif (
+        type(losses_value) is list
+        and all(type(value) is float for value in losses_value)
+    ):
+        losses = losses_value
+    else:
+        raise ValueError("finalize figure losses must be a list of floats or null")
+
+    generate_publication = request.get("generate_publication")
+    if type(generate_publication) is not bool:
+        raise ValueError("finalize figure generate_publication must be an exact boolean")
+    report_batches_path = _nullable_finalize_string(request, "report_batches_path")
+    model_bundle_path = _nullable_finalize_string(request, "model_bundle_path")
+    device = _required_finalize_string(request, "device")
+    max_tokens = request.get("max_tokens")
+    if type(max_tokens) is not int:
+        raise ValueError("finalize figure max_tokens must be an exact integer")
+    allow_large = request.get("allow_large")
+    if type(allow_large) is not bool:
+        raise ValueError("finalize figure allow_large must be an exact boolean")
+    return (
+        run_dir,
+        losses,
+        generate_publication,
+        report_batches_path,
+        model_bundle_path,
+        device,
+        max_tokens,
+        allow_large,
+    )
+
+
 def _history_from_csv(path: Path) -> List[Dict[str, object]]:
     """Rebuild history, migrating retired diagnostic columns at the loader boundary."""
     if not path.is_file():
@@ -343,8 +401,49 @@ def main() -> int:
     if not isinstance(request, Mapping):
         raise ValueError("figure request must be a JSON object")
 
-    run_dir = Path(request["run_dir"]).resolve(strict=True)
     mode = request.get("mode", "finalize")
+    if mode == "finalize":
+        (
+            run_dir_value,
+            losses,
+            generate_publication,
+            batches_path,
+            model_bundle_path,
+            device,
+            max_tokens,
+            allow_large,
+        ) = _validated_finalize_request(request)
+        run_dir = Path(run_dir_value).resolve(strict=True)
+        cfg = _load_worker_config(run_dir)
+
+        logging.basicConfig(level=logging.INFO, format="%(message)s")
+        logger = logging.getLogger(__name__)
+        _render_persisted_run_figures(run_dir, cfg, losses, logger)
+
+        if generate_publication:
+            from vfe3.viz.report import generate_figures
+
+            loader = (
+                torch.load(Path(batches_path), map_location="cpu", weights_only=True)
+                if batches_path is not None
+                else None
+            )
+            generate_figures(
+                run_dir,
+                checkpoint_path=(Path(model_bundle_path) if model_bundle_path is not None else None),
+                split="test",
+                max_tokens=max_tokens,
+                allow_large=allow_large,
+                loader=loader,
+                device=torch.device(device),
+                logger=logger,
+            )
+        return 0
+
+    run_dir_value = request.get("run_dir")
+    if not isinstance(run_dir_value, str):
+        raise ValueError("figure request run_dir must be a string")
+    run_dir = Path(run_dir_value).resolve(strict=True)
     if mode == "report":
         result_path_value = request.get("result_path")
         if not isinstance(result_path_value, str):
@@ -396,43 +495,7 @@ def main() -> int:
     if mode == "ablation":
         _render_ablation_request(request, run_dir)
         return 0
-    if mode != "finalize":
-        raise ValueError(f"unsupported figure worker mode {mode!r}")
-    cfg = _load_worker_config(run_dir)
-    losses_payload = request.get("losses")
-    losses = (
-        [float(value) for value in losses_payload]
-        if isinstance(losses_payload, list)
-        else None
-    )
-
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-    logger = logging.getLogger(__name__)
-    _render_persisted_run_figures(run_dir, cfg, losses, logger)
-
-    if request.get("generate_publication") is True:
-        from vfe3.viz.report import generate_figures
-
-        batches_path = request.get("report_batches_path")
-        model_bundle_path = request.get("model_bundle_path")
-        loader = (
-            torch.load(Path(batches_path), map_location="cpu", weights_only=True)
-            if isinstance(batches_path, str)
-            else None
-        )
-        generate_figures(
-            run_dir,
-            checkpoint_path=(
-                Path(model_bundle_path) if isinstance(model_bundle_path, str) else None
-            ),
-            split="test",
-            max_tokens=int(request.get("max_tokens", 16_384)),
-            allow_large=bool(request.get("allow_large", False)),
-            loader=loader,
-            device=torch.device(str(request.get("device", "cpu"))),
-            logger=logger,
-        )
-    return 0
+    raise ValueError(f"unsupported figure worker mode {mode!r}")
 
 
 if __name__ == "__main__":

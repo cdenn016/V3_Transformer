@@ -192,6 +192,15 @@ def run_process_tree(
     ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE``. POSIX descendants share a fresh process group. This
     prevents native plotting workers, UMAP helpers, or xdist workers from surviving a timeout.
     """
+    if isinstance(command, (str, bytes)) or not isinstance(command, Sequence):
+        raise TypeError("command must be a nonempty sequence of strings")
+    if not command:
+        raise ValueError("command must be a nonempty sequence of strings")
+    if any(not isinstance(argument, str) for argument in command):
+        raise TypeError("command must contain only strings")
+    if any(not argument for argument in command):
+        raise ValueError("command must not contain empty strings")
+
     stdout = subprocess.PIPE if capture_output else None
     stderr = subprocess.PIPE if capture_output else None
     popen_kwargs: dict[str, object] = {}
