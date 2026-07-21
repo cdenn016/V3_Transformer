@@ -15,6 +15,7 @@ training.
 """
 
 import copy
+import csv
 import json
 from pathlib import Path
 
@@ -382,6 +383,8 @@ def test_missing_requested_diagnostics_output_forbids_contract_publication(tmp_p
         "description": "requested-diagnostics completeness gate",
         "collect_diagnostics": True,
         "collect_extrapolation": True,
+        "extrapolation_lengths": [16, 32],
+        "mandatory_extrapolation_lengths": [16, 32],
     })
     monkeypatch.setattr(ablation, "make_run_overrides",
                         lambda _n: [("empty", {}), ("complete", {})])
@@ -401,20 +404,33 @@ def test_missing_requested_diagnostics_output_forbids_contract_publication(tmp_p
                 "rank_resid": 0.8,
             })
             result["extrap_ce"] = [                         # requested extrapolation output present
-                {"n": 16, "ce": 3.0, "ppl": 20.0},
-                {"n": 32, "ce": 3.1, "ppl": 22.2},
+                {"n": 16, "status": "success", "ce": 3.0, "ppl": 20.0,
+                 "effective_batch_size": 4},
+                {"n": 32, "status": "success", "ce": 3.1, "ppl": 22.2,
+                 "effective_batch_size": 2},
             ]
         return result
 
     monkeypatch.setattr(ablation, "run_single", fake_run_single)
     monkeypatch.setattr(ablation, "_cleanup", lambda: None)
-    ablation.run_sweep(sweep_name, tmp_path, dataset=DATASET, device=None, seed=6, resume=False)
+    ablation.run_sweep(
+        sweep_name,
+        tmp_path,
+        dataset=DATASET,
+        device=torch.device("cpu"),
+        seed=6,
+        resume=False,
+    )
 
     # The contract's diagnostic_flags now also binds paired_token_bootstrap (PB-07); this sweep does
     # not request it, so the published contract records it false and the rebuilt expected must match.
     flags = {"collect_diagnostics": True, "collect_extrapolation": True,
              "paired_token_bootstrap": False}
-    expected = ablation._expected_cell_contract_or_none({}, DATASET, flags, seed=6)
+    expected = ablation._expected_cell_contract_or_none(
+        {}, DATASET, flags, seed=6,
+        requested_extrapolation_lengths=(16, 32),
+        mandatory_extrapolation_lengths=(16, 32),
+    )
     assert expected is not None
 
     empty_dir = tmp_path / sweep_name / ablation._sanitize("empty")
@@ -694,3 +710,10 @@ def test_run_single_terminal_merge_preserves_metadata_and_primary_val_ppl(tmp_pa
     assert isinstance(result["n_params"], int) and result["n_params"] > 0
     assert result["error_kind"] is None
     assert "terminal_checkpoint" in result
+
+    with (tmp_path / "cell" / "metrics.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 2
+    assert set(rows[-1]) == set(rows[0])
+    assert float(rows[-1]["val_ppl"]) == 100.0
+    assert rows[-1]["attn_entropy"] == rows[0]["attn_entropy"]

@@ -776,6 +776,8 @@ def test_run_sweep_markers_persist_requests_and_terminal_state(tmp_path: Path, m
         "description": "marker contract test",
         "collect_diagnostics": True,
         "collect_extrapolation": True,
+        "extrapolation_lengths": [16, 32],
+        "mandatory_extrapolation_lengths": [16, 32],
     })
     monkeypatch.setattr(ablation, "make_run_overrides", lambda _name: [
         ("success", {}), ("failure", {}),
@@ -799,10 +801,12 @@ def test_run_sweep_markers_persist_requests_and_terminal_state(tmp_path: Path, m
                 "gauge_resid_out": 1e-7,
                 "omega_identity_dev": 0.2,
                 "rank_resid": 0.8,
-                "terminal_checkpoint": str(checkpoint),
-                "extrap_ce": [
-                    {"n": 16, "ce": 3.0, "ppl": 20.0},
-                    {"n": 32, "ce": 3.1, "ppl": 22.2},
+                    "terminal_checkpoint": str(checkpoint),
+                    "extrap_ce": [
+                        {"n": 16, "status": "success", "ce": 3.0, "ppl": 20.0,
+                         "effective_batch_size": 4},
+                        {"n": 32, "status": "success", "ce": 3.1, "ppl": 22.2,
+                         "effective_batch_size": 2},
                 ],
                 "_loaded_data_sources": {
                     split: {

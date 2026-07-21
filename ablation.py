@@ -2328,25 +2328,56 @@ def _cell_diagnostics(
 
 
 @torch.no_grad()
-def _eval_at_growing_n(model: Any, cfg: VFE3Config, dataset: str, device: torch.device) -> List[Dict[str, Any]]:
+def _eval_at_growing_n(
+    model:   Any,
+    cfg:     VFE3Config,
+    dataset: str,
+    device:  torch.device,
+
+    *,
+    requested_lengths: Optional[Sequence[int]] = None,
+) -> List[Dict[str, Any]]:
     r"""H1/EXP-13: held-out CE at sequence lengths from the trained ``max_seq_len`` outward.
 
     Re-windows the validation split at each N (anchor ``max_seq_len``, then 1.5/2/3/4x) via
     ``get_loader`` and scores the SAME trained model. Offset attention priors (alibi / t5, functions
     of |i-j|) and the causal mask rebuild at runtime N and extrapolate; the absolute schemes
     (``pos_phi='learned'`` table -- now clamped past the table; RoPE) degrade. Each N is isolated: a
-    too-short split or any failure drops that point, never the cell. Returns ``[{n, ce, ppl}, ...]``."""
+    too-short split or any failure remains in the returned domain record and makes the enclosing
+    cell incomplete when that point is mandatory. Batch size scales inversely with N to hold the
+    approximate token load fixed. Returns one status record for every requested N."""
     base = int(cfg.max_seq_len)
-    n_list = sorted({base} | {int(round(base * m)) for m in (1.5, 2.0, 3.0, 4.0)})
+    n_list = (
+        _default_extrapolation_lengths(base)
+        if requested_lengths is None
+        else _validated_extrapolation_lengths(requested_lengths, "requested_lengths")
+    )
     out: List[Dict[str, Any]] = []
     for n in n_list:
+        effective_batch_size = max(1, int(cfg.batch_size) * base // n)
         try:
-            loader = get_loader(dataset, n, cfg.batch_size, "validation",
+            loader = get_loader(dataset, n, effective_batch_size, "validation",
                                 vocab_size=cfg.vocab_size)
             m = evaluate(model, loader, device=device)
-            out.append({"n": n, "ce": float(m["ce"]), "ppl": float(m["ppl"])})
-        except Exception as exc:                              # short split / OOM at large N -> drop point
+            ce = float(m["ce"])
+            ppl = float(m["ppl"])
+            if not math.isfinite(ce) or not math.isfinite(ppl) or ppl <= 0.0:
+                raise ValueError(f"nonfinite or nonpositive extrapolation metrics: ce={ce}, ppl={ppl}")
+            out.append({
+                "n":                    n,
+                "status":               "success",
+                "ce":                   ce,
+                "ppl":                  ppl,
+                "effective_batch_size": effective_batch_size,
+            })
+        except Exception as exc:                              # short split / OOM -> retained failed point
             logger.warning("  [extrapolation eval N=%d skipped] %s", n, exc)
+            out.append({
+                "n":                    n,
+                "status":               "failed",
+                "failure_reason":       f"{type(exc).__name__}: {exc}",
+                "effective_batch_size": effective_batch_size,
+            })
     return out
 
 
@@ -2364,6 +2395,7 @@ def run_single(
     paired_token_bootstrap: bool          = False,
     max_tokens:             Optional[int] = None,
     max_steps:              Optional[int] = None,
+    extrapolation_lengths:  Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
     r"""Build a fresh model from baseline+overrides, train it, and score validation.
 
@@ -2372,6 +2404,25 @@ def run_single(
     returned as ``error_kind = "config"`` (not raised), keeping it distinct from a training
     crash; the headline is ``inf`` either way so it sorts to the bottom of the leaderboard.
     """
+    diagnostic_flags = _validated_diagnostic_flags({
+        "collect_diagnostics":    collect_diagnostics,
+        "collect_extrapolation":  collect_extrapolation,
+        "paired_token_bootstrap": paired_token_bootstrap,
+    })
+    collect_diagnostics = diagnostic_flags["collect_diagnostics"]
+    collect_extrapolation = diagnostic_flags["collect_extrapolation"]
+    paired_token_bootstrap = diagnostic_flags["paired_token_bootstrap"]
+    requested_extrapolation_lengths = (
+        None
+        if extrapolation_lengths is None
+        else _validated_extrapolation_lengths(
+            extrapolation_lengths,
+            "extrapolation_lengths",
+        )
+    )
+    if not collect_extrapolation and requested_extrapolation_lengths:
+        raise ValueError("extrapolation_lengths needs collect_extrapolation=True")
+
     cfg_dict = _cell_cfg_dict(overrides, seed=seed, max_steps=max_steps)
     try:
         cfg = VFE3Config(**cfg_dict)
@@ -2497,7 +2548,7 @@ def run_single(
             "numel":      int(per_token.numel()),
             "dtype":      str(per_token.dtype),
         }
-    result["paired_token_bootstrap"] = bool(paired_token_bootstrap)
+    result["paired_token_bootstrap"] = paired_token_bootstrap
     result["val_token_nats_path"] = (
         token_identity["path"] if token_identity is not None else None
     )
@@ -2517,7 +2568,13 @@ def run_single(
     if collect_diagnostics:                                  # opt-in converged-state probes (S2)
         result.update(_cell_diagnostics(model, cfg, val_loader, device))
     if collect_extrapolation:                                # opt-in growing-N eval (H1/EXP-13)
-        result["extrap_ce"] = _eval_at_growing_n(model, cfg, dataset, device)
+        result["extrap_ce"] = _eval_at_growing_n(
+            model,
+            cfg,
+            dataset,
+            device,
+            requested_lengths=requested_extrapolation_lengths,
+        )
     return result
 
 
@@ -2564,8 +2621,8 @@ _BASE_REQUIRED_DIAGNOSTIC_KEYS = {
 }
 
 
-_CELL_CONTRACT_SCHEMA_VERSION = 3
-_SWEEP_AGGREGATION_CONTRACT_SCHEMA_VERSION = 4
+_CELL_CONTRACT_SCHEMA_VERSION = 4
+_SWEEP_AGGREGATION_CONTRACT_SCHEMA_VERSION = 5
 _ABLATION_CELL_OWNER_SCHEMA_VERSION = 1
 _ABLATION_CELL_OWNER_FILENAME = "ablation_cell_owner.json"
 _SWEEP_DIAGNOSTIC_FLAG_KEYS = {
@@ -2578,6 +2635,13 @@ _SWEEP_DIAGNOSTIC_FLAG_KEYS = {
 def _require_exact_seed(value: object, field: str) -> int:
     if type(value) is not int or value < 0:
         raise ValueError(f"{field} must be an exact non-negative integer, got {value!r}")
+    return value
+
+
+def _require_exact_bool(value: object, field: str) -> bool:
+    """Return one exact Boolean without accepting numeric or string truthiness surrogates."""
+    if type(value) is not bool:
+        raise TypeError(f"{field} must be an exact boolean, got {value!r}")
     return value
 
 
@@ -2716,9 +2780,18 @@ def _validated_diagnostic_flags(value: object) -> Dict[str, bool]:
             "ablation diagnostic flags must contain exactly collect_diagnostics, "
             "collect_extrapolation, and paired_token_bootstrap"
         )
-    if any(type(value[key]) is not bool for key in _SWEEP_DIAGNOSTIC_FLAG_KEYS):
-        raise TypeError("ablation diagnostic flags must be exact booleans")
-    return {key: bool(value[key]) for key in sorted(_SWEEP_DIAGNOSTIC_FLAG_KEYS)}
+    return {
+        key: _require_exact_bool(value[key], key)
+        for key in sorted(_SWEEP_DIAGNOSTIC_FLAG_KEYS)
+    }
+
+
+def _sweep_diagnostic_request(sweep: Mapping[str, object]) -> Dict[str, bool]:
+    """Validate raw sweep flags before experiment construction or artifact publication."""
+    return _validated_diagnostic_flags({
+        key: sweep.get(key, False)
+        for key in _SWEEP_DIAGNOSTIC_FLAG_KEYS
+    })
 
 
 def _validated_required_diagnostic_keys(value: object) -> List[str]:
@@ -2739,6 +2812,87 @@ def _validated_min_extrapolation_points(value: object) -> int:
     return value
 
 
+def _validated_extrapolation_lengths(value: object, field: str) -> List[int]:
+    """Return a sorted exact positive requested-length domain without duplicates."""
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"{field} must be a list or tuple of exact positive integers")
+    lengths = list(value)
+    if any(type(n) is not int or n <= 0 for n in lengths):
+        raise ValueError(f"{field} must contain exact positive integers")
+    if len(lengths) != len(set(lengths)):
+        raise ValueError(f"{field} must not contain duplicate sequence lengths")
+    return sorted(lengths)
+
+
+def _default_extrapolation_lengths(base: object) -> List[int]:
+    """Return the established base, 1.5x, 2x, 3x, and 4x growing-N domain."""
+    if type(base) is not int or base <= 0:
+        raise ValueError("extrapolation base length must be an exact positive integer")
+    return sorted({base} | {int(round(base * m)) for m in (1.5, 2.0, 3.0, 4.0)})
+
+
+def _validated_extrapolation_request(
+    requested: object,
+    mandatory: object,
+
+    *,
+    collect_extrapolation: bool,
+) -> Tuple[List[int], List[int]]:
+    """Validate the requested domain and its mandatory subset under one exact collection flag."""
+    collect = _require_exact_bool(collect_extrapolation, "collect_extrapolation")
+    requested_lengths = _validated_extrapolation_lengths(
+        requested,
+        "extrapolation_lengths",
+    )
+    mandatory_lengths = _validated_extrapolation_lengths(
+        mandatory,
+        "mandatory_extrapolation_lengths",
+    )
+    if collect:
+        if len(requested_lengths) < 2:
+            raise ValueError("collect_extrapolation requires at least two requested lengths")
+        if not mandatory_lengths:
+            raise ValueError("collect_extrapolation requires at least one mandatory length")
+        if not set(mandatory_lengths).issubset(requested_lengths):
+            raise ValueError("mandatory extrapolation lengths must be requested")
+    elif requested_lengths or mandatory_lengths:
+        raise ValueError("unrequested extrapolation cannot declare sequence lengths")
+    return requested_lengths, mandatory_lengths
+
+
+def _sweep_extrapolation_request(
+    sweep: Mapping[str, object],
+    diagnostic_flags: Mapping[str, bool],
+) -> Tuple[List[int], List[int]]:
+    """Resolve one sweep's exact growing-N domain and mandatory completion points."""
+    flags = _validated_diagnostic_flags(diagnostic_flags)
+    if not flags["collect_extrapolation"]:
+        requested_raw = sweep.get("extrapolation_lengths", ())
+        mandatory_raw = sweep.get("mandatory_extrapolation_lengths", ())
+    else:
+        requires = sweep.get("requires", {})
+        if not isinstance(requires, Mapping):
+            raise TypeError("sweep['requires'] must be a mapping")
+        base = requires.get("max_seq_len", BASELINE_CONFIG["max_seq_len"])
+        requested_raw = sweep.get(
+            "extrapolation_lengths",
+            _default_extrapolation_lengths(base),
+        )
+        requested_preview = _validated_extrapolation_lengths(
+            requested_raw,
+            "extrapolation_lengths",
+        )
+        mandatory_raw = sweep.get(
+            "mandatory_extrapolation_lengths",
+            ((max(requested_preview),) if requested_preview else ()),
+        )
+    return _validated_extrapolation_request(
+        requested_raw,
+        mandatory_raw,
+        collect_extrapolation=flags["collect_extrapolation"],
+    )
+
+
 def _validated_seed_design(value: object) -> List[int]:
     """Return the sorted, unique model-seed panel used for cross-sweep comparisons."""
     if not isinstance(value, (list, tuple)) or not value:
@@ -2755,9 +2909,13 @@ def _baseline_semantic_config_fingerprint(max_steps: Optional[int]) -> str:
     return semantic_config_fingerprint(asdict(cfg))
 
 
-def _sweep_required_outputs(sweep: Mapping[str, object]) -> Tuple[List[str], int]:
+def _sweep_required_outputs(
+    sweep: Mapping[str, object],
+    diagnostic_flags: Mapping[str, bool],
+) -> Tuple[List[str], int, List[int], List[int]]:
     """Resolve the output-completeness profile declared by one sweep."""
-    collect_diagnostics = bool(sweep.get("collect_diagnostics", False))
+    flags = _validated_diagnostic_flags(diagnostic_flags)
+    collect_diagnostics = flags["collect_diagnostics"]
     extra = sweep.get("required_diagnostics", ())
     required = _validated_required_diagnostic_keys(extra)
     if collect_diagnostics:
@@ -2765,7 +2923,7 @@ def _sweep_required_outputs(sweep: Mapping[str, object]) -> Tuple[List[str], int
     elif required:
         raise ValueError("required_diagnostics needs collect_diagnostics=True")
 
-    collect_extrapolation = bool(sweep.get("collect_extrapolation", False))
+    collect_extrapolation = flags["collect_extrapolation"]
     default_points = 2 if collect_extrapolation else 0
     minimum = _validated_min_extrapolation_points(
         sweep.get("min_extrapolation_points", default_points)
@@ -2774,7 +2932,8 @@ def _sweep_required_outputs(sweep: Mapping[str, object]) -> Tuple[List[str], int
         raise ValueError("collect_extrapolation requires at least two extrapolation points")
     if not collect_extrapolation and minimum:
         raise ValueError("min_extrapolation_points needs collect_extrapolation=True")
-    return required, minimum
+    requested_lengths, mandatory_lengths = _sweep_extrapolation_request(sweep, flags)
+    return required, minimum, requested_lengths, mandatory_lengths
 
 
 def _requested_outputs_are_complete(
@@ -2783,6 +2942,8 @@ def _requested_outputs_are_complete(
     *,
     required_diagnostic_keys: Sequence[str],
     min_extrapolation_points: int,
+    requested_extrapolation_lengths: Optional[Sequence[int]] = None,
+    mandatory_extrapolation_lengths: Optional[Sequence[int]] = None,
 ) -> bool:
     """Whether one result contains every finite output promised by its sweep contract."""
     try:
@@ -2809,16 +2970,49 @@ def _requested_outputs_are_complete(
     if minimum == 0:
         return True
     curve = result.get("extrap_ce")
-    if not isinstance(curve, list) or len(curve) < minimum:
+    if not isinstance(curve, list):
         return False
+    try:
+        requested = _validated_extrapolation_lengths(
+            ([point.get("n") for point in curve] if requested_extrapolation_lengths is None
+             else requested_extrapolation_lengths),
+            "requested_extrapolation_lengths",
+        )
+        mandatory = _validated_extrapolation_lengths(
+            ((max(requested),) if mandatory_extrapolation_lengths is None and requested else
+             (() if mandatory_extrapolation_lengths is None else mandatory_extrapolation_lengths)),
+            "mandatory_extrapolation_lengths",
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if len(requested) < minimum or not requested or not set(mandatory).issubset(requested):
+        return False
+    strict_domain_record = requested_extrapolation_lengths is not None
     seen_n = set()
+    successful_n = set()
     for point in curve:
         if not isinstance(point, Mapping):
             return False
         n = point.get("n")
-        if type(n) is not int or n <= 0 or n in seen_n:
+        if type(n) is not int or n <= 0 or n in seen_n or n not in requested:
             return False
         seen_n.add(n)
+        effective_batch_size = point.get("effective_batch_size")
+        if strict_domain_record and effective_batch_size is None:
+            return False
+        if effective_batch_size is not None and (
+                type(effective_batch_size) is not int or effective_batch_size <= 0):
+            return False
+        if strict_domain_record and "status" not in point:
+            return False
+        status = point.get("status", "success")
+        if status == "failed":
+            reason = point.get("failure_reason")
+            if not isinstance(reason, str) or not reason:
+                return False
+            continue
+        if status != "success":
+            return False
         try:
             ce = float(point["ce"])
             ppl = float(point["ppl"])
@@ -2826,7 +3020,13 @@ def _requested_outputs_are_complete(
             return False
         if not math.isfinite(ce) or not math.isfinite(ppl) or ppl <= 0.0:
             return False
-    return True
+        successful_n.add(n)
+    return (
+        seen_n == set(requested)
+        and len(successful_n) >= max(2, minimum)
+        and max(requested) in successful_n
+        and set(mandatory).issubset(successful_n)
+    )
 
 
 def _validated_sweep_aggregation_contract(value: object) -> Dict[str, object]:
@@ -2848,6 +3048,8 @@ def _validated_sweep_aggregation_contract(value: object) -> Dict[str, object]:
         "diagnostic_flags",
         "required_diagnostic_keys",
         "min_extrapolation_points",
+        "requested_extrapolation_lengths",
+        "mandatory_extrapolation_lengths",
     }
     if set(value) != required:
         raise ValueError("sweep aggregation contract has missing or unknown fields")
@@ -2885,6 +3087,13 @@ def _validated_sweep_aggregation_contract(value: object) -> Dict[str, object]:
     min_extrapolation_points = _validated_min_extrapolation_points(
         value.get("min_extrapolation_points")
     )
+    requested_extrapolation_lengths, mandatory_extrapolation_lengths = (
+        _validated_extrapolation_request(
+            value.get("requested_extrapolation_lengths"),
+            value.get("mandatory_extrapolation_lengths"),
+            collect_extrapolation=diagnostic_flags["collect_extrapolation"],
+        )
+    )
     if diagnostic_flags["collect_diagnostics"] != bool(required_diagnostic_keys):
         raise ValueError("diagnostic collection and required keys are inconsistent")
     if diagnostic_flags["collect_extrapolation"]:
@@ -2910,6 +3119,8 @@ def _validated_sweep_aggregation_contract(value: object) -> Dict[str, object]:
         "diagnostic_flags":   diagnostic_flags,
         "required_diagnostic_keys": required_diagnostic_keys,
         "min_extrapolation_points": min_extrapolation_points,
+        "requested_extrapolation_lengths": requested_extrapolation_lengths,
+        "mandatory_extrapolation_lengths": mandatory_extrapolation_lengths,
     }
 
 
@@ -2927,16 +3138,37 @@ def _sweep_aggregation_contract(
     device:            str = "cpu",
     required_diagnostic_keys: Optional[Sequence[str]] = None,
     min_extrapolation_points: Optional[int]           = None,
+    requested_extrapolation_lengths: Optional[Sequence[int]] = None,
+    mandatory_extrapolation_lengths: Optional[Sequence[int]] = None,
 ) -> Dict[str, object]:
     """Build the common invocation identity under which unlike labels, values, and seeds compare."""
     flags = _validated_diagnostic_flags(diagnostic_flags)
     required_keys = _validated_required_diagnostic_keys(
-        (_BASE_REQUIRED_DIAGNOSTIC_KEYS if flags["collect_diagnostics"] else ())
+        (sorted(_BASE_REQUIRED_DIAGNOSTIC_KEYS) if flags["collect_diagnostics"] else ())
         if required_diagnostic_keys is None else required_diagnostic_keys
     )
     minimum = _validated_min_extrapolation_points(
         (2 if flags["collect_extrapolation"] else 0)
         if min_extrapolation_points is None else min_extrapolation_points
+    )
+    requested_default = (
+        _default_extrapolation_lengths(BASELINE_CONFIG["max_seq_len"])
+        if flags["collect_extrapolation"] else []
+    )
+    requested_raw = (
+        requested_default if requested_extrapolation_lengths is None
+        else requested_extrapolation_lengths
+    )
+    requested_preview = _validated_extrapolation_lengths(
+        requested_raw,
+        "requested_extrapolation_lengths",
+    )
+    requested, mandatory = _validated_extrapolation_request(
+        requested_preview,
+        ((max(requested_preview),) if mandatory_extrapolation_lengths is None and requested_preview
+         else (() if mandatory_extrapolation_lengths is None
+               else mandatory_extrapolation_lengths)),
+        collect_extrapolation=flags["collect_extrapolation"],
     )
     return _validated_sweep_aggregation_contract({
         "schema_version":     _SWEEP_AGGREGATION_CONTRACT_SCHEMA_VERSION,
@@ -2953,6 +3185,8 @@ def _sweep_aggregation_contract(
         "diagnostic_flags":   flags,
         "required_diagnostic_keys": required_keys,
         "min_extrapolation_points": minimum,
+        "requested_extrapolation_lengths": requested,
+        "mandatory_extrapolation_lengths": mandatory,
     })
 
 
@@ -2970,6 +3204,8 @@ def _cell_contract(
     code_identity:     Optional[Mapping[str, object]] = None,
     required_diagnostic_keys: Optional[Sequence[str]] = None,
     min_extrapolation_points: Optional[int]           = None,
+    requested_extrapolation_lengths: Optional[Sequence[int]] = None,
+    mandatory_extrapolation_lengths: Optional[Sequence[int]] = None,
 ) -> Dict[str, object]:
     r"""Build the versioned contract that authorizes reuse of one ablation cell.
 
@@ -2997,12 +3233,31 @@ def _cell_contract(
     )
     flags = _validated_diagnostic_flags(diagnostic_flags)
     required_keys = _validated_required_diagnostic_keys(
-        (_BASE_REQUIRED_DIAGNOSTIC_KEYS if flags["collect_diagnostics"] else ())
+        (sorted(_BASE_REQUIRED_DIAGNOSTIC_KEYS) if flags["collect_diagnostics"] else ())
         if required_diagnostic_keys is None else required_diagnostic_keys
     )
     minimum = _validated_min_extrapolation_points(
         (2 if flags["collect_extrapolation"] else 0)
         if min_extrapolation_points is None else min_extrapolation_points
+    )
+    requested_default = (
+        _default_extrapolation_lengths(int(cfg.max_seq_len))
+        if flags["collect_extrapolation"] else []
+    )
+    requested_raw = (
+        requested_default if requested_extrapolation_lengths is None
+        else requested_extrapolation_lengths
+    )
+    requested_preview = _validated_extrapolation_lengths(
+        requested_raw,
+        "requested_extrapolation_lengths",
+    )
+    requested, mandatory = _validated_extrapolation_request(
+        requested_preview,
+        ((max(requested_preview),) if mandatory_extrapolation_lengths is None and requested_preview
+         else (() if mandatory_extrapolation_lengths is None
+               else mandatory_extrapolation_lengths)),
+        collect_extrapolation=flags["collect_extrapolation"],
     )
     if flags["collect_diagnostics"] != bool(required_keys):
         raise ValueError("diagnostic collection and required keys are inconsistent")
@@ -3022,6 +3277,8 @@ def _cell_contract(
         "diagnostic_flags":            flags,
         "required_diagnostic_keys":    required_keys,
         "min_extrapolation_points":    minimum,
+        "requested_extrapolation_lengths": requested,
+        "mandatory_extrapolation_lengths": mandatory,
     }
 
 
@@ -3054,6 +3311,8 @@ def _expected_cell_contract_from_aggregation(
         code_identity=aggregation["code_identity"],
         required_diagnostic_keys=aggregation["required_diagnostic_keys"],
         min_extrapolation_points=int(aggregation["min_extrapolation_points"]),
+        requested_extrapolation_lengths=aggregation["requested_extrapolation_lengths"],
+        mandatory_extrapolation_lengths=aggregation["mandatory_extrapolation_lengths"],
     )
     contract["tokenizer_tag"] = aggregation["tokenizer_tag"]
     return contract, _gauge_reporting_fields(cfg)
@@ -3090,6 +3349,8 @@ def _expected_cell_contract_or_none(
     code_identity:     Optional[Mapping[str, object]] = None,
     required_diagnostic_keys: Optional[Sequence[str]] = None,
     min_extrapolation_points: Optional[int]           = None,
+    requested_extrapolation_lengths: Optional[Sequence[int]] = None,
+    mandatory_extrapolation_lengths: Optional[Sequence[int]] = None,
 ) -> Optional[Dict[str, object]]:
     r"""Build the reuse contract inside the per-cell failure boundary, else forbid reuse.
 
@@ -3117,6 +3378,8 @@ def _expected_cell_contract_or_none(
             code_identity=code_identity,
             required_diagnostic_keys=required_diagnostic_keys,
             min_extrapolation_points=min_extrapolation_points,
+            requested_extrapolation_lengths=requested_extrapolation_lengths,
+            mandatory_extrapolation_lengths=mandatory_extrapolation_lengths,
         )
     except Exception as exc:                                  # unbuildable config / unhashable corpus
         logger.warning("  [contract unavailable -> reuse forbidden] %s", exc)
@@ -3200,6 +3463,10 @@ def _cell_is_current(
         marker,
         required_diagnostic_keys=expected_contract.get("required_diagnostic_keys", ()),
         min_extrapolation_points=expected_contract.get("min_extrapolation_points", 0),
+        requested_extrapolation_lengths=expected_contract.get(
+            "requested_extrapolation_lengths", ()),
+        mandatory_extrapolation_lengths=expected_contract.get(
+            "mandatory_extrapolation_lengths", ()),
     ):
         return False
     if not _terminal_checkpoint_is_current(run_dir, marker):
@@ -3660,6 +3927,7 @@ def run_sweep(
     r"""Run every cell of one sweep; per-cell failures are isolated so the sweep completes."""
     sweep_name = _validated_sweep_name(sweep_name)
     sweep = SWEEPS[sweep_name]
+    diagnostic_flags = _sweep_diagnostic_request(sweep)
     cell_seeds = _validated_sweep_seeds(sweep, seed)
     data_seed_override = _validated_data_seed_override()
     sweep_scope = _sweep_output_scope(sweep_name)
@@ -3715,10 +3983,15 @@ def run_sweep(
         raise ValueError(
             f"sweep {sweep_name!r} has duplicate expanded label(s): {duplicate_labels}"
         )
-    collect_diagnostics    = bool(sweep.get("collect_diagnostics", False))
-    collect_extrapolation  = bool(sweep.get("collect_extrapolation", False))
-    paired_token_bootstrap = bool(sweep.get("paired_token_bootstrap", False))
-    required_diagnostic_keys, min_extrapolation_points = _sweep_required_outputs(sweep)
+    collect_diagnostics = diagnostic_flags["collect_diagnostics"]
+    collect_extrapolation = diagnostic_flags["collect_extrapolation"]
+    paired_token_bootstrap = diagnostic_flags["paired_token_bootstrap"]
+    (
+        required_diagnostic_keys,
+        min_extrapolation_points,
+        requested_extrapolation_lengths,
+        mandatory_extrapolation_lengths,
+    ) = _sweep_required_outputs(sweep, diagnostic_flags)
     # Multi-seed (I1/EXP-1): a sweep may declare ``seeds`` to replicate every cell across seeds for an
     # across-seed error bar. Each (cell, seed) gets its own ``{label}__s{seed}`` run dir and result row
     # (the seed also lives in the existing ``seed`` column), so the across-seed aggregate is a plain
@@ -3743,6 +4016,8 @@ def run_sweep(
         "paired_token_bootstrap": paired_token_bootstrap,
         "required_diagnostic_keys": required_diagnostic_keys,
         "min_extrapolation_points": min_extrapolation_points,
+        "requested_extrapolation_lengths": requested_extrapolation_lengths,
+        "mandatory_extrapolation_lengths": mandatory_extrapolation_lengths,
         "forest_baseline_label":  sweep.get("forest_baseline_label"),
         "grid_x":                 sweep.get("grid_x"),
         "grid_y":                 sweep.get("grid_y"),
@@ -3793,11 +4068,6 @@ def run_sweep(
           f"\n  {sweep['description']}"
           f"\n  Output: {sweep_dir}{'  [resume ON]' if resume else ''}\n{'=' * 70}")
 
-    diagnostic_flags = {
-        "collect_diagnostics":    collect_diagnostics,
-        "collect_extrapolation":  collect_extrapolation,
-        "paired_token_bootstrap": paired_token_bootstrap,
-    }
     try:
         sweep_source_identities: Optional[Dict[str, Dict[str, object]]] = (
             _ablation_source_identities(dataset))
@@ -3822,6 +4092,8 @@ def run_sweep(
                 device=str(device),
                 required_diagnostic_keys=required_diagnostic_keys,
                 min_extrapolation_points=min_extrapolation_points,
+                requested_extrapolation_lengths=requested_extrapolation_lengths,
+                mandatory_extrapolation_lengths=mandatory_extrapolation_lengths,
             )
             if sweep_source_identities is not None else None
         )
@@ -3848,7 +4120,9 @@ def run_sweep(
             source_identities=contract_source_identities,
             code_identity=contract_code_identity,
             required_diagnostic_keys=required_diagnostic_keys,
-            min_extrapolation_points=min_extrapolation_points)
+            min_extrapolation_points=min_extrapolation_points,
+            requested_extrapolation_lengths=requested_extrapolation_lengths,
+            mandatory_extrapolation_lengths=mandatory_extrapolation_lengths)
         expected_gauge_fields: Dict[str, object] = {}
         try:
             if aggregation_contract is None:
@@ -3928,6 +4202,7 @@ def run_sweep(
                                     seed=cell_seed, collect_diagnostics=collect_diagnostics,
                                     collect_extrapolation=collect_extrapolation,
                                     paired_token_bootstrap=paired_token_bootstrap,
+                                    extrapolation_lengths=requested_extrapolation_lengths,
                                     max_tokens=max_tokens, max_steps=max_steps)
             except Exception as exc:                         # one training crash must not kill the sweep
                 logger.exception("sweep %s / %s training crashed", sweep_name, label)
@@ -3965,11 +4240,11 @@ def run_sweep(
             "head_mixer_gauge_compatible": False,
             "on_gauge_pure_path":          False,
         })
-        result["collect_diagnostics"]   = collect_diagnostics
-        result["collect_extrapolation"] = collect_extrapolation
+        result["collect_diagnostics"] = diagnostic_flags["collect_diagnostics"]
+        result["collect_extrapolation"] = diagnostic_flags["collect_extrapolation"]
         # The request flag always lands in the marker; the artifact identity fields default to null on
         # any path (crash, or a sweep that did not request the artifact) so the CSV/adapters stay whole.
-        result["paired_token_bootstrap"] = paired_token_bootstrap
+        result["paired_token_bootstrap"] = diagnostic_flags["paired_token_bootstrap"]
         result.setdefault("val_token_nats_path", None)
         result.setdefault("val_token_nats_sha256", None)
         result.setdefault("val_token_nats_size_bytes", None)
@@ -3987,7 +4262,9 @@ def run_sweep(
         if successful and not _requested_outputs_are_complete(
                 result,
                 required_diagnostic_keys=required_diagnostic_keys,
-                min_extrapolation_points=min_extrapolation_points):
+                min_extrapolation_points=min_extrapolation_points,
+                requested_extrapolation_lengths=requested_extrapolation_lengths,
+                mandatory_extrapolation_lengths=mandatory_extrapolation_lengths):
             logger.warning("  [%s] requested outputs incomplete -> cell marked failed", label)
             successful = False
 
@@ -4019,7 +4296,9 @@ def run_sweep(
                     source_identities=loaded_source_identities,
                     code_identity=contract_code_identity,
                     required_diagnostic_keys=required_diagnostic_keys,
-                    min_extrapolation_points=min_extrapolation_points)
+                    min_extrapolation_points=min_extrapolation_points,
+                    requested_extrapolation_lengths=requested_extrapolation_lengths,
+                    mandatory_extrapolation_lengths=mandatory_extrapolation_lengths)
                 if expected_contract is None or post_run_contract is None:
                     successful = False
                 elif dict(post_run_contract) != dict(expected_contract):
