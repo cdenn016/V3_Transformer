@@ -15,6 +15,14 @@ SLOW_TESTS: frozenset[str] = frozenset({
 
 CUDA_TESTS: frozenset[str] = frozenset({
     (
+        "test_audit_diagnostic_memory_20260720.py"
+        "::test_cuda_diagnostic_snapshot_peak_is_bounded_to_one_sequence"
+    ),
+    (
+        "test_final_audit_integrity_20260716.py"
+        "::test_cuda_custom_optimizer_resume_preserves_cpu_control_state"
+    ),
+    (
         "test_hierarchical_probabilistic_completeness_20260712.py"
         "::test_hierarchy_full_covariant_cuda_smoke"
     ),
@@ -31,6 +39,10 @@ CUDA_TESTS: frozenset[str] = frozenset({
 })
 
 CUDA_MIRROR_TESTS: frozenset[str] = frozenset({
+    (
+        "test_audit_full_gaussian_numerics_20260720.py"
+        "::test_full_gaussian_self_kl_cuda_mirror"
+    ),
     "test_tier12_transport.py::test_per_head_transport_mean_matches_dense",
     "test_tier12_transport.py::test_per_head_transport_mean_rope_wrapped_matches_dense",
     "test_tier12_transport.py::test_stable_exp_norm_mode_small_norm_takes_fp32_path_exactly",

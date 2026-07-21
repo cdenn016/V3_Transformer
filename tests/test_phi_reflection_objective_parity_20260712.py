@@ -58,13 +58,15 @@ def _model(*, seed: int = 0, perturb: bool = True, **over) -> VFEModel:
         with torch.no_grad():
             # non-constant tr Sigma_j (precision bias non-trivial) + non-identity exp(phi) (transport
             # non-trivial), so neither fold is a hidden no-op.
-            model.prior_bank.sigma_log_embed.add_(
-                0.4 * torch.randn_like(model.prior_bank.sigma_log_embed))
+            if model.prior_bank.sigma_log_embed is not None:
+                model.prior_bank.sigma_log_embed.add_(
+                    0.4 * torch.randn_like(model.prior_bank.sigma_log_embed))
             model.prior_bank.phi_embed.add_(
                 0.3 * torch.randn_like(model.prior_bank.phi_embed))
-            if hasattr(model.prior_bank, "s_mu_embed"):
+            if getattr(model.prior_bank, "s_mu_embed", None) is not None:
                 model.prior_bank.s_mu_embed.add_(
                     0.5 * torch.randn_like(model.prior_bank.s_mu_embed))
+            if getattr(model.prior_bank, "s_sigma_log_embed", None) is not None:
                 model.prior_bank.s_sigma_log_embed.add_(
                     0.3 * torch.randn_like(model.prior_bank.s_sigma_log_embed))
     return model
@@ -444,12 +446,13 @@ def _metro_model(mode, *, seed=0, perturb=True, **over) -> VFEModel:
     m.eval()
     if perturb:
         with torch.no_grad():
-            m.prior_bank.sigma_log_embed.add_(
-                0.4 * torch.randn_like(m.prior_bank.sigma_log_embed))
-            if hasattr(m.prior_bank, "phi_embed"):
-                m.prior_bank.phi_embed.add_(0.3 * torch.randn_like(m.prior_bank.phi_embed))
-            if hasattr(m.prior_bank, "s_mu_embed"):
+            if m.prior_bank.sigma_log_embed is not None:
+                m.prior_bank.sigma_log_embed.add_(
+                    0.4 * torch.randn_like(m.prior_bank.sigma_log_embed))
+            m.prior_bank.phi_embed.add_(0.3 * torch.randn_like(m.prior_bank.phi_embed))
+            if getattr(m.prior_bank, "s_mu_embed", None) is not None:
                 m.prior_bank.s_mu_embed.add_(0.5 * torch.randn_like(m.prior_bank.s_mu_embed))
+            if getattr(m.prior_bank, "s_sigma_log_embed", None) is not None:
                 m.prior_bank.s_sigma_log_embed.add_(
                     0.3 * torch.randn_like(m.prior_bank.s_sigma_log_embed))
             for a in ("connection_W", "connection_M", "connection_L"):

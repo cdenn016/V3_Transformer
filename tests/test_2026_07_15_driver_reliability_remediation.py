@@ -1482,6 +1482,35 @@ def test_scaling_rejects_integer_enum_seed_values():
         scaling._validated_scaling_seeds([Seed.ONE])
 
 
+def test_default_parameter_match_grid_retains_two_realized_30m_widths():
+    sweep = ablation.SWEEPS["parameter_matched"]
+    grid = sweep["parameter_grid"]
+    assert ablation.CONFIG["target_n_params"] == 30_000_000
+    assert ablation.CONFIG["max_param_relative_deviation"] == 0.02
+    assert grid == {
+        "embed_dim": [32, 40, 48, 60, 64, 66, 75, 80, 96],
+        "n_heads": [4, 6, 8, 10, 11, 12, 15, 16],
+    }
+    assert len(ablation._parameter_grid_overrides(sweep)) == 72
+
+    selection = ablation._parameter_match_selection("parameter_matched")
+
+    assert len(selection["selected"]) == 2
+    assert [
+        (
+            record["overrides"]["embed_dim"],
+            record["overrides"]["n_heads"],
+            record["n_params"],
+        )
+        for record in selection["selected"]
+    ] == [(66, 11, 29_953_857), (75, 15, 30_252_833)]
+    assert all(
+        record["param_relative_deviation"]
+        <= selection["max_param_relative_deviation"]
+        for record in selection["selected"]
+    )
+
+
 def test_every_ablation_arm_constructs_with_only_invalid_arm_prerequisites_repaired():
     assert ablation.BASELINE_CONFIG["e_step_update"] == "mm_exact"
     assert ablation.BASELINE_CONFIG["phi_precond_mode"] == "pullback_per_block"

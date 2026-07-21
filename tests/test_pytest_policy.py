@@ -25,6 +25,10 @@ CUDA_MIRROR_TESTS: frozenset[str] = getattr(
 )
 
 EXPECTED_CUDA_MIRROR_TESTS: frozenset[str] = frozenset({
+    (
+        "test_audit_full_gaussian_numerics_20260720.py"
+        "::test_full_gaussian_self_kl_cuda_mirror"
+    ),
     "test_tier12_transport.py::test_per_head_transport_mean_matches_dense",
     "test_tier12_transport.py::test_per_head_transport_mean_rope_wrapped_matches_dense",
     "test_tier12_transport.py::test_stable_exp_norm_mode_small_norm_takes_fp32_path_exactly",
@@ -245,6 +249,37 @@ def test_cuda_mirror_node_is_marked_and_grouped_for_indexed_cuda(
     assert item.marker_kwargs("xdist_group") == {"name": "cuda"}
 
 
+def test_full_gaussian_cuda_mirror_is_dynamic_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node = (
+        "tests/test_audit_full_gaussian_numerics_20260720.py"
+        "::test_full_gaussian_self_kl_cuda_mirror"
+    )
+
+    monkeypatch.setenv("VFE3_TEST_DEVICE", "cpu")
+    cpu_item = _Item(node)
+    pytest_collection_modifyitems(_Config(runslow=False), [cpu_item])
+    assert cpu_item.marker_names == []
+
+    monkeypatch.setenv("VFE3_TEST_DEVICE", "cuda")
+    cuda_item = _Item(node)
+    pytest_collection_modifyitems(_Config(runslow=False), [cuda_item])
+    assert cuda_item.marker_names == ["cuda", "xdist_group"]
+    assert cuda_item.marker_kwargs("xdist_group") == {"name": "cuda"}
+
+    tree = _source_tree(
+        Path(__file__).with_name("test_audit_full_gaussian_numerics_20260720.py")
+    )
+    wrapper = next(
+        child
+        for child in tree.body
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and child.name == "test_full_gaussian_self_kl_cuda_mirror"
+    )
+    assert wrapper.decorator_list == []
+
+
 def test_external_bundle_probe_is_classified_without_a_parallel_group() -> None:
     item = _Item(
         "tests/test_hierarchical_probabilistic_completeness_20260712.py"
@@ -272,6 +307,14 @@ def test_policy_sets_define_disjoint_execution_lanes() -> None:
 def test_cuda_and_external_tables_cover_the_dedicated_prerequisite_lanes() -> None:
     assert CUDA_TESTS == {
         (
+            "test_audit_diagnostic_memory_20260720.py"
+            "::test_cuda_diagnostic_snapshot_peak_is_bounded_to_one_sequence"
+        ),
+        (
+            "test_final_audit_integrity_20260716.py"
+            "::test_cuda_custom_optimizer_resume_preserves_cpu_control_state"
+        ),
+        (
             "test_hierarchical_probabilistic_completeness_20260712.py"
             "::test_hierarchy_full_covariant_cuda_smoke"
         ),
@@ -292,6 +335,9 @@ def test_cuda_and_external_tables_cover_the_dedicated_prerequisite_lanes() -> No
             "::test_pure_route_bundle_is_byte_identical_to_branch_base"
         ),
     }
+    assert len(CUDA_TESTS) == 7
+    assert len(CUDA_MIRROR_TESTS) == 17
+    assert len(CUDA_TESTS | CUDA_MIRROR_TESTS) == 24
 
 
 def test_cuda_mirror_table_is_the_exact_curated_cohort() -> None:

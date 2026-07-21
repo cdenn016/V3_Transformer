@@ -47,6 +47,11 @@ _IDS = [reg.__name__ for reg, _, _ in _DECORATOR_REGISTRIES]
 def test_duplicate_key_fails_closed_and_override_replaces(reg, registry, name):
     assert name in registry, f"expected {name!r} to be pre-registered"
     orig = registry[name]
+    encode_registration = (
+        prior_bank_mod.get_encode_registration(name)
+        if reg is prior_bank_mod.register_encode
+        else None
+    )
     try:
         def _dup(*args, **kwargs):
             pass
@@ -59,7 +64,15 @@ def test_duplicate_key_fails_closed_and_override_replaces(reg, registry, name):
         assert reg(name, override=True)(_replacement) is _replacement
         assert registry[name] is _replacement       # explicit override replaces it
     finally:
-        reg(name, override=True)(orig)              # restore global registry state
+        if encode_registration is None:
+            reg(name, override=True)(orig)          # restore global registry state
+        else:
+            reg(
+                name,
+                override=True,
+                can_omit_base_mean=encode_registration.can_omit_base_mean,
+                can_omit_base_variance=encode_registration.can_omit_base_variance,
+            )(orig)
     assert registry[name] is orig
 
 
@@ -130,6 +143,10 @@ def _restore_decode(name, registration):
         supports_full=registration.supports_full,
         supports_chunked=registration.supports_chunked,
         fused_ce=registration.fused_ce,
+        family_consistent=registration.family_consistent,
+        covariance_kinds=registration.covariance_kinds,
+        can_omit_base_mean=registration.can_omit_base_mean,
+        can_omit_base_variance=registration.can_omit_base_variance,
         override=True,
     )(registration.callable)
 

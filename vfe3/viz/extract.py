@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 
 
 def _model_device(model) -> torch.device:
-    return model.prior_bank.mu_embed.device
+    return model.prior_bank.phi_embed.device
 
 
 def _cpu_bank_value(value: object) -> object:
@@ -967,7 +967,8 @@ def numerical_health(
     else:
         mu_t = transport_mean(omega.unsqueeze(0), out.mu.unsqueeze(0))[0]
         sigma_t = fam.transport_dispersion(out.sigma.unsqueeze(0), omega.unsqueeze(0))[0]
-    energy = pairwise_energy(fam(out.mu, out.sigma), fam(mu_t, sigma_t), alpha=cfg.renyi_order,
+    energy = pairwise_energy(fam(out.mu, out.sigma), fam.from_transported(mu_t, sigma_t, out.sigma),
+                             alpha=cfg.renyi_order,
                              kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
                              irrep_dims=model.group.irrep_dims)
     beta = attention_weights(
@@ -1067,7 +1068,8 @@ def converged_state(
             mu_t    = transport_mean(omega.unsqueeze(0), out.mu.unsqueeze(0))[0]
             sigma_t = fam.transport_dispersion(out.sigma.unsqueeze(0), omega.unsqueeze(0))[0]
         energy = pairwise_energy(
-            fam(out.mu, out.sigma), fam(mu_t, sigma_t), alpha=cfg.renyi_order,
+            fam(out.mu, out.sigma), fam.from_transported(mu_t, sigma_t, out.sigma),
+            alpha=cfg.renyi_order,
             kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
             irrep_dims=model.group.irrep_dims,
         )

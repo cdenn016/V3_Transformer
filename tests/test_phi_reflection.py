@@ -535,7 +535,7 @@ def test_phi_reflection_full_model_gauge_invariance_gamma_on():
     test_omega_direct_full_model_gauge_invariance_gamma_on: with the gamma / model-coupling (s)
     channel ON (lambda_gamma>0, s_e_step=True, gamma_as_beta_prior=True,
     prior_source='model_channel') and phi_reflection='metropolis' configured, a global ORTHOGONAL
-    gauge transform g of the tied prior tables (mu_embed, s_mu_embed, r_mu) leaves the decode logits
+    gauge transform g of the live model-channel tables (s_mu_embed, r_mu) leaves the decode logits
     invariant to fp64.
 
     HONEST FRAMING (mandatory): a gauge-INVARIANCE test certifies COVARIANCE -- that no
@@ -564,7 +564,6 @@ def test_phi_reflection_full_model_gauge_invariance_gamma_on():
                       vocab_size=6, max_seq_len=4, n_layers=1))
     with torch.no_grad():
         m.prior_bank.phi_embed.zero_()                                   # frames -> identity (Omega = I)
-        m.prior_bank.sigma_log_embed.zero_()                             # belief Sigma = I
         m.prior_bank.s_sigma_log_embed.zero_()                           # model-channel Sigma = I
         m.prior_bank.r_sigma_log.zero_()                                 # hyper-prior Sigma = I
         m.prior_bank.r_mu.copy_(torch.tensor([0.1, -0.2, 0.15, -0.05]))  # nonzero r_mu, co-transform not vacuous
@@ -580,7 +579,6 @@ def test_phi_reflection_full_model_gauge_invariance_gamma_on():
     tok = torch.randint(0, 6, (1, 4), generator=torch.Generator().manual_seed(2))
     with torch.no_grad():
         l0 = m(tok)[0].clone()
-        m.prior_bank.mu_embed.copy_(torch.einsum("kl,vl->vk", g, m.prior_bank.mu_embed))
         m.prior_bank.s_mu_embed.copy_(torch.einsum("kl,vl->vk", g, m.prior_bank.s_mu_embed))
         m.prior_bank.r_mu.copy_(g @ m.prior_bank.r_mu)
         l1 = m(tok)[0].clone()

@@ -587,8 +587,8 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "structural width/head ablation at a matched realized-parameter budget",
         "match_by": "embed_dim",
         "parameter_grid": {
-            "embed_dim": [32, 40, 48, 60, 64, 80, 96],
-            "n_heads": [4, 6, 8, 10, 12, 16],
+            "embed_dim": [32, 40, 48, 60, 64, 66, 75, 80, 96],
+            "n_heads": [4, 6, 8, 10, 11, 12, 15, 16],
         },
     },
     

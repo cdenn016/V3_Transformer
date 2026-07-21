@@ -411,7 +411,6 @@ def test_omega_direct_full_model_gauge_invariance_gamma_on():
                       decode_mode="diagonal"))
     with torch.no_grad():
         m.prior_bank.omega_embed.copy_(torch.eye(4).expand(6, 4, 4))       # frames -> identity
-        m.prior_bank.sigma_log_embed.zero_()                              # belief Sigma = I
         m.prior_bank.s_sigma_log_embed.zero_()                            # model-channel Sigma = I
         m.prior_bank.r_sigma_log.zero_()                                  # hyper-prior Sigma = I
         m.prior_bank.r_mu.copy_(torch.tensor([0.1, -0.2, 0.15, -0.05]))   # nonzero r_mu so its co-transform is not vacuous
@@ -436,7 +435,6 @@ def test_omega_direct_full_model_gauge_invariance_gamma_on():
     # frame-fidelity tests named in the docstring, NOT here.
     with torch.no_grad():
         l0 = m(tok)[0].clone()
-        m.prior_bank.mu_embed.copy_(torch.einsum("kl,vl->vk", g, m.prior_bank.mu_embed))
         m.prior_bank.s_mu_embed.copy_(torch.einsum("kl,vl->vk", g, m.prior_bank.s_mu_embed))   # s means -> g s (inert here)
         m.prior_bank.r_mu.copy_(g @ m.prior_bank.r_mu)                                          # hyper-prior mean -> g r (inert; lambda_h=0)
         # co-transform the stored frame: U -> g U (cocycle U_i U_j^{-1} g-invariant; a no-op on the decode here)

@@ -100,7 +100,12 @@ def test_one_step_ahead_residual_is_distinct_from_configured_last_step() -> None
     trace = e_step_belief_trace(model, tokens, n_iter=2)
     diag = e_step_fixed_point_diagnostics(model, tokens)
 
-    configured = metrics.estep_residuals(trace["mu"][:2], trace["sigma"][:2], trace["phi"][:2])
+    configured = metrics.estep_residuals(
+        trace["mu"][:2],
+        trace["sigma"][:2],
+        trace["phi"][:2],
+        diagonal=model.cfg.diagonal_covariance,
+    )
     fixed_point_mu = (trace["mu"][2] - trace["mu"][1]).square().mean().sqrt()
     assert diag["estep_r_mu_last"] == pytest.approx(float(configured["r_mu"][-1].mean()))
     assert diag["estep_fp_mu_rms"] == pytest.approx(float(fixed_point_mu))

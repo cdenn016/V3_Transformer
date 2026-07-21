@@ -468,7 +468,10 @@ class _EvaluationModel(nn.Module):
     def __init__(self, cross_entropies: list[float]) -> None:
         super().__init__()
         self.anchor = nn.Parameter(torch.zeros(()))
-        self.prior_bank = SimpleNamespace(mu_embed=self.anchor)
+        self.prior_bank = SimpleNamespace(
+            mu_embed=self.anchor,
+            phi_embed=self.anchor,
+        )
         self._cross_entropies = iter(cross_entropies)
 
     def forward(

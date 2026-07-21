@@ -255,6 +255,21 @@ class BeliefParams(ABC):
         )
 
     @classmethod
+    def from_transported(
+        cls,
+        mu:                torch.Tensor,         # transported means
+        dispersion:        torch.Tensor,         # transported family dispersion
+        source_dispersion: torch.Tensor,         # pre-transport dispersion and public dtype source
+    ) -> "BeliefParams":
+        r"""Construct a family belief from transported parameters.
+
+        Most families need no provenance beyond the two transported tensors. FullGaussian
+        overrides this seam because its covariance may be retained in a higher internal precision
+        than the public source family.
+        """
+        return cls(mu, dispersion)
+
+    @classmethod
     def transport_dispersion(
         cls,
         dispersion: torch.Tensor,         # (..., N, K) diagonal or (..., N, K, K) full parameter

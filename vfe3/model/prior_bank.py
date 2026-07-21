@@ -1,10 +1,11 @@
 r"""PriorBank for VFE_3.0: learnable Gaussian vocab priors + the KL decode boundary.
 
-Holds the per-vocabulary prior pi_v = N(mu_v, Sigma_v) with gauge frame phi_v as
+Holds the routed per-vocabulary prior pi_v = N(mu_v, Sigma_v) with gauge frame phi_v as
 PARAMETER TABLES (nn.Parameter -- priors, not neural maps; the no-NN rule bans
-nn.Linear/MLP/activations, not learnable parameters). encode(token_ids) looks them
-up into the initial belief (q = p); decode(mu_q, sigma_q) scores the posterior
-against every prior as logits = -KL(q || pi_v)/tau_eff (the divergence seam),
+nn.Linear/MLP/activations, not learnable parameters). The built-in model-channel route
+uses the s tables directly and omits redundant base mean/variance tables. encode(token_ids)
+looks the active tables up into the initial belief (q = p); decode(mu_q, sigma_q) scores the
+posterior against every active prior as logits = -KL(q || pi_v)/tau_eff (the divergence seam),
 replacing a linear output projection.
 
 Modularity:
@@ -36,8 +37,9 @@ to EXACTLY (and under ``log_softmax``) on the canonical path.
 """
 
 import warnings
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Callable, Dict, FrozenSet, List, Optional, Protocol, Tuple
+from typing import Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol, Tuple
 
 import torch
 import torch.utils.checkpoint as _checkpoint
@@ -65,6 +67,18 @@ _ENCODERS: 'Dict[str, EncodeCallable]' = {}
 
 
 @dataclass(frozen=True)
+class EncodeRegistration:
+    """An encode callable and registration-owned prior-table routing capabilities."""
+
+    callable:               'EncodeCallable'
+    can_omit_base_mean:     bool = False
+    can_omit_base_variance: bool = False
+
+
+_ENCODER_REGISTRATIONS: Dict[str, EncodeRegistration] = {}
+
+
+@dataclass(frozen=True)
 class DecodeRegistration:
     """A decode callable and all routing capabilities attached to that callable.
 
@@ -89,6 +103,8 @@ class DecodeRegistration:
     fused_ce:          'Optional[FusedCECallable]'
     family_consistent: bool                        = False
     covariance_kinds:  'Optional[FrozenSet[str]]'  = None
+    can_omit_base_mean: bool                       = False
+    can_omit_base_variance: bool                   = False
 
     def __post_init__(self) -> None:
         # Resolve the covariance-kind set. Omitted -> the legacy singleton derived from
@@ -113,7 +129,9 @@ def register_encode(
     name: str,
 
     *,
-    override: bool = False,
+    override:               bool           = False,
+    can_omit_base_mean:     bool = False,
+    can_omit_base_variance: bool = False,
 ) -> 'Callable[[EncodeCallable], EncodeCallable]':
     """Decorator registering an encode kernel under ``name``.
 
@@ -123,7 +141,16 @@ def register_encode(
     def _wrap(fn: 'EncodeCallable') -> 'EncodeCallable':
         if name in _ENCODERS and not override:
             raise KeyError(f"encode mode {name!r} already registered; pass override=True to replace")
+        # Capabilities belong to this NAME registration, never to the callable object. An alias or
+        # functools.wraps wrapper is therefore conservative unless this invocation declares otherwise.
+        if type(can_omit_base_mean) is not bool or type(can_omit_base_variance) is not bool:
+            raise TypeError("encoder base-table omission declarations must be bools")
         _ENCODERS[name] = fn
+        _ENCODER_REGISTRATIONS[name] = EncodeRegistration(
+            callable=fn,
+            can_omit_base_mean=can_omit_base_mean,
+            can_omit_base_variance=can_omit_base_variance,
+        )
         return fn
     return _wrap
 
@@ -137,6 +164,18 @@ def get_encode(name: str) -> 'EncodeCallable':
     return _ENCODERS[name]
 
 
+def get_encode_registration(name: str) -> EncodeRegistration:
+    """Return the registration-owned encode capabilities for ``name`` (KeyError if absent)."""
+    if name not in _ENCODERS or name not in _ENCODER_REGISTRATIONS:
+        raise KeyError(
+            f"no encode mode registered under {name!r}; available: {sorted(_ENCODERS)}"
+        )
+    registration = _ENCODER_REGISTRATIONS[name]
+    if registration.callable is not _ENCODERS[name]:
+        raise RuntimeError(f"encode mode {name!r} registry record is inconsistent")
+    return registration
+
+
 def register_decode(
     name: str,
 
@@ -147,6 +186,8 @@ def register_decode(
     family_consistent: bool                        = False,
     fused_ce:          'Optional[FusedCECallable]'      = None,
     covariance_kinds:  'Optional[FrozenSet[str]]'       = None,
+    can_omit_base_mean:     bool                        = False,
+    can_omit_base_variance: bool                        = False,
 ) -> 'Callable[[DecodeCallable], DecodeCallable]':
     """Decorator registering a decode kernel under ``name``.
 
@@ -188,6 +229,10 @@ def register_decode(
                 f"decode mode {name!r} must declare supports_chunked=True exactly when fused_ce "
                 f"is provided"
             )
+        # Capabilities belong only to this registration record. Callable identity, aliases, and
+        # functools.wraps attributes cannot confer omission rights on a new registered name.
+        if type(can_omit_base_mean) is not bool or type(can_omit_base_variance) is not bool:
+            raise TypeError("decoder base-table omission declarations must be bools")
         _DECODERS[name] = DecodeRegistration(
             callable=fn,
             supports_full=resolved_full,
@@ -195,6 +240,8 @@ def register_decode(
             fused_ce=fused_ce,
             family_consistent=family_consistent,
             covariance_kinds=resolved_kinds,
+            can_omit_base_mean=can_omit_base_mean,
+            can_omit_base_variance=can_omit_base_variance,
         )
         return fn
     return _wrap
@@ -214,18 +261,80 @@ def get_decode(name: str) -> 'DecodeCallable':
     return get_decode_registration(name).callable
 
 
+_LEGACY_DORMANT_PRIOR_TABLES = {
+    "prior_bank.mu_embed":        "prior_bank.s_mu_embed",
+    "prior_bank.sigma_log_embed": "prior_bank.s_sigma_log_embed",
+}
+
+
+def normalize_legacy_model_state(
+    saved_state:          object,
+    expected_model_state: Mapping[str, torch.Tensor],
+
+    *,
+    context: str = "model state",
+) -> object:
+    r"""Return a nonmutating exact migration of legacy dormant token-prior tables.
+
+    A current model-channel route registers both base tables as ``None`` and therefore omits them
+    from ``state_dict``. Legacy builds serialized those two inert tensors. Only those exact keys may
+    be discarded, and only when the live state exposes the corresponding routed s table. Shape,
+    dtype, layout, and finiteness are validated against that live table before removal. Token-prior
+    models retain the base keys in their expected state and therefore remain fully strict.
+    """
+    if not isinstance(saved_state, Mapping):
+        return saved_state
+    removable = [
+        key for key in _LEGACY_DORMANT_PRIOR_TABLES
+        if key in saved_state and key not in expected_model_state
+    ]
+    if not removable:
+        return saved_state
+    for key in removable:
+        routed_key = _LEGACY_DORMANT_PRIOR_TABLES[key]
+        expected = expected_model_state.get(routed_key)
+        actual = saved_state[key]
+        if expected is None:
+            raise RuntimeError(
+                f"{context} legacy dormant prior table {key!r} has no live routed-table contract"
+            )
+        if (not isinstance(actual, torch.Tensor)
+                or actual.shape != expected.shape
+                or actual.dtype != expected.dtype
+                or actual.layout != expected.layout):
+            raise RuntimeError(
+                f"{context} legacy dormant prior table {key!r} has an incompatible "
+                "shape/dtype/layout"
+            )
+        if ((actual.is_floating_point() or actual.is_complex())
+                and not bool(torch.isfinite(actual).all().item())):
+            raise RuntimeError(
+                f"{context} legacy dormant prior table {key!r} contains nonfinite values"
+            )
+    normalized = OrderedDict(saved_state)
+    metadata = getattr(saved_state, "_metadata", None)
+    if metadata is not None:
+        normalized._metadata = metadata  # type: ignore[attr-defined]
+    for key in removable:
+        del normalized[key]
+    return normalized
+
+
 class PriorBank(nn.Module):
     r"""Learnable Gaussian vocab priors; encode (lookup) and decode (-KL/tau_eff).
 
-    The tables ``mu_embed`` (V, K), ``sigma_log_embed`` (V, K), ``phi_embed`` (V, n_gen)
-    parameterize the priors pi_v = N(mu_v, exp(sigma_log_v)) with gauge frame phi_v.
-    They are PRIORS (nn.Parameter), not a neural map: there is no nn.Linear/MLP/activation
-    anywhere in this module. The learnable scalar ``decode_log_scale`` tunes the decode
-    temperature.
+    The active routed mean/variance tables and ``phi_embed`` (V, n_gen) parameterize
+    pi_v = N(mu_v, exp(sigma_log_v)) with gauge frame phi_v. Token-prior routes allocate
+    ``mu_embed`` and ``sigma_log_embed``; built-in model-channel routes consume their s-table
+    counterparts and register the redundant base names as ``None``. They are PRIORS
+    (nn.Parameter), not a neural map: there is no nn.Linear/MLP/activation anywhere in this
+    module. The learnable scalar ``decode_log_scale`` tunes the decode temperature.
     """
 
     output_proj_weight: Optional[nn.Parameter]   # (V, K) linear-decode weight; None unless use_prior_bank=False
     output_proj_bias:   Optional[nn.Parameter]   # (V,) linear-decode log-unigram bias; None unless use_prior_bank=False and decode_bias
+    mu_embed:           Optional[nn.Parameter]   # (V, K) token-prior mean; None when no executable route consumes it
+    sigma_log_embed:    Optional[nn.Parameter]   # (V, K) token-prior log variance; same routing contract
 
     def __init__(
         self,
@@ -344,8 +453,31 @@ class PriorBank(nn.Module):
         self.untie_decode_bank = untie_decode_bank and use_prior_bank
 
         sigma_log_init = float(torch.log(torch.tensor(sigma_init)))
-        self.mu_embed         = nn.Parameter(mu_init_std * torch.randn(vocab_size, K))
-        self.sigma_log_embed  = nn.Parameter(torch.full((vocab_size, K), sigma_log_init))
+        encoder = get_encode_registration(encode_mode)
+        decoder = get_decode_registration(decode_mode if use_prior_bank else "linear")
+        model_channel_route = prior_source == "model_channel"
+        self.base_mean_consumed = not (
+            model_channel_route
+            and encoder.can_omit_base_mean
+            and decoder.can_omit_base_mean
+        )
+        self.base_variance_consumed = not (
+            model_channel_route
+            and encoder.can_omit_base_variance
+            and decoder.can_omit_base_variance
+        )
+        if self.base_mean_consumed:
+            self.mu_embed = nn.Parameter(mu_init_std * torch.randn(vocab_size, K))
+        else:
+            # Preserve the established downstream phi/s/output initialization under the same seed.
+            # The historical dormant Parameter consumed this one random draw; advancing the stream
+            # without retaining the tensor removes capacity while leaving every live table unchanged.
+            _ = torch.randn(vocab_size, K)
+            self.register_parameter("mu_embed", None)
+        if self.base_variance_consumed:
+            self.sigma_log_embed = nn.Parameter(torch.full((vocab_size, K), sigma_log_init))
+        else:
+            self.register_parameter("sigma_log_embed", None)
         self.phi_embed        = nn.Parameter(phi_scale * torch.randn(vocab_size, n_gen))
         if s_frame_mode == "phi_tilde":
             self.s_phi_embed = nn.Parameter(self.phi_embed.detach().clone())
@@ -1402,7 +1534,7 @@ def _encode_prior_sigma(
     return torch.diag_embed(bounded_variance_from_log(log_diag, eps=pb.eps))
 
 
-@register_encode("per_token")
+@register_encode("per_token", can_omit_base_mean=True, can_omit_base_variance=True)
 def _encode_per_token(
     pb:        PriorBank,
     token_ids: torch.Tensor,             # (B, N) integer token ids
@@ -1421,7 +1553,7 @@ def _encode_per_token(
     return BeliefState(mu=mu, sigma=sigma, phi=phi, omega=omega)
 
 
-@register_encode("per_token_additive")
+@register_encode("per_token_additive", can_omit_base_mean=True, can_omit_base_variance=True)
 def _encode_per_token_additive(
     pb:        PriorBank,
     token_ids: torch.Tensor,             # (B, N) integer token ids
@@ -1460,7 +1592,7 @@ def _encode_gauge_fixed(
     )
 
 
-@register_decode("diagonal")
+@register_decode("diagonal", can_omit_base_mean=True, can_omit_base_variance=True)
 def _decode_diagonal(
     pb:      PriorBank,
     mu_q:    torch.Tensor,               # (B, N, K) posterior means
@@ -1511,6 +1643,8 @@ def _decode_diagonal(
     "diagonal_chunked",
     supports_chunked=True,
     fused_ce=PriorBank.decode_ce_diagonal_chunked,
+    can_omit_base_mean=True,
+    can_omit_base_variance=True,
 )
 def _decode_diagonal_chunked(
     pb:      PriorBank,
@@ -1528,7 +1662,12 @@ def _decode_diagonal_chunked(
     return _decode_diagonal(pb, mu_q, sigma_q, tau_eff)
 
 
-@register_decode("full", supports_full=True)
+@register_decode(
+    "full",
+    supports_full=True,
+    can_omit_base_mean=True,
+    can_omit_base_variance=True,
+)
 def _decode_full(
     pb:      PriorBank,
     mu_q:    torch.Tensor,               # (B, N, K) posterior means
@@ -1566,6 +1705,8 @@ def _decode_full(
     supports_full=True,
     supports_chunked=True,
     fused_ce=PriorBank.decode_ce_full_chunked,
+    can_omit_base_mean=True,
+    can_omit_base_variance=True,
 )
 def _decode_full_chunked(
     pb:      PriorBank,
@@ -1604,6 +1745,8 @@ def _decode_full_chunked(
     "family",
     covariance_kinds=frozenset({"diagonal", "full"}),
     family_consistent=True,
+    can_omit_base_mean=True,
+    can_omit_base_variance=True,
 )
 def _decode_family(
     pb:      PriorBank,
@@ -1647,6 +1790,8 @@ def _decode_family(
     family_consistent=True,
     supports_chunked=True,
     fused_ce=PriorBank.decode_ce_family_chunked,
+    can_omit_base_mean=True,
+    can_omit_base_variance=True,
 )
 def _decode_family_chunked(
     pb:      PriorBank,
@@ -1668,6 +1813,8 @@ def _decode_family_chunked(
     "expected_likelihood_chunked",
     supports_chunked=True,
     fused_ce=PriorBank.decode_ce_expected_likelihood_chunked,
+    can_omit_base_mean=True,
+    can_omit_base_variance=True,
 )
 def _decode_expected_likelihood_chunked(
     pb:      PriorBank,
@@ -1715,6 +1862,8 @@ def _decode_expected_likelihood_chunked(
     "linear",
     supports_chunked=True,
     fused_ce=PriorBank.decode_ce_linear_chunked,
+    can_omit_base_mean=True,
+    can_omit_base_variance=True,
 )
 def _decode_linear(
     pb:      PriorBank,

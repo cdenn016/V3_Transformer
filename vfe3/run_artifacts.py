@@ -49,6 +49,7 @@ from vfe3.config import (
 )
 from vfe3.contracts import DataState, DataStateBuffer
 from vfe3.ema import EMA
+from vfe3.model.prior_bank import normalize_legacy_model_state
 from vfe3.process_utils import run_process_tree
 from vfe3.runtime import deterministic_state
 
@@ -924,10 +925,17 @@ def _validate_checkpoint_model_state(
     context = f"{artifact_class} {artifact}" if artifact_class is not None else str(artifact)
     if not isinstance(saved_state, Mapping):
         raise RuntimeError(f"{context} has a non-mapping model_state")
-    if set(saved_state) != set(expected_model_state):
+    normalized_state = normalize_legacy_model_state(
+        saved_state,
+        expected_model_state,
+        context=context,
+    )
+    if not isinstance(normalized_state, Mapping):
+        raise RuntimeError(f"{context} has a non-mapping model_state")
+    if set(normalized_state) != set(expected_model_state):
         raise RuntimeError(f"{context} model_state keys do not match the live model")
     for key, expected in expected_model_state.items():
-        actual = saved_state[key]
+        actual = normalized_state[key]
         if not isinstance(actual, torch.Tensor):
             raise RuntimeError(f"{context} model_state entry {key!r} is not a tensor")
         if (actual.shape != expected.shape or actual.dtype != expected.dtype
@@ -939,7 +947,7 @@ def _validate_checkpoint_model_state(
                 and not bool(torch.isfinite(actual).all().item())):
             raise RuntimeError(
                 f"{context} model_state entry {key!r} contains nonfinite values")
-    return saved_state
+    return normalized_state
 
 
 def _validated_saved_successful_updates(
@@ -975,6 +983,9 @@ def _validate_optimizer_state(
     optimizer:   torch.optim.Optimizer,
     saved_step:  int,
     slot_manifest: object,
+
+    *,
+    dormant_base_tables_removed: bool = False,
 ) -> Mapping[str, object]:
     """Preflight optimizer topology and populated per-parameter slots without mutation."""
     if not isinstance(saved_state, Mapping):
@@ -1019,6 +1030,22 @@ def _validate_optimizer_state(
     )
     if populated_ids != manifest_ids:
         raise RuntimeError("checkpoint optimizer populated parameter slots do not match the manifest")
+    saved_parameter_count = sum(
+        len(group.get("params", ()))
+        for group in saved_groups
+        if isinstance(group.get("params"), list)
+    )
+    live_parameter_count = sum(
+        len(group.get("params", ()))
+        for group in optimizer.param_groups
+        if isinstance(group.get("params"), list)
+    )
+    if (dormant_base_tables_removed
+            and saved_parameter_count == live_parameter_count + 2):
+        raise RuntimeError(
+            "checkpoint optimizer topology contains the two removed dormant token-prior "
+            "parameters; resume with a weights-only restart with a fresh optimizer"
+        )
     if len(saved_groups) != len(optimizer.param_groups):
         raise RuntimeError("checkpoint optimizer_state parameter-group count mismatch")
 
@@ -1163,17 +1190,24 @@ def _validate_ema_state(
             or not math.isfinite(float(decay)) or float(decay) != float(ema.decay)):
         raise RuntimeError("checkpoint ema_state decay does not match the active EMA")
     shadow = saved_state["shadow"]
-    if not isinstance(shadow, Mapping) or set(shadow) != set(ema.shadow):
+    normalized_shadow = normalize_legacy_model_state(
+        shadow,
+        ema.shadow,
+        context="checkpoint EMA shadow",
+    )
+    if not isinstance(normalized_shadow, Mapping) or set(normalized_shadow) != set(ema.shadow):
         raise RuntimeError("checkpoint ema_state shadow keys do not match the active EMA")
     for name, expected in ema.shadow.items():
-        actual = shadow[name]
+        actual = normalized_shadow[name]
         if (not isinstance(actual, torch.Tensor)
                 or actual.shape != expected.shape
                 or actual.dtype != expected.dtype
                 or actual.layout != expected.layout
                 or not bool(torch.isfinite(actual).all())):
             raise RuntimeError(f"checkpoint ema_state shadow entry {name!r} is incompatible")
-    return saved_state
+    validated = dict(saved_state)
+    validated["shadow"] = normalized_shadow
+    return validated
 
 
 def _validate_rng_state(
@@ -1827,8 +1861,20 @@ def load_checkpoint(
                 f"checkpoint step {saved_step} is inconsistent with epoch {saved_epoch} and "
                 f"batches_consumed {saved_batches_consumed} for "
                 f"{expected_steps_per_epoch} steps per epoch")
+    raw_model_state = ckpt.get("model_state")
+    live_model_state = model.state_dict()
     saved_model_state = _validate_checkpoint_model_state(
-        ckpt.get("model_state"), model.state_dict(), checkpoint_path)
+        raw_model_state, live_model_state, checkpoint_path)
+    dormant_base_tables_removed = bool(
+        (isinstance(raw_model_state, Mapping)
+         and set(raw_model_state) != set(saved_model_state))
+        or (
+            "prior_bank.mu_embed" not in live_model_state
+            and "prior_bank.sigma_log_embed" not in live_model_state
+            and "prior_bank.s_mu_embed" in live_model_state
+            and "prior_bank.s_sigma_log_embed" in live_model_state
+        )
+    )
     saved_config = None
     config_drift: List[str] = []
     resume_cfg = cfg if cfg is not None else (artifacts.cfg if artifacts is not None else None)
@@ -1864,7 +1910,9 @@ def load_checkpoint(
     if optimizer is not None:
         saved_optimizer_state = _validate_optimizer_state(
             ckpt.get("optimizer_state"), optimizer, saved_step,
-            ckpt.get("optimizer_populated_slot_manifest"))
+            ckpt.get("optimizer_populated_slot_manifest"),
+            dormant_base_tables_removed=dormant_base_tables_removed,
+        )
         successful_updates = _validated_saved_successful_updates(
             saved_optimizer_state["param_groups"], saved_step)
     saved_scaler_state = ckpt.get("scaler_state")
@@ -2621,17 +2669,23 @@ def _cost_model_fields(
     d_head = K / n_blocks                                        # representative block dim
     model_channel = (cfg.lambda_h > 0.0 or cfg.lambda_gamma > 0.0
                      or cfg.prior_source == "model_channel" or cfg.s_e_step)
-    # ACTIVE params per token: the single looked-up belief row is always 2K+n_gen. The decoder then
-    # reads EITHER the prior-bank mean/variance rows (2VK) OR the linear output matrix (VK) and its
-    # optional V-vector bias. The V*n_gen phi bulk is not touched by either full-vocabulary readout.
-    token_row = 2 * K + n_gen
+    # ACTIVE params per token: the executable encoder looks up one routed mean/variance row plus its
+    # phi row. The decoder then reads EITHER its routed prior-bank rows (2VK) OR the linear output
+    # matrix (VK) and optional bias. A model-channel route reuses the s row already counted by the
+    # encoder; an independently active s channel on a token-prior route adds one more row, not the
+    # full dormant vocabulary table. Full s/r covariances include their packed strict-lower
+    # coordinates; base token priors and every decode vocabulary prior remain diagonal.
+    lower = K * (K - 1) // 2 if not cfg.diagonal_covariance else 0
+    token_row = 2 * K + n_gen + (lower if cfg.prior_source == "model_channel" else 0)
     if cfg.use_prior_bank:
         decode_readout = 2 * V * K
     else:
         decode_readout = V * K + (V if cfg.decode_bias else 0)
     active = token_row + decode_readout
-    if model_channel:
-        active += 2 * V * K                                     # s tables enter encode/decode
+    if model_channel and cfg.prior_source != "model_channel":
+        active += 2 * K + lower                                 # independent s-channel token row
+    if cfg.lambda_h > 0.0 or cfg.s_e_step:
+        active += 2 * K + lower                                 # executable hyper-prior centroid r
     # Transparent analytic FLOP proxy. Per token: decode over all V (2VK), L*T belief E-step
     # iterations, and one T-iteration model-channel refinement when s_e_step is enabled. Each E-step
     # iteration has O(N) attention energy (2NK) plus O(N) transport application (2N*d_head^2).
@@ -2727,15 +2781,17 @@ def finalize_run(
         logger.info("Reloaded best-val checkpoint (step %s, val PPL %.3f) for test eval",
                     artifacts.best_step, artifacts.best_val_ppl)
 
-    results: Dict[str, object] = {}                             # mixes float / Optional[float|int] / bool
+    results: Dict[str, object] = {
+        "diagnostics": {},
+    }                                                          # mixes scalar headlines and nested diagnostics
     if test_loader is not None:
         m = evaluate(model, test_loader, tokens_per_char=tokens_per_char, device=device)
-        results = {
+        results.update({
             "test_ce":             m["ce"],
             "test_ppl":            m["ppl"],
             "test_bits_per_token": m["bits_per_token"],
             "test_bpc":            m["bpc"],
-        }
+        })
         logger.info(
             "Test (held-out) | CE: %.4f | PPL: %.2f | BPT: %.4f | BPC: %s",
             m["ce"], m["ppl"], m["bits_per_token"],
@@ -2745,23 +2801,35 @@ def finalize_run(
     results.update({"best_val_ppl": best_val_ppl, "best_step": artifacts.best_step,
                     "reloaded_best": reloaded_best})
 
-    # E-step inference-time value: test CE with the inner E-step DISABLED (n_e_steps=0 -> belief =
-    # prior, the loop runs zero iterations) minus the configured-budget test CE. NOTE this is the
-    # INFERENCE-TIME marginal value of the E-step under tables that were TRAINED with it (the M-step
-    # co-adapts the priors to the refinement) -- NOT a clean capacity split into table vs E-step, which
-    # would need a second model trained at n_e_steps=0. A near-zero value still flags an E-step that
-    # buys little at inference. Off-graph, best-effort; n_e_steps is restored in the finally.
-    if test_loader is not None and results.get("test_ce") is not None:
+    # Opt-in held-out inference-depth counterfactual. This does not replace any selected headline
+    # metric: it is published only under the diagnostic namespace after a complete successful probe.
+    if (cfg.evaluate_zero_e_steps_counterfactual
+            and test_loader is not None
+            and results.get("test_ce") is not None):
         _saved_ne = model.cfg.n_e_steps
         try:
             model.cfg.n_e_steps = 0
             m0 = evaluate(model, test_loader, tokens_per_char=tokens_per_char, device=device)
-            results["test_ce_no_estep"]    = m0["ce"]
-            results["estep_capacity_gain"] = m0["ce"] - results["test_ce"]
-            logger.info("E-step capacity gain (CE@n_e_steps=0 - CE@%d): %.4f",
-                        _saved_ne, results["estep_capacity_gain"])
+            counterfactual_ce = float(m0["ce"])
+            ce_delta = counterfactual_ce - float(results["test_ce"])
+            diagnostics = results["diagnostics"]
+            if not isinstance(diagnostics, dict):
+                raise RuntimeError("finalization diagnostics must be a mapping")
+            diagnostics["zero_e_steps_counterfactual"] = {
+                "kind":                 "held_out_inference_depth_counterfactual",
+                "split":                "test",
+                "configured_depth":     int(_saved_ne),
+                "counterfactual_depth": 0,
+                "counterfactual_ce":    counterfactual_ce,
+                "ce_delta_vs_headline": ce_delta,
+            }
+            logger.info(
+                "Zero-E-step held-out counterfactual (CE@0 - CE@%d): %.4f",
+                _saved_ne,
+                ce_delta,
+            )
         except Exception as exc:
-            logger.warning("estep capacity-gain probe failed (%s); skipped", exc)
+            logger.warning("zero-E-step held-out counterfactual failed (%s); skipped", exc)
         finally:
             model.cfg.n_e_steps = _saved_ne
 
@@ -2854,8 +2922,7 @@ def finalize_run(
         "test_ce":      results.get("test_ce"),
         "test_bits_per_token": results.get("test_bits_per_token"),
         "test_bpc":     results.get("test_bpc"),
-        "test_ce_no_estep":    results.get("test_ce_no_estep"),
-        "estep_capacity_gain": results.get("estep_capacity_gain"),
+        "diagnostics":  results["diagnostics"],
         "estep_final_f_per_token": results.get("estep_final_f_per_token"),
         "final_train_loss": (losses[-1] if losses else None),
         "wall_time_s":  wall_time,

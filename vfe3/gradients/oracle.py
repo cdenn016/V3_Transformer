@@ -206,7 +206,8 @@ def belief_gradients_autograd(
     sd = self_divergence_for_alpha(fam(mu_q, sigma_q), fam(mu_p, sigma_p), alpha=renyi_order, kl_max=kl_max, eps=eps,
                                    divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
     alpha, reg = self_coupling_alpha(sd, mode=lambda_alpha_mode, value=value, b0=b0, c0=c0)
-    energy = pairwise_energy(fam(mu_q, sigma_q), fam(mu_t, sigma_t), alpha=renyi_order, kl_max=kl_max, eps=eps,
+    energy = pairwise_energy(fam(mu_q, sigma_q), fam.from_transported(mu_t, sigma_t, sigma_k),
+                             alpha=renyi_order, kl_max=kl_max, eps=eps,
                              divergence_family=divergence_family, irrep_dims=irrep_dims)
     # Value-gauge decoupling (RopeTransport.on_value=False): beta comes from the rotated SCORE energy
     # above, but the coupling sum the belief descends uses the UN-rotated base transport -- RoPE's
@@ -220,7 +221,9 @@ def belief_gradients_autograd(
             omega.base,
             diagonal_out=(sigma_k.dim() == mu_k.dim()),
         )
-        coupling_energy = pairwise_energy(fam(mu_q, sigma_q), fam(mu_tv, sigma_tv), alpha=renyi_order,
+        coupling_energy = pairwise_energy(fam(mu_q, sigma_q),
+                                          fam.from_transported(mu_tv, sigma_tv, sigma_k),
+                                          alpha=renyi_order,
                                           kl_max=kl_max, eps=eps, divergence_family=divergence_family,
                                           irrep_dims=irrep_dims)
     F = free_energy(

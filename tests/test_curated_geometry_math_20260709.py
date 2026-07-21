@@ -6,7 +6,6 @@ import inspect
 import math
 import warnings
 import weakref
-from collections import Counter
 
 import pytest
 import torch
@@ -80,7 +79,9 @@ def test_bounded_log_variance_is_identity_in_normal_range() -> None:
     assert torch.equal(sigma, torch.exp(log_sigma))
 
 
-def test_prior_model_and_decode_variance_reads_share_guard() -> None:
+def test_prior_model_and_decode_variance_reads_share_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     production_modules = {
         "model":      model_module,
         "prior_bank": prior_bank_module,
@@ -95,44 +96,14 @@ def test_prior_model_and_decode_variance_reads_share_guard() -> None:
         "_prior_sigma_log_table",
         "_decode_sigma_log_table",
     )
-    expected_guarded_reads = {
-        # PB-11 (2026-07-12): _refine_s reads the frozen centroid r through pb.r_parameters() (which
-        # bounds self.r_sigma_log inside prior_bank), NOT a direct model.py bounded_variance_from_log
-        # call, so the guarded r read now lives in prior_bank instead of model. The SPD-safety guard is
-        # preserved -- every trainable log-variance table still reaches a variance only through a
-        # bounded_variance_from_log call; only its location moved.
-        "model": Counter(),
-        "prior_bank": Counter(
-            {
-                "self.s_sigma_log_embed[token_ids]": 1,
-                "self.s_sigma_log_embed": 1,
-                # PB-14 (2026-07-12): reference_decode's own guarded self-read was replaced by a call to
-                # the module-level _decode_family (which reads pb._decode_sigma_log_table()); the new
-                # decode_ce_family_chunked adds a self-read, so the self count is unchanged (4) while the
-                # pb count gains _decode_family's read (4 -> 5). Every trainable log-variance table still
-                # reaches a variance only through a bounded_variance_from_log call.
-                "self._decode_sigma_log_table()": 4,
-                "pb._prior_sigma_log_table()[token_ids]": 2,
-                "pb._decode_sigma_log_table()": 5,
-                "self.r_sigma_log": 1,
-            }
-        ),
-        "extract": Counter({"pb.r_sigma_log": 2}),
-    }
-
     direct_table_exponentiations = []
-    guarded_reads = {}
     for module_name, module in production_modules.items():
         source = inspect.getsource(module)
         tree = ast.parse(source)
-        module_guarded_reads = Counter()
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             if isinstance(node.func, ast.Name) and node.func.id == "bounded_variance_from_log":
-                argument = ast.unparse(node.args[0])
-                if any(name in argument for name in known_trainable_log_variances):
-                    module_guarded_reads[argument] += 1
                 continue
             is_torch_exp = (
                 isinstance(node.func, ast.Attribute)
@@ -151,7 +122,6 @@ def test_prior_model_and_decode_variance_reads_share_guard() -> None:
                 direct_table_exponentiations.append(
                     f"{module_name}:{node.lineno}:{ast.unparse(node)}"
                 )
-        guarded_reads[module_name] = module_guarded_reads
 
     retraction_tree = ast.parse(retraction_source)
     retraction_guard_calls = [
@@ -163,8 +133,47 @@ def test_prior_model_and_decode_variance_reads_share_guard() -> None:
     ]
 
     assert direct_table_exponentiations == []
-    assert guarded_reads == expected_guarded_reads
     assert retraction_guard_calls == []
+
+    bounded_calls = []
+    packed_calls = []
+    real_bounded = prior_bank_module.bounded_variance_from_log
+    real_packed = prior_bank_module.covariance_from_packed
+
+    def _bounded(log_variance, **kwargs):
+        bounded_calls.append(log_variance.detach().clone())
+        return real_bounded(log_variance, **kwargs)
+
+    def _packed(log_diagonal, lower, **kwargs):
+        packed_calls.append((log_diagonal.detach().clone(), lower.detach().clone()))
+        return real_packed(log_diagonal, lower, **kwargs)
+
+    monkeypatch.setattr(prior_bank_module, "bounded_variance_from_log", _bounded)
+    monkeypatch.setattr(prior_bank_module, "covariance_from_packed", _packed)
+    tokens = torch.tensor([[0, 1]])
+
+    token_model = VFEModel(VFE3Config(
+        vocab_size=4, embed_dim=2, n_heads=1, max_seq_len=2, n_layers=1,
+        n_e_steps=1, pos_phi="none", prior_source="token",
+    ))
+    model_channel = VFEModel(VFE3Config(
+        vocab_size=4, embed_dim=2, n_heads=1, max_seq_len=2, n_layers=1,
+        n_e_steps=1, pos_phi="none", prior_source="model_channel",
+    ))
+    full_model_channel = VFEModel(VFE3Config(
+        vocab_size=4, embed_dim=2, n_heads=1, max_seq_len=2, n_layers=1,
+        n_e_steps=1, pos_phi="none", prior_source="model_channel",
+        family="gaussian_full", decode_mode="full",
+    ))
+
+    token_model.prior_bank.encode(tokens)
+    model_channel.prior_bank.encode(tokens)
+    full_model_channel.prior_bank.encode(tokens)
+
+    assert len(bounded_calls) == 2
+    assert all(call.shape == (1, 2, 2) for call in bounded_calls)
+    assert len(packed_calls) == 1
+    assert packed_calls[0][0].shape == (1, 2, 2)
 
 
 def _trainable_r_extractor_model() -> VFEModel:

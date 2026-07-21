@@ -169,9 +169,9 @@ def build_optimizer(
 ) -> torch.optim.Optimizer:
     r"""AdamW with per-group M-step learning rates over the PriorBank prior tables.
 
-    The three prior tables carry distinct natural scales, so each is given its own
-    M-step learning rate: the mean table ``mu_embed`` at ``m_p_mu_lr``; the (log) scale
-    tables ``sigma_log_embed`` and the decode temperature ``decode_log_scale`` together
+    The prior-table roles carry distinct natural scales, so each is given its own
+    M-step learning rate: every live mean table at ``m_p_mu_lr``; every live (log) scale
+    table and the decode temperature ``decode_log_scale`` together
     at ``m_p_sigma_lr``; the belief gauge-frame coordinates ``phi_embed`` at ``m_phi_lr``;
     and an active independent model frame at ``m_s_phi_lr``. The weight decay
     ``cfg.weight_decay`` is shared.
@@ -207,8 +207,8 @@ def build_optimizer(
     # Each group carries an explicit "role" in {mu, sigma, phi} -- the belief-component family it
     # steps (mean-LR / scale-LR / gauge-LR). The grad-norm decomposition (train_step) aggregates the
     # pre-clip grad by role, so the figure attributes the signal correctly REGARDLESS of group order
-    # or which tables are live (e.g. under prior_source='model_channel' the dead mu_embed contributes
-    # 0 while the live s_mu_embed carries the mean signal -- both are role='mu'). Role is used in
+    # or which tables are live (e.g. under prior_source='model_channel' the omitted mu_embed is absent
+    # while the live s_mu_embed carries the mean signal as role='mu'). Role is used in
     # preference to the group INDEX (the old 0/1/2 assumption broke whenever a config rerouted the
     # active mean/scale capacity off mu_embed/sigma_log_embed) and to the LR VALUE (m_p_mu_lr and
     # m_phi_lr may coincide). Extra dict keys ride alongside the optimizer metadata and are ignored
@@ -223,11 +223,15 @@ def build_optimizer(
     # every sigma-role CAPACITY table (belief, s-channel, untied decode); the centroid r_sigma_log
     # keeps its existing hard 0.0 exemption.
     sigma_wd = {} if cfg.sigma_weight_decay is None else {"weight_decay": cfg.sigma_weight_decay}
-    groups = [
-        {"params": [pb.mu_embed],                              "lr": cfg.m_p_mu_lr,    "role": "mu"},
-        {"params": [pb.sigma_log_embed, pb.decode_log_scale],  "lr": cfg.m_p_sigma_lr, "role": "sigma", **sigma_wd},
-        phi_group,
-    ]
+    groups = []
+    if pb.mu_embed is not None:
+        groups.append({"params": [pb.mu_embed], "lr": cfg.m_p_mu_lr, "role": "mu"})
+    sigma_parameters = [parameter for parameter in (pb.sigma_log_embed, pb.decode_log_scale)
+                        if parameter is not None]
+    if sigma_parameters:
+        groups.append({"params": sigma_parameters, "lr": cfg.m_p_sigma_lr,
+                       "role": "sigma", **sigma_wd})
+    groups.append(phi_group)
     if omega_direct:                                           # omega_embed holds GL(K) elements U directly
         # Stepped by the group-manifold retraction (weight_decay=0: Euclidean L2 on a group element is
         # non-geometric, the same exemption the gauge frame carries). role='phi' -> gauge-LR + phi grad-norm.
@@ -327,6 +331,15 @@ def build_optimizer(
     if ln_affine:
         groups.append({"params": ln_affine, "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
 
+    # Stable CSV learning-rate fields are attached to semantic roles rather than optimizer indices.
+    # When the base mean table is absent, the first realized mean-role group supplies lr_mu.
+    reported_roles = set()
+    for group in groups:
+        role = group.get("role")
+        if role in {"mu", "sigma", "phi"} and role not in reported_roles:
+            group["lr_report_role"] = role
+            reported_roles.add(role)
+
     # Exact-coverage guard: every TRAINABLE model parameter (requires_grad=True) must land in exactly
     # one group. A missing group would leave that weight frozen (no AdamW update) with no error -- the
     # bug class the optimizer is most prone to as new learnable seams (output_proj, head mixer, ...) are
@@ -337,10 +350,9 @@ def build_optimizer(
     # (the E-step is detached; test-pinned in test_model.py), decode_log_scale under
     # use_prior_bank=False (the linear decode discards tau_eff), ALL encode tables under
     # use_prior_bank=False AND detach_e_step=True (only output_proj_weight reaches the loss; the
-    # model emits a warning for that combination), and mu_embed/sigma_log_embed under
-    # prior_source='model_channel' (the prior reroutes to the s tables, so the belief tables are dead
-    # but stay grouped -- AdamW skips a None-grad param ENTIRELY, so neither an update NOR weight
-    # decay fires on the dead table; audit 2026-06-13 L3). These are intentional, not coverage bugs.
+    # model emits a warning for that combination). Under the built-in model-channel routes,
+    # mu_embed/sigma_log_embed are omitted and the live s tables take their roles. These are
+    # intentional route properties, not coverage bugs.
     grouped = {p for g in groups for p in g["params"]}
     missing = {p for p in model.parameters() if p.requires_grad} - grouped   # frozen params are exempt
     if missing:
@@ -382,8 +394,29 @@ def build_optimizer(
         )
     # fused AdamW (one CUDA kernel for the whole M-step) when the priors live on CUDA; it is
     # CUDA-only, so on a CPU box this is the standard AdamW. Per-group LRs are honored either way.
-    use_fused = pb.mu_embed.is_cuda
+    use_fused = pb.phi_embed.is_cuda
     return torch.optim.AdamW(groups, weight_decay=cfg.weight_decay, fused=use_fused)
+
+
+def _learning_rates_by_role(
+    param_groups: Sequence[Dict[str, object]],
+    lrs:          Sequence[float],
+) -> Dict[str, float]:
+    """Resolve the stable CSV learning-rate fields from optimizer role metadata."""
+    if len(param_groups) != len(lrs):
+        raise RuntimeError("optimizer parameter groups and scheduler learning rates differ in length")
+    resolved = {
+        str(group["lr_report_role"]): float(lr)
+        for group, lr in zip(param_groups, lrs)
+        if "lr_report_role" in group
+    }
+    required = {"mu", "sigma", "phi"}
+    if set(resolved) != required:
+        raise RuntimeError(
+            f"optimizer learning-rate report roles must be exactly {sorted(required)}, "
+            f"got {sorted(resolved)}"
+        )
+    return resolved
 
 
 def lr_lambda(
@@ -626,7 +659,7 @@ def train_step(
         # per-ROLE norms (mu/sigma/phi from each group's "role" tag in build_optimizer, aggregated in
         # quadrature across ALL groups carrying that role). Role -- not the old groups[0/1/2] index --
         # so the LIVE tables are attributed correctly under any config (e.g. under
-        # prior_source='model_channel' the dead mu_embed adds 0 while the live s_mu_embed carries the
+        # prior_source='model_channel' the omitted mu_embed is absent while live s_mu_embed carries the
         # role='mu' signal; previously mu/sigma logged a flat 0). Captured AFTER unscale_ but BEFORE
         # clip so the value is the true pre-clip gradient magnitude. The three roles partition every
         # group, so role grads sum in quadrature to grad_norm.
@@ -809,7 +842,7 @@ def evaluate(
     null rather than silently relabeling bits per token as bits per character.
     """
     if device is None:
-        device = model.prior_bank.mu_embed.device
+        device = model.prior_bank.phi_embed.device
     was_training = model.training
     model.eval()
     try:
@@ -1260,7 +1293,7 @@ def train(
     resume_path = resume_from if resume_from is not None else cfg.resume_from
     start_step = 0
     if device is None:
-        device = model.prior_bank.mu_embed.device
+        device = model.prior_bank.phi_embed.device
     loader_sampler = getattr(loader, "sampler", None)
     shuffled_loader = isinstance(loader_sampler, torch.utils.data.RandomSampler)
     loader_generator = getattr(loader, "generator", None)
@@ -1633,15 +1666,16 @@ def train(
         # commensurate with val_ce, a token-weighted mean (nats/token; see audit-2026-06-05 Finding 2).
         if do_csv:
             n_tok = max(int(tokens.shape[1]), 1)
-            lrs = scheduler.get_last_lr()                     # per-group current LR (groups 0,1,2 = mu,sigma,phi)
+            raw_lrs = scheduler.get_last_lr()
+            lrs = _learning_rates_by_role(optimizer.param_groups, raw_lrs)
             row = {
                 "step":              step + 1,
                 "train_loss":        losses[-1],
                 "train_ce":          ce,                      # true CE (nats), off the graph
                 "train_ppl":         math.exp(min(ce, 20.0)),  # train perplexity = exp(CE), mirrors the console line
-                "lr_mu":             float(lrs[0]),           # group 0 = mu_embed          (m_p_mu_lr)
-                "lr_sigma":          float(lrs[1]),           # group 1 = sigma_log+decode  (m_p_sigma_lr)
-                "lr_phi":            float(lrs[2]),           # group 2 = phi_embed         (m_phi_lr)
+                "lr_mu":             lrs["mu"],
+                "lr_sigma":          lrs["sigma"],
+                "lr_phi":            lrs["phi"],
                 "val_ce":            last_val["ce"]  if do_eval else float("nan"),  # eval-cadence: fresh on
                 "val_ppl":           last_val["ppl"] if do_eval else float("nan"),  # an eval step (last_val just
                 "val_bits_per_token": (last_val["bits_per_token"] if do_eval
@@ -1669,7 +1703,7 @@ def train(
                     "corpus_pass":     float("nan"),
                 })
             if s_phi_group_index is not None:
-                row["lr_s_phi"] = float(lrs[s_phi_group_index])
+                row["lr_s_phi"] = float(raw_lrs[s_phi_group_index])
             # Peak memory (Tier-1): CUDA peak MB at the clean train-window boundary.
             row["peak_mem_mb"] = peak_mem_mb
             # Learnable softmax temperatures (default-off): log the live kappa values once per
@@ -1899,7 +1933,7 @@ def _fmt_tau(cfg: VFE3Config, model: VFEModel) -> str:
     r"""Banner format for the softmax temperature: a scalar kappa -> '1.5000', a per-head
     (list) kappa -> '[t0, t1, ...]' (T1). Converts a list kappa to a tensor first so attention_tau
     does not choke on a raw list."""
-    dev = model.prior_bank.mu_embed.device
+    dev = model.prior_bank.phi_embed.device
     tau = attention_tau(_as_coeff(cfg.kappa_beta, dev), model.group.irrep_dims)
     if isinstance(tau, torch.Tensor) and tau.dim() >= 1:
         return "[" + ", ".join(f"{x:.4f}" for x in tau.tolist()) + "]"
@@ -1919,9 +1953,9 @@ def parameter_report(
     ``total`` is ``sum(p.numel())``; ``trainable`` filters ``requires_grad`` (catches the frozen
     hyper-prior centroid r under ``learnable_r=False``). ``live`` is MEASURED, not inferred from
     toggles: one synthetic forward+backward runs and a parameter counts as live only if it receives
-    a non-None gradient -- so config-dead tables that stay allocated and grouped
-    (``mu_embed``/``sigma_log_embed`` under ``prior_source='model_channel'``, ``decode_log_scale``
-    under ``use_prior_bank=False``, ``phi_embed`` under ``detach_e_step=True``, ...) are counted as
+    a non-None gradient -- so config-dead tables that remain allocated and grouped
+    (``decode_log_scale`` under ``use_prior_bank=False``, ``phi_embed`` under
+    ``detach_e_step=True``, ...) are counted as
     dead REGARDLESS of which toggle silenced them, so the report never drifts from the config as the
     toggles change. The synthetic ids come from a LOCAL generator (the global RNG is untouched) and
     ``.grad`` is cleared afterward, so the probe is side-effect-free. Best-effort: any failure (e.g. a

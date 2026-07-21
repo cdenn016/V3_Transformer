@@ -422,7 +422,8 @@ def belief_gradients(
             irrep_dims=irrep_dims,
         )
     if pair_stats is None:
-        energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=1.0, kl_max=kl_max, eps=eps,
+        energy = pairwise_energy(fam(mu, sigma), fam.from_transported(mu_t, sigma_t, sigma_k),
+                                 alpha=1.0, kl_max=kl_max, eps=eps,
                                  divergence_family=divergence_family, irrep_dims=irrep_dims)
     else:
         energy = pair_stats.energy
@@ -548,7 +549,8 @@ def mm_exact_update(
             irrep_dims=irrep_dims,
         )
     if pair_stats is None:
-        energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=1.0, kl_max=kl_max, eps=eps,
+        energy = pairwise_energy(fam(mu, sigma), fam.from_transported(mu_t, sigma_t, sigma_k),
+                                 alpha=1.0, kl_max=kl_max, eps=eps,
                                  divergence_family=divergence_family, irrep_dims=irrep_dims)
     else:
         energy = pair_stats.energy

@@ -1554,7 +1554,7 @@ def gauge_equivariance_residual(
     """
     from vfe3.families.base import get_family
     from vfe3.free_energy import attention_tau, attention_weights, pairwise_energy
-    from vfe3.geometry.transport import transport_covariance, transport_mean
+    from vfe3.geometry.transport import transport_mean
 
     compact_factors: Optional[
         Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
@@ -1595,17 +1595,17 @@ def gauge_equivariance_residual(
                     omega_row = torch.einsum(
                         "kl,ijlm,mn->ijkn", gauge_left, omega_row, gauge_right)
                 mu_rows.append(transport_mean(omega_row, mu_q)[0])
-                sig_rows.append(transport_covariance(
-                    omega_row,
+                sig_rows.append(full.transport_dispersion(
                     sig_q,
+                    omega_row,
                     diagonal_out=sig_q.dim() == mu_q.dim(),
                 )[0])
             mu_t = torch.stack(mu_rows, dim=0)                              # (N, N, K)
             sig_t = torch.stack(sig_rows, dim=0)                            # (N, N, K[, K])
         else:
             mu_t = transport_mean(om.unsqueeze(0), mu_q.unsqueeze(0))[0]          # (N, N, K)
-            sig_t = transport_covariance(om.unsqueeze(0), sig_q.unsqueeze(0))[0]  # (N, N, K, K)
-        e = pairwise_energy(full(mu_q, sig_q), full(mu_t, sig_t),
+            sig_t = full.transport_dispersion(sig_q.unsqueeze(0), om.unsqueeze(0))[0]  # (N, N, K, K)
+        e = pairwise_energy(full(mu_q, sig_q), full.from_transported(mu_t, sig_t, sig_q),
                             alpha=renyi_order, kl_max=kl_max, eps=eps,
                             divergence_family=divergence_family, irrep_dims=group.irrep_dims)
         return e, attention_weights(e, tau=tau)

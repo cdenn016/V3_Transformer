@@ -218,7 +218,11 @@ class _ConstantCEModel(torch.nn.Module):
     def __init__(self, ce: float) -> None:
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(()))
-        self.prior_bank = type("PriorBankStub", (), {"mu_embed": self.anchor})()
+        self.prior_bank = type(
+            "PriorBankStub",
+            (),
+            {"mu_embed": self.anchor, "phi_embed": self.anchor},
+        )()
         self.ce = ce
 
     def forward(
@@ -234,7 +238,11 @@ class _NoncausalContextCEModel(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(()))
-        self.prior_bank = type("PriorBankStub", (), {"mu_embed": self.anchor})()
+        self.prior_bank = type(
+            "PriorBankStub",
+            (),
+            {"mu_embed": self.anchor, "phi_embed": self.anchor},
+        )()
         self.call_shapes: List[Tuple[int, ...]] = []
 
     def forward(
@@ -298,10 +306,14 @@ def test_training_log_always_names_bits_per_token_when_bpc_is_available(
             log_interval=1,
             tokens_per_char=2.0,
         )
-    metric_messages = [record.getMessage() for record in caplog.records if "F: self" in record.getMessage()]
+    metric_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "Inner alignment energy:" in record.getMessage()
+    ]
     assert len(metric_messages) == 1
-    assert "BPT" in metric_messages[0]
-    assert "BPC" in metric_messages[0]
+    assert "| BPT " in metric_messages[0]
+    assert "| BPC " in metric_messages[0]
 
 
 def test_data_integrity_signatures_follow_defined_before_optional_order() -> None:
@@ -644,6 +656,7 @@ class _ArtifactSink:
     def __init__(self) -> None:
         self.saved: List[Dict[str, object]] = []
         self.code_identity_sha256 = "c" * 64
+        self.selection_data_identity = None
         self.run_start_git_identity = {
             "git_sha": "0" * 40,
             "git_dirty": False,
@@ -731,6 +744,7 @@ def test_train_provenance_and_research_counts_share_one_corpus_scan(monkeypatch)
         def __init__(self) -> None:
             self.saved: Dict[str, Dict[str, object]] = {}
             self.code_identity_sha256 = "c" * 64
+            self.selection_data_identity = None
             self.run_start_git_identity = {
                 "git_sha": "0" * 40,
                 "git_dirty": False,

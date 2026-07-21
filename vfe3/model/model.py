@@ -13,7 +13,7 @@ import inspect
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Sequence, Tuple, Dict
+from typing import Any, Callable, Mapping, Optional, Sequence, Tuple, Dict
 
 import torch
 import torch.nn.functional as F
@@ -47,7 +47,11 @@ from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.block import _as_coeff, vfe_block
 from vfe3.model.model_frame import resolve_model_frame
 from vfe3.model.positional_phi import apply_positional_phi, positional_phi_coords
-from vfe3.model.prior_bank import PriorBank, get_decode_registration
+from vfe3.model.prior_bank import (
+    PriorBank,
+    get_decode_registration,
+    normalize_legacy_model_state,
+)
 from vfe3.model.stack import vfe_stack
 from vfe3.families.base import get_family
 
@@ -387,6 +391,7 @@ class VFEModel(nn.Module):
                     f"{tuple(built_state)!r}; declared serialization keys are "
                     f"{self._transport_state_keys!r}"
                 )
+
             if len({id(parameter) for parameter in built_state.values()}) != len(built_state):
                 raise ValueError(f"transport {cfg.transport_mode!r} state parameters must be unique")
             for state_key in self._transport_state_keys:
@@ -565,6 +570,20 @@ class VFEModel(nn.Module):
                     stacklevel=2,
                 )
 
+    def load_state_dict(
+        self,
+        state_dict: Mapping[str, Any],
+        strict:     bool = True,
+        assign:     bool = False,
+    ):
+        """Strictly load current state, admitting only exact legacy dormant prior tables."""
+        normalized = normalize_legacy_model_state(
+            state_dict,
+            self.state_dict(),
+            context="VFEModel state_dict",
+        )
+        return super().load_state_dict(normalized, strict=strict, assign=assign)
+
     def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor], recurse: bool = True) -> "VFEModel":
         r"""Carry the gauge group's generators through ``.to(...)`` / ``.cuda()`` etc.
 
@@ -593,7 +612,7 @@ class VFEModel(nn.Module):
         dtype after a ``.to(torch.float64)`` move (audit 2f: the old call omitted dtype). ``prior``
         lets the gamma model-coupling block reuse the same cache under its own attention prior."""
         name = prior if prior is not None else self.cfg.beta_attention_prior
-        dtype = self.prior_bank.mu_embed.dtype
+        dtype = self.prior_bank.phi_embed.dtype
         # Learnable T5 bias: the per-bucket table is a live nn.Parameter that changes every step, so
         # the (name, N, ...) cache MUST be bypassed -- a cached tensor would serve a stale table and
         # sever the gradient. Build fresh each call, passing the parameter as bias_values so the loss
@@ -640,7 +659,7 @@ class VFEModel(nn.Module):
         r"""Cached gauge-RoPE rotation R(theta) for length n (None when pos_rotation='none')."""
         if self.cfg.pos_rotation == "none":
             return None
-        dtype = self.prior_bank.mu_embed.dtype
+        dtype = self.prior_bank.phi_embed.dtype
         key = (n, device, dtype, self.cfg.pos_rotation, self.cfg.rope_base)
         cached = self._rope_cache.get(key)
         if cached is None:
@@ -1867,7 +1886,7 @@ class VFEModel(nn.Module):
         s_sigma_t = fam.transport_dispersion(                        # (B,N,N,K) diag or (B,N,N,K,K) full
             s_sigma, omega, diagonal_out=(s_sigma.dim() == s_mu.dim()))
         e_s = pairwise_energy(
-            fam(s_mu, s_sigma), fam(s_mu_t, s_sigma_t),
+            fam(s_mu, s_sigma), fam.from_transported(s_mu_t, s_sigma_t, s_sigma),
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
         )                                                            # (B,H,N,N) block_glk; (B,N,N) single-block
@@ -2491,7 +2510,8 @@ class VFEModel(nn.Module):
             sigma_t = fam.transport_dispersion(
                 belief.sigma.unsqueeze(0), omega.unsqueeze(0))[0]
         energy = pairwise_energy(
-            fam(belief.mu, belief.sigma), fam(mu_t, sigma_t),
+            fam(belief.mu, belief.sigma),
+            fam.from_transported(mu_t, sigma_t, belief.sigma),
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
         )
@@ -2720,7 +2740,7 @@ class VFEModel(nn.Module):
             mu_t    = transport_mean(omega.unsqueeze(0), out.mu.unsqueeze(0))[0]
             sigma_t = fam.transport_dispersion(out.sigma.unsqueeze(0), omega.unsqueeze(0))[0]
         energy = pairwise_energy(                                    # (N, N) or (H, N, N)
-            fam(out.mu, out.sigma), fam(mu_t, sigma_t),
+            fam(out.mu, out.sigma), fam.from_transported(mu_t, sigma_t, out.sigma),
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family,
             irrep_dims=self.group.irrep_dims,
@@ -2728,7 +2748,7 @@ class VFEModel(nn.Module):
         coupling_energy = None
         if mu_tv is not None:
             coupling_energy = pairwise_energy(
-                fam(out.mu, out.sigma), fam(mu_tv, sigma_tv),
+                fam(out.mu, out.sigma), fam.from_transported(mu_tv, sigma_tv, out.sigma),
                 alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family,
                 irrep_dims=self.group.irrep_dims,
@@ -3177,7 +3197,8 @@ class VFEModel(nn.Module):
                 sigma_t = fam.transport_dispersion(
                     belief.sigma.unsqueeze(0), omega.unsqueeze(0))[0]
             energy = pairwise_energy(                                 # (N, N) or (H, N, N)
-                fam(belief.mu, belief.sigma), fam(mu_t, sigma_t),
+                fam(belief.mu, belief.sigma),
+                fam.from_transported(mu_t, sigma_t, belief.sigma),
                 alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
             )
@@ -3312,14 +3333,16 @@ class VFEModel(nn.Module):
                 sigma_t = fam.transport_dispersion(
                     belief.sigma.unsqueeze(0), omega.unsqueeze(0))[0]
             energy = pairwise_energy(                                 # (N, N) or (H, N, N)
-                fam(belief.mu, belief.sigma), fam(mu_t, sigma_t),
+                fam(belief.mu, belief.sigma),
+                fam.from_transported(mu_t, sigma_t, belief.sigma),
                 alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
             )
             coupling_energy = None
             if mu_tv is not None:
                 coupling_energy = pairwise_energy(
-                    fam(belief.mu, belief.sigma), fam(mu_tv, sigma_tv),
+                    fam(belief.mu, belief.sigma),
+                    fam.from_transported(mu_tv, sigma_tv, belief.sigma),
                     alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                     divergence_family=cfg.divergence_family,
                     irrep_dims=self.group.irrep_dims,

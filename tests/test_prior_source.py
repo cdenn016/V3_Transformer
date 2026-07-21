@@ -71,13 +71,13 @@ def test_model_channel_forces_s_tables():
 
 def test_copy_equivalence_model_channel_equals_token():
     m_tok = _make("token")               # no s tables
-    m_mc = _make("model_channel")        # s tables drawn LAST -> belief tables byte-identical
-    assert torch.equal(m_tok.prior_bank.mu_embed, m_mc.prior_bank.mu_embed)
-    assert torch.equal(m_tok.prior_bank.sigma_log_embed, m_mc.prior_bank.sigma_log_embed)
+    m_mc = _make("model_channel")        # the dormant base tables are registered None
+    assert m_mc.prior_bank.mu_embed is None
+    assert m_mc.prior_bank.sigma_log_embed is None
     assert torch.equal(m_tok.prior_bank.phi_embed, m_mc.prior_bank.phi_embed)
     with torch.no_grad():                # set the model-channel prior EQUAL to the belief prior
-        m_mc.prior_bank.s_mu_embed.copy_(m_mc.prior_bank.mu_embed)
-        m_mc.prior_bank.s_sigma_log_embed.copy_(m_mc.prior_bank.sigma_log_embed)
+        m_mc.prior_bank.s_mu_embed.copy_(m_tok.prior_bank.mu_embed)
+        m_mc.prior_bank.s_sigma_log_embed.copy_(m_tok.prior_bank.sigma_log_embed)
     tok = torch.randint(0, 20, (3, 5))
     tgt = torch.randint(0, 20, (3, 5))
     log_t, loss_t, ce_t = m_tok(tok, tgt)
@@ -103,8 +103,8 @@ def test_copy_equivalence_holds_through_mstep_and_multilayer():
     m_tok = build("token")
     m_mc = build("model_channel")
     with torch.no_grad():
-        m_mc.prior_bank.s_mu_embed.copy_(m_mc.prior_bank.mu_embed)
-        m_mc.prior_bank.s_sigma_log_embed.copy_(m_mc.prior_bank.sigma_log_embed)
+        m_mc.prior_bank.s_mu_embed.copy_(m_tok.prior_bank.mu_embed)
+        m_mc.prior_bank.s_sigma_log_embed.copy_(m_tok.prior_bank.sigma_log_embed)
     tok = torch.randint(0, 20, (3, 6))
     tgt = torch.randint(0, 20, (3, 6))
     log_t, loss_t, _ = m_tok(tok, tgt)       # loss_t includes the M-step self-coupling term
@@ -125,13 +125,11 @@ def test_model_channel_s_is_live_mu_embed_is_dead():
         m.prior_bank.s_mu_embed.add_(torch.randn_like(m.prior_bank.s_mu_embed))
     log1 = m(tok, tgt)[0]
     assert not torch.equal(log0, log1)
-    # mu_embed is bypassed under model_channel: perturbing it does nothing
-    log_a = m(tok, tgt)[0]
-    torch.manual_seed(2)
-    with torch.no_grad():
-        m.prior_bank.mu_embed.add_(torch.randn_like(m.prior_bank.mu_embed))
-    log_b = m(tok, tgt)[0]
-    assert torch.equal(log_a, log_b)
+    # The bypassed base tables are absent from parameters and serialized capacity.
+    assert m.prior_bank.mu_embed is None
+    assert m.prior_bank.sigma_log_embed is None
+    assert "prior_bank.mu_embed" not in m.state_dict()
+    assert "prior_bank.sigma_log_embed" not in m.state_dict()
 
 
 # ---- (4) grad: the prior gradient trains s, not mu_embed, under model_channel -----------------
@@ -144,7 +142,7 @@ def test_model_channel_grad_trains_s_not_mu_embed():
     loss.backward()
     g_s = m.prior_bank.s_mu_embed.grad
     assert g_s is not None and torch.isfinite(g_s).all() and g_s.abs().sum() > 0
-    assert m.prior_bank.mu_embed.grad is None        # mu_embed dead under model_channel -> no grad
+    assert m.prior_bank.mu_embed is None             # dormant base capacity is not registered
 
 
 # ---- (5) config validation -------------------------------------------------------------------

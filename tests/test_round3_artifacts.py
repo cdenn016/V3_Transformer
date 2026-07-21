@@ -16,6 +16,7 @@ from vfe3.config import VFE3Config
 from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import _atomic_replace
+from vfe3.train import _loader_data_identity
 
 
 # ---------------------------------------------------------------- _atomic_replace (punch item 9)
@@ -92,7 +93,13 @@ def test_comparison_emit_closes_figures_after_thunk_or_save_failure(
         model,
         dataset="synthetic-period3",
     )
+    selection_data_identity = _loader_data_identity(_loader(), model.cfg.vocab_size)
+    art.bind_selection_data_identity(selection_data_identity)
     art.maybe_save_best(1, model, 1.0)
+    art.save_json("provenance.json", {
+        "code_identity_sha256":    art.code_identity_sha256,
+        "selection_data_identity": selection_data_identity,
+    })
     monkeypatch.setattr(report, "_build_loader", lambda *args, **kwargs: _loader())
     monkeypatch.setattr(report.extract, "vocab_prediction_stats", lambda *args, **kwargs: {})
     monkeypatch.setattr(report.extract, "decode_readout", lambda *args, **kwargs: None)

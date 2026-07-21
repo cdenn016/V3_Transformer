@@ -341,13 +341,15 @@ def test_finalize_writes_tier3_research_and_provenance() -> None:
     import json
     from vfe3.run_artifacts import RunArtifacts, finalize_run
     from vfe3.runtime import seed_everything
-    cfg = _cfg(log_interval=6, eval_interval=12, eval_max_batches=2, generate_figures=False,
-               deterministic=True)
+    from vfe3.train import _loader_data_identity
+    cfg = _cfg(log_interval=6, eval_interval=12, eval_max_batches=2, generate_figures=True,
+               deterministic=True, evaluate_zero_e_steps_counterfactual=True)
     seed_everything(cfg.seed, deterministic=cfg.deterministic)
     model = VFEModel(cfg).to(DEVICE)
     loader = _loader(cfg)
     with tempfile.TemporaryDirectory() as tmp:
         art = RunArtifacts(tmp, cfg, model, dataset="synthetic-period3", device=str(DEVICE))
+        art.bind_selection_data_identity(_loader_data_identity(loader, cfg.vocab_size))
         losses = train(model, loader, cfg, n_steps=24, log_interval=6, eval_interval=12,
                        val_loader=loader, artifacts=art, device=DEVICE, generate_samples=False)
         res = finalize_run(
@@ -360,8 +362,15 @@ def test_finalize_writes_tier3_research_and_provenance() -> None:
             device=DEVICE,
         )
         root = Path(tmp)
-        # the n_e_steps=0 capacity-gain falsifier is computed and the budget is restored
-        assert "estep_capacity_gain" in res and math.isfinite(res["estep_capacity_gain"])
+        # The n_e_steps=0 counterfactual is opt-in, diagnostic-only, and restores the budget.
+        zero_estep = res["diagnostics"]["zero_e_steps_counterfactual"]
+        assert zero_estep["kind"] == "held_out_inference_depth_counterfactual"
+        assert zero_estep["split"] == "test"
+        assert zero_estep["configured_depth"] == cfg.n_e_steps
+        assert zero_estep["counterfactual_depth"] == 0
+        assert math.isfinite(zero_estep["counterfactual_ce"])
+        assert math.isfinite(zero_estep["ce_delta_vs_headline"])
+        assert "test_ce_no_estep" not in res and "estep_capacity_gain" not in res
         assert model.cfg.n_e_steps == cfg.n_e_steps                # restored after the probe
         # C2/EXP-5: the converged final E-step F/token is persisted (for the F-vs-CE decorrelation)
         assert "estep_final_f_per_token" in res and math.isfinite(res["estep_final_f_per_token"])

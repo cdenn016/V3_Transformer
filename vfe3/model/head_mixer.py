@@ -46,7 +46,7 @@ under DIAGONAL gauges (the diagonal-of-sandwich approximation V3 already uses wh
 ``diagonal_covariance=True``), not under a general tied gauge.
 """
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -54,11 +54,60 @@ from torch import nn
 from vfe3.families.base import get_family
 
 
+def _component_runs(
+    irrep_dims:   Sequence[int],
+    irrep_labels: Optional[Sequence[str]],
+) -> List[Tuple[int, int]]:
+    """Validate the mixer layout and return maximal equal-label block runs."""
+    if len(irrep_dims) < 2:
+        raise ValueError(
+            f"HeadMixer needs >= 2 blocks to mix, got irrep_dims={list(irrep_dims)}; a single-block "
+            f"group (glk / so_k) has nothing to mix. Use block_glk (n_heads >= 2). (If using "
+            f"block_glk with cross_couplings, the off-block basis collapses irrep_dims to [K]; "
+            f"remove cross_couplings or disable the mixer.)"
+        )
+    if irrep_labels is None:
+        if len(set(irrep_dims)) != 1:
+            raise ValueError(
+                f"HeadMixer needs equal-size blocks for kron(A, I_d), got "
+                f"irrep_dims={list(irrep_dims)}. A labeled irrep tower (so_n/sp_n) mixes per "
+                f"isotypic component instead."
+            )
+        return [(0, len(irrep_dims))]
+    if len(irrep_labels) != len(irrep_dims):
+        raise ValueError(
+            f"irrep_labels has {len(irrep_labels)} entries but there are "
+            f"{len(irrep_dims)} irrep blocks"
+        )
+    runs, i = [], 0
+    while i < len(irrep_dims):
+        j = i
+        while j < len(irrep_dims) and irrep_labels[j] == irrep_labels[i]:
+            j += 1
+        runs.append((i, j))
+        i = j
+    for i, j in runs:
+        if len(set(irrep_dims[i:j])) != 1:
+            raise ValueError(
+                f"blocks {i}:{j} share label {irrep_labels[i]!r} but have unequal dims "
+                f"{list(irrep_dims[i:j])}; copies of one irrep must share its dimension"
+            )
+    return runs
+
+
 class HeadMixer(nn.Module):
     r"""Isotypic per-component mixer: one :math:`A_t = \exp(\Delta_t)` per maximal run of
     equal-labeled blocks, embedded as :math:`\mathrm{blockdiag}_t(A_t \otimes I_{d_t})` --
     the full linear commutant of the tower for real-type irreps. Without labels the whole
     group must be one equal-dims component (the legacy behavior, byte-identical)."""
+
+    @staticmethod
+    def parameter_count(
+        irrep_dims:   Sequence[int],
+        irrep_labels: Optional[Sequence[str]] = None,
+    ) -> int:
+        """Exact trainable scalar count for the validated component layout."""
+        return sum((j - i) ** 2 for i, j in _component_runs(irrep_dims, irrep_labels))
 
     def __init__(
         self,
@@ -71,40 +120,7 @@ class HeadMixer(nn.Module):
         super().__init__()
         self.family_name = family
         self._family = get_family(family)
-        if len(irrep_dims) < 2:
-            raise ValueError(
-                f"HeadMixer needs >= 2 blocks to mix, got irrep_dims={irrep_dims}; a single-block "
-                f"group (glk / so_k) has nothing to mix. Use block_glk (n_heads >= 2). (If using "
-                f"block_glk with cross_couplings, the off-block basis collapses irrep_dims to [K]; "
-                f"remove cross_couplings or disable the mixer.)"
-            )
-        if irrep_labels is None:
-            if len(set(irrep_dims)) != 1:
-                raise ValueError(
-                    f"HeadMixer needs equal-size blocks for kron(A, I_d), got "
-                    f"irrep_dims={irrep_dims}. A labeled irrep tower (so_n/sp_n) mixes per "
-                    f"isotypic component instead."
-                )
-            runs = [(0, len(irrep_dims))]                       # one component: all blocks
-        else:
-            if len(irrep_labels) != len(irrep_dims):
-                raise ValueError(
-                    f"irrep_labels has {len(irrep_labels)} entries but there are "
-                    f"{len(irrep_dims)} irrep blocks"
-                )
-            runs, i = [], 0                                     # maximal runs of equal labels
-            while i < len(irrep_dims):
-                j = i
-                while j < len(irrep_dims) and irrep_labels[j] == irrep_labels[i]:
-                    j += 1
-                runs.append((i, j))
-                i = j
-            for i, j in runs:
-                if len(set(irrep_dims[i:j])) != 1:
-                    raise ValueError(
-                        f"blocks {i}:{j} share label {irrep_labels[i]!r} but have unequal dims "
-                        f"{irrep_dims[i:j]}; copies of one irrep must share its dimension"
-                    )
+        runs = _component_runs(irrep_dims, irrep_labels)
         # components: (coordinate start, copies m, block dim d); spec layout makes runs contiguous
         starts = [0]
         for d in irrep_dims:

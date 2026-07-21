@@ -1,0 +1,301 @@
+{
+  "schema_version": "1.0",
+  "mode": "closure",
+  "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+  "claims": [
+    {
+      "id": "H1-bounded-validation-diagnostics",
+      "domain": "code",
+      "statement": "Active validation diagnostics preserve their outputs while decoding only a one-sequence snapshot, and the current RTX 5090 regression demonstrates bounded peak allocation; this does not assert that the historical implementation produced a measured OOM.",
+      "severity": "high",
+      "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "bounded allocation and diagnostic preservation", "score": 20}],
+      "escalation_triggers": ["high_severity"],
+      "escalation_target": 4,
+      "views": {
+        "calibration_kind": "implementation, allocation, adversarial, and adjudication views",
+        "unresolved_disagreement": false,
+        "comparison": {
+          "method": "pairwise",
+          "candidate_count": 2,
+          "candidate_ids": ["bounded-current", "historical-copy-pair"],
+          "candidate_descriptions": [
+            {"id": "bounded-current", "description": "Current implementation decodes one aligned diagnostic sequence and releases the snapshot."},
+            {"id": "historical-copy-pair", "description": "Historical implementation materializes the full validation logits copy pair for diagnostics."}
+          ],
+          "pivot_ids": [],
+          "orders": ["AB", "BA"],
+          "matches": [
+            {"left": "bounded-current", "right": "historical-copy-pair", "view_id": "H1-source", "outcome": "left", "criteria": [{"name": "bounded allocation and diagnostic preservation", "score": 20}], "result_location": "docs/2026-07-20-edits.md#bounded-validation-diagnostics"},
+            {"left": "historical-copy-pair", "right": "bounded-current", "view_id": "H1-skeptic", "outcome": "right", "criteria": [{"name": "bounded allocation and diagnostic preservation", "score": 20}], "result_location": ".superpowers/sdd/task-14-report.md#cuda-marker-lane"}
+          ]
+        },
+        "scores": [
+          {"view_id": "H1-source", "criteria": [{"name": "bounded allocation and diagnostic preservation", "score": 20}]},
+          {"view_id": "H1-allocation", "criteria": [{"name": "bounded allocation and diagnostic preservation", "score": 20}]},
+          {"view_id": "H1-skeptic", "criteria": [{"name": "bounded allocation and diagnostic preservation", "score": 20}]},
+          {"view_id": "H1-adjudication", "criteria": [{"name": "bounded allocation and diagnostic preservation", "score": 20}]}
+        ]
+      },
+      "evidence": [
+        {"id": "H1-mechanical", "kind": "mechanical", "location": "docs/2026-07-20-edits.md Task 6; focused JUnit C:/tmp/vfe3-task06-lifetime-full-green.xml SHA-256 304B0C4FEE1FF8EC8AE424AD00E727634C0CCF5954918D21E6EFCF2667EB7E3B; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505, tests=4224 failures=0 errors=0 skipped=39", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"},
+        {"id": "H1-cuda", "kind": "reproduced_output", "location": "RTX 5090 JUnit post-review-cuda-lane.xml SHA-256 EFA94CEAB97EEFFCDFEA5A0A1E265AF58C6B6ACB85AD3B5597704AB7FEF97A1E, tests=24 failures=0 errors=0 skipped=0; H1 bounded-peak node passed in 0.703 seconds", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}
+      ],
+      "counterevidence": [],
+      "verifiers": [
+        {"role": "verifier-skeptic", "view_ids": ["H1-skeptic"], "result": "support", "evidence_ids": ["H1-cuda"], "result_location": ".superpowers/sdd/task-14-report.md#cuda-marker-lane"},
+        {"role": "verifier-adjudicator", "view_ids": ["H1-source", "H1-allocation", "H1-skeptic", "H1-adjudication"], "result": "support", "evidence_ids": ["H1-cuda", "H1-mechanical"], "result_location": "docs/2026-07-20-edits.md#full-audit-remediation-final-verification"}
+      ],
+      "open_obligations": [],
+      "evidence_invalidated": false
+    },
+    {
+      "id": "M1-owned-binary-cache",
+      "domain": "code",
+      "statement": "An uncapped binary cache owns immutable token storage after identity binding, so external writable mappings cannot drift the loaded data.",
+      "severity": "medium",
+      "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}],
+      "escalation_triggers": [],
+      "escalation_target": 2,
+      "views": {
+        "calibration_kind": "independent source and regression views",
+        "unresolved_disagreement": false,
+        "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "Identity-bound cache data is owned."}, {"id": "unfixed", "description": "Identity-bound cache data aliases writable external storage."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "M1-source", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#binary-cache-ownership-and-resolved-identity"}, {"left": "unfixed", "right": "fixed", "view_id": "M1-test", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-task01-count-green.xml"}]},
+        "scores": [{"view_id": "M1-source", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "M1-test", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]
+      },
+      "evidence": [{"id": "M1-mechanical", "kind": "mechanical", "location": "Focused JUnit C:/tmp/vfe3-fixall-task01-count-green.xml tests=28 failures=0 errors=0 skipped=1; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505 tests=4224 failures=0 errors=0 skipped=39", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [],
+      "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["M1-source", "M1-test"], "result": "support", "evidence_ids": ["M1-mechanical"], "result_location": ".superpowers/sdd/task-1-report.md"}],
+      "open_obligations": [],
+      "evidence_invalidated": false
+    },
+    {
+      "id": "M2-resolved-cache-sidecars",
+      "domain": "code",
+      "statement": "Binary-cache payload, metadata, provenance, and cached-token-count operations use one resolved path family, including symlinked payloads.",
+      "severity": "medium",
+      "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}],
+      "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "independent source and regression views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "All cache identities use the resolved payload family."}, {"id": "unfixed", "description": "Symlink payload and sidecars split across unresolved and resolved paths."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "M2-source", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#binary-cache-ownership-and-resolved-identity"}, {"left": "unfixed", "right": "fixed", "view_id": "M2-test", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-task01-count-green.xml"}]}, "scores": [{"view_id": "M2-source", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "M2-test", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]},
+      "evidence": [{"id": "M2-mechanical", "kind": "mechanical", "location": "Focused JUnit C:/tmp/vfe3-fixall-task01-count-green.xml tests=28 failures=0 errors=0 skipped=1; symlink case is environment-skipped only on Windows privilege denial; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["M2-source", "M2-test"], "result": "support", "evidence_ids": ["M2-mechanical"], "result_location": ".superpowers/sdd/task-1-report.md"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "M3-selected-model-identity-validation",
+      "domain": "code",
+      "statement": "Final selected-model evaluation validates code, configuration, data, selection, and provenance identities at a nonmutating load boundary.",
+      "severity": "medium", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "independent source and regression views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "Selected-model loading enforces exact identity validation."}, {"id": "unfixed", "description": "Final evaluation loads selected weights without identity validation."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "M3-source", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#selected-model-identity-and-finite-state-validation"}, {"left": "unfixed", "right": "fixed", "view_id": "M3-test", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-task04-live-prescribed-green.xml"}]}, "scores": [{"view_id": "M3-source", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "M3-test", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]},
+      "evidence": [{"id": "M3-mechanical", "kind": "mechanical", "location": "Focused JUnit C:/tmp/vfe3-fixall-task04-live-prescribed-green.xml tests=175 failures=0 errors=0 skipped=1; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["M3-source", "M3-test"], "result": "support", "evidence_ids": ["M3-mechanical"], "result_location": ".superpowers/sdd/task-4-report.md"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "M4-reject-nonfinite-model-state",
+      "domain": "code",
+      "statement": "Checkpoint and selected-bundle validation rejects NaN and infinite floating model tensors before restoration or publication.",
+      "severity": "medium", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "independent source and regression views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "Nonfinite floating model tensors fail validation."}, {"id": "unfixed", "description": "Resume validation accepts NaN or infinite tensors."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "M4-source", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#selected-model-identity-and-finite-state-validation"}, {"left": "unfixed", "right": "fixed", "view_id": "M4-test", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-task04-controller-final.xml"}]}, "scores": [{"view_id": "M4-source", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "M4-test", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]},
+      "evidence": [{"id": "M4-mechanical", "kind": "mechanical", "location": "Focused JUnit C:/tmp/vfe3-fixall-task04-controller-final.xml tests=167 failures=0 errors=0 skipped=1; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["M4-source", "M4-test"], "result": "support", "evidence_ids": ["M4-mechanical"], "result_location": ".superpowers/sdd/task-4-report.md"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "M5-reject-invalid-class-ids",
+      "domain": "code",
+      "statement": "Fused chunked cross-entropy validates targets once and rejects every nonignored class ID outside the vocabulary range.",
+      "severity": "medium", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "independent source and regression views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "Fused decoder validates all class IDs."}, {"id": "unfixed", "description": "Invalid class IDs are silently scored."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "M5-source", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#runtime-metric-input-validation"}, {"left": "unfixed", "right": "fixed", "view_id": "M5-test", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-task07-green.xml"}]}, "scores": [{"view_id": "M5-source", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "M5-test", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]},
+      "evidence": [{"id": "M5-mechanical", "kind": "mechanical", "location": "Focused JUnit C:/tmp/vfe3-fixall-task07-green.xml SHA-256 F85D5CCB67E6B8D29C700C7D543197CD3B40B45E353F4B50D59695FA4355D92A tests=117 failures=0 errors=0 skipped=0; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["M5-source", "M5-test"], "result": "support", "evidence_ids": ["M5-mechanical"], "result_location": ".superpowers/sdd/task-7-report.md"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "M6-undefined-empty-evaluation",
+      "domain": "code",
+      "statement": "Evaluation with zero valid targets raises an undefined-metric error instead of reporting perfect perplexity.",
+      "severity": "medium", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "independent source and regression views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "Empty evaluation is explicitly undefined."}, {"id": "unfixed", "description": "Empty evaluation reports perplexity one."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "M6-source", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#runtime-metric-input-validation"}, {"left": "unfixed", "right": "fixed", "view_id": "M6-test", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-task07-green.xml"}]}, "scores": [{"view_id": "M6-source", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "M6-test", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]},
+      "evidence": [{"id": "M6-mechanical", "kind": "mechanical", "location": "Focused JUnit C:/tmp/vfe3-fixall-task07-green.xml SHA-256 F85D5CCB67E6B8D29C700C7D543197CD3B40B45E353F4B50D59695FA4355D92A tests=117 failures=0 errors=0 skipped=0; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["M6-source", "M6-test"], "result": "support", "evidence_ids": ["M6-mechanical"], "result_location": ".superpowers/sdd/task-7-report.md"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "M7-exact-estep-truncation",
+      "domain": "code",
+      "statement": "The E-step backpropagation suffix requires an exact plain integer within its valid range and preserves the requested complete differentiable suffix.",
+      "severity": "medium", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "independent configuration and runtime views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "Exact validated suffix length drives runtime graph construction."}, {"id": "unfixed", "description": "Fractional truncation silently changes graph connectivity."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "M7-config", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#strict-configuration-and-loader-types"}, {"left": "unfixed", "right": "fixed", "view_id": "M7-runtime", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-task07-green.xml"}]}, "scores": [{"view_id": "M7-config", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "M7-runtime", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]},
+      "evidence": [{"id": "M7-mechanical", "kind": "mechanical", "location": "Task 2 configuration JUnit C:/tmp/vfe3-fixall-task02-green.xml tests=347 failures=0 errors=0 skipped=0; Task 7 runtime JUnit C:/tmp/vfe3-fixall-task07-green.xml tests=117 failures=0 errors=0 skipped=0; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["M7-config", "M7-runtime"], "result": "support", "evidence_ids": ["M7-mechanical"], "result_location": ".superpowers/sdd/task-7-report.md"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "M8-additive-encoder-update-compatibility",
+      "domain": "code",
+      "statement": "Configuration rejects the additive phi encoder with the group-chart updater because that encoder has no stored group-chart state.",
+      "severity": "medium", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "independent compatibility and regression views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "Incompatible encoder and updater are rejected before execution."}, {"id": "unfixed", "description": "Additive encoder can receive a group-chart update."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "M8-source", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#strict-configuration-and-loader-types"}, {"left": "unfixed", "right": "fixed", "view_id": "M8-test", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-task02-green.xml"}]}, "scores": [{"view_id": "M8-source", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "M8-test", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]},
+      "evidence": [{"id": "M8-mechanical", "kind": "mechanical", "location": "Focused configuration JUnit C:/tmp/vfe3-fixall-task02-green.xml tests=347 failures=0 errors=0 skipped=0; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["M8-source", "M8-test"], "result": "support", "evidence_ids": ["M8-mechanical"], "result_location": ".superpowers/sdd/task-2-report.md"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "M9-registered-trainable-transport-state",
+      "domain": "code",
+      "statement": "A transport registration can declare, construct, optimize, serialize, and replay a new trainable state bundle without central name branches.",
+      "severity": "medium", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "independent registry and execution views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "Transport registration owns arbitrary state construction and metadata."}, {"id": "unfixed", "description": "Central consumers hardcode connection state names."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "M9-registry", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#registry-owned-trainable-transport-state"}, {"left": "unfixed", "right": "fixed", "view_id": "M9-runtime", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": ".superpowers/sdd/task-8-report.md"}]}, "scores": [{"view_id": "M9-registry", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "M9-runtime", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]},
+      "evidence": [{"id": "M9-mechanical", "kind": "mechanical", "location": "Focused transport registry matrix in docs/2026-07-20-edits.md reports 171 tests failures=0 errors=0 skipped=0; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["M9-registry", "M9-runtime"], "result": "support", "evidence_ids": ["M9-mechanical"], "result_location": ".superpowers/sdd/task-8-report.md"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "M10-full-gaussian-self-kl",
+      "domain": "mathematics",
+      "statement": "For identical full Gaussian operands, the closed-form KL and its derivative along a shared covariance perturbation are exactly zero; the implementation's float64 island preserves this identity within the stated numerical tolerances and public dtype policy.",
+      "severity": "medium", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "derivation validity and implementation agreement", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "analytic derivation and adversarial numerical-oracle views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["identity", "false-residual"], "candidate_descriptions": [{"id": "identity", "description": "Exact self-KL and shared covariance derivative both vanish."}, {"id": "false-residual", "description": "Finite-precision factorization creates a nonzero mathematical self-divergence or derivative."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "identity", "right": "false-residual", "view_id": "M10-derivation", "outcome": "left", "criteria": [{"name": "derivation validity and implementation agreement", "score": 20}], "result_location": "docs/2026-07-20-edits.md#full-gaussian-float64-numerical-island"}, {"left": "false-residual", "right": "identity", "view_id": "M10-oracle", "outcome": "right", "criteria": [{"name": "derivation validity and implementation agreement", "score": 20}], "result_location": "tests/test_audit_full_gaussian_numerics_20260720.py"}]}, "scores": [{"view_id": "M10-derivation", "criteria": [{"name": "derivation validity and implementation agreement", "score": 20}]}, {"view_id": "M10-oracle", "criteria": [{"name": "derivation validity and implementation agreement", "score": 20}]}]},
+      "evidence": [
+        {"id": "M10-proof", "kind": "derivation", "location": "docs/2026-07-20-edits.md#full-gaussian-float64-numerical-island: KL(q||q)=0.5*(tr(Sigma^-1 Sigma)-K+logdet(Sigma)-logdet(Sigma))=0; along shared dSigma, d tr(Sigma^-1 Sigma)=tr(-Sigma^-1 dSigma+Sigma^-1 dSigma)=0 and logdet differentials cancel", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"},
+        {"id": "M10-numerical", "kind": "numerical", "location": "Focused JUnit C:/tmp/vfe3-fixall-task09-device-green.xml SHA-256 5350D2CA48514ABDDC45EC61DC16D8955557A7E8BAB249DACF516406B2FD3151 tests=30 failures=0 errors=0 skipped=0; RTX 5090 mirror in post-review-cuda-lane.xml passed; final CPU JUnit SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}
+      ],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["M10-derivation", "M10-oracle"], "result": "support", "evidence_ids": ["M10-proof", "M10-numerical"], "result_location": ".superpowers/sdd/task-9-report.md#exact-audit-construction-and-mathematical-obligation"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "M11-large-n-extrapolation-tail",
+      "domain": "code",
+      "statement": "Growing-sequence extrapolation is complete only when every configured point, including the large-N tail, is finite, valid, and successful.",
+      "severity": "medium", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "independent controller and point-contract views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "Completion requires the entire declared extrapolation tail."}, {"id": "unfixed", "description": "A partial prefix can be declared complete."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "M11-controller", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#growing-sequence-and-ablation-contracts"}, {"left": "unfixed", "right": "fixed", "view_id": "M11-points", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-task05-controller-green.xml"}]}, "scores": [{"view_id": "M11-controller", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "M11-points", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]},
+      "evidence": [{"id": "M11-mechanical", "kind": "mechanical", "location": "Focused JUnit C:/tmp/vfe3-fixall-task05-controller-green.xml tests=76 failures=0 errors=0 skipped=0; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["M11-controller", "M11-points"], "result": "support", "evidence_ids": ["M11-mechanical"], "result_location": ".superpowers/sdd/task-5-report.md"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "M12-exact-boolean-config",
+      "domain": "code",
+      "statement": "Boolean configuration fields in the audited surface require exact plain booleans rather than truthy values.",
+      "severity": "medium", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "independent validator and compatibility views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "Audited Boolean fields reject non-Boolean values."}, {"id": "unfixed", "description": "Truthy strings and numbers pass Boolean validation."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "M12-validator", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#strict-configuration-and-loader-types"}, {"left": "unfixed", "right": "fixed", "view_id": "M12-compat", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-task02-green.xml"}]}, "scores": [{"view_id": "M12-validator", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "M12-compat", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]},
+      "evidence": [{"id": "M12-mechanical", "kind": "mechanical", "location": "Focused JUnit C:/tmp/vfe3-fixall-task02-green.xml tests=347 failures=0 errors=0 skipped=0; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["M12-validator", "M12-compat"], "result": "support", "evidence_ids": ["M12-mechanical"], "result_location": ".superpowers/sdd/task-2-report.md"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "M13-exact-integer-config",
+      "domain": "code",
+      "statement": "Core integer configuration fields require exact plain integers and reject booleans and fractional values.",
+      "severity": "medium", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "independent validator and boundary views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "Integer fields accept only plain integers in range."}, {"id": "unfixed", "description": "Booleans and fractional numbers pass integer validation."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "M13-validator", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#strict-configuration-and-loader-types"}, {"left": "unfixed", "right": "fixed", "view_id": "M13-boundary", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-task02-green.xml"}]}, "scores": [{"view_id": "M13-validator", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "M13-boundary", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]},
+      "evidence": [{"id": "M13-mechanical", "kind": "mechanical", "location": "Focused JUnit C:/tmp/vfe3-fixall-task02-green.xml tests=347 failures=0 errors=0 skipped=0; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["M13-validator", "M13-boundary"], "result": "support", "evidence_ids": ["M13-mechanical"], "result_location": ".superpowers/sdd/task-2-report.md"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "M14-ablation-flags-before-coercion",
+      "domain": "code",
+      "statement": "Ablation diagnostic flags are type-validated before any Boolean coercion, so strings cannot silently enable diagnostics.",
+      "severity": "medium", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "independent parser and controller views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "Diagnostic flags are checked before conversion."}, {"id": "unfixed", "description": "String flags become truthy before validation."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "M14-parser", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#growing-sequence-and-ablation-contracts"}, {"left": "unfixed", "right": "fixed", "view_id": "M14-controller", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-task05-green.xml"}]}, "scores": [{"view_id": "M14-parser", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "M14-controller", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]},
+      "evidence": [{"id": "M14-mechanical", "kind": "mechanical", "location": "Focused JUnit C:/tmp/vfe3-fixall-task05-green.xml tests=67 failures=0 errors=0 skipped=0; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["M14-parser", "M14-controller"], "result": "support", "evidence_ids": ["M14-mechanical"], "result_location": ".superpowers/sdd/task-5-report.md"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "M15-route-owned-prior-capacity",
+      "domain": "code",
+      "statement": "Dormant base prior vocabulary tables are absent from parameter counts and optimization unless an executable encode, prior, or decode route consumes them.",
+      "severity": "medium", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "independent route and capacity views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "Only route-consumable prior tables are allocated."}, {"id": "unfixed", "description": "Dormant vocabulary tables inflate active capacity and optimizer state."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "M15-route", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#routed-prior-table-capacity-and-legacy-compatibility"}, {"left": "unfixed", "right": "fixed", "view_id": "M15-capacity", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-task10-prescribed-green.xml"}]}, "scores": [{"view_id": "M15-route", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "M15-capacity", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]},
+      "evidence": [{"id": "M15-mechanical", "kind": "mechanical", "location": "Task 10 prescribed JUnit C:/tmp/vfe3-fixall-task10-prescribed-green.xml SHA-256 2CEB8952E5B8B210DC5A80058145A5BFA6236E273C6BEEE56840109548EEB5DC tests=129 failures=0 errors=0 skipped=0 plus refreshed 145-test prescribed matrix; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["M15-route", "M15-capacity"], "result": "support", "evidence_ids": ["M15-mechanical"], "result_location": ".superpowers/sdd/task-10-report.md"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "M16-opt-in-zero-estep-evaluation",
+      "domain": "code",
+      "statement": "Finalization performs the second full held-out zero-E-step evaluation only under an exact opt-in and publishes it only as a diagnostic while restoring configured depth.",
+      "severity": "medium", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "independent disabled and enabled route views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "Counterfactual evaluation is exact opt-in and diagnostic-only."}, {"id": "unfixed", "description": "Finalization always repeats held-out evaluation at zero E-steps."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "M16-disabled", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#opt-in-zero-e-step-counterfactual"}, {"left": "unfixed", "right": "fixed", "view_id": "M16-enabled", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-task11-green-v2.xml"}]}, "scores": [{"view_id": "M16-disabled", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "M16-enabled", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]},
+      "evidence": [{"id": "M16-mechanical", "kind": "mechanical", "location": "Focused JUnit C:/tmp/vfe3-fixall-task11-audit-green-v2.xml SHA-256 F2C553ED560F4EC1C6BDAE069DC758933E73D79B2336183ECF7A02DB81DF16CC tests=5 failures=0 errors=0 skipped=0; broad JUnit C:/tmp/vfe3-fixall-task11-green-v2.xml SHA-256 130D663A0A515CFAF0CDF25D73C14513D7F44662816345D31BD3C090AEE373B5 tests=102 failures=0 errors=0 skipped=1; final CPU JUnit SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["M16-disabled", "M16-enabled"], "result": "support", "evidence_ids": ["M16-mechanical"], "result_location": ".superpowers/sdd/task-11-report.md"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "M17-exact-loader-booleans",
+      "domain": "code",
+      "statement": "Data-loader shuffle and drop-last controls require exact booleans, preventing string booleans from shuffling evaluation or omitting its tail.",
+      "severity": "medium", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "independent loader and boundary views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "Loader Boolean controls require plain booleans."}, {"id": "unfixed", "description": "String booleans alter evaluation ordering and tail coverage."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "M17-loader", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#strict-configuration-and-loader-types"}, {"left": "unfixed", "right": "fixed", "view_id": "M17-boundary", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-task02-green.xml"}]}, "scores": [{"view_id": "M17-loader", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "M17-boundary", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]},
+      "evidence": [{"id": "M17-mechanical", "kind": "mechanical", "location": "Focused JUnit C:/tmp/vfe3-fixall-task02-green.xml tests=347 failures=0 errors=0 skipped=0; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["M17-loader", "M17-boundary"], "result": "support", "evidence_ids": ["M17-mechanical"], "result_location": ".superpowers/sdd/task-2-report.md"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "L1-strict-figure-worker-schema",
+      "domain": "code",
+      "statement": "Figure-worker finalization validates all required fields and their exact nullable or nonnullable types before rendering or coercion.",
+      "severity": "low", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "independent schema and no-render views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "Worker schema rejects omitted or mistyped fields before rendering."}, {"id": "unfixed", "description": "Worker fields are permissively coerced or omitted."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "L1-schema", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#strict-finalize-worker-and-process-contracts"}, {"left": "unfixed", "right": "fixed", "view_id": "L1-order", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-task03-review-green-final.xml"}]}, "scores": [{"view_id": "L1-schema", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "L1-order", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]},
+      "evidence": [{"id": "L1-mechanical", "kind": "mechanical", "location": "Focused JUnit C:/tmp/vfe3-fixall-task03-review-green-final.xml tests=60 failures=0 errors=0 skipped=0; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["L1-schema", "L1-order"], "result": "support", "evidence_ids": ["L1-mechanical"], "result_location": ".superpowers/sdd/task-3-report.md"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "L2-process-command-sequence",
+      "domain": "code",
+      "statement": "Process-tree commands reject string and byte outer values and require a nonempty sequence of nonempty string arguments.",
+      "severity": "low", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "independent type and execution-boundary views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "Process commands require a valid argument sequence."}, {"id": "unfixed", "description": "A bare string is decomposed into character arguments."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "L2-type", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#strict-finalize-worker-and-process-contracts"}, {"left": "unfixed", "right": "fixed", "view_id": "L2-boundary", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-task03-review-green-final.xml"}]}, "scores": [{"view_id": "L2-type", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "L2-boundary", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]},
+      "evidence": [{"id": "L2-mechanical", "kind": "mechanical", "location": "Focused JUnit C:/tmp/vfe3-fixall-task03-review-green-final.xml tests=60 failures=0 errors=0 skipped=0; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["L2-type", "L2-boundary"], "result": "support", "evidence_ids": ["L2-mechanical"], "result_location": ".superpowers/sdd/task-3-report.md"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "L3-positive-plain-irrep-multiplicity",
+      "domain": "code",
+      "statement": "Irrep multiplicities require positive plain integers and reject Boolean one.",
+      "severity": "low", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "current-artifact code closure", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "independent type and value-boundary views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["fixed", "unfixed"], "candidate_descriptions": [{"id": "fixed", "description": "Multiplicities are positive plain integers."}, {"id": "unfixed", "description": "Boolean true is accepted as multiplicity one."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "fixed", "right": "unfixed", "view_id": "L3-type", "outcome": "left", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "docs/2026-07-20-edits.md#strict-configuration-and-loader-types"}, {"left": "unfixed", "right": "fixed", "view_id": "L3-value", "outcome": "right", "criteria": [{"name": "current-artifact code closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-task02-green.xml"}]}, "scores": [{"view_id": "L3-type", "criteria": [{"name": "current-artifact code closure", "score": 20}]}, {"view_id": "L3-value", "criteria": [{"name": "current-artifact code closure", "score": 20}]}]},
+      "evidence": [{"id": "L3-mechanical", "kind": "mechanical", "location": "Focused JUnit C:/tmp/vfe3-fixall-task02-green.xml tests=347 failures=0 errors=0 skipped=0; final CPU JUnit C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["L3-type", "L3-value"], "result": "support", "evidence_ids": ["L3-mechanical"], "result_location": ".superpowers/sdd/task-2-report.md"}], "open_obligations": [], "evidence_invalidated": false
+    },
+    {
+      "id": "aggregate-original-ten-baseline-failures",
+      "domain": "code",
+      "statement": "The exact ten failures reproduced on the clean audit baseline all pass on the frozen final remediation artifact without deselection.",
+      "severity": "medium", "state": "EVIDENCE_VERIFIED",
+      "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f",
+      "criteria": [{"name": "exact baseline-failure closure", "score": 20}], "escalation_triggers": [], "escalation_target": 2,
+      "views": {"calibration_kind": "exact-node and complete-suite views", "unresolved_disagreement": false, "comparison": {"method": "pairwise", "candidate_count": 2, "candidate_ids": ["remediated", "baseline"], "candidate_descriptions": [{"id": "remediated", "description": "All exact baseline failure nodes pass on the final artifact."}, {"id": "baseline", "description": "The same exact nodes fail on clean origin/main baseline."}], "pivot_ids": [], "orders": ["AB", "BA"], "matches": [{"left": "remediated", "right": "baseline", "view_id": "aggregate-exact", "outcome": "left", "criteria": [{"name": "exact baseline-failure closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-original-ten.xml"}, {"left": "baseline", "right": "remediated", "view_id": "aggregate-full", "outcome": "right", "criteria": [{"name": "exact baseline-failure closure", "score": 20}], "result_location": "C:/tmp/vfe3-fixall-full-cpu-final-20260721.xml"}]}, "scores": [{"view_id": "aggregate-exact", "criteria": [{"name": "exact baseline-failure closure", "score": 20}]}, {"view_id": "aggregate-full", "criteria": [{"name": "exact baseline-failure closure", "score": 20}]}]},
+      "evidence": [{"id": "aggregate-mechanical", "kind": "reproduced_output", "location": "Exact-node JUnit C:/tmp/vfe3-fixall-original-ten.xml SHA-256 7DDA7DF9415BEF02B1B09A14F17042BCBBE40066F0CD612F2C0D4A6DA9596006 tests=10 failures=0 errors=0 skipped=0; audit cohort C:/tmp/vfe3-fixall-audit-focused.xml SHA-256 DF053BECFF782024D67618158B6C0D7D6D174D82553E97C3E857545C8674F49F tests=292 failures=0 errors=0 skipped=2; final CPU JUnit SHA-256 9F5F3CD67A6AA4F33AD989DAE8C7B75864CCA751115A403EF9551A0CF9FB4505 tests=4224 failures=0 errors=0 skipped=39", "artifact_revision": "git:1de67f8d6804bfc3eea355a32b2922d7f7af416e:sha256:71d2b7138dfebe03ac4fba58254c9f08bf41c135b223533b589abb0f8a809f6f"}],
+      "counterevidence": [], "verifiers": [{"role": "verifier-adjudicator", "view_ids": ["aggregate-exact", "aggregate-full"], "result": "support", "evidence_ids": ["aggregate-mechanical"], "result_location": ".superpowers/sdd/task-13-report.md#exact-original-ten"}], "open_obligations": [], "evidence_invalidated": false
+    }
+  ]
+}

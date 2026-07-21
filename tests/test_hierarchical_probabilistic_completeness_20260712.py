@@ -759,7 +759,8 @@ def _gamma_e_s_reference(m, tok, phi, *, mu_state, sigma_state):
     s_mu_t = _transport_mean(omega, s_mu)
     s_sigma_t = fam.transport_dispersion(
         s_sigma, omega, diagonal_out=(s_sigma.dim() == s_mu.dim()))
-    return _pairwise_energy(fam(s_mu, s_sigma), fam(s_mu_t, s_sigma_t),
+    return _pairwise_energy(fam(s_mu, s_sigma),
+                            fam.from_transported(s_mu_t, s_sigma_t, s_sigma),
                             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                             divergence_family=cfg.divergence_family,
                             irrep_dims=m.group.irrep_dims)
@@ -775,7 +776,8 @@ def _belief_channel_energy(m, tok, phi):
     q_mu_t = _transport_mean(omega, enc.mu)
     q_sigma_t = fam.transport_dispersion(
         enc.sigma, omega, diagonal_out=(enc.sigma.dim() == enc.mu.dim()))
-    return _pairwise_energy(fam(enc.mu, enc.sigma), fam(q_mu_t, q_sigma_t),
+    return _pairwise_energy(fam(enc.mu, enc.sigma),
+                            fam.from_transported(q_mu_t, q_sigma_t, enc.sigma),
                             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                             divergence_family=cfg.divergence_family,
                             irrep_dims=m.group.irrep_dims)

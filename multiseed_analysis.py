@@ -754,7 +754,8 @@ CONFIG: Dict[str, Any] = {
 # Dotted keys dig into nested research blocks.
 SCALAR_KEYS: List[str] = [
     "test_ppl", "best_val_ppl", "test_ce", "test_bits_per_token", "test_bpc",
-    "test_ce_no_estep", "estep_capacity_gain",
+    "diagnostics.zero_e_steps_counterfactual.counterfactual_ce",
+    "diagnostics.zero_e_steps_counterfactual.ce_delta_vs_headline",
     "wall_time_s", "ece", "overall_ce", "sigma_trace_cv", "sigma_ce_spearman",
     "fd_gradient_worst_rel_error",
     "corpus_freq_strata_ce.rare", "corpus_freq_strata_ce.mid", "corpus_freq_strata_ce.frequent",

@@ -7,15 +7,17 @@ enriched ``scaling_point`` block (n_params, n_gen, active-params-per-token, FLOP
 There is no CLI arg parsing (project policy): edit the ``CONFIG`` dict and the active ``ROUTES`` at the
 bottom, then run ``python scaling.py``. Aggregate + fit + plot afterwards with ``scaling_analysis.py``.
 
-WHY A PARAMETER AXIS IS SUBTLE HERE (read before picking a grid). The pure-path parameters are the
-prior tables only: ``mu_embed (V,K)``, ``sigma_log_embed (V,K)``, ``phi_embed (V,n_gen)``, and a scalar
-(prior_bank.py). So ``N = 2*V*K + V*n_gen + 1`` with ``V=50257``, and ``phi_embed = V*n_gen`` usually
-DOMINATES. ``n_gen`` is set by the gauge group: for ``block_glk`` it is ``K^2/n_heads`` (so FEWER/larger
+WHY A PARAMETER AXIS IS SUBTLE HERE (read before picking a grid). The token-prior pure path has
+``mu_embed (V,K)``, ``sigma_log_embed (V,K)``, ``phi_embed (V,n_gen)``, and a scalar
+(prior_bank.py), so ``N = 2*V*K + V*n_gen + 1`` with ``V=50257``. A built-in model-channel route
+uses its s tables instead of allocating a redundant base pair; an untied decoder adds a second
+``2*V*K`` table pair. ``phi_embed = V*n_gen`` usually DOMINATES. ``n_gen`` is set by the gauge group:
+for ``block_glk`` it is ``K^2/n_heads`` (so FEWER/larger
 blocks = MORE params -- the opposite sign of a standard transformer); ``glk`` is ``K^2``; ``so_k`` is
 ``K(K-1)/2``; the ``so_n``/``sp_n`` towers decouple ``n_gen`` from ``K`` entirely. Three consequences:
 the gauge group / n_heads is a FIRST-CLASS parameter lever; growing ``embed_dim`` moves ``N`` on two
-fronts (linear ``2VK`` + quadratic ``V*n_gen``); and ``n_layers`` / ``n_e_steps`` / full-covariance add
-ZERO parameters (they are inference-compute axes at flat ``N``, plotted separately, NEVER on ``L(N)``).
+fronts (linear ``2VK`` + quadratic ``V*n_gen``); and ``n_layers`` / ``n_e_steps`` add ZERO parameters.
+Full covariance adds packed-lower coordinates only when an s channel or r centroid is active.
 
 The baseline operating point is the self-contained ``config`` dict IN THIS FILE (it is NOT imported
 from ``train_vfe3.py`` -- edit ``config`` below to set what every scaling cell trains around). ``BASELINE``
@@ -54,7 +56,9 @@ from vfe3.data.datasets import (
     make_dataloader,
     tokens_per_char as _tokens_per_char,
 )
+from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.model import VFEModel, build_group
+from vfe3.model.prior_bank import get_decode_registration, get_encode_registration
 from vfe3.path_utils import portable_path_component_key
 from vfe3.run_artifacts import RunArtifacts, _git_code_identity, _write_json_atomic, finalize_run
 from vfe3.runtime import seed_everything
@@ -463,7 +467,7 @@ BASELINE: Dict[str, Any] = config
 
 def route_grow_k(embed_dims: List[int], n_heads: int = 4) -> List[Dict[str, Any]]:
     r"""Grow N by widening embed_dim at a FIXED block_glk head count (route A). Mixed linear+quadratic
-    route: 2VK grows linearly, phi_embed = V*K^2/n_heads quadratically. n_heads stays equal to the
+    token-prior route: 2VK grows linearly, phi_embed = V*K^2/n_heads quadratically. n_heads stays equal to the
     block count so the baseline causal_alibi prior and the head mixer remain valid."""
     return [{"label": f"K{k}", "route": "grow_K", "scale_knob": "embed_dim",
              "overrides": {"embed_dim": k, "n_heads": n_heads, "gauge_group": "block_glk"}}
@@ -597,10 +601,10 @@ def route_group(embed_dim: int) -> List[Dict[str, Any]]:
 
 
 def route_model_channel() -> List[Dict[str, Any]]:
-    r"""Grow N by ~2VK by turning ON the model-channel s tables (route D), vs a pure single-tier token
-    prior. A coarse 2-point route: the 'token' arm strips the s/r tables (prior_source='token',
-    s_e_step/lambda_h/lambda_gamma off), the 'model_channel' arm keeps the baseline channel. Only the
-    s-table mass counts as real added capacity when gamma/lambda_h shape s beyond CE."""
+    r"""Compare a routed model-channel prior with a single-tier token prior (route D). The built-in
+    model-channel path replaces the base prior pair with the s pair, so this route need not grow N by
+    2VK unless another independent s use or decoder bank is enabled. The 'token' arm strips the s/r
+    tables; the 'model_channel' arm keeps the baseline channel."""
     return [
         {"label": "model_channel", "route": "model_channel", "scale_knob": "model_channel",
          "overrides": {}},   
@@ -640,7 +644,7 @@ def route_inference_l(n_layers_list: List[int]) -> List[Dict[str, Any]]:
 #     blocksize     FIXED K=64, vary n_heads in {8,4,2} (= block GL(8),GL(16),GL(32)); same idea as
 #                   blocks_K48 but parameterized by n_heads instead of GL(b).
 #     group         FIXED K=64, swap the gauge GROUP: tied_block_glk -> block_glk -> so_k (spans n_gen).
-#     model_channel token-prior (no s-tables) vs the full model channel (+2VK params).
+#     model_channel token-prior vs the routed model-channel capacity (counted from active tables).
 #   INFERENCE routes (FLAT N -- plotted on a SEPARATE inference-capacity figure, NEVER on L(N)):
 #     infer_T       n_e_steps in {1,2,4,8} at constant params.   infer_L  n_layers in {1,2,4,6}.
 #
@@ -686,22 +690,44 @@ ROUTES: Dict[str, List[Dict[str, Any]]] = {
 
 def predict_n_params(cfg: VFE3Config) -> Tuple[int, int]:
     r"""Predicted total ``n_params`` and ``n_gen`` for ``cfg``, by building only the (cheap) gauge group
-    and summing the prior-table sizes per ``PriorBank`` (prior_bank.py). Exact on the pure path; the
-    small head-mixer / CG / connection_W / learnable-scalar tables (when toggled on) are omitted, so a
-    tiny predicted-vs-actual gap there is expected and only printed, never enforced."""
-    n_gen = int(build_group(cfg).generators.shape[0])
+    and summing the prior-table sizes per ``PriorBank`` (prior_bank.py). Exact on the pure path and for
+    the active head mixer; CG / connection_W / learnable-scalar tables remain outside this sizing model."""
+    group = build_group(cfg)
+    n_gen = int(group.generators.shape[0])
     V, K = int(cfg.vocab_size), int(cfg.embed_dim)
-    n = 2 * V * K + V * n_gen + 1                            # mu_embed, sigma_log_embed, phi_embed, decode_log_scale
+    encoder = get_encode_registration(cfg.encode_mode)
+    decoder = get_decode_registration(cfg.decode_mode if cfg.use_prior_bank else "linear")
+    model_channel_route = cfg.prior_source == "model_channel"
+    base_mean = not (
+        model_channel_route
+        and encoder.can_omit_base_mean
+        and decoder.can_omit_base_mean
+    )
+    base_variance = not (
+        model_channel_route
+        and encoder.can_omit_base_variance
+        and decoder.can_omit_base_variance
+    )
+    n = V * n_gen + 1                                        # phi_embed, decode_log_scale
+    n += int(base_mean) * V * K                               # routed token-prior mean table
+    n += int(base_variance) * V * K                           # routed token-prior variance table
     if not cfg.use_prior_bank:
         n += V * K                                          # output_proj_weight
         if cfg.decode_bias:
             n += V                                          # output_proj_bias
+    elif cfg.untie_decode_bank:
+        n += 2 * V * K                                      # independent routed decode tables
+    lower = K * (K - 1) // 2 if not cfg.diagonal_covariance else 0
     if cfg.lambda_h > 0.0 or cfg.lambda_gamma > 0.0 or cfg.prior_source == "model_channel" or cfg.s_e_step:
         n += 2 * V * K                                      # s_mu_embed, s_sigma_log_embed
+        n += V * lower                                      # full s packed strict-lower table
     if cfg.lambda_h > 0.0 or cfg.s_e_step:
         n += 2 * K                                          # r_mu, r_sigma_log
+        n += lower                                          # full r packed strict-lower centroid
     if cfg.pos_phi == "learned":
         n += int(cfg.max_seq_len) * n_gen                   # pos_phi_free
+    if cfg.use_head_mixer:
+        n += HeadMixer.parameter_count(group.irrep_dims, group.irrep_labels)
     return n, n_gen
 
 

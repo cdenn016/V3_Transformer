@@ -65,14 +65,16 @@ def test_frozen_r_created_when_s_e_step_is_the_only_trigger():
     assert m.prior_bank.r_mu.requires_grad is False
 
 
-def test_belief_tables_byte_identical_with_or_without_s_e_step():
-    # s-tables are drawn LAST, so the belief tables (drawn first) are bit-identical.
+def test_live_downstream_tables_byte_identical_with_or_without_s_e_step():
+    # Removing dormant base tables still advances their historical RNG draw, so downstream live
+    # phi/readout initialization remains bit-identical under the same seed.
     torch.manual_seed(0); off = VFEModel(_tiny_cfg(s_e_step=False))
     torch.manual_seed(0); on = VFEModel(_tiny_cfg(s_e_step=True, prior_source="model_channel",
                                                   lambda_h=1.0, lambda_gamma=1.0))
-    assert torch.equal(off.prior_bank.mu_embed, on.prior_bank.mu_embed)
+    assert on.prior_bank.mu_embed is None
+    assert on.prior_bank.sigma_log_embed is None
     assert torch.equal(off.prior_bank.phi_embed, on.prior_bank.phi_embed)
-    assert torch.equal(off.prior_bank.sigma_log_embed, on.prior_bank.sigma_log_embed)
+    assert torch.equal(off.prior_bank.output_proj_weight, on.prior_bank.output_proj_weight)
 
 
 def test_refine_s_preserves_shape_and_zero_lr_is_static():

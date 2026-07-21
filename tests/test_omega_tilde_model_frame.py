@@ -250,8 +250,6 @@ def test_phi_tilde_gamma_energy_respects_a_common_coordinate_pushforward() -> No
     )
     gauge = torch.linalg.matrix_exp(torch.einsum("a,aij->ij", eta, model.group.generators))
     with torch.no_grad():
-        model.prior_bank.mu_embed.copy_(
-            torch.einsum("kl,vl->vk", gauge, model.prior_bank.mu_embed))
         model.prior_bank.s_mu_embed.copy_(
             torch.einsum("kl,vl->vk", gauge, model.prior_bank.s_mu_embed))
         model.prior_bank.r_mu.copy_(gauge @ model.prior_bank.r_mu)

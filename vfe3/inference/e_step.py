@@ -626,11 +626,15 @@ def free_energy_value(
     sd = self_divergence_for_alpha(fam(belief.mu, belief.sigma), fam(mu_p, sigma_p), alpha=renyi_order, kl_max=kl_max,
                                    eps=eps, divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
     alpha, reg = self_coupling_alpha(sd, value=value, mode=lambda_alpha_mode, b0=b0, c0=c0)
-    energy = pairwise_energy(fam(belief.mu, belief.sigma), fam(mu_t, sigma_t), alpha=renyi_order, kl_max=kl_max, eps=eps,
+    energy = pairwise_energy(fam(belief.mu, belief.sigma),
+                             fam.from_transported(mu_t, sigma_t, key_belief.sigma),
+                             alpha=renyi_order, kl_max=kl_max, eps=eps,
                              divergence_family=divergence_family, irrep_dims=group.irrep_dims)
     coupling_energy = None
     if mu_tv is not None:
-        coupling_energy = pairwise_energy(fam(belief.mu, belief.sigma), fam(mu_tv, sigma_tv), alpha=renyi_order,
+        coupling_energy = pairwise_energy(fam(belief.mu, belief.sigma),
+                                          fam.from_transported(mu_tv, sigma_tv, key_belief.sigma),
+                                          alpha=renyi_order,
                                           kl_max=kl_max, eps=eps, divergence_family=divergence_family,
                                           irrep_dims=group.irrep_dims)
     F = free_energy(
@@ -748,7 +752,7 @@ def phi_alignment_loss(
     fam = get_family(family)
     mu_t = transport_mean(omega, mu)              # rank-agnostic: (N,N,K) or (B,N,N,K)
     sigma_t = fam.transport_dispersion(sigma, omega)
-    score_energy = pairwise_energy(fam(mu, sigma), fam(mu_t, sigma_t), alpha=renyi_order,
+    score_energy = pairwise_energy(fam(mu, sigma), fam.from_transported(mu_t, sigma_t, sigma), alpha=renyi_order,
                                    kl_max=kl_max, eps=eps, divergence_family=divergence_family,
                                    irrep_dims=group.irrep_dims)
     mass = 0.5 * mass_phi * (phi ** 2).sum() if mass_phi > 0.0 else 0.0
@@ -760,7 +764,7 @@ def phi_alignment_loss(
     if has_decoupled_value:
         mu_tv = transport_mean(omega.base, mu)
         sigma_tv = fam.transport_dispersion(sigma, omega.base)
-        value_energy = pairwise_energy(fam(mu, sigma), fam(mu_tv, sigma_tv), alpha=renyi_order,
+        value_energy = pairwise_energy(fam(mu, sigma), fam.from_transported(mu_tv, sigma_tv, sigma), alpha=renyi_order,
                                        kl_max=kl_max, eps=eps, divergence_family=divergence_family,
                                        irrep_dims=group.irrep_dims)
         zero = score_energy.new_zeros(score_energy.shape[:-1])

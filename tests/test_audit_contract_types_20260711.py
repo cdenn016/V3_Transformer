@@ -144,6 +144,8 @@ def test_prior_bank_registries_use_concrete_callable_aliases() -> None:
 
     module_hints = get_type_hints(prior_bank)
     assert module_hints["_ENCODERS"] == Dict[str, prior_bank.EncodeCallable]
+    encode_record_hints = get_type_hints(prior_bank.EncodeRegistration)
+    assert encode_record_hints["callable"] == prior_bank.EncodeCallable
     record_hints = get_type_hints(prior_bank.DecodeRegistration)
     assert record_hints["callable"] == prior_bank.DecodeCallable
     assert record_hints["fused_ce"] == Optional[prior_bank.FusedCECallable]
@@ -153,6 +155,7 @@ def test_prior_bank_registries_use_concrete_callable_aliases() -> None:
         [prior_bank.EncodeCallable], prior_bank.EncodeCallable
     ]
     assert get_type_hints(prior_bank.get_encode)["return"] == prior_bank.EncodeCallable
+    assert get_type_hints(prior_bank.get_encode_registration)["return"] == prior_bank.EncodeRegistration
 
     decode_register_hints = get_type_hints(prior_bank.register_decode)
     assert decode_register_hints["fused_ce"] == Optional[prior_bank.FusedCECallable]

@@ -1917,6 +1917,8 @@ def transport_covariance(
     sigma: torch.Tensor,                                          # (..., N, K) diagonal OR (..., N, K, K) full
 
     *,
+    retain_full_precision: bool = False,
+
     diagonal_out: Optional[bool] = None,
 ) -> torch.Tensor:
     r"""Sandwich action Sigma_t[i,j] = Omega_ij Sigma_j Omega_ij^T.
@@ -1940,10 +1942,19 @@ def transport_covariance(
     the un-rotated base covariance; full-gauge (``on_cov=True``) applies the RoPE congruence. A
     direct-link base remains factored through that congruence; other bases retain their established
     dense or compact dispatch.
+
+    ``retain_full_precision=True`` keeps only a full-covariance sandwich in float64 after its
+    existing float64 contraction. The default remains the source dtype, and every diagonal route
+    ignores this opt-in so the default and compact hot paths remain unchanged.
     """
     if isinstance(omega, RopeTransport):
         if not omega.on_cov:
-            return transport_covariance(omega.base, sigma, diagonal_out=diagonal_out)   # mu-only
+            return transport_covariance(
+                omega.base,
+                sigma,
+                retain_full_precision=retain_full_precision,
+                diagonal_out=diagonal_out,
+            )   # mu-only
         if isinstance(omega.base, DirectLinkTransport):
             is_diag = _direct_link_is_diagonal(omega.base, sigma, diagonal_out)
             if omega.base.exp_phi is None:
@@ -1961,7 +1972,12 @@ def transport_covariance(
                 exp_phi=exp_phi,
                 exp_neg_phi=exp_neg_phi,
             )
-            return transport_covariance(rotated, sigma, diagonal_out=is_diag)
+            return transport_covariance(
+                rotated,
+                sigma,
+                retain_full_precision=retain_full_precision,
+                diagonal_out=is_diag,
+            )
         if isinstance(omega.base, CompactFactoredTransport):
             blocks = _equal_diag_blocks(
                 omega.rope, omega.base.n_blocks, omega.base.block_dim)
@@ -1973,10 +1989,19 @@ def transport_covariance(
                 exp_blocks, inv_blocks, omega.base.K,
                 mean_per_head=omega.base.mean_per_head,
                 same_frame_flat_cocycle=_certifies_same_frame_flat_cocycle(omega))
-            return transport_covariance(rotated, sigma, diagonal_out=diagonal_out)
+            return transport_covariance(
+                rotated,
+                sigma,
+                retain_full_precision=retain_full_precision,
+                diagonal_out=diagonal_out,
+            )
         # Other full-gauge bases use the established rotated dense operator.
-        out = transport_covariance(_rope_dense_omega(omega.base, omega.rope), sigma,
-                                   diagonal_out=diagonal_out)
+        out = transport_covariance(
+            _rope_dense_omega(omega.base, omega.rope),
+            sigma,
+            retain_full_precision=retain_full_precision,
+            diagonal_out=diagonal_out,
+        )
         if isinstance(omega.base, FactoredTransport):
             is_diag = (
                 sigma.dim() == omega.base.exp_phi.dim() - 1
@@ -1988,7 +2013,8 @@ def transport_covariance(
     if isinstance(omega, DirectLinkTransport):
         if _direct_link_is_diagonal(omega, sigma, diagonal_out):
             return _direct_link_diagonal_covariance(omega, sigma)
-        return _direct_link_full_covariance(omega, sigma)
+        sigma_work = sigma.double() if retain_full_precision else sigma
+        return _direct_link_full_covariance(omega, sigma_work)
     if isinstance(omega, CompactFactoredTransport):
         is_diag = (
             sigma.dim() == omega.exp_blocks.dim() - 2
@@ -1997,9 +2023,14 @@ def transport_covariance(
         if is_diag:
             out = _compact_factored_diagonal_covariance(omega, sigma)
         else:
-            out = _compact_factored_full_covariance(omega, sigma)
+            sigma_work = sigma.double() if retain_full_precision else sigma
+            out = _compact_factored_full_covariance(omega, sigma_work)
         return _restore_certified_self_links_(
-            out, sigma, omega, event_ndim=(1 if is_diag else 2))
+            out,
+            sigma if is_diag or not retain_full_precision else sigma.double(),
+            omega,
+            event_ndim=(1 if is_diag else 2),
+        )
     if isinstance(omega, FactoredTransport):
         # Diagonal sigma is (..., N, K) -> same rank as exp_phi minus the trailing K axis; a full
         # sigma is (..., N, K, K) -> same rank as exp_phi (the dense-Omega rank-gap is +1 here
@@ -2008,9 +2039,14 @@ def transport_covariance(
         if is_diag:
             out = _factored_diagonal_covariance(omega, sigma)
         else:
-            out = _factored_full_covariance(omega, sigma)
+            sigma_work = sigma.double() if retain_full_precision else sigma
+            out = _factored_full_covariance(omega, sigma_work)
         return _restore_certified_self_links_(
-            out, sigma, omega, event_ndim=(1 if is_diag else 2))
+            out,
+            sigma if is_diag or not retain_full_precision else sigma.double(),
+            omega,
+            event_ndim=(1 if is_diag else 2),
+        )
     is_diag = sigma.dim() == omega.dim() - 2 if diagonal_out is None else diagonal_out
     if is_diag:
         return torch.einsum("...ijkl,...ijkl,...jl->...ijk", omega, omega, sigma)
@@ -2033,10 +2069,11 @@ def transport_covariance(
             f"sigma against a batch-independent omega)."
         )
     # Full-covariance congruence sandwich Omega Sigma Omega^T SQUARES cond(Omega) (audit 2026-06-13
-    # M4). Evaluate the contraction in a float64 island (like the matrix-exp upcast) then cast back:
-    # this CORRECTLY-ROUNDS the sandwich (removes the fp32 sum-over-l,m accumulation error), so the
-    # fp32-stored result is the best fp32 representation of the true sandwich. NOTE this does not
-    # rescue the EXTREME regime: for the non-compact groups (glk/block_glk/sp_n) cond(Omega) ~
+    # M4). Evaluate the contraction in a float64 island (like the matrix-exp upcast). By default it
+    # casts back, correctly rounding the sandwich and removing fp32 sum-over-l,m accumulation error.
+    # FullGaussian opts into retaining the float64 result because a correctly rounded fp32 matrix can
+    # still leave the SPD cone. NOTE this does not rescue the EXTREME regime: for the non-compact
+    # groups (glk/block_glk/sp_n) cond(Omega) ~
     # exp(2||phi||) can reach ~1e6 at the retraction's default max_norm=5, and the squared sandwich
     # (~1e12) is then unrepresentable in fp32 STORAGE regardless of compute precision -- bound ||phi||
     # or use a compact group / diagonal family there. Reached only on the full-covariance path
@@ -2044,7 +2081,7 @@ def transport_covariance(
     # groups are untouched, so the hot path is unchanged.
     out = torch.einsum("...ijkl,...jlm,...ijnm->...ijkn",
                        omega.double(), sigma.double(), omega.double())
-    return out.to(sigma.dtype)
+    return out if retain_full_precision else out.to(sigma.dtype)
 
 
 def transport_scale(

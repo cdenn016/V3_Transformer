@@ -25,6 +25,10 @@ from vfe3.numerics import safe_cholesky
 _RENYI_KL_BAND: float = 1e-2
 
 
+def _full_gaussian_public_dtype(*dtypes: torch.dtype) -> torch.dtype:
+    return torch.float64 if torch.float64 in dtypes else torch.float32
+
+
 def diag_kl_unclamped(
     mu_q:    torch.Tensor,             # (..., N, K) query means
     sigma_q: torch.Tensor,             # (..., N, K) query variances
@@ -326,29 +330,69 @@ class FullGaussian(BeliefParams):
     r"""Full-covariance Gaussian: mu (..., K), sigma (..., K, K) SPD covariance.
 
     Natural theta = (Sigma^{-1} mu, -1/2 Sigma^{-1}); A(theta) = -1/4 t1^T t2^{-1} t1 - 1/2 log|-2 t2|.
+
+    External construction retains the any-operand float64 result policy, including mixed public
+    mean/covariance dtypes. ``from_transported`` records the source covariance dtype while the
+    family transport seam retains an internal float64 covariance, so this numerical representation
+    does not promote the public divergence result.
     """
 
     cov_kind = "full"
     dispersion_is_covariance = True
 
-    def __init__(self, mu: torch.Tensor, sigma: torch.Tensor) -> None:
+    def __init__(
+        self,
+        mu:    torch.Tensor,
+        sigma: torch.Tensor,
+
+        *,
+        _public_dtype: Optional[torch.dtype] = None,
+    ) -> None:
         self.mu = mu
         self.sigma = sigma
+        self._public_dtype = (
+            _public_dtype
+            if _public_dtype is not None
+            else _full_gaussian_public_dtype(mu.dtype, sigma.dtype)
+        )
+
+    @classmethod
+    def from_transported(
+        cls,
+        mu:                torch.Tensor,         # transported means
+        dispersion:        torch.Tensor,         # retained full covariance
+        source_dispersion: torch.Tensor,         # pre-transport covariance and public dtype source
+    ) -> "FullGaussian":
+        return cls(
+            mu,
+            dispersion,
+            _public_dtype=_full_gaussian_public_dtype(mu.dtype, source_dispersion.dtype),
+        )
 
     def coordinate_dim(self) -> int:
         return self.mu.shape[-1]
 
     def block(self, start: int, end: int) -> "FullGaussian":
-        return FullGaussian(self.mu[..., start:end], self.sigma[..., start:end, start:end])
+        return FullGaussian(
+            self.mu[..., start:end],
+            self.sigma[..., start:end, start:end],
+            _public_dtype=self._public_dtype,
+        )
 
     def broadcast_over_keys(self) -> "FullGaussian":
-        return FullGaussian(self.mu.unsqueeze(-2), self.sigma.unsqueeze(-3))
+        return FullGaussian(
+            self.mu.unsqueeze(-2),
+            self.sigma.unsqueeze(-3),
+            _public_dtype=self._public_dtype,
+        )
 
     @classmethod
     def stack(cls, parts: List["FullGaussian"], *, dim: int = 0) -> "FullGaussian":
+        public_dtype = _full_gaussian_public_dtype(*(part._public_dtype for part in parts))
         return FullGaussian(
             torch.stack([p.mu for p in parts], dim=dim),
             torch.stack([p.sigma for p in parts], dim=dim),
+            _public_dtype=public_dtype,
         )
 
     @classmethod
@@ -419,6 +463,29 @@ class FullGaussian(BeliefParams):
         return mixing @ dispersion @ mixing.transpose(-1, -2)
 
     @classmethod
+    def transport_dispersion(
+        cls,
+        dispersion: torch.Tensor,         # (..., N, K, K) full covariance
+        omega:      object,               # dense/factored/direct-link/RoPE transport container
+
+        *,
+        diagonal_out: Optional[bool] = None,
+    ) -> torch.Tensor:
+        r"""Retain the float64 full-covariance congruence through SPD factorization.
+
+        A dense sandwich can be positive definite in float64 but indefinite after float32 storage.
+        The public divergence retains the source-family dtype; only this transported covariance is
+        kept in float64 until the FullGaussian KL/Renyi computation has consumed it.
+        """
+        from vfe3.geometry.transport import transport_covariance
+        return transport_covariance(
+            omega,
+            dispersion,
+            retain_full_precision=True,
+            diagonal_out=diagonal_out,
+        )
+
+    @classmethod
     def diagnostic_labels(cls) -> dict[str, str]:
         return {
             "dispersion":             "Gaussian covariance",
@@ -485,13 +552,17 @@ class FullGaussian(BeliefParams):
         r"""Closed-form full-covariance Gaussian Renyi/KL (ported verbatim from
         ``divergence._gaussian_full_renyi``; mu_q=self, mu_t=other)."""
         K = self.mu.shape[-1]
-        # float64 computes in float64 (audit 2026-07-12 N11, the F12 dtype policy: an fp64 island
-        # is preserved end to end instead of silently collapsing to fp32 precision -- measured ~4%
-        # relative error at cond(Sigma)~1e6); half/fp32 keep the existing fp32 compute.
-        compute_dtype = (torch.float64
-                         if torch.float64 in (self.mu.dtype, self.sigma.dtype,
-                                              other.mu.dtype, other.sigma.dtype)
-                         else torch.float32)
+        # Preserve the public dtype policy (float64 for a public float64 family, otherwise float32),
+        # but evaluate every full-SPD factorization and cancellation in float64. Near the admitted
+        # cond(Sigma)~1e6 ceiling, float32 can turn the exact self-KL and shared derivative into
+        # O(1e-2) and O(1e4) artifacts, respectively.
+        # External construction retains the any-operand float64 policy. Family-owned transport
+        # records the source public dtype before retaining an internal float64 covariance, and the
+        # constructor plus shape combinators carry that provenance to this boundary.
+        result_dtype = (torch.float64
+                        if torch.float64 in (self._public_dtype, other._public_dtype)
+                        else torch.float32)
+        compute_dtype = torch.float64
         mu_q = self.mu.to(compute_dtype)
         sigma_q = self.sigma.to(compute_dtype)
         mu_t = other.mu.to(compute_dtype)
@@ -542,9 +613,8 @@ class FullGaussian(BeliefParams):
             ).squeeze(-1)
             mahal_term = alpha * (v ** 2).sum(dim=-1)
             if abs(alpha - 1.0) < _RENYI_KL_BAND:
-                # fp32 cancellation band: the three logdets nearly cancel before the /(alpha-1).
-                # Recompute them in float64 via slogdet on the f64 regularized covariances; the
-                # fp32 cholesky factors above still drive mahal_term and the ok mask.
+                # The three logdets nearly cancel before division by (alpha - 1). Retain the
+                # established slogdet cancellation route inside the float64 island.
                 sq64 = sigma_q.double()
                 st64 = sigma_t.double()
                 sb64 = (1.0 - alpha) * sq64 + alpha * st64
@@ -572,4 +642,4 @@ class FullGaussian(BeliefParams):
             blend_pd = torch.linalg.eigvalsh(sigma_blend)[..., 0] > 0   # smallest eigenvalue > 0
             ok = blend_pd & ok_q & ok_t            # non-PD blend or failed factor -> NaN -> kl_max
             div = torch.where(ok, div, div.new_tensor(float("nan")))
-        return safe_kl_clamp(div, kl_max=kl_max)
+        return safe_kl_clamp(div, kl_max=kl_max).to(result_dtype)

@@ -845,7 +845,6 @@ def test_link_s_transport_is_belief_state_independent_but_moves_with_connection_
     with torch.no_grad():
         m.prior_bank.s_mu_embed.normal_(0.0, 0.9)
         m.prior_bank.s_sigma_log_embed.normal_(0.0, 0.7)
-        m.prior_bank.mu_embed.normal_(0.0, 0.9)
     omega_b = _link_s_transport(m, phi)
     assert torch.allclose(omega_a, omega_b, atol=0.0)          # transport invariant to q/s mean+cov
     # ...but it DOES move with the shared connection_L.
@@ -866,6 +865,5 @@ def test_link_charted_transport_depends_on_frame_but_not_belief_state():
     # ...yet still invariant to the s / belief state (no needs_mu / needs_sigma).
     with torch.no_grad():
         m.prior_bank.s_mu_embed.normal_(0.0, 0.9)
-        m.prior_bank.mu_embed.normal_(0.0, 0.9)
     omega_phi0b = _link_s_transport(m, phi)
     assert torch.allclose(omega_phi0, omega_phi0b, atol=0.0)

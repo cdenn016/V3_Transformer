@@ -339,7 +339,10 @@ def test_cost_model_counts_s_channel_estep_once_per_forward():
     belief_estep = L * T * estep_kernel
     s_estep = T * estep_kernel
     decode = 2.0 * V * K
-    expected_active = (2 * K + n_gen) + V * K + 2 * V * K
+    # prior_source='model_channel' makes the single encoder row the s row itself. The linear decoder
+    # reads only W, so counting the full s vocabulary bank again would double-count dormant storage.
+    # s_e_step executes the allocated diagonal r centroid once per refinement, adding its 2K values.
+    expected_active = (2 * K + n_gen) + V * K + 2 * K
     assert out["model_channel_active"] is True
     assert out["active_params_per_token"] == expected_active
     assert out["flops_per_token_estep"] == belief_estep + s_estep
@@ -428,6 +431,7 @@ def _finalize_ns(**over):
         # figure memory-guard inputs: 8*V*N*B/1e9 ~ 13.2 GB fp32 logits+probs peak > the 8 GB guard
         vocab_size=50257, max_seq_len=1024, batch_size=32,
         generate_figures=True, force_large_figures=False,
+        evaluate_zero_e_steps_counterfactual=False,
         # numeric-path attrs (summary / provenance / cost model / pure-path report)
         seed=0, max_steps=2, use_prior_bank=True, decode_bias=False, use_head_mixer=False,
         include_attention_entropy=True, transport_mode="flat", lambda_alpha_mode="constant",
