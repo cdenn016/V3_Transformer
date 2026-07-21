@@ -97,6 +97,18 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _resolved_binary_cache_paths(
+    source: Path,
+) -> Tuple[Path, Path, Path]:
+    """Resolve a binary payload and derive its sidecars from that one target path."""
+    payload = source.resolve(strict=True)
+    return (
+        payload,
+        Path(str(payload) + ".meta.json"),
+        Path(str(payload) + ".provenance.json"),
+    )
+
+
 def _binary_cache_metadata(
     path: Path,
 ) -> Tuple[Dict[str, object], np.dtype]:
@@ -234,10 +246,9 @@ def cache_source_identity(
 
     binp = cache_path(dataset, split, suffix="bin", cache_dir=cache_dir)
     if binp.exists():
-        resolved = binp.resolve()
+        resolved, meta_path, _provenance_path = _resolved_binary_cache_paths(binp)
         meta, _ = _binary_cache_metadata(resolved)
         stat = resolved.stat()
-        meta_path = Path(str(binp) + ".meta.json")
         payload_sha256 = _sha256_file(resolved)
         identity = {
             "format":        "bin",
@@ -321,14 +332,15 @@ def load_cached_tokens(
 
     binp = cache_path(dataset, split, suffix="bin", cache_dir=cache_dir)
     if binp.exists():
-        meta, dtype = _binary_cache_metadata(binp)
+        resolved, _meta_path, _provenance_path = _resolved_binary_cache_paths(binp)
+        meta, dtype = _binary_cache_metadata(resolved)
         n = int(meta["n_tokens"])
-        mm = np.memmap(binp, dtype=dtype, mode="r", shape=(n,))
+        mm = np.memmap(resolved, dtype=dtype, mode="r", shape=(n,))
         if limit is not None:
             capped = torch.from_numpy(np.asarray(mm[:limit]))
             return capped.clone() if capped.dtype == torch.long else capped.to(torch.long)
         tokens = torch.from_numpy(np.asarray(mm))
-        _require_supported_token_dtype(tokens, source=binp)
+        _require_supported_token_dtype(tokens, source=resolved)
         return tokens
 
     raise FileNotFoundError(
@@ -351,6 +363,8 @@ def _load_identity_bound_tokens(
         if limit is None
         else load_cached_tokens(dataset, split, cache_dir=cache_dir, limit=limit)
     )
+    if limit is None and identity_before["format"] == "bin":
+        tokens = tokens.clone()
     identity_after = cache_source_identity(dataset, split, cache_dir=cache_dir)
     if identity_before != identity_after:
         differing = sorted(
