@@ -32,6 +32,27 @@ from vfe3.run_artifacts import (
 )
 
 
+_FINALIZE_REQUEST_FIELDS = (
+    "run_dir",
+    "losses",
+    "generate_publication",
+    "report_batches_path",
+    "model_bundle_path",
+    "device",
+    "max_tokens",
+    "allow_large",
+)
+
+
+def _require_finalize_fields(request: Mapping[str, object]) -> None:
+    """Reject a finalize request that omits any declared contract field."""
+    missing = [field for field in _FINALIZE_REQUEST_FIELDS if field not in request]
+    if missing:
+        raise ValueError(
+            "finalize figure request is missing required fields: " + ", ".join(missing)
+        )
+
+
 def _required_finalize_string(request: Mapping[str, object], field: str) -> str:
     """Return one required nonempty JSON string from a finalize request."""
     value = request.get(field)
@@ -54,6 +75,7 @@ def _validated_finalize_request(
     request: Mapping[str, object],
 ) -> tuple[str, List[float] | None, bool, str | None, str | None, str, int, bool]:
     """Validate the exact JSON fields emitted by ``_run_figures_isolated``."""
+    _require_finalize_fields(request)
     run_dir = _required_finalize_string(request, "run_dir")
     losses_value = request.get("losses")
     if losses_value is None:

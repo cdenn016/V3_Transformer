@@ -58,10 +58,49 @@ def test_finalize_request_rejects_invalid_json_fields_before_render(
     assert rendered == []
 
 
-def test_finalize_request_from_run_artifacts_schema_reaches_renderer(tmp_path, monkeypatch):
+@pytest.mark.parametrize("field", [
+    "run_dir",
+    "losses",
+    "generate_publication",
+    "report_batches_path",
+    "model_bundle_path",
+    "device",
+    "max_tokens",
+    "allow_large",
+])
+def test_finalize_request_rejects_missing_required_field_before_render(
+    tmp_path,
+    monkeypatch,
+    field,
+):
+    request = _finalize_request(tmp_path)
+    del request[field]
+    request_path = tmp_path / "figure_request.json"
+    request_path.write_text(json.dumps(request), encoding="utf-8")
+    monkeypatch.setenv("VFE3_FIGURE_REQUEST", str(request_path))
+    monkeypatch.setattr(figure_worker, "_load_worker_config", lambda _path: object())
+    rendered = []
+    monkeypatch.setattr(
+        figure_worker,
+        "_render_persisted_run_figures",
+        lambda *_args: rendered.append(True),
+    )
+
+    with pytest.raises(ValueError, match=field):
+        figure_worker.main()
+
+    assert rendered == []
+
+
+@pytest.mark.parametrize("losses", [[1.25], None])
+def test_finalize_request_from_run_artifacts_schema_reaches_renderer(
+    tmp_path,
+    monkeypatch,
+    losses,
+):
     request_path = tmp_path / "figure_request.json"
     request_path.write_text(
-        json.dumps(_finalize_request(tmp_path)),
+        json.dumps(_finalize_request(tmp_path, losses=losses)),
         encoding="utf-8",
     )
     monkeypatch.setenv("VFE3_FIGURE_REQUEST", str(request_path))
@@ -77,7 +116,7 @@ def test_finalize_request_from_run_artifacts_schema_reaches_renderer(tmp_path, m
     assert figure_worker.main() == 0
     assert rendered[0][0] == tmp_path.resolve()
     assert rendered[0][1] is cfg
-    assert rendered[0][2] == [1.25]
+    assert rendered[0][2] == losses
 
 
 @pytest.mark.parametrize("command", [
