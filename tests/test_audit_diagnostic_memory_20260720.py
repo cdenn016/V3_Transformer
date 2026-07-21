@@ -1,5 +1,7 @@
 """Regression coverage for bounded held-out diagnostic snapshot memory."""
 
+import gc
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -8,7 +10,7 @@ import torch
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 import vfe3.train as train_module
-from vfe3.train import _val_diagnostics, evaluate, train
+from vfe3.train import ValidationDiagnostics, _val_diagnostics, evaluate, train
 
 
 _ACTIVE_BATCH_SIZE = 256
@@ -323,6 +325,95 @@ def test_periodic_eval_reuses_one_held_out_snapshot_for_metrics_and_maps(
     assert all(torch.equal(tokens, val_tokens[:1]) for _, tokens, _ in consumers)
     assert all(snapshot is held_out_snapshot for _, _, snapshot in consumers)
     assert [channel for channel, _, _ in artifacts.saved] == ["beta", "gamma"]
+
+
+@pytest.mark.parametrize("map_behavior", ["enabled", "disabled", "raises"])
+def test_periodic_eval_releases_snapshot_before_next_training_step(
+    map_behavior: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = VFE3Config(
+        vocab_size=8,
+        embed_dim=4,
+        n_heads=2,
+        max_seq_len=4,
+        n_layers=1,
+        n_e_steps=1,
+        batch_size=2,
+        generate_figures=map_behavior != "disabled",
+        use_ema=False,
+    )
+    model = VFEModel(cfg)
+    train_tokens = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]])
+    train_targets = torch.roll(train_tokens, shifts=-1, dims=1)
+    val_tokens = torch.tensor([[7, 6, 5, 4], [6, 5, 4, 3]])
+    val_targets = torch.roll(val_tokens, shifts=-1, dims=1)
+    snapshot_refs: list[weakref.ReferenceType[object]] = []
+    train_step_calls = 0
+    best_calls = 0
+    map_calls = 0
+
+    class _SnapshotProbe:
+        pass
+
+    def fake_val_diagnostics(
+        _model: object,
+        _loader: object,
+        _device: torch.device,
+    ) -> ValidationDiagnostics:
+        snapshot = _SnapshotProbe()
+        snapshot_refs.append(weakref.ref(snapshot))
+        return ValidationDiagnostics({}, val_tokens[:1], snapshot)  # type: ignore[arg-type]
+
+    def fake_save_maps(*args: object, **kwargs: object) -> None:
+        nonlocal map_calls
+        del args, kwargs
+        map_calls += 1
+        assert snapshot_refs[-1]() is not None
+        if map_behavior == "raises":
+            raise RuntimeError("map write failed")
+
+    def fake_train_step(*args: object, **kwargs: object) -> float:
+        nonlocal train_step_calls
+        del args
+        train_step_calls += 1
+        if train_step_calls == 2:
+            gc.collect()
+            assert snapshot_refs[0]() is None
+        metrics = kwargs["metrics_out"]
+        status = kwargs["status_out"]
+        assert isinstance(metrics, dict)
+        assert isinstance(status, dict)
+        metrics["train_ce"] = 1.0
+        status["did_step"] = False
+        return 1.0
+
+    class _Artifacts:
+        def maybe_save_best(self, _step: int, _model: object, _ppl: float) -> None:
+            nonlocal best_calls
+            best_calls += 1
+            assert snapshot_refs[-1]() is not None
+
+        def log_metrics(self, _row: dict[str, float]) -> None:
+            return None
+
+    monkeypatch.setattr(train_module, "_val_diagnostics", fake_val_diagnostics)
+    monkeypatch.setattr(train_module, "_save_eval_attention_maps", fake_save_maps)
+    monkeypatch.setattr(train_module, "train_step", fake_train_step)
+
+    train(
+        model,
+        [(train_tokens, train_targets)],
+        cfg,
+        n_steps=2,
+        eval_interval=1,
+        val_loader=[(val_tokens, val_targets)],
+        artifacts=_Artifacts(),
+        generate_samples=False,
+    )
+
+    assert best_calls == 2
+    assert map_calls == (0 if map_behavior == "disabled" else 2)
 
 
 def test_h1_logits_copy_pair_allocation_arithmetic_is_bounded() -> None:

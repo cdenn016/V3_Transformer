@@ -1587,26 +1587,29 @@ def train(
                 except Exception as exc:
                     logger.warning("       (validation diagnostics failed: %s); continuing", exc)
                     last_val_diag.update({k: float("nan") for k in _VAL_DIAG_KEYS})
-                artifacts.maybe_save_best(step + 1, model, m["ppl"])
-                # Per-layer/per-head attention heatmap grid for this eval (off the graph, seq 0 of
-                # the held-out batch), plus the model-coupling (gamma) heatmaps in a distinct color
-                # (viridis vs magma; gamma_attention_maps returns None when the model channel is
-                # off -> no-op). The model REPLAYS (attention_maps / gamma_attention_maps) are
-                # argument expressions evaluated HERE in the caller, OUTSIDE the save helpers'
-                # internal try/except, so guard them too -- a replay error must never kill training
-                # (audit 2026-07-01 F11). Kept at EVAL cadence (one grid per eval, not per log).
-                if cfg.generate_figures and validation_diagnostics is not None:
-                    try:
-                        _save_eval_attention_maps(
-                            validation_diagnostics.token_ids,
-                            validation_diagnostics.snapshot,
-                            model,
-                            artifacts,
-                            logger,
-                            step=step + 1,
-                        )
-                    except Exception as exc:
-                        logger.warning("       (attention-map replay failed: %s); continuing", exc)
+                try:
+                    artifacts.maybe_save_best(step + 1, model, m["ppl"])
+                    # Per-layer/per-head attention heatmap grid for this eval (off the graph, seq 0
+                    # of the held-out batch), plus model-coupling gamma heatmaps. Kept at EVAL
+                    # cadence (one grid per eval, not per log), and guarded so replay errors remain
+                    # nonfatal (audit 2026-07-01 F11).
+                    if cfg.generate_figures and validation_diagnostics is not None:
+                        try:
+                            _save_eval_attention_maps(
+                                validation_diagnostics.token_ids,
+                                validation_diagnostics.snapshot,
+                                model,
+                                artifacts,
+                                logger,
+                                step=step + 1,
+                            )
+                        except Exception as exc:
+                            logger.warning("       (attention-map replay failed: %s); continuing", exc)
+                finally:
+                    # This loop-local otherwise retains the dense held-out logits and frozen clone
+                    # until the next evaluation overwrites it. Release after the final consumer on
+                    # enabled, disabled, and failed-map branches before training resumes.
+                    validation_diagnostics = None
             if ema is not None:
                 ema.restore(model)                       # live SGD weights back before the next train_step
 
