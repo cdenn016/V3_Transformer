@@ -749,13 +749,21 @@ def _selection_semantic_config(
     return normalized
 
 
+class _BestModelContractMismatch(RuntimeError):
+    """A valid selected bundle was measured under a different live selection contract."""
+
+
 def _validate_best_model_mapping(
     bundle:               object,
     cfg:                  Optional[VFE3Config],
     expected_model_state: Mapping[str, torch.Tensor],
     context:              str,
+
+    *,
+    expected_code_identity:           Optional[str] = None,
+    expected_selection_data_identity: Optional[Mapping[str, object]] = None,
 ) -> Dict[str, object]:
-    """Validate an already-loaded selected-weights mapping without mutating live state."""
+    """Return an owned selected state after validating the complete artifact contract."""
     legacy_fields = {"model_state", "config", "config_fingerprint"}
     current_fields = legacy_fields | {"code_identity_sha256", "selection_data_identity"}
     if not isinstance(bundle, Mapping) or set(bundle) not in (legacy_fields, current_fields):
@@ -768,20 +776,15 @@ def _validate_best_model_mapping(
     if (cfg is not None
             and semantic_config_fingerprint(_selection_semantic_config(saved_config))
             != semantic_config_fingerprint(_selection_semantic_config(cfg))):
-        raise RuntimeError(f"{context} does not match the active selection config")
+        raise _BestModelContractMismatch(
+            f"{context} does not match the active selection config")
     saved_state = bundle["model_state"]
-    if not isinstance(saved_state, Mapping):
-        raise RuntimeError(f"{context} has a non-mapping model_state")
-    if set(saved_state) != set(expected_model_state):
-        raise RuntimeError(f"{context} model_state keys do not match the live model")
-    for key, expected in expected_model_state.items():
-        actual = saved_state[key]
-        if not isinstance(actual, torch.Tensor):
-            raise RuntimeError(f"{context} entry {key!r} is not a tensor")
-        if (actual.shape != expected.shape or actual.dtype != expected.dtype
-                or actual.layout != expected.layout):
-            raise RuntimeError(
-                f"{context} entry {key!r} has an incompatible shape/dtype/layout")
+    validated_state = _validate_checkpoint_model_state(
+        saved_state,
+        expected_model_state,
+        context,
+        artifact_class=None,
+    )
     validated = dict(bundle)
     if set(bundle) == current_fields:
         code_identity = bundle["code_identity_sha256"]
@@ -794,81 +797,93 @@ def _validate_best_model_mapping(
                 validated["selection_data_identity"] = _normalized_data_identity(selection_identity)
             except (TypeError, ValueError) as exc:
                 raise RuntimeError(f"{context} has an invalid validation-data identity") from exc
+    if expected_code_identity is not None:
+        if set(bundle) != current_fields:
+            raise _BestModelContractMismatch(
+                f"{context} has no executable-code identity")
+        if validated["code_identity_sha256"] != expected_code_identity:
+            raise _BestModelContractMismatch(
+                f"{context} does not match the active executable-code identity")
+    if expected_selection_data_identity is not None:
+        if set(bundle) != current_fields:
+            raise _BestModelContractMismatch(
+                f"{context} has no validation-data identity")
+        try:
+            live_selection_identity = _normalized_data_identity(
+                expected_selection_data_identity)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"{context} received an invalid active validation-data identity") from exc
+        saved_selection_identity = validated["selection_data_identity"]
+        if saved_selection_identity is None:
+            raise _BestModelContractMismatch(
+                f"{context} has no validation-data identity")
+        if saved_selection_identity != live_selection_identity:
+            raise _BestModelContractMismatch(
+                f"{context} does not match the active validation-data identity")
+    validated["model_state"] = {
+        key: tensor.detach().clone()
+        for key, tensor in validated_state.items()
+    }
     return validated
 
 
-def _best_selection_is_portable(
-    bundle:                           Mapping[str, object],
-    cfg:                              Optional[VFE3Config],
+def _read_best_model_bundle(
+    path:                             Path,
+    cfg:                              VFE3Config,
+    expected_model_state:             Mapping[str, torch.Tensor],
+    map_location:                     'str | torch.device',
     expected_code_identity:           str,
     expected_selection_data_identity: Optional[Mapping[str, object]],
-) -> bool:
-    """Return whether selected weights were measured under this code/config/validation contract."""
-    if set(bundle) != {
-            "model_state", "config", "config_fingerprint",
-            "code_identity_sha256", "selection_data_identity"}:
-        return False
-    if bundle.get("code_identity_sha256") != expected_code_identity:
-        return False
-    if expected_selection_data_identity is None or bundle.get("selection_data_identity") is None:
-        return False
-    try:
-        saved_selection_identity = _normalized_data_identity(bundle["selection_data_identity"])
-        live_selection_identity = _normalized_data_identity(expected_selection_data_identity)
-        if saved_selection_identity != live_selection_identity:
-            return False
-        if (cfg is not None
-                and semantic_config_fingerprint(
-                    _selection_semantic_config(bundle["config"]))
-                != semantic_config_fingerprint(_selection_semantic_config(cfg))):
-            return False
-    except (TypeError, ValueError):
-        return False
-    return True
-
-
-def _read_best_model_bundle(
-    path:                 Path,
-    cfg:                  VFE3Config,
-    expected_model_state: Mapping[str, torch.Tensor],
-    map_location:         'str | torch.device',
 ) -> Dict[str, object]:
     r"""Safe-load ``best_model.pt`` and validate it as a portable selected-weights bundle, NONMUTATING.
 
     Loaded with ``weights_only=True`` (the bundle is only tensors, an ``asdict`` config, and a
-    fingerprint string). Fails closed unless every check passes: the bundle is the three-key semantic
-    best-model mapping; its stored full ``config_fingerprint`` equals the recomputed fingerprint of its
-    own saved config (excluded-field tampering is still caught BEFORE the selection projection); the
-    SELECTION projection of the saved config matches the live config's projection; and ``model_state``
-    matches ``expected_model_state`` key-for-key on tensor type, shape, and dtype. Neither ``cfg`` nor
-    ``expected_model_state`` is mutated, and no state is loaded into any model. Returns the validated
-    bundle as a plain ``dict``."""
+    fingerprint string). Fails closed unless the exact current five-field schema passes its stored
+    fingerprint, semantic selection config, model-state structure and finiteness, executable-code
+    identity, and validation-data identity checks. A bundle with a null stored data identity may remain
+    structurally readable for legacy checkpoint persistence, but it cannot supply cross-run selection or
+    headline finalization when a live identity is expected. Neither live configuration nor model state
+    is mutated. The returned model-state mapping owns cloned tensors, so later caller mutation cannot
+    alter the validated source bundle."""
     bundle = torch.load(path, map_location=map_location, weights_only=True)
     return _validate_best_model_mapping(
-        bundle, cfg, expected_model_state, f"best-model bundle at {path}")
+        bundle,
+        cfg,
+        expected_model_state,
+        f"best-model bundle at {path}",
+        expected_code_identity=expected_code_identity,
+        expected_selection_data_identity=expected_selection_data_identity,
+    )
 
 
 def _validate_checkpoint_model_state(
     saved_state:          object,
     expected_model_state: Mapping[str, torch.Tensor],
-    checkpoint_path:      Path,
+    artifact:             'str | Path',
+
+    *,
+    artifact_class: Optional[str] = "checkpoint",
 ) -> Mapping[str, torch.Tensor]:
     """Validate a checkpoint model state completely before any live tensor is copied."""
+    context = f"{artifact_class} {artifact}" if artifact_class is not None else str(artifact)
     if not isinstance(saved_state, Mapping):
-        raise RuntimeError(f"checkpoint {checkpoint_path} has a non-mapping model_state")
+        raise RuntimeError(f"{context} has a non-mapping model_state")
     if set(saved_state) != set(expected_model_state):
-        raise RuntimeError(
-            f"checkpoint {checkpoint_path} model_state keys do not match the live model")
+        raise RuntimeError(f"{context} model_state keys do not match the live model")
     for key, expected in expected_model_state.items():
         actual = saved_state[key]
         if not isinstance(actual, torch.Tensor):
-            raise RuntimeError(
-                f"checkpoint {checkpoint_path} model_state entry {key!r} is not a tensor")
+            raise RuntimeError(f"{context} model_state entry {key!r} is not a tensor")
         if (actual.shape != expected.shape or actual.dtype != expected.dtype
                 or actual.layout != expected.layout):
             raise RuntimeError(
-                f"checkpoint {checkpoint_path} model_state entry {key!r} has an incompatible "
+                f"{context} model_state entry {key!r} has an incompatible "
                 f"shape/dtype/layout")
+        if ((actual.is_floating_point() or actual.is_complex())
+                and not bool(torch.isfinite(actual).all().item())):
+            raise RuntimeError(
+                f"{context} model_state entry {key!r} contains nonfinite values")
     return saved_state
 
 
@@ -1188,7 +1203,14 @@ def _publish_best_model_bundle(
     checkpoint reachable in the new run directory for later finalization."""
     with _unique_sibling_temp(artifacts.best_path) as tmp:
         torch.save(dict(bundle), tmp)
-        _read_best_model_bundle(tmp, artifacts.cfg, expected_model_state, "cpu")
+        _read_best_model_bundle(
+            tmp,
+            artifacts.cfg,
+            expected_model_state,
+            "cpu",
+            artifacts.code_identity_sha256,
+            artifacts.selection_data_identity,
+        )
         _atomic_replace(artifacts.best_path, tmp)
 
 
@@ -1421,7 +1443,13 @@ class RunArtifacts:
                     f"finite best_val_ppl ({float(self.best_val_ppl)}) but no readable best_model.pt "
                     f"at {self.best_path}; cannot embed a portable best-model bundle")
             best_model_bundle: Optional[Dict[str, object]] = _read_best_model_bundle(
-                self.best_path, cfg, model.state_dict(), "cpu")
+                self.best_path,
+                cfg,
+                model.state_dict(),
+                "cpu",
+                self.code_identity_sha256,
+                self.selection_data_identity,
+            )
             saved_best_val_ppl = float(self.best_val_ppl)
             saved_best_step    = self.best_step
         else:
@@ -1506,7 +1534,13 @@ def _restore_best_selection(
         old_best = checkpoint_path.parent.parent / "best_model.pt"
         if old_best.is_file():
             bundle = _read_best_model_bundle(
-                old_best, artifacts.cfg, expected_model_state, map_location)
+                old_best,
+                artifacts.cfg,
+                expected_model_state,
+                map_location,
+                artifacts.code_identity_sha256,
+                artifacts.selection_data_identity,
+            )
             _publish_best_model_bundle(bundle, expected_model_state, artifacts)
             artifacts.best_val_ppl = float(ckpt_best_ppl)
             artifacts.best_step    = ckpt.get("best_step")
@@ -1558,31 +1592,41 @@ def _preflight_best_selection(
             raise RuntimeError(
                 "checkpoint best-model selection step must be a non-negative integer no later "
                 "than the checkpoint step")
-        if embedded_present:
-            if not isinstance(embedded, Mapping):
-                raise RuntimeError(
-                    "checkpoint best-model selection has no reachable embedded weight bundle")
-            candidate = _validate_best_model_mapping(
-                embedded, None, expected_model_state,
-                f"checkpoint {checkpoint_path} best-model selection bundle",
-            )
-        else:
-            sibling = checkpoint_path.parent.parent / "best_model.pt"
-            if not sibling.is_file():
-                raise RuntimeError(
-                    "checkpoint best-model selection has no reachable legacy sibling weights")
-            bundle = torch.load(sibling, map_location=map_location, weights_only=True)
-            candidate = _validate_best_model_mapping(
-                bundle, None, expected_model_state,
-                f"checkpoint {checkpoint_path} legacy best-model selection bundle",
-            )
+        try:
+            if embedded_present:
+                if not isinstance(embedded, Mapping):
+                    raise RuntimeError(
+                        "checkpoint best-model selection has no reachable embedded weight bundle")
+                candidate = _validate_best_model_mapping(
+                    embedded,
+                    cfg,
+                    expected_model_state,
+                    f"checkpoint {checkpoint_path} best-model selection bundle",
+                    expected_code_identity=expected_code_identity,
+                    expected_selection_data_identity=expected_selection_data_identity,
+                )
+            else:
+                sibling = checkpoint_path.parent.parent / "best_model.pt"
+                if not sibling.is_file():
+                    raise RuntimeError(
+                        "checkpoint best-model selection has no reachable legacy sibling weights")
+                bundle = torch.load(sibling, map_location=map_location, weights_only=True)
+                candidate = _validate_best_model_mapping(
+                    bundle,
+                    cfg,
+                    expected_model_state,
+                    f"checkpoint {checkpoint_path} legacy best-model selection bundle",
+                    expected_code_identity=expected_code_identity,
+                    expected_selection_data_identity=expected_selection_data_identity,
+                )
+        except _BestModelContractMismatch:
+            return False
     elif best_step is not None or embedded is not None:
         raise RuntimeError(
             "checkpoint empty best-model selection must use best_step=None and no weight bundle")
     if not selected or candidate is None:
         return False
-    if not _best_selection_is_portable(
-            candidate, cfg, expected_code_identity, expected_selection_data_identity):
+    if expected_selection_data_identity is None:
         return False
     checkpoint_code_identity = ckpt.get("code_identity_sha256")
     checkpoint_selection_identity = ckpt.get("selection_data_identity")
@@ -2653,26 +2697,17 @@ def finalize_run(
         raise RuntimeError("finite best-model metadata has no reachable weights")
     reloaded_best = False
     if has_best_metadata:
-        bundle = torch.load(artifacts.best_path, map_location=device, weights_only=True)
-        if not isinstance(bundle, Mapping) or not {
-                "model_state", "config", "config_fingerprint"}.issubset(bundle):
-            raise ValueError(
-                f"best checkpoint {artifacts.best_path} is not a semantic best-model bundle")
-        saved_config = bundle["config"]
-        if not isinstance(saved_config, Mapping):
-            raise ValueError(
-                f"best checkpoint {artifacts.best_path} has a non-mapping config")
-        saved_fingerprint = semantic_config_fingerprint(saved_config)
-        # RETAINED full internal fingerprint check (excluded-field tampering is still caught)...
-        if bundle["config_fingerprint"] != saved_fingerprint:
-            raise ValueError(
-                f"best checkpoint {artifacts.best_path} has a config fingerprint mismatch")
-        # ...but the saved-vs-live comparison is on the SELECTION PROJECTION, so a resume-path or
-        # output-cadence change cannot reject otherwise-identical selected weights.
-        if (semantic_config_fingerprint(_selection_semantic_config(saved_config))
-                != semantic_config_fingerprint(_selection_semantic_config(cfg))):
-            raise ValueError(
-                f"best checkpoint {artifacts.best_path} does not match the active selection config")
+        if artifacts.selection_data_identity is None:
+            raise RuntimeError(
+                "best-model finalization requires a bound validation-data identity")
+        bundle = _read_best_model_bundle(
+            artifacts.best_path,
+            cfg,
+            model.state_dict(),
+            device,
+            artifacts.code_identity_sha256,
+            artifacts.selection_data_identity,
+        )
         model.load_state_dict(bundle["model_state"])
         reloaded_best = True
         logger.info("Reloaded best-val checkpoint (step %s, val PPL %.3f) for test eval",

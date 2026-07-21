@@ -1618,6 +1618,7 @@ def test_validation_finalizer_scores_terminal_ema_before_best_selection(tmp_path
     # A DISTINCT prior best whose PPL (4.0) is LOWER than the final EMA result (9.0).
     torch.manual_seed(123)
     prior = VFEModel(cfg)
+    art.bind_selection_data_identity(_loader_data_identity(_eval_loader(), cfg.vocab_size))
     art.maybe_save_best(1, prior, 4.0)
     prior_state = torch.load(art.best_path, weights_only=True)["model_state"]
     prior_bytes = art.best_path.read_bytes()
