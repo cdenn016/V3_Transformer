@@ -7,7 +7,8 @@ import torch
 
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
-from vfe3.train import _val_diagnostics, evaluate
+import vfe3.train as train_module
+from vfe3.train import _val_diagnostics, evaluate, train
 
 
 _ACTIVE_BATCH_SIZE = 256
@@ -42,11 +43,13 @@ class _DiagnosticSnapshotSpy(torch.nn.Module):
         self.forward_calls += 1
         if self.forward_calls > 1:
             raise AssertionError("held-out diagnostic consumer replayed forward_beliefs")
-        return torch.zeros(
+        logits = torch.zeros(
             (*token_ids.shape, 8),
             dtype=torch.float32,
             device=token_ids.device,
         )
+        logits[..., 0] = 4.0
+        return logits
 
     def build_diagnostic_snapshot(self, token_ids: torch.Tensor) -> object:
         self.build_shapes.append(tuple(token_ids.shape))
@@ -129,7 +132,8 @@ def test_val_diagnostics_slices_first_sequence_before_snapshot_decode(
         _ACTIVE_BATCH_SIZE * _ACTIVE_SEQUENCE_LENGTH,
         dtype=torch.long,
     ).reshape(_ACTIVE_BATCH_SIZE, _ACTIVE_SEQUENCE_LENGTH) % 8
-    targets = torch.roll(token_ids, shifts=-1, dims=1)
+    targets = torch.arange(_ACTIVE_BATCH_SIZE, dtype=torch.long).remainder(8)
+    targets = targets[:, None].expand(-1, _ACTIVE_SEQUENCE_LENGTH).clone()
     model = _DiagnosticSnapshotSpy()
     snapshots: list[object] = []
     covariance_flags: list[bool | None] = []
@@ -186,7 +190,7 @@ def test_val_diagnostics_slices_first_sequence_before_snapshot_decode(
     monkeypatch.setattr(extract, "e_step_fixed_point_diagnostics", fixed_point)
     monkeypatch.setattr(metrics, "estep_residuals", residuals)
 
-    _val_diagnostics(model, [(token_ids, targets)], torch.device("cpu"))
+    result = _val_diagnostics(model, [(token_ids, targets)], torch.device("cpu"))
 
     assert model.build_shapes == [(1, _ACTIVE_SEQUENCE_LENGTH)]
     assert len(snapshots) == 1
@@ -200,6 +204,10 @@ def test_val_diagnostics_slices_first_sequence_before_snapshot_decode(
     }
     assert all(shape == (1, _ACTIVE_SEQUENCE_LENGTH) for _, shape, _ in model.consumer_calls)
     assert all(snapshot is snapshots[0] for _, _, snapshot in model.consumer_calls)
+    expected_first_row_ce = torch.log(torch.exp(torch.tensor(4.0)) + 7.0) - 4.0
+    assert result.metrics["pos_loss_first_q"] == pytest.approx(float(expected_first_row_ce), abs=1e-6)
+    assert result.metrics["pos_loss_last_q"] == pytest.approx(float(expected_first_row_ce), abs=1e-6)
+    assert result.metrics["pos_loss_ratio"] == pytest.approx(1.0)
 
     population_model = _PopulationEvaluationSpy()
     scores = evaluate(
@@ -210,6 +218,111 @@ def test_val_diagnostics_slices_first_sequence_before_snapshot_decode(
     assert population_model.shapes == [(_ACTIVE_BATCH_SIZE, _ACTIVE_SEQUENCE_LENGTH)]
     assert population_model.scored_targets == _ACTIVE_BATCH_SIZE * _ACTIVE_SEQUENCE_LENGTH
     assert scores["ce"] == pytest.approx(2.0)
+
+
+def test_periodic_eval_reuses_one_held_out_snapshot_for_metrics_and_maps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = VFE3Config(
+        vocab_size=8,
+        embed_dim=4,
+        n_heads=2,
+        max_seq_len=4,
+        n_layers=1,
+        n_e_steps=1,
+        batch_size=2,
+        generate_figures=True,
+        use_ema=False,
+    )
+    model = VFEModel(cfg)
+    train_tokens = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]])
+    train_targets = torch.roll(train_tokens, shifts=-1, dims=1)
+    val_tokens = torch.tensor([[7, 6, 5, 4], [6, 5, 4, 3]])
+    val_targets = torch.roll(val_tokens, shifts=-1, dims=1)
+    builds: list[tuple[torch.Tensor, object]] = []
+    consumers: list[tuple[str, torch.Tensor, object]] = []
+    real_build = model.build_diagnostic_snapshot
+    real_diagnostics = model.diagnostics
+    real_attention_maps = model.attention_maps
+    real_gamma_attention_maps = model.gamma_attention_maps
+
+    def build_snapshot(tokens: torch.Tensor) -> object:
+        snapshot = real_build(tokens)
+        builds.append((tokens.detach().clone(), snapshot))
+        return snapshot
+
+    def diagnostics(tokens: torch.Tensor, *, snapshot: object | None = None) -> dict[str, float]:
+        if snapshot is not None:
+            consumers.append(("diagnostics", tokens.detach().clone(), snapshot))
+        return real_diagnostics(tokens, snapshot=snapshot)
+
+    def attention_maps(tokens: torch.Tensor, *, snapshot: object | None = None) -> torch.Tensor:
+        if snapshot is not None:
+            consumers.append(("attention_maps", tokens.detach().clone(), snapshot))
+        return real_attention_maps(tokens, snapshot=snapshot)
+
+    def gamma_attention_maps(tokens: torch.Tensor, *, snapshot: object | None = None) -> object:
+        if snapshot is not None:
+            consumers.append(("gamma_attention_maps", tokens.detach().clone(), snapshot))
+        return real_gamma_attention_maps(tokens, snapshot=snapshot)
+
+    def fake_train_step(*args: object, **kwargs: object) -> float:
+        del args
+        metrics = kwargs["metrics_out"]
+        status = kwargs["status_out"]
+        assert isinstance(metrics, dict)
+        assert isinstance(status, dict)
+        metrics["train_ce"] = 1.0
+        status["did_step"] = False
+        return 1.0
+
+    class _Artifacts:
+        def __init__(self) -> None:
+            self.saved: list[tuple[str, int, object]] = []
+
+        def maybe_save_best(self, step: int, _model: object, _ppl: float) -> None:
+            del step
+
+        def save_attention_maps(self, step: int, maps: object, *, logger: object) -> None:
+            del logger
+            self.saved.append(("beta", step, maps))
+
+        def save_gamma_attention_maps(self, step: int, maps: object, *, logger: object) -> None:
+            del logger
+            self.saved.append(("gamma", step, maps))
+
+        def log_metrics(self, _row: dict[str, float]) -> None:
+            return None
+
+    monkeypatch.setattr(model, "build_diagnostic_snapshot", build_snapshot)
+    monkeypatch.setattr(model, "diagnostics", diagnostics)
+    monkeypatch.setattr(model, "attention_maps", attention_maps)
+    monkeypatch.setattr(model, "gamma_attention_maps", gamma_attention_maps)
+    monkeypatch.setattr(train_module, "train_step", fake_train_step)
+    artifacts = _Artifacts()
+
+    train(
+        model,
+        [(train_tokens, train_targets)],
+        cfg,
+        n_steps=1,
+        eval_interval=1,
+        val_loader=[(val_tokens, val_targets)],
+        artifacts=artifacts,
+        generate_samples=False,
+    )
+
+    assert len(builds) == 1
+    assert torch.equal(builds[0][0], val_tokens[:1])
+    held_out_snapshot = builds[0][1]
+    assert {name for name, _, _ in consumers} == {
+        "diagnostics",
+        "attention_maps",
+        "gamma_attention_maps",
+    }
+    assert all(torch.equal(tokens, val_tokens[:1]) for _, tokens, _ in consumers)
+    assert all(snapshot is held_out_snapshot for _, _, snapshot in consumers)
+    assert [channel for channel, _, _ in artifacts.saved] == ["beta", "gamma"]
 
 
 def test_h1_logits_copy_pair_allocation_arithmetic_is_bounded() -> None:

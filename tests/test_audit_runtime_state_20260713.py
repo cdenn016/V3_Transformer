@@ -193,14 +193,15 @@ def test_eval_attention_pair_uses_one_shared_post_eval_snapshot():
     tokens = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.long)
     _save_eval_attention_maps(
         tokens,
+        snapshot,
         model,
         artifacts,
         logging.getLogger(__name__),
         step=3,
     )
-    assert model.built == 1
-    assert len(model.seen) == 3
-    assert all(torch.equal(seen, tokens[:1]) for seen in model.seen)
+    assert model.built == 0
+    assert len(model.seen) == 2
+    assert all(torch.equal(seen, tokens) for seen in model.seen)
     assert [item[0] for item in artifacts.saved] == ["beta", "gamma"]
 
 
@@ -265,6 +266,6 @@ def test_head_mixer_builder_failure_is_logged(caplog, monkeypatch):
     with caplog.at_level(logging.WARNING, logger="vfe3.train"):
         result = _val_diagnostics(model, [(tokens, targets)], torch.device("cpu"))
 
-    assert "val_builder_resid" not in result
+    assert "val_builder_resid" not in result.metrics
     assert "head-mixer builder-residual diagnostic failed" in caplog.text
     assert "probe failed" in caplog.text

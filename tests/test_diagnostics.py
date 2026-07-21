@@ -100,10 +100,12 @@ def test_eval_diagnostics_builds_one_snapshot(monkeypatch) -> None:
 
     assert calls == 1
     assert training_modes == [False]
-    assert math.isfinite(diagnostics["val_inner_alignment_energy_total"])
-    assert diagnostics["val_free_energy_total"] == diagnostics["val_inner_alignment_energy_total"]
-    assert math.isfinite(diagnostics["estep_f_drop"])
-    assert math.isfinite(diagnostics["pos_loss_ratio"])
+    assert math.isfinite(diagnostics.metrics["val_inner_alignment_energy_total"])
+    assert diagnostics.metrics["val_free_energy_total"] == diagnostics.metrics[
+        "val_inner_alignment_energy_total"
+    ]
+    assert math.isfinite(diagnostics.metrics["estep_f_drop"])
+    assert math.isfinite(diagnostics.metrics["pos_loss_ratio"])
 
 
 def test_snapshot_and_independent_diagnostics_are_value_equal() -> None:

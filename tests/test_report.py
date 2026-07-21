@@ -181,7 +181,7 @@ def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
     ) -> object:
         kind = str(kwargs.get("kind", "Belief"))
         path = str(kwargs["path"])
-        umap_calls.append((channel, kind))
+        umap_calls.append((channel, kind, path))
         figure = plt.figure()
         figure.savefig(path)
         return figure
@@ -208,10 +208,18 @@ def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
         "model_umap_sigma.png",
         "reliability_diagram.png",
     } <= written
-    assert {
+    model_umap_calls = [call for call in umap_calls if call[1] == "Model"]
+    assert {(channel, kind) for channel, kind, _ in model_umap_calls} == {
         ("mu", "Model"),
         ("sigma", "Model"),
-    } <= set(umap_calls)
+    }
+    for channel, _, rendered_path in model_umap_calls:
+        rendered = Path(rendered_path)
+        assert rendered.parent == tmp_path / "run" / "figures"
+        assert rendered.name.startswith(f".model_umap_{channel}.")
+        assert rendered.name.endswith(".tmp.png")
+        assert not rendered.exists()
+        assert (tmp_path / "run" / "figures" / f"model_umap_{channel}.png").exists()
 
 
 def test_model_channel_report_extractors_do_not_replay_snapshot_state(monkeypatch):

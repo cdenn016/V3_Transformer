@@ -44,7 +44,7 @@ from vfe3.gauge_optim import (
     project_phi_parameter_rows_,
 )
 from vfe3.model.block import _as_coeff
-from vfe3.model.model import VFEModel
+from vfe3.model.model import DiagnosticSnapshot, VFEModel
 from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artifacts imports evaluate
 #                                                      lazily (function-local), so there is no cycle
 from vfe3.runtime import seed_everything
@@ -898,12 +898,20 @@ _VAL_DIAG_KEYS = (
 )
 
 
+class ValidationDiagnostics(NamedTuple):
+    r"""Metrics and bounded held-out state shared by one periodic evaluation event."""
+
+    metrics:   Dict[str, float]
+    token_ids: torch.Tensor
+    snapshot:  DiagnosticSnapshot
+
+
 @torch.no_grad()
 def _val_diagnostics(
     model:      VFEModel,
     val_loader: Iterable,
     device:     torch.device,
-) -> Dict[str, float]:
+) -> ValidationDiagnostics:
     r"""Held-out per-eval probes (the train-loop ``diagnostics`` runs on the live TRAIN batch).
 
     Computes the validation-side F decomposition, attention-map structure across ALL layers/heads
@@ -1041,12 +1049,13 @@ def _val_diagnostics(
                 "unavailable for this evaluation",
                 exc,
             )
-    return out
+    return ValidationDiagnostics(out, diagnostic_tokens, snapshot)
 
 
 def _save_eval_attention_maps(
     token_ids: torch.Tensor,                # (B, N) post-step evaluation batch
 
+    snapshot:  DiagnosticSnapshot,
     model:     VFEModel,
     artifacts: RunArtifacts,
     logger:    logging.Logger,
@@ -1055,16 +1064,14 @@ def _save_eval_attention_maps(
     step:      int,
 ) -> None:
     r"""Save beta/gamma maps from one post-step, post-EMA diagnostic snapshot."""
-    tokens = token_ids[:1]
-    snapshot = model.build_diagnostic_snapshot(tokens)
     artifacts.save_attention_maps(
         step,
-        model.attention_maps(tokens, snapshot=snapshot),
+        model.attention_maps(token_ids, snapshot=snapshot),
         logger=logger,
     )
     artifacts.save_gamma_attention_maps(
         step,
-        model.gamma_attention_maps(tokens, snapshot=snapshot),
+        model.gamma_attention_maps(token_ids, snapshot=snapshot),
         logger=logger,
     )
 
@@ -1573,22 +1580,31 @@ def train(
                 # RESETS the probes to NaN (blank CSV cells) so a previous eval's values are never
                 # carried forward as if fresh (audit 2026-07-01 F11), and a viz/replay fault never
                 # kills training.
+                validation_diagnostics: Optional[ValidationDiagnostics] = None
                 try:
-                    last_val_diag.update(_val_diagnostics(model, val_loader, device))
+                    validation_diagnostics = _val_diagnostics(model, val_loader, device)
+                    last_val_diag.update(validation_diagnostics.metrics)
                 except Exception as exc:
                     logger.warning("       (validation diagnostics failed: %s); continuing", exc)
                     last_val_diag.update({k: float("nan") for k in _VAL_DIAG_KEYS})
                 artifacts.maybe_save_best(step + 1, model, m["ppl"])
                 # Per-layer/per-head attention heatmap grid for this eval (off the graph, seq 0 of
-                # the live batch), plus the model-coupling (gamma) heatmaps in a distinct color
+                # the held-out batch), plus the model-coupling (gamma) heatmaps in a distinct color
                 # (viridis vs magma; gamma_attention_maps returns None when the model channel is
                 # off -> no-op). The model REPLAYS (attention_maps / gamma_attention_maps) are
                 # argument expressions evaluated HERE in the caller, OUTSIDE the save helpers'
                 # internal try/except, so guard them too -- a replay error must never kill training
                 # (audit 2026-07-01 F11). Kept at EVAL cadence (one grid per eval, not per log).
-                if cfg.generate_figures:
+                if cfg.generate_figures and validation_diagnostics is not None:
                     try:
-                        _save_eval_attention_maps(tokens, model, artifacts, logger, step=step + 1)
+                        _save_eval_attention_maps(
+                            validation_diagnostics.token_ids,
+                            validation_diagnostics.snapshot,
+                            model,
+                            artifacts,
+                            logger,
+                            step=step + 1,
+                        )
                     except Exception as exc:
                         logger.warning("       (attention-map replay failed: %s); continuing", exc)
             if ema is not None:
