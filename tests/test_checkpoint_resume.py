@@ -1558,6 +1558,40 @@ def test_legacy_cross_run_resume_imports_sibling_best_bundle(tmp_path):
         assert torch.equal(published[n], v)                     # sibling best imported into the new run
 
 
+def test_legacy_resume_publishes_owned_preflight_snapshot_when_sibling_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = _cfg()
+    checkpoint, best_state, _ = _build_embedded_best_checkpoint(tmp_path / "A", cfg)
+    _strip_to_legacy(checkpoint)
+    sibling = tmp_path / "A" / "best_model.pt"
+    replacement = torch.load(sibling, weights_only=True)
+    with torch.no_grad():
+        for key, tensor in replacement["model_state"].items():
+            if tensor.is_floating_point():
+                replacement["model_state"][key] = tensor + 7.0
+
+    fresh = VFEModel(cfg)
+    new_art = RunArtifacts(tmp_path / "B", cfg, fresh)
+    new_art.bind_selection_data_identity(_loader_data_identity(_eval_loader(), cfg.vocab_size))
+    original_load_state_dict = fresh.load_state_dict
+
+    def replace_sibling_after_preflight(state_dict, *args, **kwargs):
+        torch.save(replacement, sibling)
+        return original_load_state_dict(state_dict, *args, **kwargs)
+
+    monkeypatch.setattr(fresh, "load_state_dict", replace_sibling_after_preflight)
+    load_checkpoint(checkpoint, fresh, artifacts=new_art)
+
+    replaced_sibling = torch.load(sibling, weights_only=True)["model_state"]
+    for name, expected in replacement["model_state"].items():
+        assert torch.equal(replaced_sibling[name], expected)
+    published = torch.load(new_art.best_path, weights_only=True)["model_state"]
+    for name, expected in best_state.items():
+        assert torch.equal(published[name], expected)
+
+
 def test_resume_without_best_weights_rejects_unreachable_selection(tmp_path):
     cfg = _cfg()
     ckpt, _, _ = _build_embedded_best_checkpoint(tmp_path / "A", cfg)

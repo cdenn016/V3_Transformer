@@ -2,12 +2,17 @@
 
 import json
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Optional
 
 import torch
 
-from vfe3.config import VFE3Config, config_from_serialized, migrate_serialized_config
-from vfe3.run_artifacts import _selection_semantic_config, semantic_config_fingerprint
+from vfe3.config import VFE3Config, config_from_serialized
+from vfe3.run_artifacts import (
+    _normalized_data_identity,
+    _validate_best_model_mapping,
+    _validate_live_figure_snapshot_mapping,
+    semantic_config_fingerprint,
+)
 
 
 def load_run_config(run_dir: Path) -> 'tuple[VFE3Config, str]':
@@ -29,30 +34,110 @@ def load_run_config(run_dir: Path) -> 'tuple[VFE3Config, str]':
 
 
 def load_best_model_state(
-    path: Path,
-    cfg:  VFE3Config,
+    path:                             Path,
+    cfg:                              VFE3Config,
+    expected_model_state:             Mapping[str, torch.Tensor],
+    expected_code_identity:           str,
+    expected_selection_data_identity: Mapping[str, object],
 
     *,
     map_location: object,
 ) -> Mapping[str, torch.Tensor]:
-    """Validate and unwrap a self-bound best-model bundle for strict model loading."""
+    """Return an owned model state after the unified selected-bundle validation boundary."""
     payload = torch.load(path, map_location=map_location, weights_only=True)
-    required = {"model_state", "config", "config_fingerprint"}
-    if not isinstance(payload, Mapping) or not payload or not required.issubset(payload):
-        raise ValueError(f"best checkpoint {path} is not a self-bound model/config bundle")
-    embedded = payload["config"]
-    if not isinstance(embedded, Mapping) or not embedded:
-        raise ValueError(f"best checkpoint {path} has no embedded config mapping")
-    if payload["config_fingerprint"] != semantic_config_fingerprint(embedded):
-        raise ValueError(f"best checkpoint {path} has a config fingerprint mismatch")
-    embedded_cfg = migrate_serialized_config(
-        embedded,
-        source=f"{path} embedded config",
-        strict_unknown=True,
-    ).config
-    if _selection_semantic_config(embedded_cfg) != _selection_semantic_config(cfg):
-        raise ValueError(f"best checkpoint {path} has a semantic config mismatch with config.json")
-    model_state = payload["model_state"]
-    if not isinstance(model_state, Mapping) or not model_state:
-        raise ValueError(f"best checkpoint {path} must contain a nonempty model_state mapping")
-    return model_state
+    try:
+        validated = _validate_best_model_mapping(
+            payload,
+            cfg,
+            expected_model_state,
+            f"offline best-model bundle at {path}",
+            expected_code_identity=expected_code_identity,
+            expected_selection_data_identity=expected_selection_data_identity,
+        )
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+    return validated["model_state"]
+
+
+def load_figure_model_state(
+    path:                             Path,
+    cfg:                              VFE3Config,
+    expected_model_state:             Mapping[str, torch.Tensor],
+    expected_code_identity:           str,
+    expected_selection_data_identity: Optional[Mapping[str, object]],
+
+    *,
+    map_location: object,
+) -> Mapping[str, torch.Tensor]:
+    """Load either a selected bundle or the exact nonselected live-figure snapshot schema."""
+    payload = torch.load(path, map_location=map_location, weights_only=True)
+    try:
+        if isinstance(payload, Mapping) and "artifact_kind" in payload:
+            return _validate_live_figure_snapshot_mapping(
+                payload,
+                cfg,
+                expected_model_state,
+                expected_code_identity,
+                path,
+            )
+        if expected_selection_data_identity is None:
+            raise RuntimeError(
+                f"offline selected-model loading requires a trusted validation-data identity "
+                f"before loading {path}")
+        validated = _validate_best_model_mapping(
+            payload,
+            cfg,
+            expected_model_state,
+            f"offline best-model bundle at {path}",
+            expected_code_identity=expected_code_identity,
+            expected_selection_data_identity=expected_selection_data_identity,
+        )
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+    return validated["model_state"]
+
+
+def _load_run_provenance(run_dir: Path) -> 'tuple[Path, Mapping[str, object]]':
+    """Load the independent run-provenance mapping or fail closed."""
+    path = run_dir / "provenance.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"offline model loading requires readable provenance at {path}") from exc
+    if not isinstance(payload, Mapping):
+        raise RuntimeError(f"offline model loading requires mapping provenance at {path}")
+    return path, payload
+
+
+def load_run_figure_contract(
+    run_dir: Path,
+) -> 'tuple[str, Optional[Mapping[str, object]]]':
+    """Load trusted code identity plus an optional selected-data identity for figure replay."""
+    path, payload = _load_run_provenance(run_dir)
+    code_identity = payload.get("code_identity_sha256")
+    if (not isinstance(code_identity, str) or len(code_identity) != 64
+            or any(character not in "0123456789abcdef" for character in code_identity)):
+        raise RuntimeError(
+            f"offline model loading requires a trusted executable-code identity in {path}")
+    selection_identity = payload.get("selection_data_identity")
+    if selection_identity is None:
+        return code_identity, None
+    try:
+        normalized_identity = _normalized_data_identity(selection_identity)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"offline model loading found an invalid validation-data identity in {path}") from exc
+    return code_identity, normalized_identity
+
+
+def load_run_selection_contract(
+    run_dir: Path,
+) -> 'tuple[str, Mapping[str, object]]':
+    """Load trusted selected-model identities from the run's independent provenance record."""
+    code_identity, selection_identity = load_run_figure_contract(run_dir)
+    if selection_identity is None:
+        raise RuntimeError(
+            f"offline selected-model loading requires a trusted validation-data identity in "
+            f"{run_dir / 'provenance.json'}")
+    return code_identity, selection_identity

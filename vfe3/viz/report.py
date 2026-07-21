@@ -46,7 +46,10 @@ from vfe3.viz import embedding_comparison
 from vfe3.viz import figures as figs
 from vfe3.viz.run_loading import (
     load_best_model_state as _load_best_model_state,
+    load_figure_model_state as _load_figure_model_state,
     load_run_config as _load_config,
+    load_run_figure_contract as _load_run_figure_contract,
+    load_run_selection_contract as _load_run_selection_contract,
 )
 from vfe3.viz.text import supports_english_linguistic_taxonomies
 
@@ -517,8 +520,30 @@ def generate_figures(
         best = checkpoint_path if checkpoint_path is not None else run_dir / "best_model.pt"
         if not best.exists():
             raise FileNotFoundError(f"no model checkpoint at {best}; train with RunArtifacts first")
+        if checkpoint_path is None:
+            expected_code_identity, expected_selection_data_identity = (
+                _load_run_selection_contract(run_dir))
+            model_state = _load_best_model_state(
+                best,
+                cfg,
+                model.state_dict(),
+                expected_code_identity,
+                expected_selection_data_identity,
+                map_location=device or "cpu",
+            )
+        else:
+            expected_code_identity, expected_selection_data_identity = (
+                _load_run_figure_contract(run_dir))
+            model_state = _load_figure_model_state(
+                best,
+                cfg,
+                model.state_dict(),
+                expected_code_identity,
+                expected_selection_data_identity,
+                map_location=device or "cpu",
+            )
         model.load_state_dict(
-            _load_best_model_state(best, cfg, map_location=device or "cpu"),
+            model_state,
             strict=True,
         )
     else:
@@ -1056,8 +1081,17 @@ def vocab_comparison_figures(
         best = rd / "best_model.pt"
         if not best.exists():
             raise FileNotFoundError(f"no best_model.pt in {rd}; train with RunArtifacts first")
+        expected_code_identity, expected_selection_data_identity = (
+            _load_run_selection_contract(rd))
         model.load_state_dict(
-            _load_best_model_state(best, cfg, map_location=device or "cpu"),
+            _load_best_model_state(
+                best,
+                cfg,
+                model.state_dict(),
+                expected_code_identity,
+                expected_selection_data_identity,
+                map_location=device or "cpu",
+            ),
             strict=True,
         )
         dev = device or next(model.parameters()).device

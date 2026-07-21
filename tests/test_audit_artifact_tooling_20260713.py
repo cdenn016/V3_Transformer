@@ -10,11 +10,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pytest
 import torch
+from torch.utils.data import DataLoader
 
 import make_figures
 import scaling
 import scaling_analysis
 from vfe3.config import VFE3Config
+from vfe3.data.datasets import TokenWindows
 from vfe3.model.model import VFEModel
 from vfe3.path_utils import filesystem_slug
 from vfe3.run_artifacts import (
@@ -24,6 +26,7 @@ from vfe3.run_artifacts import (
 )
 from vfe3.viz import figures as figs
 from vfe3.viz.sweep_adapters import pareto_frontier_kwargs
+from vfe3.train import _loader_data_identity
 
 
 def _write_finalized_figure_run(
@@ -47,10 +50,25 @@ def _write_finalized_figure_run(
     }), encoding="utf-8")
     if model_state is None:
         model_state = model.state_dict()
+    tokens = torch.arange(cfg.vocab_size).repeat(cfg.max_seq_len + 1)
+    loader = DataLoader(
+        TokenWindows(tokens.long(), cfg.max_seq_len),
+        batch_size=1,
+        shuffle=False,
+        drop_last=True,
+    )
+    selection_data_identity = _loader_data_identity(loader, cfg.vocab_size)
+    code_identity = "c" * 64
+    (run_dir / "provenance.json").write_text(json.dumps({
+        "code_identity_sha256":    code_identity,
+        "selection_data_identity": selection_data_identity,
+    }), encoding="utf-8")
     torch.save({
-        "model_state": model_state,
-        "config": config,
-        "config_fingerprint": semantic_config_fingerprint(config),
+        "model_state":             model_state,
+        "config":                  config,
+        "config_fingerprint":      semantic_config_fingerprint(config),
+        "code_identity_sha256":    code_identity,
+        "selection_data_identity": selection_data_identity,
     }, run_dir / "best_model.pt")
 
 

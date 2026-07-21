@@ -32,7 +32,7 @@ from vfe3.run_artifacts import (
     finalize_run,
     semantic_config_fingerprint,
 )
-from vfe3.train import build_optimizer, train
+from vfe3.train import _loader_data_identity, build_optimizer, train
 from vfe3.viz import figures as figs
 
 
@@ -765,6 +765,8 @@ def test_provenance_records_all_split_hashes_and_data_knobs(tmp_path):
     train_loader = _loader(seed=1, n=300)
     val_loader = _loader(seed=2, n=360)
     test_loader = _loader(seed=3, n=420)
+    selection_data_identity = _loader_data_identity(val_loader, cfg.vocab_size)
+    art.bind_selection_data_identity(selection_data_identity)
 
     finalize_run(
         model,
@@ -787,6 +789,7 @@ def test_provenance_records_all_split_hashes_and_data_knobs(tmp_path):
     assert prov["data_seed"] == 17
     assert prov["max_tokens"] == 300
     assert prov["tokenizer_tag"] == "synthetic-v1"
+    assert prov["selection_data_identity"] == selection_data_identity
     assert prov["data_sha256"] == prov["test_data_sha256"]
     assert prov["data_n_tokens"] == prov["test_data_n_tokens"]
 

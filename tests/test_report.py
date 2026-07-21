@@ -23,7 +23,7 @@ from vfe3.data.datasets import TokenWindows
 from vfe3.geometry.transport import CompactFactoredTransport
 from vfe3.model.model import VFEModel
 from vfe3.run_artifacts import RunArtifacts, finalize_run, semantic_config_fingerprint
-from vfe3.train import train
+from vfe3.train import _loader_data_identity, train
 from vfe3.viz.extract import converged_state
 from vfe3.viz.figures import register_figure
 from vfe3.viz.report import generate_figures, plan_single_run_figures, vocab_comparison_figures
@@ -47,6 +47,17 @@ def _cfg(**kw):
 def _model(**kw):
     torch.manual_seed(0)
     return VFEModel(_cfg(**kw))
+
+
+def _bind_offline_selection_contract(
+    artifacts: RunArtifacts,
+) -> None:
+    identity = _loader_data_identity(_loader(), artifacts.cfg.vocab_size)
+    artifacts.bind_selection_data_identity(identity)
+    artifacts.save_json("provenance.json", {
+        "code_identity_sha256":    artifacts.code_identity_sha256,
+        "selection_data_identity": identity,
+    })
 
 
 def test_converged_state_shapes_and_finite():
@@ -230,6 +241,7 @@ def test_generate_figures_rejects_corrupt_best_bundle_fingerprint(tmp_path):
     cfg = _cfg()
     model = _model()
     art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
+    _bind_offline_selection_contract(art)
     art.maybe_save_best(1, model, 1.0)
     bundle = torch.load(art.best_path, map_location="cpu", weights_only=True)
     bundle["config_fingerprint"] = "corrupt"
@@ -243,14 +255,17 @@ def test_generate_figures_rejects_empty_best_bundle_state(tmp_path):
     cfg = _cfg()
     model = _model()
     art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
+    _bind_offline_selection_contract(art)
     config = asdict(cfg)
     torch.save({
-        "model_state": {},
-        "config": config,
-        "config_fingerprint": semantic_config_fingerprint(config),
+        "model_state":             {},
+        "config":                  config,
+        "config_fingerprint":      semantic_config_fingerprint(config),
+        "code_identity_sha256":    art.code_identity_sha256,
+        "selection_data_identity": art.selection_data_identity,
     }, art.best_path)
 
-    with pytest.raises(ValueError, match="nonempty model_state"):
+    with pytest.raises(ValueError, match="model_state keys"):
         generate_figures(art.run_dir, loader=_loader(), max_sequences=16)
 
 
@@ -258,14 +273,17 @@ def test_vocab_comparison_rejects_semantically_mismatched_best_bundle(tmp_path):
     cfg = _cfg()
     model = _model()
     art = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic-period3")
+    _bind_offline_selection_contract(art)
     mismatched = asdict(_cfg(n_e_steps=3))
     torch.save({
-        "model_state": model.state_dict(),
-        "config": mismatched,
-        "config_fingerprint": semantic_config_fingerprint(mismatched),
+        "model_state":             model.state_dict(),
+        "config":                  mismatched,
+        "config_fingerprint":      semantic_config_fingerprint(mismatched),
+        "code_identity_sha256":    art.code_identity_sha256,
+        "selection_data_identity": art.selection_data_identity,
     }, art.best_path)
 
-    with pytest.raises(ValueError, match="semantic config mismatch"):
+    with pytest.raises(ValueError, match="selection config"):
         vocab_comparison_figures([art.run_dir], tmp_path / "comparison")
 
 

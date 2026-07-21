@@ -31,7 +31,11 @@ import torch
 
 from vfe3.process_utils import run_process_tree
 from vfe3.run_artifacts import _unique_sibling_temp
-from vfe3.viz.run_loading import load_best_model_state, load_run_config
+from vfe3.viz.run_loading import (
+    load_best_model_state,
+    load_run_config,
+    load_run_selection_contract,
+)
 
 RUN_ROOT = "vfe3_runs"
 _FIGURE_TIMEOUT_SECONDS = 2 * 60 * 60
@@ -93,13 +97,18 @@ def _validated_run_dir(path: Path) -> Path:
         from vfe3.model.model import VFEModel
 
         cfg, _dataset = load_run_config(path)
-        model_state = load_best_model_state(
-            path / "best_model.pt",
-            cfg,
-            map_location="cpu",
-        )
+        expected_code_identity, expected_selection_data_identity = (
+            load_run_selection_contract(path))
         with torch.random.fork_rng(devices=[]):
             validation_model = VFEModel(cfg)
+            model_state = load_best_model_state(
+                path / "best_model.pt",
+                cfg,
+                validation_model.state_dict(),
+                expected_code_identity,
+                expected_selection_data_identity,
+                map_location="cpu",
+            )
             validation_model.load_state_dict(model_state, strict=True)
     except Exception as exc:
         raise ValueError(f"run directory {path} has an invalid best_model.pt") from exc

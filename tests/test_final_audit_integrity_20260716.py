@@ -11,13 +11,16 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch.utils.data import DataLoader
 
 import multiseed_analysis
 import scaling_analysis
 from vfe3.config import VFE3Config
+from vfe3.data.datasets import TokenWindows
 from vfe3.gauge_optim import GaugeManifoldAdamW
 from vfe3.geometry.groups import get_group
 from vfe3.run_artifacts import RunArtifacts, load_checkpoint, semantic_config_fingerprint
+from vfe3.train import _loader_data_identity
 
 
 def _sha256(value: object) -> str:
@@ -459,20 +462,44 @@ def test_visualization_best_model_verifies_raw_legacy_fingerprint_before_migrati
     raw_config.pop("m_phi_update_mode")
     raw_config["m_phi_natural_grad"] = False
     checkpoint = tmp_path / "best_model.pt"
+    loader = DataLoader(
+        TokenWindows(torch.arange(8).repeat(4).long(), cfg.max_seq_len),
+        batch_size=1,
+        shuffle=False,
+        drop_last=True,
+    )
+    selection_data_identity = _loader_data_identity(loader, cfg.vocab_size)
+    code_identity = "c" * 64
     payload = {
-        "model_state": model.state_dict(),
-        "config": raw_config,
-        "config_fingerprint": semantic_config_fingerprint(raw_config),
+        "model_state":             model.state_dict(),
+        "config":                  raw_config,
+        "config_fingerprint":      semantic_config_fingerprint(raw_config),
+        "code_identity_sha256":    code_identity,
+        "selection_data_identity": selection_data_identity,
     }
     torch.save(payload, checkpoint)
 
-    loaded = load_best_model_state(checkpoint, cfg, map_location="cpu")
+    loaded = load_best_model_state(
+        checkpoint,
+        cfg,
+        model.state_dict(),
+        code_identity,
+        selection_data_identity,
+        map_location="cpu",
+    )
     assert set(loaded) == set(model.state_dict())
 
     payload["config_fingerprint"] = "f" * 64
     torch.save(payload, checkpoint)
     with pytest.raises(ValueError, match="fingerprint mismatch"):
-        load_best_model_state(checkpoint, cfg, map_location="cpu")
+        load_best_model_state(
+            checkpoint,
+            cfg,
+            model.state_dict(),
+            code_identity,
+            selection_data_identity,
+            map_location="cpu",
+        )
 
 
 def test_pullback_group_artifact_reports_fixed_factor_norm_route() -> None:

@@ -106,6 +106,8 @@ _DATA_ITERATOR_IDENTITY_FIELDS = {
     "sampler_replacement",
     "sampler_num_samples",
 }
+_LIVE_FIGURE_SNAPSHOT_KIND = "live_figure_snapshot"
+_LIVE_FIGURE_SNAPSHOT_SCHEMA_VERSION = 1
 
 
 def _require_identity_sha256(value: object, field: str) -> str:
@@ -555,9 +557,12 @@ def _run_figures_isolated(
                 if generate_publication and not best_path.is_file():
                     config = asdict(artifacts.cfg)
                     torch.save({
-                        "model_state":        model.state_dict(),
-                        "config":             config,
-                        "config_fingerprint": semantic_config_fingerprint(config),
+                        "artifact_kind":        _LIVE_FIGURE_SNAPSHOT_KIND,
+                        "schema_version":       _LIVE_FIGURE_SNAPSHOT_SCHEMA_VERSION,
+                        "model_state":          model.state_dict(),
+                        "config":               config,
+                        "config_fingerprint":   semantic_config_fingerprint(config),
+                        "code_identity_sha256": _verified_process_code_identity(),
                     }, model_path)
                     live_model_path = str(model_path)
                 request = {
@@ -826,6 +831,56 @@ def _validate_best_model_mapping(
         for key, tensor in validated_state.items()
     }
     return validated
+
+
+def _validate_live_figure_snapshot_mapping(
+    bundle:                 object,
+    cfg:                    VFE3Config,
+    expected_model_state:   Mapping[str, torch.Tensor],
+    expected_code_identity: str,
+    path:                   Path,
+) -> Mapping[str, torch.Tensor]:
+    """Return owned live weights after validating the exact nonselected figure contract."""
+    fields = {
+        "artifact_kind",
+        "schema_version",
+        "model_state",
+        "config",
+        "config_fingerprint",
+        "code_identity_sha256",
+    }
+    context = f"live figure snapshot at {path}"
+    if not isinstance(bundle, Mapping) or set(bundle) != fields:
+        raise RuntimeError(f"{context} does not have the exact live-snapshot schema")
+    if bundle["artifact_kind"] != _LIVE_FIGURE_SNAPSHOT_KIND:
+        raise RuntimeError(f"{context} has an invalid artifact kind")
+    if type(bundle["schema_version"]) is not int or (
+            bundle["schema_version"] != _LIVE_FIGURE_SNAPSHOT_SCHEMA_VERSION):
+        raise RuntimeError(f"{context} has an unsupported schema version")
+    saved_config = bundle["config"]
+    if not isinstance(saved_config, Mapping):
+        raise RuntimeError(f"{context} has a non-mapping config")
+    if bundle["config_fingerprint"] != semantic_config_fingerprint(saved_config):
+        raise RuntimeError(f"{context} has a config fingerprint mismatch")
+    if (semantic_config_fingerprint(saved_config)
+            != semantic_config_fingerprint(asdict(cfg))):
+        raise RuntimeError(f"{context} does not match the active full configuration")
+    code_identity = bundle["code_identity_sha256"]
+    if (not isinstance(code_identity, str) or len(code_identity) != 64
+            or any(character not in "0123456789abcdef" for character in code_identity)):
+        raise RuntimeError(f"{context} has an invalid executable-code identity")
+    if code_identity != expected_code_identity:
+        raise RuntimeError(f"{context} does not match the active executable-code identity")
+    validated_state = _validate_checkpoint_model_state(
+        bundle["model_state"],
+        expected_model_state,
+        path,
+        artifact_class="live figure snapshot",
+    )
+    return {
+        key: tensor.detach().clone()
+        for key, tensor in validated_state.items()
+    }
 
 
 def _read_best_model_bundle(
@@ -1488,25 +1543,15 @@ def _restore_best_selection(
     checkpoint_path:      Path,
     artifacts:            'RunArtifacts',
     expected_model_state: Mapping[str, torch.Tensor],
-    map_location:         'str | torch.device',
-    inherit_selection:    bool,
+    validated_selection:  Optional[Mapping[str, object]],
 ) -> None:
-    r"""Restore portable best-model selection state into ``artifacts`` from a loaded checkpoint (PB-03).
-
-    Precedence: (1) validate + publish a modern checkpoint's embedded ``best_model_bundle``; (2) for a
-    legacy checkpoint lacking that field, validate ``<old_run>/best_model.pt`` (``old_run`` is
-    ``checkpoint_path.parent.parent``) and publish it into the new run; (3) otherwise reset the
-    selection state to empty, warning only when a finite-but-unreachable best scalar is being dropped.
-    The best weights are only PUBLISHED (made reachable in the new run directory), never loaded into the
-    live training model. After publication the scalar metadata is set and the file is required to exist.
-    """
+    r"""Publish the owned selected snapshot captured before any live checkpoint restoration."""
     import warnings
 
-    embedded = ckpt.get("best_model_bundle")
     ckpt_best_ppl = ckpt.get("best_val_ppl")
     had_finite_best = ckpt_best_ppl is not None and math.isfinite(float(ckpt_best_ppl))
 
-    if not inherit_selection:
+    if validated_selection is None:
         artifacts.best_val_ppl = float("inf")
         artifacts.best_step = None
         if had_finite_best:
@@ -1519,48 +1564,12 @@ def _restore_best_selection(
             )
         return
 
-    # (1) Modern checkpoint carrying an embedded validated bundle.
-    if isinstance(embedded, Mapping):
-        _publish_best_model_bundle(embedded, expected_model_state, artifacts)
-        artifacts.best_val_ppl = float(ckpt_best_ppl)
-        artifacts.best_step    = ckpt.get("best_step")
-        if not artifacts.best_path.is_file():
-            raise RuntimeError(
-                "best-model bundle is not reachable after publication into the resumed run")
-        return
-
-    # (2) Legacy checkpoint (no best_model_bundle field): import the sibling best_model.pt if reachable.
-    if "best_model_bundle" not in ckpt and had_finite_best:
-        old_best = checkpoint_path.parent.parent / "best_model.pt"
-        if old_best.is_file():
-            bundle = _read_best_model_bundle(
-                old_best,
-                artifacts.cfg,
-                expected_model_state,
-                map_location,
-                artifacts.code_identity_sha256,
-                artifacts.selection_data_identity,
-            )
-            _publish_best_model_bundle(bundle, expected_model_state, artifacts)
-            artifacts.best_val_ppl = float(ckpt_best_ppl)
-            artifacts.best_step    = ckpt.get("best_step")
-            if not artifacts.best_path.is_file():
-                raise RuntimeError(
-                    "best-model bundle is not reachable after publication into the resumed run")
-            return
-
-    # (3) No reachable selected weights: reset to empty, never retaining an unreachable finite scalar.
-    artifacts.best_val_ppl = float("inf")
-    artifacts.best_step    = None
-    if had_finite_best:
-        warnings.warn(
-            f"resume from {checkpoint_path.name} carried finite best-val metadata "
-            f"(best_val_ppl={float(ckpt_best_ppl)}) but no reachable best-model weights (neither an "
-            f"embedded bundle nor a sibling best_model.pt); dropping the unreachable selection state, "
-            f"so model selection restarts from this run.",
-            UserWarning,
-            stacklevel=3,
-        )
+    _publish_best_model_bundle(validated_selection, expected_model_state, artifacts)
+    artifacts.best_val_ppl = float(ckpt_best_ppl)
+    artifacts.best_step    = ckpt.get("best_step")
+    if not artifacts.best_path.is_file():
+        raise RuntimeError(
+            "best-model bundle is not reachable after publication into the resumed run")
 
 
 def _preflight_best_selection(
@@ -1572,8 +1581,8 @@ def _preflight_best_selection(
     saved_step:           int,
     expected_code_identity: str,
     expected_selection_data_identity: Optional[Mapping[str, object]],
-) -> bool:
-    """Validate selection scalars and all reachable selected weights before live restoration."""
+) -> Optional[Dict[str, object]]:
+    """Return one owned selected snapshot validated before live restoration, or ``None``."""
     if "best_val_ppl" not in ckpt or "best_step" not in ckpt:
         raise RuntimeError("checkpoint best-model selection metadata is missing")
     best_ppl = ckpt["best_val_ppl"]
@@ -1620,26 +1629,26 @@ def _preflight_best_selection(
                     expected_selection_data_identity=expected_selection_data_identity,
                 )
         except _BestModelContractMismatch:
-            return False
+            return None
     elif best_step is not None or embedded is not None:
         raise RuntimeError(
             "checkpoint empty best-model selection must use best_step=None and no weight bundle")
     if not selected or candidate is None:
-        return False
+        return None
     if expected_selection_data_identity is None:
-        return False
+        return None
     checkpoint_code_identity = ckpt.get("code_identity_sha256")
     checkpoint_selection_identity = ckpt.get("selection_data_identity")
     if (checkpoint_code_identity != candidate.get("code_identity_sha256")
             or checkpoint_selection_identity is None):
-        return False
+        return None
     try:
         if (_normalized_data_identity(checkpoint_selection_identity)
                 != _normalized_data_identity(candidate["selection_data_identity"])):
-            return False
+            return None
     except (TypeError, ValueError):
-        return False
-    return True
+        return None
+    return candidate
 
 
 def _preflight_resume_config(
@@ -1884,7 +1893,7 @@ def load_checkpoint(
         if artifacts is not None
         else _verified_process_code_identity()
     )
-    inherit_selection = _preflight_best_selection(
+    validated_selection = _preflight_best_selection(
         ckpt,
         checkpoint_path,
         active_selection_cfg,
@@ -1927,8 +1936,12 @@ def load_checkpoint(
     #   (3) neither -> the selection state resets to empty, and any unreachable finite scalar is dropped.
     if artifacts is not None:
         _restore_best_selection(
-            ckpt, checkpoint_path, artifacts, model.state_dict(), map_location,
-            inherit_selection)
+            ckpt,
+            checkpoint_path,
+            artifacts,
+            model.state_dict(),
+            validated_selection,
+        )
     if resume_cfg is not None:
         if config_drift:
             import warnings
@@ -2342,6 +2355,7 @@ def _write_provenance(
         "max_tokens":          (int(max_tokens) if max_tokens is not None else None),
         "tokenizer_tag":       tokenizer_tag,
         "code_identity_sha256":       artifacts.code_identity_sha256,
+        "selection_data_identity":    artifacts.selection_data_identity,
         "final_code_identity_sha256": final_code_identity_sha256,
         "code_identity_drift":        code_identity_drift,
         "run_start_git_identity":     run_start_git_identity,
