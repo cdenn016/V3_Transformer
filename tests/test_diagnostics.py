@@ -186,7 +186,28 @@ def test_attention_and_trace_reuse_snapshot_without_forward_replay(monkeypatch) 
     assert model.diagnostics_per_layer(tokens, snapshot=snapshot)
     assert model.gamma_attention_maps(tokens, snapshot=snapshot).shape == (2, 4, 4)
     assert extract.e_step_belief_trace(model, tokens, snapshot=snapshot)["mu"].shape[0] == 3
+    diagonal_flags = []
+    real_spd_geodesic_distance = metrics.spd_geodesic_distance
+
+    def record_spd_covariance_family(
+        sigma_a: torch.Tensor,
+        sigma_b: torch.Tensor,
+
+        *,
+        diagonal: bool | None = None,
+        eps:      float = 1e-12,
+    ) -> torch.Tensor:
+        diagonal_flags.append(diagonal)
+        return real_spd_geodesic_distance(
+            sigma_a,
+            sigma_b,
+            diagonal=diagonal,
+            eps=eps,
+        )
+
+    monkeypatch.setattr(metrics, "spd_geodesic_distance", record_spd_covariance_family)
     assert extract.across_layer_belief_trace(model, tokens, snapshot=snapshot)["mu"].shape[0] == 2
+    assert diagonal_flags == [True]
     assert extract.numerical_health(model, tokens, snapshot=snapshot)
     assert extract.converged_state(model, tokens, snapshot=snapshot)
     assert extract.gamma_attention(model, tokens, snapshot=snapshot)["gamma"].shape == (2, 4, 4)

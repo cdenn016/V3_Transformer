@@ -913,7 +913,11 @@ def across_layer_belief_trace(
     mu_stack = torch.stack(mus)                                   # (L, N, K)
     sig_stack = torch.stack(sigmas)                              # (L, N, [K])
     base = sig_stack[0].unsqueeze(0).expand_as(sig_stack)
-    d_ai = metrics.spd_geodesic_distance(base, sig_stack).mean(dim=-1)   # (L,) mean over tokens
+    d_ai = metrics.spd_geodesic_distance(                       # (L,) mean over tokens
+        base,
+        sig_stack,
+        diagonal=cfg.diagonal_covariance,
+    ).mean(dim=-1)
     eff = metrics.effective_rank_per_token(
         sig_stack,
         diagonal=cfg.diagonal_covariance,

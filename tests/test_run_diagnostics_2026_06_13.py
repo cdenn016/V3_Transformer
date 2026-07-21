@@ -270,7 +270,10 @@ def test_val_diagnostics_passes_explicit_diagonal_covariance_for_square_trace(mo
     monkeypatch.setattr(metrics_module, "estep_residuals", _record_diagonal)
     _val_diagnostics(model, loader, DEVICE)
 
-    assert observed == [True]
+    # The configured-state residual and the one-step-ahead fixed-point residual are separate
+    # reductions; both must retain the explicit family flag when N == K makes shape inference
+    # ambiguous.
+    assert observed == [True, True]
 
 
 def test_diagnostics_has_renyi_band_frac() -> None:

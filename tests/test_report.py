@@ -179,9 +179,9 @@ def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
         channel: str = "mu",
         **kwargs: object,
     ) -> object:
-        path = str(kwargs["path"])
         kind = str(kwargs.get("kind", "Belief"))
-        umap_calls.append((channel, kind, Path(path).name))
+        path = str(kwargs["path"])
+        umap_calls.append((channel, kind))
         figure = plt.figure()
         figure.savefig(path)
         return figure
@@ -209,8 +209,8 @@ def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
         "reliability_diagram.png",
     } <= written
     assert {
-        ("mu", "Model", "model_umap_mu.png"),
-        ("sigma", "Model", "model_umap_sigma.png"),
+        ("mu", "Model"),
+        ("sigma", "Model"),
     } <= set(umap_calls)
 
 
@@ -297,6 +297,11 @@ class _MemoryGuardModel(torch.nn.Module):
             batch_size=32,
             n_e_steps=1,
             embed_dim=4,
+            use_prior_bank=True,
+            decode_mode="family",
+            diagonal_covariance=True,
+            family="gaussian_diagonal",
+            decode_chunk_size=4096,
         )
 
 
