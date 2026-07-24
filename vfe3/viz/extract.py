@@ -46,13 +46,30 @@ def _model_device(model) -> torch.device:
     return model.prior_bank.phi_embed.device
 
 
+def _cpu_bank_tensor(value: torch.Tensor) -> torch.Tensor:
+    r"""Detach and CPU-host one tensor, widening a reduced-precision float to float32.
+
+    The viz sibling of ``model._freeze_tensor``: ``collect_inference_bank`` captures the belief
+    straight out of the autocast E-step, so under ``cfg.amp_dtype`` the retained ``mu``/``sigma``
+    arrive in bf16/fp16 (``phi`` keeps its own fp32 gauge island). The analysis layer downstream is
+    fp32 -- NumPy has NO bfloat16 dtype, and ``torch.linalg.eigh`` has no bfloat16 kernel -- so the
+    bank is the boundary that must widen. bf16/fp16 -> fp32 is exact (both are truncations of
+    float32), so this preserves the captured values. Integer and float32 fields pass through
+    untouched, keeping the amp_dtype=None default path byte-identical.
+    """
+    hosted = value.detach().cpu()
+    if hosted.dtype in (torch.float16, torch.bfloat16):
+        hosted = hosted.float()
+    return hosted
+
+
 def _cpu_bank_value(value: object) -> object:
     r"""Detach and CPU-host every tensor retained by a bank record or field."""
     if isinstance(value, torch.Tensor):
-        return value.detach().cpu()
+        return _cpu_bank_tensor(value)
     if isinstance(value, CompactBlockElement):
         return CompactBlockElement(
-            value.blocks.detach().cpu(),
+            _cpu_bank_tensor(value.blocks),
             value.K,
             value.tied,
         )

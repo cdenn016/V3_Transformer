@@ -10,11 +10,15 @@ test runs amp_dtype=None); these tests pin the AMP wiring specifically.
 from contextlib import nullcontext
 from unittest import mock
 
+import numpy as np
 import torch
 
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 from vfe3.train import _val_diagnostics
+from vfe3.belief import BeliefState
+from vfe3.viz import figures as figs
+from vfe3.viz.extract import _cpu_bank_value
 
 
 def _tiny_model(**overrides) -> VFEModel:
@@ -135,3 +139,83 @@ def test_bf16_head_mixer_validation_diagnostics_run_in_fp32():
     assert snapshot.beta_maps.dtype == torch.float32
     assert torch.isfinite(torch.tensor(diagnostics["total"]))
     assert torch.isfinite(torch.tensor(val_diagnostics.metrics["val_free_energy_total"]))
+
+
+# ---------------------------------------------------------------------------------------------
+# The AMP -> analysis boundary: report banks and the numpy conversion behind every figure.
+# Under amp_dtype='bf16' the autocast E-step returns bf16 mu/sigma (phi keeps its own fp32
+# island), and NumPy has NO bfloat16 dtype -- .numpy() raises "Got unsupported ScalarType
+# BFloat16". The diagnostic snapshot already upcasts at capture (_freeze_tensor, model.py);
+# these pin the same invariant for the viz bank capture and the figure numpy boundary.
+# ---------------------------------------------------------------------------------------------
+
+def test_cpu_bank_value_upcasts_reduced_precision_to_fp32():
+    # The bank-capture helper is the viz sibling of model._freeze_tensor: it must upcast the
+    # autocast forward's bf16/fp16 beliefs to fp32 so downstream analysis (numpy, eigh,
+    # sklearn) receives a representable dtype. Integer and fp32 fields must pass through
+    # untouched, so the amp_dtype=None default path stays byte-identical.
+    for reduced in (torch.bfloat16, torch.float16):
+        hosted = _cpu_bank_value(torch.ones(3, dtype=reduced))
+        assert hosted.dtype == torch.float32, reduced
+
+    ids = torch.arange(3)
+    assert _cpu_bank_value(ids).dtype == torch.int64
+    assert _cpu_bank_value(torch.ones(3)).dtype == torch.float32
+
+    belief = BeliefState(
+        mu=torch.ones(2, 3, dtype=torch.bfloat16),
+        sigma=torch.ones(2, 3, dtype=torch.bfloat16),
+        phi=torch.ones(2, 3),
+    )
+    hosted_belief = _cpu_bank_value(belief)
+    assert hosted_belief.mu.dtype == torch.float32
+    assert hosted_belief.sigma.dtype == torch.float32
+    assert hosted_belief.phi.dtype == torch.float32
+
+
+def test_np_conversion_accepts_bfloat16():
+    # Every figure funnels its tensors through figures._np. NumPy cannot represent bfloat16 at
+    # all, so the helper must widen it; bf16 -> fp32 is exact (bf16 is a truncated fp32), so the
+    # values must survive the widening unchanged.
+    values = torch.tensor([-1.5, 0.0, 2.25], dtype=torch.bfloat16)
+    converted = figs._np(values)
+    assert converted.dtype == np.float32
+    assert np.array_equal(converted, np.array([-1.5, 0.0, 2.25], dtype=np.float32))
+
+
+def test_sigma_calibration_figures_render_from_a_bf16_bank(tmp_path):
+    # The two figures the bf16 run lost outright: both read belief_ce_bank['tr_sigma'], which
+    # carries the autocast E-step's dtype straight from metrics.sigma_trace(out.sigma).
+    generator = torch.Generator().manual_seed(0)
+    bank = {
+        "tr_sigma": torch.rand(64, generator=generator).to(torch.bfloat16),
+        "ce":       torch.rand(64, generator=generator).to(torch.bfloat16),
+    }
+    stratified = tmp_path / "sigma_stratified_error.png"
+    scatter = tmp_path / "sigma_ce_scatter.png"
+    figs.plot_sigma_stratified_error(bank, n_bins=4, n_boot=8, path=str(stratified))
+    figs.plot_sigma_ce_scatter(bank, path=str(scatter))
+    assert stratified.exists() and scatter.exists()
+
+
+def test_belief_channel_features_and_clustering_accept_a_bf16_bank():
+    # belief_category_separation and the mu/sigma UMAP panels crossed to numpy through
+    # _belief_channel_features -> clustering_metrics; phi survived only because the gauge path
+    # keeps its own fp32 island. Cover the full-covariance chart too: torch.linalg.eigh has no
+    # bfloat16 kernel, so the log-Euclidean branch fails before the numpy boundary is reached.
+    diagonal_bank = {
+        "mu":    torch.randn(8, 3, dtype=torch.bfloat16),
+        "sigma": torch.rand(8, 3, dtype=torch.bfloat16) + 0.5,
+        "phi":   torch.randn(8, 3),
+    }
+    labels = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+    for channel in ("mu", "sigma", "phi"):
+        features = figs._np(figs._belief_channel_features(diagonal_bank, channel))
+        assert features.dtype == np.float32
+        assert np.isfinite(features).all()
+        assert np.isfinite(figs.clustering_metrics(features, labels)["silhouette"])
+
+    spd = torch.eye(3).expand(8, 3, 3) * (1.0 + torch.rand(8, 1, 1))
+    full_bank = {**diagonal_bank, "sigma": spd.to(torch.bfloat16)}
+    vech = figs._np(figs._belief_channel_features(full_bank, "sigma"))
+    assert vech.dtype == np.float32 and np.isfinite(vech).all()

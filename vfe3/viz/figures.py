@@ -36,8 +36,16 @@ _TAB20_DISTINCT = [0, 2, 4, 6, 8, 10, 12, 16, 18, 1, 3, 5, 7, 9, 11, 13, 17, 19,
 
 
 def _np(x) -> np.ndarray:
-    """Detach a torch tensor (or pass an array) to a contiguous numpy array."""
+    """Detach a torch tensor (or pass an array) to a contiguous numpy array.
+
+    NumPy has no bfloat16 dtype, so a tensor left in bf16 by an ``amp_dtype`` autocast forward
+    cannot cross this boundary at all (``.numpy()`` raises "Got unsupported ScalarType BFloat16").
+    Widen it to float32 first -- bf16 is a truncated float32, so the values are preserved exactly.
+    """
     if hasattr(x, "detach"):
+        import torch
+        if x.dtype is torch.bfloat16:
+            x = x.float()
         x = x.detach().cpu().numpy()
     return np.asarray(x)
 
@@ -755,7 +763,12 @@ def _belief_channel_features(bank: Dict, channel: str):
     if channel == "phi":
         return bank["phi"]
     if channel == "sigma":
+        # The log-Euclidean chart is an eigendecomposition and a log: both need fp32. A bank
+        # captured under an amp_dtype autocast can arrive in bf16/fp16, for which linalg.eigh has
+        # no kernel at all, so widen before charting rather than fail (or lose the log's precision).
         sig = bank["sigma"]
+        if sig.dtype in (torch.float16, torch.bfloat16):
+            sig = sig.float()
         if sig.dim() == 2:                                       # (M, K) diagonal -> log-variances
             return torch.log(sig.clamp(min=1e-12))
         sym = 0.5 * (sig + sig.transpose(-1, -2))               # (M, K, K) full -> vech(log Sigma)
