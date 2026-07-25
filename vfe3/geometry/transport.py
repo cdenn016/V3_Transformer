@@ -845,7 +845,7 @@ def _build_regime_ii(
 # holds SEVERAL dense (B, chunk, N, K, K) transients AT ONCE -- the flat cocycle Omega^0, the
 # transported-key covariance, the edge Lie-algebra matrix, its exponential, and the output Omega
 # chunk -- so the peak working set is ~``_REGIME_II_LIVE_TRANSIENTS`` times ONE such tensor (the
-# original budget modelled a single tensor and so underestimated peak by ~5x; audit 2026-06-18). At
+# original budget modeled a single tensor and so underestimated peak by ~5x; audit 2026-06-18). At
 # K=20 / 2-head / B=64 / N=128 one tensor is ~1.68 GB, so the full build OOMs on a 32 GB GPU while
 # the flat K=80 run (factored, no dense Omega) fits. The chunk size bounds the SUM of the
 # simultaneous transients under ``_REGIME_II_CHUNK_ELEMS`` fp32 elements; the build is otherwise

@@ -1635,7 +1635,7 @@ def _decode_diagonal(
     |mu| / tight sigma_v). We remove the common offset BEFORE the matmul by subtracting
     the v-independent shift ``c = mean_v(mu_v)`` (per dim) from both means; since
     ``(mu_q - c) - (mu_v - c) == mu_q - mu_v`` the closed form is unchanged exactly while
-    the cancelled magnitude collapses to the residual spread of the means.
+    the canceled magnitude collapses to the residual spread of the means.
     """
     sigma_v = bounded_variance_from_log(pb._decode_sigma_log_table(), eps=pb.eps)  # (V, K)
     mu_v = pb._decode_mu_table()                                        # (V, K) decode table (untied if set)

@@ -37,7 +37,13 @@ def test_recommended_estep_and_phi_sweeps_are_registered_and_runnable() -> None:
 
 
 def test_recommended_sweep_activation_matches_click_run_order() -> None:
-    from ablation import SWEEP_ORDER
+    from ablation import SWEEPS, SWEEP_ORDER
 
-    assert SWEEP_ORDER == ["pos_extrapolation", "estep_depth_damping"]
-    assert {"phi_chart_control", "pos_phi_composition"}.isdisjoint(SWEEP_ORDER)
+    # Assert the INVARIANT, not the literal selection (audit 2026-07-25 F19). SWEEP_ORDER is the
+    # owner's click-to-run choice of which sweeps to activate and changes constantly, so pinning its
+    # contents made this test report a config edit as a regression. What must hold is that every
+    # activated name resolves to a registered sweep and that the order names no duplicates.
+    assert SWEEP_ORDER, "no sweeps activated"
+    unknown = [name for name in SWEEP_ORDER if name not in SWEEPS]
+    assert not unknown, f"SWEEP_ORDER names unregistered sweeps: {unknown}"
+    assert len(set(SWEEP_ORDER)) == len(SWEEP_ORDER), "SWEEP_ORDER repeats a sweep"

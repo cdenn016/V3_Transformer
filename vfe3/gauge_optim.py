@@ -571,8 +571,11 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         self._omega_retract_mode = omega_retract_mode
         # Orthogonality-drift control for a SKEW (orthogonal, e.g. so_k/so_n) omega_direct group:
         # fp32 accumulation of exp(skew) retraction products walks the stored U off O(K) over many
-        # M-steps, after which U^T stops being the exact inverse (the transpose fast path
-        # build_transport_from_element relies on for skew groups). skew_symmetric mirrors
+        # M-steps. The mechanism is legitimate -- it keeps the stored U inside O(K) -- but its former
+        # stated reason was wrong and is corrected here (audit 2026-07-25 F21): there is NO transpose
+        # fast path for build_transport_from_element to rely on. Verified behaviorally:
+        # group_element_inverse(U, so_k) returns bit-identical tensors at residual_tol 1e-12 and 1e2
+        # while |U^T - U^-1| = 2.4e-07, so the transpose is never consulted. skew_symmetric mirrors
         # group.skew_symmetric; omega_reorth_every>0 turns on a
         # periodic polar re-orthogonalization every that many M-steps. Default 0 = off = byte-identical.
         self._skew_symmetric     = bool(group.skew_symmetric)

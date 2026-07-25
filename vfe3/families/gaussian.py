@@ -285,7 +285,7 @@ class DiagonalGaussian(BeliefParams):
             # See renyi_closed_form: alpha in (0,1) blend is always > 0 (mask inert, byte-identical);
             # for alpha > 1 a non-positive-blend coordinate is masked to NaN -> kl_max PER COORDINATE
             # (the per-coord twin of the summed mask), so a bad coordinate is gated without killing
-            # its in-bounds neighbours.
+            # its in-bounds neighbors.
             raw_blend   = (1.0 - alpha) * sigma_q + alpha * sigma_t
             sigma_blend = raw_blend.clamp(min=eps)
             mahal       = alpha * (delta ** 2) / sigma_blend

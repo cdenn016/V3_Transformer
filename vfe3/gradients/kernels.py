@@ -143,7 +143,7 @@ def _diag_kl_filtering_kernel(
     self-divergence clamped as one scalar, so the mask is per-token (N,1); a per-coordinate
     coefficient (N,K) (the ``state_dependent_per_coord`` form) carries a coordinate-wise clamp, so
     the mask is per-coordinate (N,K) and a saturated coordinate is gated WITHOUT killing its
-    unsaturated neighbours. The two coincide at K=1.
+    unsaturated neighbors. The two coincide at K=1.
     """
     if (pair_inv_sigma_t is None) != (pair_delta_tq is None):
         raise ValueError(

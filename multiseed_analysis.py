@@ -1,6 +1,6 @@
 r"""Across-seed digest for an identical-config multi-seed run.
 
-``train_vfe3.py`` with ``NUM_RUNS``/``SEEDS`` writes one seed-labelled run dir per seed, each holding a
+``train_vfe3.py`` with ``NUM_RUNS``/``SEEDS`` writes one seed-labeled run dir per seed, each holding a
 ``summary.json`` / ``test_results.json`` (headline scalars), ``provenance.json`` (the ``seed``),
 ``research.json`` (ECE, frequency-stratified CE, sigma diagnostics), ``metrics.csv`` (the per-step
 training curves) and ``metrics_per_layer.csv`` (final per-layer diagnostics). This module aggregates

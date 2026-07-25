@@ -1512,11 +1512,20 @@ def test_default_parameter_match_grid_retains_two_realized_30m_widths():
 
 
 def test_every_ablation_arm_constructs_with_only_invalid_arm_prerequisites_repaired():
-    assert ablation.BASELINE_CONFIG["e_step_update"] == "mm_exact"
-    assert ablation.BASELINE_CONFIG["phi_precond_mode"] == "pullback_per_block"
-    assert ablation.BASELINE_CONFIG["m_phi_update_mode"] == "adamw"
-    assert ablation.BASELINE_CONFIG["m_phi_group_trust_radius"] == 0.1
-    assert ablation.SWEEP_ORDER == ["pos_extrapolation", "estep_depth_damping"]
+    # Audit 2026-07-25 F19: these five assertions used to pin literal values of BASELINE_CONFIG and
+    # SWEEP_ORDER -- the owner's click-to-run selection, which CLAUDE.md says changes constantly. They
+    # therefore reported a config edit as a regression, and because they run first this test aborted
+    # before reaching the arm-construction coverage its own name promises. Replaced by the structural
+    # invariants: the baseline is a valid config, and every activated sweep is a registered one.
+    from vfe3.config import VFE3Config
+    from dataclasses import fields as _dc_fields
+    _known = {f.name for f in _dc_fields(VFE3Config)}
+    _unknown = sorted(set(ablation.BASELINE_CONFIG) - _known)
+    assert not _unknown, f"BASELINE_CONFIG has keys that are not VFE3Config fields: {_unknown}"
+    VFE3Config(**ablation.BASELINE_CONFIG)                  # the baseline itself must construct
+    assert ablation.SWEEP_ORDER, "no sweeps activated"
+    _unregistered = [name for name in ablation.SWEEP_ORDER if name not in ablation.SWEEPS]
+    assert not _unregistered, f"SWEEP_ORDER names unregistered sweeps: {_unregistered}"
 
     transport = dict(ablation.make_run_overrides("transport_mode"))
     assert "e_step_update" not in transport["flat"]

@@ -178,3 +178,23 @@ def test_report_source_uses_american_english_color_spelling():
         assert british not in source
     assert "color" in source
     assert "gray" in source
+
+
+def test_all_project_sources_use_american_english_spelling():
+    r"""American English across ALL of vfe3/** and the root drivers, not one module.
+
+    Audit 2026-07-25 F21: the sibling test above scans only ``vfe3/viz/report.py``, which created the
+    impression the project-wide convention in CLAUDE.md was enforced while the largest offender
+    (``vfe3/viz/figures.py``, the module that owns the color logic) sat outside its scope -- 13 UK
+    spellings were live across six files.
+    """
+    banned = ("colour", "behaviour", "normalise", "optimise", "factorise", "fibre",
+              "modelled", "modelling", "neighbour", "cancelled", "labelled", "grey")
+    roots = sorted(Path("vfe3").rglob("*.py")) + sorted(Path(".").glob("*.py"))
+    offenders: list[str] = []
+    for path in roots:
+        lowered = path.read_text(encoding="utf-8").lower()
+        for word in banned:
+            if word in lowered:
+                offenders.append(f"{path.as_posix()}: {word}")
+    assert not offenders, "UK spellings found (CLAUDE.md mandates American English):\n" + "\n".join(offenders)
