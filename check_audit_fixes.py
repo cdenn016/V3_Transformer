@@ -29,7 +29,10 @@ AUDIT_TESTS = [
     ("M1", "tests/test_learnable_kappa.py::test_extractors_use_learned_kappa_in_iter_and_fe_kwargs"),
     ("M1", "tests/test_learnable_kappa.py::test_converged_state_beta_tracks_learned_kappa"),
     ("M2", "tests/test_train.py::test_phi_clamp_monitor_threshold_matches_transport_clamp"),
-    ("M3", "tests/test_belief_cache.py::test_cache_supported_gates_result_changing_toggles"),
+    # M3's pin (tests/test_belief_cache.py) was deleted with the active-inference/EFE removal in
+    # 53e72f1. Because every node ID below goes to ONE pytest invocation, the dangling path aborted
+    # collection for the whole driver (exit 4, zero tests run) while the banner read "FAILURES".
+    # The surviving cache-gating coverage is tests/test_removed_policy_surface.py.
     ("M4", "tests/test_reporting_additions.py::test_gauge_transport_figure_aggregates_seeds"),
     ("M4", "tests/test_reporting_additions.py::test_mu_precond_figure_aggregates_seeds"),
     ("M4", "tests/test_reporting_additions.py::test_attention_entropy_figure_aggregates_seeds"),

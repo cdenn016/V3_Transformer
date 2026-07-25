@@ -570,7 +570,12 @@ def test_compact_phi_block_transport_matches_legacy_autocast_dtype_and_vjp() -> 
         outputs.append((mean, covariance))
         gradients.append(torch.autograd.grad(loss, phi)[0])
 
-    assert factor_dtypes == [torch.bfloat16, torch.bfloat16]
+    # Audit 2026-07-25 F2: the represented group element is never STORED below float32, on EITHER
+    # route. Rounding the exponential (and its float64 inverse) back to the autocast dtype made
+    # U U^-1 deviate from the identity like eps * cond(U) -- reaching O(1) near cond ~ 1/eps_bf16 --
+    # and the vertex factor's cocycle property IS Regime-I flatness. This test's contract is dense/
+    # compact PARITY, which is preserved; the parity now holds at float32 instead of at bfloat16.
+    assert factor_dtypes == [torch.float32, torch.float32]
     assert torch.equal(factor_values[1], factor_values[0])
     for legacy, compact in zip(outputs[0], outputs[1]):
         assert torch.allclose(compact, legacy, atol=8e-3, rtol=1e-2)

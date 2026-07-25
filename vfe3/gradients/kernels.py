@@ -25,7 +25,7 @@ from vfe3.geometry.transport import (
     transport_covariance,
     transport_mean,
 )
-from vfe3.gradients.oracle import belief_gradients_autograd
+from vfe3.gradients.oracle import _transport_to_float, belief_gradients_autograd
 from vfe3.gradients.pairwise_stats import diagonal_kl_pair_stats
 
 _KERNELS: Dict[str, Callable] = {}
@@ -393,6 +393,45 @@ def belief_gradients(
             omega_builder=omega_builder,
         )
 
+    # Reduced-precision island (audit 2026-07-25 F1). Under an outer AMP context the closed-form
+    # kernel would otherwise build its transported key moments, energy, beta and derivative at the
+    # autocast dtype, while its own reference oracle re-enters fp32 (oracle.py:140). That asymmetry
+    # made the two sides of a seam the golden tests pin at fp32 tolerance disagree by ~4e-3 relative,
+    # flipped the raw-energy saturation mask that gates the pair derivative, left the structural
+    # self-pair energy no longer exactly zero, and silently disabled the reuse_pairwise_kl_stats hoist
+    # (whose eligibility test below requires fp32). Re-enter only the kernel body under an explicit
+    # fp32 island; the recursion terminates immediately because autocast is disabled in the nested
+    # call, and the caller resumes its own autocast context on return. amp_dtype=None is unaffected.
+    if torch.is_autocast_enabled(mu.device.type):
+        with torch.autocast(device_type=mu.device.type, enabled=False):
+            return belief_gradients(
+                mu.float(), sigma.float(), mu_p.float(), sigma_p.float(),
+                (_transport_to_float(omega) if omega is not None else None),
+                tau=(tau.float() if isinstance(tau, torch.Tensor) else tau),
+                renyi_order=renyi_order,
+                kl_max=kl_max,
+                eps=eps,
+                b0=b0,
+                c0=c0,
+                lambda_beta=(lambda_beta.float()
+                             if isinstance(lambda_beta, torch.Tensor) else lambda_beta),
+                lambda_twohop=lambda_twohop,
+                include_attention_entropy=include_attention_entropy,
+                create_graph=create_graph,
+                need_sigma_grad=need_sigma_grad,
+                compile_pair_kernel=compile_pair_kernel,
+                reuse_pairwise_kl_stats=reuse_pairwise_kl_stats,
+                gradient_mode=gradient_mode,
+                family=family,
+                divergence_family=divergence_family,
+                lambda_alpha_mode=lambda_alpha_mode,
+                transport_mode=transport_mode,
+                value=value,
+                irrep_dims=irrep_dims,
+                log_prior=(log_prior.float() if log_prior is not None else None),
+                omega_builder=omega_builder,
+            )
+
     mu_k, sigma_k = mu.detach(), sigma.detach()
     mu_t = transport_mean(omega, mu_k)                 # rank-agnostic: (N,N,K) or (B,N,N,K)
     # diagonal_out from the BELIEF shape (diagonal iff sigma has the same rank as mu), not the omega
@@ -525,6 +564,33 @@ def mm_exact_update(
     sigma_max cap. The graph stays LIVE through (mu*, sigma*) (analytic in mu/sigma via beta, sd),
     matching the kernel's unroll behavior; the caller detaches for straight_through.
     """
+    # Reduced-precision island (audit 2026-07-25 F1), for the same reason as ``belief_gradients``
+    # above: this closed-form minimizer reuses the same transported moments, energy, beta and
+    # saturation mask, and a reduced-dtype pair_mask changes WHICH pairs enter the precision fusion,
+    # not merely its rounding. Recursion terminates at once (autocast disabled in the nested call).
+    if torch.is_autocast_enabled(mu.device.type):
+        with torch.autocast(device_type=mu.device.type, enabled=False):
+            return mm_exact_update(
+                mu.float(), sigma.float(), mu_p.float(), sigma_p.float(),
+                (_transport_to_float(omega) if omega is not None else None),
+                tau=(tau.float() if isinstance(tau, torch.Tensor) else tau),
+                b0=(b0.float() if isinstance(b0, torch.Tensor) else b0),
+                c0=(c0.float() if isinstance(c0, torch.Tensor) else c0),
+                lambda_beta=(lambda_beta.float()
+                             if isinstance(lambda_beta, torch.Tensor) else lambda_beta),
+                kl_max=kl_max,
+                eps=eps,
+                lambda_twohop=lambda_twohop,
+                value=value,
+                lambda_alpha_mode=lambda_alpha_mode,
+                family=family,
+                divergence_family=divergence_family,
+                need_sigma_update=need_sigma_update,
+                reuse_pairwise_kl_stats=reuse_pairwise_kl_stats,
+                irrep_dims=irrep_dims,
+                log_prior=(log_prior.float() if log_prior is not None else None),
+            )
+
     mu_k, sigma_k = mu.detach(), sigma.detach()
     mu_t    = transport_mean(omega, mu_k)                        # (..., N, N, K) transported keys
     sigma_t = transport_covariance(omega, sigma_k, diagonal_out=(sigma_k.dim() == mu_k.dim()))

@@ -1256,6 +1256,11 @@ def _direct_link_dense_bytes(batch: int, n_tok: int, k: int, dtype: torch.dtype)
 # diverge (audit 2026-07-06 M2).
 TRANSPORT_CLAMP_MAX_NORM: float = 20.0
 
+# Process-wide "the exponential clamp has fired at least once" latch (audit 2026-07-25 F2). The clamp
+# returns a surrogate operator rather than exp(M), so its first occurrence is reported even when the
+# per-build clamp_monitor is off; the latch keeps the default path from paying a host sync forever.
+_CLAMP_SURROGATE_WARNED: bool = False
+
 
 def stable_matrix_exp_pair(
     matrix:                  torch.Tensor,       # (..., d, d) Lie-algebra matrices
@@ -1341,19 +1346,39 @@ def stable_matrix_exp_pair(
             )
         mat_norm = raw_mat_norm.clamp(min=1e-8)
         scale = (max_norm / mat_norm).clamp(max=1.0)
-        if clamp_monitor:
+        # The clamp substitutes exp(M * scale) for exp(M) -- a DIFFERENT operator, not a rounding of
+        # the intended one (measured ~98% relative error at ||M||_F = 30). Before audit 2026-07-25 F2
+        # this was announced only under the opt-in clamp_monitor, so the default configuration could
+        # model a surrogate transport with no signal whatsoever. The verbose per-build report stays
+        # gated on clamp_monitor; the FIRST occurrence is now always reported. The reduction costs one
+        # host sync per build (one per forward under share_refine_s_transport), which is why the
+        # default path stops paying it once it has fired. transport_chart_max_norm remains the
+        # fail-closed alternative and its default is deliberately unchanged: every value the
+        # pullback_group validator admits (5.0 < bound < 20.0) would hard-abort runs whose observed
+        # ||M||_F already reaches 18, so failing closed stays the caller's explicit choice.
+        global _CLAMP_SURROGATE_WARNED
+        if clamp_monitor or not _CLAMP_SURROGATE_WARNED:
             frac = (scale < 1.0).float().mean()
             if bool(frac > 0):
                 import warnings
+                _CLAMP_SURROGATE_WARNED = True
+                once = ("" if clamp_monitor else
+                        " Warned once for this process; set transport_clamp_monitor=True to report "
+                        "every occurrence, or transport_chart_max_norm to fail closed instead.")
                 warnings.warn(
                     f'stable_matrix_exp_pair: Frobenius clamp active on {float(frac):.1%} of matrices '
-                    f'(max_norm={max_norm}); returned factor is a surrogate, not exp(M).',
+                    f'(max_norm={max_norm}); the returned factor is a SURROGATE exp(M*scale), NOT '
+                    f'exp(M).{once}',
                     RuntimeWarning, stacklevel=2,
                 )
     matrix = matrix * scale
 
     d = matrix.shape[-1]
-    orig_dtype = matrix.dtype
+    # float32 storage floor, matching _stable_compact_glk_exp_pair (audit 2026-07-25 F2). The dense
+    # route reaches here with an autocast-eligible einsum(phi, generators) result, so without this the
+    # dense and compact representations would only agree on their (reduced) storage dtype by both
+    # being wrong. Parity between the two paths is preserved -- at float32 rather than at bf16.
+    orig_dtype = matrix.dtype if matrix.dtype in (torch.float32, torch.float64) else torch.float32
     if exp_fp64_mode == "norm":
         # Norm-keyed float64 island (Tier-1 toggle): upcast ONLY when the max CLAMPED block
         # Frobenius norm reaches the threshold. Computed from the already-clamped matrices (the
@@ -1525,7 +1550,7 @@ def compute_transport_operators(
     if gauge_mode != "learned":
         raise ValueError(f"gauge_mode must be 'learned' or 'trivial', got {gauge_mode!r}")
 
-    phi_matrix = torch.einsum("bna,aij->bnij", phi, generators)
+    phi_matrix = _embed_algebra_fp32_floor(phi, generators, pattern="bna,aij->bnij")
     # Per-block exp when the group is genuinely block-diagonal (block_glk without cross-couplings
     # -> irrep_dims [d_head]*H); single-block ([K]: glk, so_k, cross-coupled) takes the full path.
     # exp_dim keys the float64-island decision on the dimension actually exponentiated -- the
@@ -1552,10 +1577,43 @@ def compute_transport_operators(
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
 
 
-def _checked_group_inverse(
-    omega: torch.Tensor,                    # (..., d, d) stored full elements or compact blocks
+def _embed_algebra_fp32_floor(
+    phi:        torch.Tensor,               # (..., n_gen) gauge-frame coordinates
+    generators: torch.Tensor,               # (n_gen, K, K) algebra basis
+
+    *,
+    pattern:    str = "...na,aij->...nij",  # einsum pattern for the embedding contraction
 ) -> torch.Tensor:
-    r"""True float64 inverse with immediate nonfinite/singular failure and dtype restoration."""
+    r"""Embed ``phi`` in the Lie algebra at float32 minimum, outside any autocast context.
+
+    ``einsum`` is autocast-eligible, so under AMP this contraction otherwise returns a bf16/fp16
+    Lie-algebra matrix and the matrix exponential can only ever recover a reduced-precision operator,
+    however carefully its own interior upcasts (audit 2026-07-25 F2). Pinning the embedding also
+    restores exact dense/compact parity: the compact route reshapes ``phi`` with no contraction at
+    all, so only the dense route was being rounded. float64 inputs are preserved.
+    """
+    with torch.amp.autocast(phi.device.type, enabled=False):
+        phi_f = phi if phi.dtype in (torch.float32, torch.float64) else phi.float()
+        gen_f = (generators if generators.dtype in (torch.float32, torch.float64)
+                 else generators.float())
+        return torch.einsum(pattern, phi_f, gen_f)
+
+
+def _checked_group_inverse(
+    omega:        torch.Tensor,             # (..., d, d) stored full elements or compact blocks
+
+    *,
+    residual_tol: Optional[float] = None,   # None skips the identity residual check (no host sync)
+) -> torch.Tensor:
+    r"""True float64 inverse with immediate nonfinite/singular failure and dtype restoration.
+
+    When ``residual_tol`` is supplied, the STORED pair is additionally verified against
+    :math:`\lVert U U^{-1} - I \rVert_\infty \le \texttt{residual\_tol}`. The finiteness checks alone
+    cannot see precision loss: the inverse is exact in float64, so every way this pair stops being a
+    group-inverse pair is a rounding effect of the storage dtype, which stays perfectly finite
+    (audit 2026-07-25 F2). The check costs one reduction and a host sync, so it is opt-in and off on
+    the training hot path.
+    """
     with torch.no_grad():
         if not bool(torch.isfinite(omega).all()):
             raise FloatingPointError("omega group element contains nonfinite values before inversion")
@@ -1574,6 +1632,18 @@ def _checked_group_inverse(
         if not bool(torch.isfinite(inverse).all()):
             raise FloatingPointError(
                 f"omega group-element inverse is nonfinite after conversion to {omega.dtype}")
+        if residual_tol is not None:
+            eye = torch.eye(omega.shape[-1], device=omega.device, dtype=torch.float64)
+            residual = float(
+                (omega.double() @ inverse.double() - eye).abs().amax()
+            )
+            if not (residual <= residual_tol):
+                raise FloatingPointError(
+                    "stored omega group-element pair violates the inverse identity: "
+                    f"||U U^-1 - I||_inf={residual:.6g} > residual_tol={residual_tol:.6g} "
+                    f"(storage dtype {omega.dtype}); the represented element and its stored inverse "
+                    "no longer form a group-inverse pair, so the transport cocycle is not exact"
+                )
     return inverse
 
 
@@ -1588,18 +1658,24 @@ def group_element_inverse(
 
     A matrix exponential of a skew generator is orthogonal analytically, but its stored float32
     representation generally is not exactly orthogonal. Using a transpose for that representation
-    breaks exact cocycle telescoping. ``residual_tol`` remains a validated compatibility argument;
-    inverse selection no longer depends on a practically unreachable exact-equality fast path.
+    breaks exact cocycle telescoping, so the inverse is always a true float64 solve -- there is no
+    transpose fast path here for any group (see the note on ``skew_symmetric`` in
+    :mod:`vfe3.geometry.groups`).
+
+    ``residual_tol`` bounds the STORED pair's identity residual
+    :math:`\lVert U U^{-1} - I \rVert_\infty` and raises when it is exceeded (audit 2026-07-25 F2;
+    previously validated and then discarded, which left the one named guard against reduced-precision
+    group elements inert).
     """
     if not math.isfinite(residual_tol) or residual_tol < 0.0:
         raise ValueError(
             f"residual_tol must be finite and nonnegative, got {residual_tol!r}")
 
     if isinstance(omega, CompactBlockElement):
-        inverse_blocks = _checked_group_inverse(omega.blocks)
+        inverse_blocks = _checked_group_inverse(omega.blocks, residual_tol=residual_tol)
         return CompactBlockElement(inverse_blocks, omega.K, tied=omega.tied)
     del group
-    return _checked_group_inverse(omega)
+    return _checked_group_inverse(omega, residual_tol=residual_tol)
 
 
 def build_transport_from_element(
@@ -1687,7 +1763,14 @@ def _stable_compact_glk_exp_pair(
     blocks = blocks * scale
 
     d = blocks.shape[-1]
-    orig_dtype = blocks.dtype
+    # A represented group element is never STORED below float32 (audit 2026-07-25 F2). The interior
+    # already upcasts, but rounding the result (and its float64 inverse) back to a reduced autocast
+    # dtype makes U U^{-1} deviate from the identity like eps * cond(U), reaching O(1) near
+    # cond ~ 1/eps_bf16 ~ 128, and the vertex factor's cocycle property IS Regime-I flatness. The
+    # EDGE exponential already pins float32 unconditionally (_direct_link_edge_exp); this is the
+    # matching floor for the vertex, and it also makes the fp32 diagnostic rebuild describe the same
+    # operator the forward used.
+    store_dtype = blocks.dtype if blocks.dtype in (torch.float32, torch.float64) else torch.float32
     if exp_fp64_mode == "norm":
         with torch.no_grad():
             key_norm = blocks.norm(dim=(-2, -1)).max()
@@ -1699,7 +1782,7 @@ def _stable_compact_glk_exp_pair(
 
     with torch.amp.autocast(blocks.device.type, enabled=False):
         blocks_up = blocks.to(up_dtype).contiguous()
-        exp_pos = torch.linalg.matrix_exp(blocks_up).to(orig_dtype)
+        exp_pos = torch.linalg.matrix_exp(blocks_up).to(store_dtype)
         exp_neg = _checked_group_inverse(exp_pos)
     return exp_pos, exp_neg
 
@@ -1763,12 +1846,11 @@ def build_factored_transport(
         # H consecutive row-major d x d matrices. The reshape is therefore the exact algebra
         # embedding with the structural zero off-block entries omitted.
         phi_blocks = phi.reshape(*phi.shape[:-1], H, d, d)
-        if phi_blocks.dtype == torch.float32 and torch.is_autocast_enabled(phi.device.type):
-            # The legacy einsum(phi, generators) is an autocast-eligible contraction. A reshape
-            # performs no arithmetic and would otherwise leave packed factors in fp32, changing
-            # both values and gradients under AMP. Mirror the contraction's public output dtype
-            # without allocating the dense K x K embedding.
-            phi_blocks = phi_blocks.to(torch.get_autocast_dtype(phi.device.type))
+        # The former autocast-dtype downcast here (dtype parity with the dense
+        # einsum(phi, generators) route) is removed by audit 2026-07-25 F2: it rounded the ALGEBRA
+        # element to bf16 before exponentiation, so the fp32 store floor in the exp helper could not
+        # recover the already-lost input precision. Parity with the dense route is now maintained at
+        # float32, because stable_matrix_exp_pair carries the same floor.
         exp_blocks, inv_blocks = _stable_compact_glk_exp_pair(
             phi_blocks,
             exp_fp64_mode=exp_fp64_mode,
@@ -1778,8 +1860,6 @@ def build_factored_transport(
         )
         if right_phi is not None:
             right_blocks = right_phi.reshape(*right_phi.shape[:-1], H, d, d)
-            if right_blocks.dtype == torch.float32 and torch.is_autocast_enabled(phi.device.type):
-                right_blocks = right_blocks.to(torch.get_autocast_dtype(phi.device.type))
             right_exp, right_inv = _stable_compact_glk_exp_pair(
                 right_blocks,
                 exp_fp64_mode=exp_fp64_mode,
@@ -1793,7 +1873,7 @@ def build_factored_transport(
             exp_blocks=exp_blocks, inv_blocks=inv_blocks, K=group.generators.shape[-1],
             mean_per_head=mean_per_head, same_frame_flat_cocycle=True)
 
-    phi_matrix = torch.einsum("...na,aij->...nij", phi, group.generators)
+    phi_matrix = _embed_algebra_fp32_floor(phi, group.generators)
     # exp_dim: same block-scale float64-island keying as compute_transport_operators (see the
     # comment there) -- the factored hot path is exactly where the (B, N, K, K) f64 upcast hurt.
     exp_phi, exp_neg_phi = stable_matrix_exp_pair(
