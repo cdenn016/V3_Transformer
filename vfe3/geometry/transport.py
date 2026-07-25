@@ -1261,6 +1261,10 @@ TRANSPORT_CLAMP_MAX_NORM: float = 20.0
 # per-build clamp_monitor is off; the latch keeps the default path from paying a host sync forever.
 _CLAMP_SURROGATE_WARNED: bool = False
 
+# Latch for the diagonal congruence's nonnegativity floor (audit 2026-07-25 F3). The floor itself is
+# free and unconditional; only the report needs a reduction, so the latch stops paying for it.
+_DIAG_CONGRUENCE_NEGATIVE_WARNED: bool = False
+
 
 def stable_matrix_exp_pair(
     matrix:                  torch.Tensor,       # (..., d, d) Lie-algebra matrices
@@ -2333,15 +2337,43 @@ def _compact_factored_diagonal_covariance(
     First form each key-side second moment
     ``C_j = U_j^-1 diag(sigma_j) U_j^-T`` and contract it with each query factor. This avoids the
     ``(..., N_q, N_k, H, d, d)`` pair-block allocation for every block and sequence shape.
+
+    Precision (audit 2026-07-25 F3): this two-stage regrouping replaces the manifestly nonnegative
+    ``sigma_t[k] = sum_l Omega_kl^2 sigma_l`` with a quadratic form whose intermediate terms have
+    MIXED SIGN, so cancellation can drive an output variance negative -- measured minimum -1.51e+03 at
+    cond(U) 3.5e3, and -4.52 even in float32 at the clamp boundary where the dense reference returns
+    +4.00. Nothing detected it: a negative variance was mapped straight to ``clamp(min=eps)`` = 1e-6 by
+    the divergence kernel, inverting that key's precision weight by ~6 orders of magnitude, pushing
+    E_ij to kl_max and thereby zeroing the pair gradient through pair_mask. The reduction therefore
+    runs in float64, matching the precision policy the full-covariance sibling already applies to the
+    same congruence (which SQUARES cond(Omega)), and the result is floored at zero, which is a no-op
+    for any mathematically valid value.
     """
     H, d = factored.n_blocks, factored.block_dim
     sigma_blocks = sigma.reshape(*sigma.shape[:-1], H, d)                 # (..., N, H, d)
-    key_second = torch.einsum(
-        "...jhlp,...jhmp,...jhp->...jhlm",
-        factored.inv_blocks, factored.inv_blocks, sigma_blocks)           # (...,Nk,H,d,d)
-    out = torch.einsum(
-        "...ihkl,...jhlm,...ihkm->...ijhk",
-        factored.exp_blocks, key_second, factored.exp_blocks)
+    with torch.amp.autocast(sigma.device.type, enabled=False):
+        inv64 = factored.inv_blocks.double()
+        exp64 = factored.exp_blocks.double()
+        key_second = torch.einsum(
+            "...jhlp,...jhmp,...jhp->...jhlm",
+            inv64, inv64, sigma_blocks.double())                          # (...,Nk,H,d,d)
+        out = torch.einsum(
+            "...ihkl,...jhlm,...ihkm->...ijhk", exp64, key_second, exp64)
+        global _DIAG_CONGRUENCE_NEGATIVE_WARNED
+        if not _DIAG_CONGRUENCE_NEGATIVE_WARNED:
+            with torch.no_grad():
+                worst = float(out.amin())
+            if worst < 0.0:
+                import warnings
+                _DIAG_CONGRUENCE_NEGATIVE_WARNED = True
+                warnings.warn(
+                    "diagonal congruence produced a NEGATIVE transported variance "
+                    f"(min={worst:.6g}) and floored it at zero; the factored quadratic form has lost "
+                    "its nonnegativity to cancellation, which indicates an ill-conditioned transport "
+                    "(reduce ||phi|| or set transport_chart_max_norm). Warned once for this process.",
+                    RuntimeWarning, stacklevel=2,
+                )
+        out = out.clamp(min=0.0).to(sigma.dtype)
     return out.reshape(*out.shape[:-2], factored.K)
 
 
@@ -2406,17 +2438,22 @@ def _factored_diagonal_covariance(
     is (..., N, d, d, d), and the contraction lands directly on the (..., N, N, d) output -- peak
     memory N d^3 + N^2 d instead of N^2 d^2, at identical flop count. Exact w.r.t. the dense
     diagonal sandwich because the dense Omega is block-diagonal (off-block entries exactly 0.0);
-    the regrouping is algebraically exact (rounding differs at fp32 epsilon, covered by the
-    factored-vs-dense allclose pins). Rank-agnostic via the leading ellipsis.
+    the regrouping is algebraically exact. Its ROUNDING is not: the ``d <= n_tokens`` regrouping
+    below has mixed-sign intermediates, so audit 2026-07-25 F3 runs the reduction in float64 here for
+    the same reason (and with the same precision policy) as the compact sibling and the
+    full-covariance congruence. That keeps the two factored routes agreeing with each other AND with
+    the manifestly nonnegative squared form used by the tall-block branch. Rank-agnostic via the
+    leading ellipsis.
     """
     parts: List[torch.Tensor] = []
     start = 0
     n_tokens = sigma.shape[-2]
+    out_dtype = sigma.dtype
     for d in factored.irrep_dims:
         end = start + d
-        ep = factored.exp_phi[..., start:end, start:end]               # (..., N, d, d) exp(phi_i)^(h)
-        en = factored.exp_neg_phi[..., start:end, start:end]           # (..., N, d, d) exp(-phi_j)^(h)
-        sig_blk = sigma[..., start:end]                                # (..., N, d)
+        ep = factored.exp_phi[..., start:end, start:end].double()      # (..., N, d, d) exp(phi_i)^(h)
+        en = factored.exp_neg_phi[..., start:end, start:end].double()  # (..., N, d, d) exp(-phi_j)^(h)
+        sig_blk = sigma[..., start:end].double()                       # (..., N, d)
         if d <= n_tokens:
             g = torch.einsum("...jml,...jnl,...jl->...jmn", en, en, sig_blk)   # (..., N, d, d) G_j
             ep2 = ep.unsqueeze(-1) * ep.unsqueeze(-2)                  # (..., N, d, d, d) ep[k,m] ep[k,n]
@@ -2431,7 +2468,10 @@ def _factored_diagonal_covariance(
             parts.append(torch.einsum("...ijkl,...ijkl,...jl->...ijk",
                                       omega_blk, omega_blk, sig_blk))
         start = end
-    return torch.cat(parts, dim=-1)                                    # (..., N, N, K)
+    # Floored at zero for the same reason as the compact sibling: a no-op for any mathematically
+    # valid variance, and it stops a cancellation-induced negative from reaching the divergence
+    # kernel's clamp(min=eps), which would invert that key's precision weight (audit 2026-07-25 F3).
+    return torch.cat(parts, dim=-1).clamp(min=0.0).to(out_dtype)       # (..., N, N, K)
 
 
 def _factored_full_covariance(

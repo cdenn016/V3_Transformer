@@ -2047,7 +2047,16 @@ class VFEModel(nn.Module):
             c_rows, me_rows = self._gamma_coupling_rows(
                 token_ids,
                 model_phi,
-                head_reduction="mean",
+                # Canonical sum over heads (audit 2026-07-25 F5). This scored path (s_e_step=False)
+                # previously reduced heads by "mean" while BOTH the diagnostics reduction and the
+                # s_e_step=True route -- whose kernel contraction applies head h(k)'s weight to
+                # coordinate k -- use the sum. One lambda_gamma therefore denoted the canonical block
+                # at s_e_step=True and 1/n_heads of it here, so an ablation toggling s_e_step at fixed
+                # lambda_gamma was not weight-matched and the reported gamma block was n_heads times
+                # the scale that entered the loss. BEHAVIOR CHANGE: for s_e_step=False runs the
+                # effective model-coupling weight is now n_heads times its former value at the same
+                # lambda_gamma; divide lambda_gamma by n_heads to reproduce earlier runs exactly.
+                head_reduction="sum",
                 omega=(belief.omega.detach()
                        if tied_model_frame and belief.omega is not None else None),
                 reflection=(belief.reflection.detach()
@@ -2876,7 +2885,15 @@ class VFEModel(nn.Module):
                 d["gamma_coupling"]     = float(c_rows[0].sum())     # raw sum_{h,i,j} gamma E^s
                 d["gamma_meta_entropy"] = float(me_rows[0].sum())    # raw sum_{h,i,j} tau_g gamma log(gamma/pi^s)
                 model_coupling_rows = cfg.lambda_gamma * c_rows[0]   # (N,)
-                meta_entropy_rows = cfg.lambda_gamma * me_rows[0]
+                # Gate the REPORTED meta-entropy exactly as the scored objective does above
+                # (audit 2026-07-25 F6). Without this, include_attention_entropy=False left a block in
+                # d["total"] -- and in every figure fed by gamma_meta_entropy -- that neither the
+                # s E-step nor the loss descends, so the reported total tracked a different functional
+                # than the one being minimized under the surrogate toggle.
+                meta_entropy_rows = (
+                    cfg.lambda_gamma * me_rows[0]
+                    if cfg.include_attention_entropy else torch.zeros_like(c_rows[0])
+                )
             d["total"] = float(hierarchical_free_energy_terms(
                 belief_rows.self_coupling, belief_rows.belief_coupling,
                 belief_rows.attention_entropy, belief_rows.twohop_coupling,

@@ -110,11 +110,18 @@ def test_default_adamw_one_step_is_byte_identical_to_golden():
         data = tensor.detach().cpu().contiguous().numpy().tobytes()
         return hashlib.sha256(data).hexdigest()
 
-    assert digest(model.prior_bank.mu_embed) == "75c40d1b09a080c392223ff5160794c886e371193b7ba79a18fcab05febfd288"
-    assert digest(model.prior_bank.sigma_log_embed) == "6f5f7fe389ec74bc1a27b0a162defce8b50aedc1ebbcd601bcfea12442c1cb33"
-    assert digest(model.prior_bank.phi_embed) == "0526f6ab4e6fc547285a40cdabb36444f16e3b6523d79c5e5766861fcc661adb"
+    # Golden re-pinned by audit 2026-07-25 F3, which evaluates the factored diagonal congruence in
+    # float64 (its two-stage regrouping has mixed-sign intermediates and could return NEGATIVE
+    # variances that were then floored to eps, inverting a key's precision weight by ~6 orders of
+    # magnitude). The FORWARD is unaffected -- `loss` above is bit-identical to its previous pinned
+    # value, 2.0770487785339355 -- but the BACKWARD through the higher-precision einsums yields
+    # different low-order fp32 bits, so every table the step actually trains moves.
+    # decode_log_scale is unchanged, as it must be: use_prior_bank=False leaves it inert.
+    assert digest(model.prior_bank.mu_embed) == "b58852ff3fe9231b2b3d6f1c78dd408abf67ec183b0c812dc58d4377e3b69a37"
+    assert digest(model.prior_bank.sigma_log_embed) == "efe8a7d485c1e9125f08806a601041878281d671e24dd794af36ed36f7831f32"
+    assert digest(model.prior_bank.phi_embed) == "0d7f45bd488d283b121cfc5618cd069038aa74d33b5a57db561e52101dbaa6a7"
     assert digest(model.prior_bank.decode_log_scale) == "df3f619804a92fdb4057192dc43dd748ea778adc52bc498ce80524c014b81119"
-    assert digest(model.prior_bank.output_proj_weight) == "a200e956283737dd6aaba9de0194aecf2d1613bdb76b71feb12f8c641fd0b708"
+    assert digest(model.prior_bank.output_proj_weight) == "20f27b046641e9d92e9dafeb8127f4d0d50572245b26024748e9f6685fdd5752"
 
 
 def test_default_adamw_one_step_matches_recompute_dense_low_level_oracle(

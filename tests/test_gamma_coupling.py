@@ -97,7 +97,12 @@ def _gamma_term(model: VFEModel, tokens: torch.Tensor) -> torch.Tensor:
         cfg.gamma_attention_prior, n, n, device=tokens.device, dtype=s_mu.dtype,
     )                                                                    # (N, N)
     gamma_tau = attention_tau(cfg.kappa_gamma, model.group.irrep_dims)   # mirrors the impl (group-aware)
-    return reduced_free_energy(e_s, tau=gamma_tau, log_prior=log_prior).mean()
+    # SUM over the head axis, mean over batch and position (audit 2026-07-25 F5). The scored
+    # s_e_step=False path reduced heads by "mean" while both the diagnostics reduction and the
+    # s_e_step=True kernel route use the canonical sum, so one lambda_gamma meant two different
+    # things; the objective now sums, and this independent oracle follows it. Reducing by mean here
+    # would understate the term by exactly n_heads.
+    return reduced_free_energy(e_s, tau=gamma_tau, log_prior=log_prior).sum(dim=1).mean()
 
 
 # ---- (1) pure path ---------------------------------------------------------------------------
