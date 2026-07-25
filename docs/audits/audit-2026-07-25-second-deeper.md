@@ -932,9 +932,33 @@ that on the owner's pinned environment; it reports only what this environment pr
 obligation is to re-run both tests on the owner's pinned torch build before treating either as a
 regression.
 
-Final lane, after installing the optional extras (same command, same markers, private output path
-so no concurrent agent could overwrite it) — see the "Final lane" note at the end of this section
-for the machine-read counts.
+Final lane, after installing the optional extras (same command and markers, written to a private
+output path so no concurrent investigator could overwrite it):
+
+```
+$ VFE3_TEST_DEVICE=cpu CUDA_VISIBLE_DEVICES=-1 python3 -m pytest -n 12 --dist loadscope \
+      -m "not slow and not cuda and not external" --junitxml=<private>/final.xml
+EXIT=1
+
+tests="4217"  failures="8"  errors="0"  skipped="9"  time="562.291"
+```
+
+Installing the optional extras removed 20 of the 28 baseline failures, leaving eight, **none of
+which is attributable to the code under audit**. Six are environmental: three
+`requests.exceptions.ProxyError` reaching `openaipublic.blob.core.windows.net` for the GPT-2 BPE
+vocabulary (`test_get_tiktoken_decoder_roundtrips_when_tiktoken_present`,
+`test_default_manifest_forms_are_exact_single_gpt2_tokens`,
+`test_auto_default_sample_decoder_emits_at_gpt2_vocab` — this container's proxy blocks that host),
+one missing CJK glyph in DejaVu Sans, one missing `powershell` binary, and one absent NVIDIA
+driver. The remaining two are the torch-version-attributable pair described above
+(`test_default_adamw_one_step_is_byte_identical_to_golden` and
+`test_audited_seed_17_reproduces_legacy_failure_and_float64_oracle`), unchanged between the two
+lanes.
+
+So on this environment the suite is green apart from six environmental gaps and two
+build-sensitive goldens; the audit found no test failure caused by a finding in this report, and
+correspondingly none of the findings above is evidenced by a failing test — each is evidenced by
+quoted source plus a direct probe.
 
 Per-lens targeted lanes, each read from its own JUnit XML: transport/gauge suite
 (`test_transport.py`, `test_gauge_groups.py`, `test_regime_ii*.py`, `test_rope.py`,
