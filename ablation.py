@@ -221,7 +221,34 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
     renyi_order               = 1.0,       # Renyi order (1.0 -> KL)
 
-    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" (single covariance toggle; diagonal_covariance is derived)
+    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" | "gaussian_frame_diagonal"
+                                                     # | "gaussian_diagonal_exact" (single covariance toggle; diagonal_covariance is derived)
+                                                     # "gaussian_frame_diagonal" (default OFF): covariance diagonal in the agent's OWN fiber frame,
+                                                     # Sigma_i = U_i diag(sigma_i) U_i^T, which IS closed under GL(K) -- so the pair energy is the EXACT
+                                                     # full-covariance divergence at diagonal cost instead of the diagonal-of-sandwich truncation.
+                                                     # CONSEQUENCE: for the Regime-I coboundary the relative frame cancels, so Omega leaves the pair
+                                                     # energy and the gauge no longer shapes the belief coupling. A DIFFERENT model, not a refinement.
+                                                     # REQUIRES e_step_update="gradient": mm_exact is a hand kernel registered only for
+                                                     # "gaussian_diagonal", so this family routes to the autograd oracle (slower per step).
+                                                     # NOTE phi_embed receives NO gradient under this family (nothing on the belief path reads it),
+                                                     # so it stays at init and decays under phi_weight_decay -- compare against gauge_transport="off".
+                                                     #
+                                                     # "gaussian_diagonal_exact" (default OFF): the SAME diagonal Gaussian as "gaussian_diagonal"
+                                                     # (same self-divergence, decode, retraction); only the pair energy differs. Instead of pushing
+                                                     # the key FORWARD and truncating Omega diag(s_j) Omega^T to its diagonal, it pulls the QUERY BACK
+                                                     # by Omega^{-1} (a divergence is invariant under a common invertible pushforward), which leaves
+                                                     # the second argument exactly diagonal and needs the first only through its diagonal and its
+                                                     # determinant. The energy is then the EXACT congruence KL at the same cost, and unlike
+                                                     # "gaussian_frame_diagonal" the gauge STAYS in the coupling (phi keeps its gradient).
+                                                     # REQUIRES divergence_family="renyi" + renyi_order=1.0: the pullback identity is KL-specific
+                                                     #   (a Renyi blend of the dense pushforward with a diagonal covariance does not reduce). Raises.
+                                                     # REQUIRES e_step_update="gradient": no hand kernel is registered for this family, so it routes
+                                                     #   to the autograd oracle (slower per step); mm_exact is rejected at config time.
+                                                     # REQUIRES oracle_unroll_grad=True under e_step_gradient="unroll": the oracle otherwise returns a
+                                                     #   DETACHED tangent and phi_embed receives no gradient -- silently a frozen-gauge run.
+                                                     # TRANSPORT: flat vertex-factored cocycle (the fast route inverts by the pair transpose
+                                                     #   Omega_ij^{-1} = Omega_ji) or a dense pairwise Omega (the O(N^2 K^3) reference route).
+                                                     #   regime_ii / direct-link / RoPE-wrapped transports raise rather than silently truncating.
     
     #################################
     #        Initialization
@@ -278,7 +305,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group"
     transport_chart_max_norm  = None, 
-    phi_mstep_max_matrix_norm = 10,
+    phi_mstep_max_matrix_norm = 5,
     
     m_phi_group_trust_radius  = 0.1,          # embedded Frobenius bound on the group factor
     

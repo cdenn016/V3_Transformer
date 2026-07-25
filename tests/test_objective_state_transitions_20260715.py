@@ -418,13 +418,16 @@ def test_resumed_scheduler_uses_persisted_successful_update_clock(
 def test_outer_estep_autocast_and_inner_oracle_fp32_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import vfe3.gradients.oracle as oracle
+    import vfe3.free_energy as free_energy
     import vfe3.model.block as block
 
     outer_autocast = []
     inner_calls = []
     real_e_step = block.e_step
-    real_pairwise_energy = oracle.pairwise_energy
+    # The oracle composes the inner divergence through the family coupling seam
+    # (BeliefParams.coupling_energy), which imports pairwise_energy at call time -- so the spy goes
+    # on the definition module, which catches the call wherever the composition happens.
+    real_pairwise_energy = free_energy.pairwise_energy
 
     def e_step_spy(*args: Any, **kwargs: Any) -> Any:
         belief = args[0]
@@ -447,7 +450,7 @@ def test_outer_estep_autocast_and_inner_oracle_fp32_boundary(
         return real_pairwise_energy(query, target, *args, **kwargs)
 
     monkeypatch.setattr(block, "e_step", e_step_spy)
-    monkeypatch.setattr(oracle, "pairwise_energy", pairwise_spy)
+    monkeypatch.setattr(free_energy, "pairwise_energy", pairwise_spy)
     model = _model(amp_dtype="bf16", gradient_mode="smoothing")
     tokens = _tokens().repeat(2, 1)
     targets = torch.roll(tokens, shifts=-1, dims=-1)
