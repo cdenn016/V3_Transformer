@@ -278,9 +278,13 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group"
     transport_chart_max_norm  = None, 
+    phi_mstep_max_matrix_norm = 10,
+    
     m_phi_group_trust_radius  = 0.1,          # embedded Frobenius bound on the group factor
     
     phi_precond_mode          = "pullback_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
+                                                       # needs e_phi_lr>0
+    
     phi_retract_mode          = "bch",                # "euclidean" | "bch"
     spd_retract_mode          = "spd_affine",         # SPD covariance retraction (registry: "spd_affine" | "log_euclidean")
 
@@ -332,7 +336,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
 
     pos_phi                   = "learned",           # "none" (pure path) | "learned" | "frozen"
     pos_rotation              = "none",              # "none" | "rope" (block-diagonal positional rotation folded into transport)
-    pos_phi_compose           = "bch",               # composition chart: "bch" | "euclidean"
+    pos_phi_compose           = "group_product",     # composition chart: "bch" | "euclidean" |"group_product"
                
     
     rope_base                 = 100.0,               # rotary frequency base
@@ -533,7 +537,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
                                              # E-step (+ all layers); valid on flat/e_phi_lr=0/no-rope configs
     compile_pair_kernel       = False,       # torch.compile the closed-form pair kernel (eager fallback + warn)
     
-    evaluate_zero_e_steps_counterfactual = False
+    evaluate_zero_e_steps_counterfactual = True
 
 )
 
@@ -958,7 +962,11 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # AdamW-on-phi versus stateless pullback group descent. e_phi_lr=0 keeps the
         # preconditioner off the E-step so this measures the M-step only.
         "description": "gauge M-step: AdamW vs pullback group descent [D1/EXP-8]",
-        "requires": {"e_phi_lr": 0.0},
+        # phi_mstep_max_matrix_norm pinned to None so the pullback_group factor radius is the 5.0
+        # default and the arm's transport_chart_max_norm=6.0 satisfies radius < chart < clamp. The
+        # baseline's 10 would otherwise reject it (10 < 6.0 is false). Same reason phi_chart_control
+        # pins None.
+        "requires": {"e_phi_lr": 0.0, "phi_mstep_max_matrix_norm": None},
         "configs": [
             {"label": "adamw", "m_phi_update_mode": "adamw"},
             {"label": "pullback_group", "m_phi_update_mode": "pullback_group",
@@ -973,9 +981,12 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # m_phi_lr need not transfer. Gated to the certified pullback-group path.
         "description": "log-spaced m_phi_lr on the pullback group M-step [D1/EXP-8]",
         "param": "m_phi_lr", "values": [0.0005, 0.0015, 0.005, 0.015, 0.05, 0.15],
+        # phi_mstep_max_matrix_norm pinned to None so the factor radius is the 5.0 default and
+        # transport_chart_max_norm=6.0 satisfies radius < chart < clamp; the baseline's 10 rejects it.
         "requires": {"m_phi_update_mode": "pullback_group",
                      "phi_precond_mode": "pullback_per_block", "e_phi_lr": 0.0,
-                     "transport_chart_max_norm": 6.0},
+                     "transport_chart_max_norm": 6.0,
+                     "phi_mstep_max_matrix_norm": None},
     },
 
    
@@ -1536,18 +1547,10 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "mstep_self_coupling_weight": {
         "description": "M-step self-coupling term alpha_hat * sum_i KL(q_i*||p_i)",
-        "param": "mstep_self_coupling_weight", "values": [0, 0.1, 0.25, 0.5, 0.75, 1],
+        "param": "mstep_self_coupling_weight", "values": [0, 0.01, 0.1, 0.25, 0.5, 0.75, 1],
     },
     
-    "mass_phiA": {  # D1 / EXP-8: the regime knob (NOT phi_weight_decay, which is hard-zeroed under
-        # pullback group descent). The pullback advantage is predicted to shrink as mass_phi rises (the frame-
-        # norm penalty pulls phi toward 0, where ad_phi -> 0 and the pullback metric -> I).
-        "description": "mass_phi frame-norm penalty: pullback-group regime knob [D1/EXP-8]",
-        "param": "mass_phi", "values": [0.0, 0.001, 0.01, 0.1],
-        "requires": {"m_phi_update_mode": "pullback_group",
-                     "phi_precond_mode": "pullback_per_block", "e_phi_lr": 0.0,
-                     "transport_chart_max_norm": 6.0},
-    },
+   
     
     "mass_phi": {  # D1 / EXP-8: the regime knob (NOT phi_weight_decay, which is hard-zeroed under
         # pullback group descent). The pullback advantage is predicted to shrink as mass_phi rises (the frame-
@@ -2185,7 +2188,44 @@ def make_run_overrides(sweep_name: str) -> List[Tuple[str, Dict[str, Any]]]:
         param = sweep["param"]
         for value in _sweep_values(sweep):
             runs.append((f"{param}={value}", {**requires, param: value}))
-    return runs
+    return [(label, _repair_arm_prerequisites(overrides)) for label, overrides in runs]
+
+
+# The three toggles pos_phi_compose='group_product' requires (config.py rejects any other value of
+# them alongside it). Kept next to the repair so the two cannot drift apart.
+_GROUP_PRODUCT_REQUIRES = {
+    "gauge_parameterization": "phi",
+    "transport_mode":         "flat",
+    "s_frame_mode":           "tied",
+}
+
+
+def _repair_arm_prerequisites(overrides: Dict[str, Any]) -> Dict[str, Any]:
+    r"""Downgrade baseline settings an arm's own overrides have made invalid.
+
+    ``pos_phi_compose='group_product'`` is the exact positional composition -- it forms the frame as
+    the true product ``exp(X) exp(Y)`` instead of a truncated-BCH single coordinate -- but it is
+    admissible ONLY with ``gauge_parameterization='phi'``, ``transport_mode='flat'`` and
+    ``s_frame_mode='tied'``. Sweeps exist to vary precisely those three, so once the BASELINE carries
+    group_product every such arm becomes unconstructible: 26 arms across seven sweeps failed
+    ``validate_sweeps`` this way. Since group_product is a property of the baseline rather than of
+    those arms, the arm keeps its swept dimension and falls back to the ordinary ``'bch'`` chart,
+    which every configuration accepts. Arms that set ``pos_phi_compose`` explicitly are left alone,
+    so the dedicated ``pos_phi_composition`` sweep still contrasts the two charts directly.
+
+    Returned as a NEW dict; the sweep declarations are never mutated.
+    """
+    if overrides.get("pos_phi_compose", BASELINE_CONFIG.get("pos_phi_compose")) != "group_product":
+        return overrides
+    if "pos_phi_compose" in overrides:            # an explicit arm choice is authoritative
+        return overrides
+    conflicting = [
+        field for field, required in _GROUP_PRODUCT_REQUIRES.items()
+        if overrides.get(field, BASELINE_CONFIG.get(field)) != required
+    ]
+    if not conflicting:
+        return overrides
+    return {**overrides, "pos_phi_compose": "bch"}
 
 
 # =============================================================================
