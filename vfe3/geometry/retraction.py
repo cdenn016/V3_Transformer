@@ -693,9 +693,18 @@ def retract_log_euclidean(
         compute_dtype = torch.float64 if orig_dtype == torch.float64 else torch.float32
         sigma_safe  = sigma.to(compute_dtype).clamp(min=eps)
         delta_sigma = delta_sigma.to(compute_dtype) / sigma_safe
+        exp_arg     = step_size * delta_sigma
         if trust_region is not None and trust_region > 0:
-            delta_sigma = delta_sigma.clamp(-trust_region, trust_region)
-        exp_arg   = (step_size * delta_sigma).clamp(-50.0, 50.0)
+            # L2 ball on the STEP-SCALED chart tangent (audit 2026-07-25 F17), matching
+            # retract_spd_diagonal above and this function's own full-covariance arm, which bounds the
+            # Frobenius norm of step_size * tangent. The former componentwise clamp(-tr, tr) applied
+            # BEFORE step_size was a SUP-norm bound, admitting a chart step sqrt(K) larger than every
+            # other arm (4.47x at the live K=20, and 13.4x once step_size != 1) and contradicting the
+            # equivalence config.py asserts between log_euclidean and spd_affine on commuting diagonal
+            # covariances -- an equivalence that in fact held only while the trust region was inactive.
+            tangent_norm = torch.linalg.vector_norm(exp_arg, dim=-1, keepdim=True)
+            exp_arg = exp_arg * torch.clamp(trust_region / (tangent_norm + eps), max=1.0)
+        exp_arg   = exp_arg.clamp(-50.0, 50.0)
         sigma_new = sigma_safe * torch.exp(exp_arg)
     sigma_new = (
         sigma_new.clamp(min=lower_bound)
