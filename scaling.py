@@ -78,7 +78,7 @@ _SCALING_SUMMARY_DIGEST_FIELD = "scaling_reuse_contract_sha256"
 # =============================================================================
 CONFIG: Dict[str, Any] = {
     # Which routes to run (keys of ROUTES), in order. See the ROUTE MENU above the ROUTES registry.
-    "routes":     ["grow_K"], # "grow_K_GL10","blocks_K48", "grow_K_mup" (seems to be identical)                      
+    "routes":     ["blocks_K48"], # "grow_K_GL10","blocks_K48", "grow_K_mup" (seems to be identical)                      
                    #"blocksize", "grow_K", "group", "model_channel", "infer_T", "infer_L"
 
     # Seeds per cell. Graduated budget is sensible (more seeds at the cheap small end); the simplest
@@ -119,7 +119,7 @@ config = dict(
     max_seq_len               = 128,                 # N, context length
     
     batch_size                = 64,
-    max_steps                 = 15000,
+    max_steps                 = 60000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
@@ -368,7 +368,7 @@ config = dict(
     #################################
     #         Misc/Logging
     #################################     
-    amp_dtype                 = None,      # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
+    amp_dtype                 = 'bf16',      # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
         
     log_interval              = 100,       # console log every N steps (0 = off)
     eval_interval             = 1500,      # periodic validation every N steps (0 = off)

@@ -83,6 +83,11 @@ class VFE3Config:
     vocab_size:                int   = 50257
     embed_dim:                 int   = 64           # K (total belief dimension)
     max_seq_len:               int   = 128          # N (context length)
+    
+    batch_size:                int   = 64
+    max_steps:                 int   = 15000
+    warmup_steps:              int   = 100
+    
     n_layers:                  int   = 1            # L (number of blocks)
     n_e_steps:                 int   = 1            # T (E-step inner iterations)
     n_heads:                   int   = 8
@@ -143,16 +148,7 @@ class VFE3Config:
     link_alpha:                float = 1.0
     link_soft_cap:             float = 6.0
 
-    # Opt-in transport diagnostic (audit 2026-07-01 round-3, punch 12c): forward clamp_monitor=True
-    # into every production stable_matrix_exp_pair transport build, emitting a RuntimeWarning when
-    # the hard Frobenius clamp (max_norm=15) fires (the returned factor is then a surrogate, not
-    # exp(M)). Costs a tensor-reduction host sync per build; keep OFF on the training hot path.
-    transport_clamp_monitor:   bool            = False
-
-    # Optional fail-closed chart-validity domain for every production transport exponential.
-    # None preserves the existing permissive clamp behavior; a positive finite bound rejects the
-    # raw Lie-algebra matrix before the numerical clamp can silently change the modeled operator.
-    transport_chart_max_norm:  Optional[float] = None
+    
 
     # Cross-head GL(K) coupling: a list of directed (head_a, head_b) index pairs that add off-block
     # generators (and a genuinely larger-than-direct-sum subalgebra under the builder's bracket
@@ -242,7 +238,7 @@ class VFE3Config:
     # "position-dependent attention, position-independent values" asymmetry. Decoupled breaks beta's
     # coupling-sum stationarity, so the belief gradient routes to the autograd oracle (no closed-form
     # kernel). Inert unless pos_rotation='rope'.
-    rope_on_value:             bool  = True        # False -> value aggregation uses the un-rotated base (RoPE on Q/K only)
+    rope_on_value:             bool  = False        # False -> value aggregation uses the un-rotated base (RoPE on Q/K only)
 
     # belief family. ``family`` is the SINGLE covariance-structure toggle (a registry key;
     # gaussian_diagonal | gaussian_full | ...). The diagonal-vs-full flag is its derived,
@@ -555,10 +551,26 @@ class VFE3Config:
     m_phi_update_mode:         str   = "adamw"
     m_phi_group_trust_radius:  float = 0.1
 
+    # Opt-in transport diagnostic (audit 2026-07-01 round-3, punch 12c): forward clamp_monitor=True
+    # into every production stable_matrix_exp_pair transport build, emitting a RuntimeWarning EVERY
+    # time the hard Frobenius clamp (TRANSPORT_CLAMP_MAX_NORM, 20.0) fires (the returned factor is
+    # then a surrogate exp(M*scale), not exp(M)). Costs a tensor-reduction host sync per build; keep
+    # OFF on the training hot path. Since audit 2026-07-25 F2 the FIRST occurrence is reported even
+    # with this off, so leaving it off no longer means silence.
+    transport_clamp_monitor:   bool            = False
+
+    # Optional fail-closed chart-validity domain for every production transport exponential.
+    # None preserves the existing permissive clamp behavior; a positive finite bound rejects the
+    # raw Lie-algebra matrix before the numerical clamp can silently change the modeled operator.
+    transport_chart_max_norm:  Optional[float] = None
+
+
     # Optional post-M-step chart guard. AdamW projects rows back along their algebra ray after the
     # optimizer step. The pullback-group route instead treats this value as an in-optimizer candidate
     # bound and rejects atomically; when None, that route uses the fixed factor radius 5.0.
     phi_mstep_max_matrix_norm: Optional[float] = None
+
+
 
     weight_decay:              float = 0.05
    
@@ -576,7 +588,7 @@ class VFE3Config:
     # weight_decay (the long-standing behavior, unchanged); set explicitly for an LR-invariant
     # connection-norm ceiling that pulls the transport toward the flat cocycle.
     connection_weight_decay:   Optional[float] = None
-    batch_size:                int   = 64
+    
     
     # Accumulate gradients over N microbatches before an optimizer step, for a larger
     # effective batch without the memory of one big forward. Each pulled batch is split
@@ -584,8 +596,7 @@ class VFE3Config:
     # single clip + optimizer.step() + scheduler.step() fires at the boundary. Default 1 =
     # current single-step behavior (byte-identical: no chunking, no divide).
     grad_accum_steps:          int   = 1
-    max_steps:                 int   = 15000
-    warmup_steps:              int   = 100
+    
     
     min_lr:                    float = 0         # absolute cosine-decay floor: each group's LR
     #                          never decays below this. 0.0 recovers the pure half-cosine-to-zero.
@@ -1530,8 +1541,11 @@ class VFE3Config:
             )
         # lambda_h_mode validated against the hyper-prior-coupling registry (the model-fiber mirror of
         # lambda_alpha_mode). r_update_mode selects the centroid M-step (gradient vs closed-form barycenter).
-        from vfe3.lambda_h_i import _LAMBDA_H_MODES
-        _require(self.lambda_h_mode, _LAMBDA_H_MODES, "lambda_h_mode")
+        # Registry-driven, exactly as lambda_alpha_mode is validated 12 lines above
+        # (audit 2026-07-25 F9): the model fiber delegates its whole implementation to the alpha
+        # registry, so a newly registered alpha form must be selectable here without a call-site edit.
+        from vfe3.lambda_h_i import lambda_h_modes
+        _require(self.lambda_h_mode, lambda_h_modes(), "lambda_h_mode")
         _require(self.r_update_mode, ("gradient", "barycenter"), "r_update_mode")
         # r_update_mode='barycenter' needs a closed-form barycenter for the model-channel family.
         # PriorBank.barycenter_r_ implements the moment-matched m-projection ONLY for the Gaussian
@@ -2016,17 +2030,13 @@ class VFE3Config:
         if self.decode_bias and self.use_prior_bank:
             import warnings
             warnings.warn(
-                "decode_bias=True is inert when use_prior_bank=True: the KL-to-prior decode's "
-                "per-vocab priors already play the log-unigram role. Set use_prior_bank=False "
-                "(linear decode) for the learned bias to take effect.",
+                "decode_bias=True is inert when use_prior_bank=True",
                 UserWarning,
             )
         if not self.use_prior_bank and self.decode_tau != 1.0:
             import warnings
             warnings.warn(
-                f"decode_tau={self.decode_tau} is inert when use_prior_bank=False: the linear decode "
-                "does not apply the KL-decode temperature. Set use_prior_bank=True for decode_tau to "
-                "affect logits, or leave decode_tau=1.0 on the linear path.",
+                f"decode_tau={self.decode_tau} is inert when use_prior_bank=False",
                 UserWarning,
             )
         # precision_weighted_attention's per-key reliability -log(b0 + tr Sigma_j) needs a positive b0.
@@ -2034,8 +2044,8 @@ class VFE3Config:
             math.isfinite(self.precision_attention_b0) and self.precision_attention_b0 > 0.0
         ):
             raise ValueError(
-                f"precision_attention_b0 must be finite and positive (the b0 in the per-key reliability "
-                f"-log(b0 + tr Sigma_j)), got {self.precision_attention_b0}")
+                "precision_attention_b0 must be finite and positive",
+                )
         if self.precision_weighted_attention:
             import warnings
             warnings.warn(
@@ -2499,12 +2509,7 @@ class VFE3Config:
             if self.lambda_alpha_mode in ("state_dependent", "state_dependent_per_coord"):
                 import warnings
                 warnings.warn(
-                    f"e_step_update='mm_exact' with lambda_alpha_mode={self.lambda_alpha_mode!r} "
-                    "computes the frozen-alpha minimizer of the strict-pair-masked surrogate "
-                    "(NOT a majorizer of the canonical objective; see the e_step_update note); the "
-                    f"iteration takes a step toward it using mm_damping={self.mm_damping} (a damped "
-                    "step for values below 1.0, the full step at 1.0). It is not one-step exact for "
-                    "the profiled state-dependent-alpha objective.",
+                    f"e_step_update='mm_exact' with lambda_alpha_mode={self.lambda_alpha_mode!r} ",
                     UserWarning,
                     stacklevel=2,
                 )
