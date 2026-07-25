@@ -562,6 +562,23 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         self._group                  = group
         self._generators             = group.generators
         self._irrep_dims             = list(group.irrep_dims)
+        # Whether the stored element lives in the DEFINING representation, where polar projection onto
+        # O(K) coincides with the structure group (audit 2026-07-25 F17). A single-block irrep TOWER
+        # (e.g. so_n with irrep_spec=[('l2',1)], irrep_dims=[5]) also has len(irrep_dims)==1, but
+        # rho(SO(3)) is a 3-dimensional submanifold of the 10-dimensional SO(5), so projecting there
+        # restores orthogonality while leaving the element OFF the group -- measured: polar took
+        # ||U^T U - I|| from 8.4e-03 to 1.6e-15 yet left the element 2.0e-3 away from rho(SO(3)), and
+        # the dirty flag was then cleared so it was never revisited. group.algebra is None exactly for
+        # the plain matrix groups whose defining rep IS the whole of O(K)/Sp; an irrep tower carries a
+        # non-None algebra with labels.
+        # ``algebra`` is None exactly for the plain matrix groups (so_k, glk, block_glk), whose stored
+        # element lives in O(K)/GL(K) itself, so polar projection lands back in the structure group. It
+        # is a non-None label for an irrep TOWER (so_n / sp_n), where rho's image is a proper
+        # submanifold of O(K) and polar projection restores orthogonality WITHOUT restoring group
+        # membership. GaugeGroup exposes no group_n, so the tower's defining block cannot be identified
+        # from the group object alone -- towers are therefore excluded wholesale, which is exactly what
+        # the comment at the gate below always claimed.
+        self._defining_rep = getattr(group, "algebra", None) is None
         self._precond_mode           = phi_precond_mode
         self._phi_group_trust_radius = phi_group_trust_radius
         self._phi_chart_max_norm     = phi_chart_max_norm
@@ -923,8 +940,11 @@ class GaugeManifoldAdamW(torch.optim.AdamW):
         # their faithful rho(SO(N)) image is a proper submanifold of O(K). The cadence is one clock
         # per optimizer step, after every omega group commits; when it fires, every eligible omega
         # group is projected on that same step, including dirty rows accumulated without new grads.
+        # The block-COUNT test alone admitted single-block irrep towers, whose image is a proper
+        # submanifold of O(K); _defining_rep implements the intent the comment above already stated
+        # (audit 2026-07-25 F17).
         if (self._has_omega_group and self._skew_symmetric and self._omega_reorth_every > 0
-                and len(self._irrep_dims) == 1):
+                and len(self._irrep_dims) == 1 and self._defining_rep):
             self._omega_step += 1
             if self._omega_step % self._omega_reorth_every == 0:
                 for omega_group in self.param_groups:

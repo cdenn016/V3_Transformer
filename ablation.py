@@ -884,11 +884,23 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "untied_block_glk", "gauge_group": "block_glk", "use_head_mixer": True,
              "family": "gaussian_full", "use_prior_bank": True, "decode_mode": "full_chunked",
              "phi_precond_mode": "killing", "s_e_step": False, "precision_weighted_attention": False,
-             "lambda_alpha_mode": "constant"},
+             "lambda_alpha_mode": "constant",
+             # audit 2026-07-25 F13: family='gaussian_full' routes the belief gradient to the
+             # autograd oracle, whose tangent is DETACHED unless oracle_unroll_grad is set, which
+             # would freeze prior_bank.phi_embed -- the gauge frame -- at its random init for the
+             # entire arm. ablation.py measures params by numel (allocation), not liveness, so
+             # such an arm still reports as parameter-matched.
+             "oracle_unroll_grad": True},
             {"label": "tied_block_glk",   "gauge_group": "tied_block_glk", "use_head_mixer": True,
              "family": "gaussian_full", "use_prior_bank": True, "decode_mode": "full_chunked",
              "phi_precond_mode": "killing", "s_e_step": False, "precision_weighted_attention": False,
-             "lambda_alpha_mode": "constant"},
+             "lambda_alpha_mode": "constant",
+             # audit 2026-07-25 F13: family='gaussian_full' routes the belief gradient to the
+             # autograd oracle, whose tangent is DETACHED unless oracle_unroll_grad is set, which
+             # would freeze prior_bank.phi_embed -- the gauge frame -- at its random init for the
+             # entire arm. ablation.py measures params by numel (allocation), not liveness, so
+             # such an arm still reports as parameter-matched.
+             "oracle_unroll_grad": True},
             # PARAM-MATCHED CONTROL: the untied arm carries +55.6% params (14.10M vs 9.06M tied) because
             # the per-head gauge gives the head mixer a larger Schur commutant, so the raw tied-vs-untied
             # PPL gap is only an UPPER BOUND on the equivariance tax. This arm widens the exact-equivariant
@@ -900,7 +912,13 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "tied_block_glk_wide", "gauge_group": "tied_block_glk", "use_head_mixer": True,
              "family": "gaussian_full", "use_prior_bank": True, "decode_mode": "full_chunked",
              "phi_precond_mode": "killing", "s_e_step": False, "precision_weighted_attention": False,
-             "embed_dim": 28, "kl_max": 224, "lambda_alpha_mode": "constant"},
+             "embed_dim": 28, "kl_max": 224, "lambda_alpha_mode": "constant",
+             # audit 2026-07-25 F13: family='gaussian_full' routes the belief gradient to the
+             # autograd oracle, whose tangent is DETACHED unless oracle_unroll_grad is set, which
+             # would freeze prior_bank.phi_embed -- the gauge frame -- at its random init for the
+             # entire arm. ablation.py measures params by numel (allocation), not liveness, so
+             # such an arm still reports as parameter-matched.
+             "oracle_unroll_grad": True},
         ],
     },
 
@@ -929,7 +947,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # e_phi_lr=0 keeps the gauge preconditioner off the E-step across the sweep. (The F-vs-CE
         # decorrelation half additionally needs a persisted final E-step F/token -- a separate infra
         # gap noted in the readiness doc.)
-        "description": "n_e_steps {1,2,3,5,8} x e_step_gradient {unroll, straight_through}, e_phi_lr=0 [C2/EXP-5]",
+        "description": "n_e_steps {1,2,3,5,8} x e_step_gradient {unroll, straight_through}, e_phi_lr=0 [C2/EXP-5]. CONFOUND (audit 2026-07-25 F13): the straight_through arms sever the E-step tangent, which is prior_bank.phi_embed's ONLY loss path at mass_phi=0, so those arms train the gauge frame NOT AT ALL while the unroll arms train it -- measured |grad| 8.178e-03 under unroll versus None under straight_through, i.e. a literal zero optimizer step. The estimator contrast therefore also contrasts a live versus a frozen 10.05M-parameter table (50257 x n_gen=200 at K=20), and ablation.py counts parameters by numel (allocation) not liveness, so the arms still report as parameter-matched. This is intrinsic to what straight_through MEANS -- it cannot be patched away by a toggle -- so read the comparison as estimator-plus-frame-liveness, not estimator alone.",
         "configs": [
             {"label": f"T{t}_{g}", "n_e_steps": t, "e_step_gradient": g, "e_phi_lr": 0.0}
             for t in (1, 2, 3, 5, 8) for g in ("unroll", "straight_through")
@@ -1114,7 +1132,13 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "full_gauge", "pos_rotation": "rope", "rope_full_gauge": True,
                                     "e_step_update": "gradient",
                                     "family": "gaussian_full",
-                                    "lambda_alpha_mode": "state_dependent"},
+                                    "lambda_alpha_mode": "state_dependent",
+             # audit 2026-07-25 F13: family='gaussian_full' routes the belief gradient to the
+             # autograd oracle, whose tangent is DETACHED unless oracle_unroll_grad is set, which
+             # would freeze prior_bank.phi_embed -- the gauge frame -- at its random init for the
+             # entire arm. ablation.py measures params by numel (allocation), not liveness, so
+             # such an arm still reports as parameter-matched.
+             "oracle_unroll_grad": True},
         ],
     },
 
@@ -1128,7 +1152,13 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "configs": [
             {"label": "diagonal", "family": "gaussian_diagonal"},
             {"label": "full",     "family": "gaussian_full", "e_step_update": "gradient",
-                                  "lambda_alpha_mode": "state_dependent"},
+                                  "lambda_alpha_mode": "state_dependent",
+             # audit 2026-07-25 F13: family='gaussian_full' routes the belief gradient to the
+             # autograd oracle, whose tangent is DETACHED unless oracle_unroll_grad is set, which
+             # would freeze prior_bank.phi_embed -- the gauge frame -- at its random init for the
+             # entire arm. ablation.py measures params by numel (allocation), not liveness, so
+             # such an arm still reports as parameter-matched.
+             "oracle_unroll_grad": True},
         ],
     },
 

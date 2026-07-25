@@ -38,12 +38,45 @@ class EMA:
         self._model_ref = weakref.ref(model)
         # Track only trainable params: frozen tensors (e.g. r_mu with learnable_r=False) never move,
         # so averaging them is a wasteful no-op. Keyed by the stable parameter name.
+        #
+        # EXCLUDING stored GROUP ELEMENTS (audit 2026-07-25 F17). Under
+        # gauge_parameterization='omega_direct' the parameter prior_bank.omega_embed is not a vector but
+        # a POINT OF THE STRUCTURE GROUP, and a convex combination in the ambient matrix space is not a
+        # group operation for any compact or symplectic member -- Lee 2012 §7: a Lie group is not a
+        # linear subspace of the ambient matrix algebra, so averaging must go through exp/log (a Karcher
+        # mean), not componentwise. Measured after 3000 steps of an exact so_k trajectory at
+        # decay=0.999: the live frame held ||U^T U - I|| = 1.4e-14 while the linear shadow drifted to
+        # 2.5e-03 with det 0.9975, and the transport built from it stopped being an isometry of the trace
+        # form (deviation -1.6e-03). copy_to then installs that off-group frame for evaluation AND for
+        # the final trained weights. The optimizer already carries this exact drift control for the same
+        # table (gauge_optim's polar re-orthogonalization under omega_reorth_every); the EMA path
+        # bypassed it entirely, and config.py places no constraint on use_ema under omega_direct.
+        # Excluded rather than group-projected: leaving the live (on-group) parameter in place is
+        # correct, whereas a projected linear mean would still not be the group mean.
+        _group_element_params = self._stored_group_element_names(model)
         self.shadow: Dict[str, torch.Tensor] = {
             name: param.detach().clone()
             for name, param in model.named_parameters()
-            if param.requires_grad
+            if param.requires_grad and name not in _group_element_params
         }
+        self._excluded_group_elements: Set[str] = _group_element_params
         self._backup: Dict[str, torch.Tensor] = {}
+
+    @staticmethod
+    def _stored_group_element_names(model: torch.nn.Module) -> Set[str]:
+        r"""Parameters that ARE points of the structure group, so linear averaging is not defined.
+
+        Only ``gauge_parameterization='omega_direct'`` stores a group element directly; the default
+        ``'phi'`` parameterization stores Lie-ALGEBRA coordinates, which form a vector space where a
+        convex combination is perfectly well defined and the EMA is correct.
+        """
+        cfg = getattr(model, "cfg", None)
+        if cfg is None or getattr(cfg, "gauge_parameterization", "phi") != "omega_direct":
+            return set()
+        return {
+            name for name, _ in model.named_parameters()
+            if name.rsplit(".", 1)[-1] in ("omega_embed", "s_omega_embed")
+        }
 
     @staticmethod
     def _derived_parameter_names(model: torch.nn.Module) -> Set[str]:

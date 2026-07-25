@@ -157,6 +157,8 @@ config = dict(
     
     m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group"
     transport_chart_max_norm  = None, 
+    phi_mstep_max_matrix_norm = 5,
+    
     m_phi_group_trust_radius  = 0.1,          # embedded Frobenius bound on the group factor
     
     phi_precond_mode          = "pullback_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
