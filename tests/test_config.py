@@ -471,11 +471,36 @@ def test_detach_with_learnable_trigger_warns():
         VFE3Config(e_step_gradient="detach", transport_mode="regime_ii")
 
 
-def test_straight_through_without_learnable_does_not_warn():
+def test_straight_through_warns_about_phi_embed_but_not_inactive_learnables():
+    r"""straight_through freezes the gauge frame, and the warning must say so.
+
+    Audit 2026-07-25 F13 corrected this test's premise. It previously asserted that
+    straight_through emits no "frozen" warning when no OPT-IN learnable is enabled -- but
+    prior_bank.phi_embed is always present and always trainable, and at the default
+    phi_scale>0 with mass_phi=0 its ONLY loss path is the per-iteration E-step tangent, which
+    this estimator severs. Measured: |grad| 8.178e-03 under 'unroll' versus None under
+    'straight_through', reaching the optimizer as a literal zero step. So the warning is correct and
+    the old expectation was wrong. What still must hold is that the message names the parameter that
+    actually freezes and does NOT implicate opt-in learnables that are switched off.
+    """
     import warnings
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        VFE3Config(e_step_gradient="straight_through")          # no learnable param active
+        VFE3Config(e_step_gradient="straight_through")
+    frozen = [str(w.message) for w in caught if "frozen" in str(w.message)]
+    assert frozen, "straight_through must warn that the gauge frame freezes"
+    joined = " ".join(frozen)
+    assert "phi_embed" in joined
+    for inactive in ("t5_bias", "log_kappa_beta", "log_kappa_gamma"):
+        assert inactive not in joined, f"named {inactive}, which is not enabled here"
+
+
+def test_unroll_default_does_not_warn_about_frozen_parameters():
+    r"""The default estimator trains the frame, so nothing reports as frozen (F13 companion)."""
+    import warnings
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        VFE3Config()
     assert not any("frozen" in str(w.message) for w in caught)
 
 

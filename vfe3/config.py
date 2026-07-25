@@ -2298,15 +2298,25 @@ class VFE3Config:
         # (pos_phi='learned' ALSO freezes under these estimators, but it is the DEFAULT and is warned
         # at the MODEL level -- VFEModel.__init__, keyed on the EFFECTIVE estimator -- so it is left out
         # of this config-level predicate to keep the default config silent here.)
+        # phi_embed is the PRIMARY such parameter and was absent here (audit 2026-07-25 F13). The
+        # gauge frame's only loss path is Omega(phi) inside the E-step tangent whenever mass_phi == 0,
+        # so straight_through/detach freeze it -- measured |grad| 8.178e-03 under 'unroll' versus None
+        # under 'straight_through', reaching the optimizer as a literal zero step. The old predicate
+        # keyed only on registry transport state and learnable_r, both false under the flat transport,
+        # so on the pure path this warning never fired while the frame stayed at its random init.
+        _phi_frame_is_tangent_only = (self.phi_scale != 0.0 and self.mass_phi == 0.0)
         if self.e_step_gradient in ("straight_through", "detach") and (
             transport_registration.state_builder is not None
             or (self.learnable_r and self.r_update_mode == "gradient" and self.s_e_step)
+            or _phi_frame_is_tangent_only
         ):
             import warnings
             warnings.warn(
                 f"e_step_gradient={self.e_step_gradient!r} severs the per-iteration E-step tangent, so a "
                 "learnable parameter that enters the loss only through it (registry-owned transport "
-                "state, or r_mu/r_sigma_log under learnable_r+r_update_mode='gradient'+s_e_step) "
+                "state, prior_bank.phi_embed -- the gauge-frame table that generates every transport "
+                "operator -- whenever mass_phi=0, or r_mu/r_sigma_log under "
+                "learnable_r+r_update_mode='gradient'+s_e_step) "
                 "receives NO gradient and stays frozen. Use e_step_gradient='unroll' (the default) to "
                 "train these.",
                 UserWarning,
@@ -2410,6 +2420,11 @@ class VFE3Config:
                 # E-step, so it trains through any estimator when lambda_gamma > 0).
                 or self.learnable_kappa_beta
                 or (self.learnable_kappa_gamma and self.s_e_step)
+                # phi_embed was missing from this disjunction too (F13): on the oracle route with
+                # oracle_unroll_grad=False the detached tangent severs its only loss path, so with
+                # pos_phi='none' plus a full-covariance or entropy-suppressed config NO config-time
+                # warning fired at all while phi_embed.grad was None.
+                or _phi_frame_is_tangent_only
             )
         ):
             import warnings
@@ -2419,7 +2434,9 @@ class VFE3Config:
                 "gradient_mode='filtering' + family='gaussian_diagonal' + divergence_family='renyi' + "
                 "renyi_order=1.0 + include_attention_entropy=True), which returns a DETACHED tangent while "
                 "oracle_unroll_grad=False. A learnable parameter that enters the loss only through the "
-                "E-step tangent (registry-owned transport state, r_mu/r_sigma_log under "
+                "E-step tangent (prior_bank.phi_embed -- the gauge-frame table generating every "
+                "transport operator -- whenever mass_phi=0, registry-owned transport state, "
+                "r_mu/r_sigma_log under "
                 "learnable_r+r_update_mode='gradient'+s_e_step, pos_phi_free under pos_phi='learned', "
                 "s_phi_embed/s_pos_phi_free under s_frame_mode='phi_tilde', "
                 "t5_bias under t5_learnable_bias with an active t5_relative_bias channel, "
@@ -2521,7 +2538,12 @@ class VFE3Config:
             if self.lambda_alpha_mode in ("state_dependent", "state_dependent_per_coord"):
                 import warnings
                 warnings.warn(
-                    f"e_step_update='mm_exact' with lambda_alpha_mode={self.lambda_alpha_mode!r} ",
+                    f"e_step_update='mm_exact' with lambda_alpha_mode={self.lambda_alpha_mode!r} "
+                    "computes the frozen-alpha minimizer of the strict-pair-masked surrogate "
+                    "(NOT a majorizer of the canonical objective; see the e_step_update note); the "
+                    f"iteration takes a step toward it using mm_damping={self.mm_damping} (a damped "
+                    "step for values below 1.0, the full step at 1.0). It is not one-step exact for "
+                    "the profiled state-dependent-alpha objective.",
                     UserWarning,
                     stacklevel=2,
                 )
