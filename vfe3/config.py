@@ -581,7 +581,7 @@ class VFE3Config:
     # bare VFE3Config(), and this project keeps a clean config warning-free. Runtime detection belongs
     # in train.py's _warn_phi_transport_clamp, which currently keys on 20.0 and measures each stored
     # table separately rather than the composed frame actually exponentiated.
-    phi_mstep_max_matrix_norm: Optional[float] = None
+    phi_mstep_max_matrix_norm: Optional[float] = None   #5
 
 
 

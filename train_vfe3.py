@@ -160,6 +160,8 @@ config = dict(
     m_phi_group_trust_radius  = 0.1,          # embedded Frobenius bound on the group factor
     
     phi_precond_mode          = "pullback_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
+                                                       # needs e_phi_lr>0
+    
     phi_retract_mode          = "bch",                # "euclidean" | "bch"
     spd_retract_mode          = "spd_affine",         # SPD covariance retraction (registry: "spd_affine" | "log_euclidean")
 
@@ -211,7 +213,7 @@ config = dict(
 
     pos_phi                   = "learned",           # "none" (pure path) | "learned" | "frozen"
     pos_rotation              = "none",              # "none" | "rope" (block-diagonal positional rotation folded into transport)
-    pos_phi_compose           = "bch",               # composition chart: "bch" | "euclidean"
+    pos_phi_compose           = "group_product",     # composition chart: "bch" | "euclidean" |"group_product"
                
     
     rope_base                 = 100.0,               # rotary frequency base
