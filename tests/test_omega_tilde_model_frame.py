@@ -190,9 +190,17 @@ def test_model_frame_sweeps_are_registered_but_inactive() -> None:
     assert "s_frame_mode" not in ablation.SWEEP_ORDER
     assert "m_s_phi_lr" not in ablation.SWEEP_ORDER
 
+    # Build the arm through make_run_overrides -- the path ablation.py actually runs -- rather than
+    # merging `requires` by hand (audit 2026-07-25). Hand-merging skips
+    # _repair_arm_prerequisites, so it no longer reflects what the harness constructs: with a baseline
+    # carrying pos_phi_compose='group_product' (valid only at gauge_parameterization='phi' +
+    # transport_mode='flat' + s_frame_mode='tied'), a phi_tilde arm needs that setting downgraded, and
+    # the repair does it centrally instead of every affected sweep re-declaring it.
+    arms = dict(ablation.make_run_overrides("s_frame_mode"))
+    assert "s_frame_mode=phi_tilde" in arms
     values = copy.deepcopy(ablation.BASELINE_CONFIG)
-    values.update(ablation.SWEEPS["s_frame_mode"]["requires"])
-    values["s_frame_mode"] = "phi_tilde"
+    values.update(arms["s_frame_mode=phi_tilde"])
+    assert values["s_frame_mode"] == "phi_tilde"
     VFE3Config(**values)
 
 
