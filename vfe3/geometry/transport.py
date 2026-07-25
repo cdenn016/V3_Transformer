@@ -1261,9 +1261,49 @@ TRANSPORT_CLAMP_MAX_NORM: float = 20.0
 # per-build clamp_monitor is off; the latch keeps the default path from paying a host sync forever.
 _CLAMP_SURROGATE_WARNED: bool = False
 
-# Latch for the diagonal congruence's nonnegativity floor (audit 2026-07-25 F3). The floor itself is
-# free and unconditional; only the report needs a reduction, so the latch stops paying for it.
+# Latch for the diagonal congruence's float64 escalation (audit 2026-07-25 F3): report the first
+# escalation, then stay quiet so a persistently ill-conditioned run does not flood the log.
 _DIAG_CONGRUENCE_NEGATIVE_WARNED: bool = False
+
+
+def _escalate_if_negative(
+    out:    torch.Tensor,                          # (..., N, N, H, d) working-dtype congruence
+    reduce: 'Callable[[torch.dtype], torch.Tensor]',  # recompute the same reduction at a given dtype
+
+) -> torch.Tensor:
+    r"""Recompute a diagonal congruence in float64 iff the working-dtype result went negative.
+
+    The factored regrouping trades the manifestly nonnegative ``sum_l Omega_kl^2 sigma_l`` for a
+    quadratic form with mixed-sign intermediates, so cancellation can drive an output variance below
+    zero. That is not a rounding nuisance: a negative variance reaches the divergence kernel's
+    ``clamp(min=eps)``, which inverts that key's precision weight by ~6 orders of magnitude, saturates
+    ``E_ij`` at ``kl_max``, and silently drops the pair from the coupling via ``pair_mask``.
+
+    Measured, the working dtype is not the problem in the common case -- float32's median relative
+    error against a float64 sum-of-squares reference stays ~1.5e-07 at EVERY conditioning tested. It
+    is a tail effect: min ``sigma_t`` is comfortably positive up to cond(U) ~ 1e2 and reaches
+    -1.51e+03 at cond 3.5e3 and -1.27e+07 at cond 7.1e4. Since the nonnegativity test is a single
+    reduction the floor needs regardless, the precision decision is made from the DATA rather than
+    from a static toggle the caller would have to guess: pay float32 speed in the common case, and pay
+    float64 exactly on the calls that actually lose nonnegativity. This mirrors the escalating-ridge
+    ladder :func:`safe_cholesky` already uses rather than upcasting unconditionally.
+    """
+    global _DIAG_CONGRUENCE_NEGATIVE_WARNED
+    with torch.no_grad():
+        worst = float(out.amin())
+    if worst >= 0.0:
+        return out
+    if not _DIAG_CONGRUENCE_NEGATIVE_WARNED:
+        import warnings
+        _DIAG_CONGRUENCE_NEGATIVE_WARNED = True
+        warnings.warn(
+            f"diagonal congruence lost nonnegativity at {out.dtype} (min={worst:.6g}); recomputing "
+            "this congruence in float64. The factored quadratic form has mixed-sign intermediates, so "
+            "this indicates an ill-conditioned transport -- reduce ||phi|| or set "
+            "transport_chart_max_norm if it persists. Warned once for this process.",
+            RuntimeWarning, stacklevel=3,
+        )
+    return reduce(torch.float64)
 
 
 def stable_matrix_exp_pair(
@@ -2351,28 +2391,19 @@ def _compact_factored_diagonal_covariance(
     """
     H, d = factored.n_blocks, factored.block_dim
     sigma_blocks = sigma.reshape(*sigma.shape[:-1], H, d)                 # (..., N, H, d)
+
+    def _reduce(dtype: torch.dtype) -> torch.Tensor:
+        inv = factored.inv_blocks.to(dtype)
+        exp = factored.exp_blocks.to(dtype)
+        key_second = torch.einsum(                                        # (...,Nk,H,d,d) C_j
+            "...jhlp,...jhmp,...jhp->...jhlm", inv, inv, sigma_blocks.to(dtype))
+        return torch.einsum("...ihkl,...jhlm,...ihkm->...ijhk", exp, key_second, exp)
+
     with torch.amp.autocast(sigma.device.type, enabled=False):
-        inv64 = factored.inv_blocks.double()
-        exp64 = factored.exp_blocks.double()
-        key_second = torch.einsum(
-            "...jhlp,...jhmp,...jhp->...jhlm",
-            inv64, inv64, sigma_blocks.double())                          # (...,Nk,H,d,d)
-        out = torch.einsum(
-            "...ihkl,...jhlm,...ihkm->...ijhk", exp64, key_second, exp64)
-        global _DIAG_CONGRUENCE_NEGATIVE_WARNED
-        if not _DIAG_CONGRUENCE_NEGATIVE_WARNED:
-            with torch.no_grad():
-                worst = float(out.amin())
-            if worst < 0.0:
-                import warnings
-                _DIAG_CONGRUENCE_NEGATIVE_WARNED = True
-                warnings.warn(
-                    "diagonal congruence produced a NEGATIVE transported variance "
-                    f"(min={worst:.6g}) and floored it at zero; the factored quadratic form has lost "
-                    "its nonnegativity to cancellation, which indicates an ill-conditioned transport "
-                    "(reduce ||phi|| or set transport_chart_max_norm). Warned once for this process.",
-                    RuntimeWarning, stacklevel=2,
-                )
+        work = sigma.dtype if sigma.dtype in (torch.float32, torch.float64) else torch.float32
+        out = _reduce(work)
+        if work is not torch.float64:
+            out = _escalate_if_negative(out, _reduce)
         out = out.clamp(min=0.0).to(sigma.dtype)
     return out.reshape(*out.shape[:-2], factored.K)
 
@@ -2439,38 +2470,52 @@ def _factored_diagonal_covariance(
     memory N d^3 + N^2 d instead of N^2 d^2, at identical flop count. Exact w.r.t. the dense
     diagonal sandwich because the dense Omega is block-diagonal (off-block entries exactly 0.0);
     the regrouping is algebraically exact. Its ROUNDING is not: the ``d <= n_tokens`` regrouping
-    below has mixed-sign intermediates, so audit 2026-07-25 F3 runs the reduction in float64 here for
-    the same reason (and with the same precision policy) as the compact sibling and the
-    full-covariance congruence. That keeps the two factored routes agreeing with each other AND with
-    the manifestly nonnegative squared form used by the tall-block branch. Rank-agnostic via the
-    leading ellipsis.
+    below has mixed-sign intermediates and can therefore return a NEGATIVE variance, so audit
+    2026-07-25 F3 escalates that branch to float64 exactly when it loses nonnegativity, matching the
+    compact sibling (see :func:`_escalate_if_negative` for the measurements and the rationale for
+    deciding from the data instead of a static toggle). The tall-block branch needs no escalation: its
+    squared form is manifestly nonnegative. Rank-agnostic via the leading ellipsis.
     """
     parts: List[torch.Tensor] = []
     start = 0
     n_tokens = sigma.shape[-2]
     out_dtype = sigma.dtype
-    for d in factored.irrep_dims:
-        end = start + d
-        ep = factored.exp_phi[..., start:end, start:end].double()      # (..., N, d, d) exp(phi_i)^(h)
-        en = factored.exp_neg_phi[..., start:end, start:end].double()  # (..., N, d, d) exp(-phi_j)^(h)
-        sig_blk = sigma[..., start:end].double()                       # (..., N, d)
-        if d <= n_tokens:
-            g = torch.einsum("...jml,...jnl,...jl->...jmn", en, en, sig_blk)   # (..., N, d, d) G_j
-            ep2 = ep.unsqueeze(-1) * ep.unsqueeze(-2)                  # (..., N, d, d, d) ep[k,m] ep[k,n]
-            parts.append(torch.einsum("...ikmn,...jmn->...ijk", ep2, g))   # (..., N, N, d)
-        else:
-            # Tall-block regime d > N (audit 2026-06-09 overnight F4): the query-side outer
-            # product N d^3 would EXCEED the per-pair dense block's N^2 d^2 there, so rebuild
-            # the (exactly equivalent) per-pair block Omega and run the squared diagonal
-            # sandwich; for d <= N (the usual case) the factored route above stays the
-            # memory winner (N d^3 + N^2 d < N^2 d^2).
-            omega_blk = torch.einsum("...ikm,...jml->...ijkl", ep, en)  # (..., N, N, d, d)
-            parts.append(torch.einsum("...ijkl,...ijkl,...jl->...ijk",
-                                      omega_blk, omega_blk, sig_blk))
-        start = end
-    # Floored at zero for the same reason as the compact sibling: a no-op for any mathematically
-    # valid variance, and it stops a cancellation-induced negative from reaching the divergence
-    # kernel's clamp(min=eps), which would invert that key's precision weight (audit 2026-07-25 F3).
+    work = out_dtype if out_dtype in (torch.float32, torch.float64) else torch.float32
+    # Autocast-disabled island, matching the compact sibling (audit 2026-07-25 F3): these einsums are
+    # autocast-eligible, so under AMP the congruence would otherwise be built in bf16 -- reintroducing
+    # exactly the cancellation the float32 working dtype and the escalation below exist to control.
+    with torch.amp.autocast(sigma.device.type, enabled=False):
+      for d in factored.irrep_dims:
+          end = start + d
+          ep = factored.exp_phi[..., start:end, start:end]                # (..., N, d, d) exp(phi_i)^(h)
+          en = factored.exp_neg_phi[..., start:end, start:end]            # (..., N, d, d) exp(-phi_j)^(h)
+          sig_blk = sigma[..., start:end]                                 # (..., N, d)
+          if d <= n_tokens:
+              def _reduce(dtype: torch.dtype, ep=ep, en=en, sig_blk=sig_blk) -> torch.Tensor:
+                  e, n_, s = ep.to(dtype), en.to(dtype), sig_blk.to(dtype)
+                  g = torch.einsum("...jml,...jnl,...jl->...jmn", n_, n_, s)  # (..., N, d, d) G_j
+                  e2 = e.unsqueeze(-1) * e.unsqueeze(-2)                 # (..., N, d, d, d)
+                  return torch.einsum("...ikmn,...jmn->...ijk", e2, g)   # (..., N, N, d)
+              blk = _reduce(work)
+              if work is not torch.float64:
+                  blk = _escalate_if_negative(blk, _reduce)
+              # Back to the common working dtype so torch.cat below sees one dtype across blocks. An
+              # escalated block keeps its CORRECTED value here; only its extra precision is dropped,
+              # which is the whole point -- float64 was used to avoid the cancellation, not to be stored.
+              parts.append(blk.to(work))
+          else:
+              # Tall-block regime d > N (audit 2026-06-09 overnight F4): the query-side outer
+              # product N d^3 would EXCEED the per-pair dense block's N^2 d^2 there, so rebuild
+              # the (exactly equivalent) per-pair block Omega and run the squared diagonal
+              # sandwich; for d <= N (the usual case) the factored route above stays the
+              # memory winner (N d^3 + N^2 d < N^2 d^2).
+              omega_blk = torch.einsum("...ikm,...jml->...ijkl", ep, en)  # (..., N, N, d, d)
+              parts.append(torch.einsum("...ijkl,...ijkl,...jl->...ijk",
+                                        omega_blk, omega_blk, sig_blk))
+          start = end
+      # Floored at zero for the same reason as the compact sibling: a no-op for any mathematically
+      # valid variance, and it stops a cancellation-induced negative from reaching the divergence
+      # kernel's clamp(min=eps), which would invert that key's precision weight (audit 2026-07-25 F3).
     return torch.cat(parts, dim=-1).clamp(min=0.0).to(out_dtype)       # (..., N, N, K)
 
 
