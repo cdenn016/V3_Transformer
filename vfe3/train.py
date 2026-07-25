@@ -905,7 +905,7 @@ def evaluate(
 # pos_loss_* needs targets and seq_len >= 4) stay NaN on runs where they do not apply.
 _VAL_DIAG_KEYS = (
     "val_self_coupling", "val_self_divergence", "val_belief_coupling", "val_attention_entropy",
-    "val_inner_alignment_energy_total", "val_free_energy_total",
+    "val_inner_alignment_energy_total",
     "val_attn_entropy", "val_effective_rank", "val_belief_cond_median", "val_attn_entropy_min",
     "val_attn_entropy_min_all", "val_attn_collapsed_heads", "val_future_leakage", "val_row_sum_error",
     "val_pos_content_r2", "val_prev_token_mass", "val_period_match_mass", "val_head_redundancy_js",
@@ -970,7 +970,10 @@ def _val_diagnostics(
     out["val_belief_coupling"]    = vd["belief_coupling"]   / vn
     out["val_attention_entropy"]  = vd["attention_entropy"] / vn
     out["val_inner_alignment_energy_total"] = vd["total"]   / vn
-    out["val_free_energy_total"] = out["val_inner_alignment_energy_total"]  # legacy CSV alias
+    # The "val_free_energy_total" alias is retired (audit 2026-07-25 F7): vd["total"] is assembled
+    # with log_likelihood=None, so it omits -E_q[log p(o|x)] entirely and the name claimed a
+    # quantity it never carried. multiseed_analysis.py still reads the old name when the correct
+    # column is absent, so CSVs written before this change keep working.
     out["val_attn_entropy"]       = vd["attn_entropy"]
     out["val_effective_rank"]     = vd["effective_rank"]
     out["val_belief_cond_median"] = vd["belief_cond_median"]
@@ -1688,7 +1691,12 @@ def train(
                 "belief_coupling":    d["belief_coupling"]   / n_tok,
                 "attention_entropy":  d["attention_entropy"] / n_tok,
                 "inner_alignment_energy_total": d["total"]  / n_tok,
-                "free_energy_total":  d["total"]             / n_tok,  # legacy CSV alias
+                # Weights emitted alongside the RAW per-term fields (audit 2026-07-25 F7): those
+                # fields are deliberately unweighted while "total" routes through the weighted
+                # evaluator, so a naive column sum missed the total by up to 98% relative at
+                # lambda_beta=0.5 with no column to reconcile it. Now each row is self-describing.
+                "lambda_beta":        float(cfg.lambda_beta),
+                "lambda_twohop":      float(cfg.lambda_twohop),
                 "effective_rank":     d["effective_rank"],
                 "holonomy_deviation": d["holonomy_deviation"],
                 "gauge_trace_spread": d["gauge_trace_spread"],

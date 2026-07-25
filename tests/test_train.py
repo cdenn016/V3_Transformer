@@ -687,7 +687,7 @@ def test_val_diagnostics_failure_resets_to_nan(tmp_path, monkeypatch):
             metrics = dict(current.metrics)
             metrics.update({
                 "val_inner_alignment_energy_total": 1.23,
-                "val_free_energy_total": 1.23,
+                "val_inner_alignment_energy_total": 1.23,
             })
             return vt.ValidationDiagnostics(
                 metrics,
@@ -705,8 +705,8 @@ def test_val_diagnostics_failure_resets_to_nan(tmp_path, monkeypatch):
     assert calls["n"] == 2                                      # both evals hit the probe
     assert rows[0]["val_inner_alignment_energy_total"] == "1.23"
     assert rows[1]["val_inner_alignment_energy_total"] == ""
-    assert rows[0]["val_free_energy_total"] == "1.23"           # eval 1 wrote the fresh value
-    assert rows[1]["val_free_energy_total"] == ""               # eval 2 failed -> NaN -> blank, NOT stale 1.23
+    assert rows[0]["val_inner_alignment_energy_total"] == "1.23"           # eval 1 wrote the fresh value
+    assert rows[1]["val_inner_alignment_energy_total"] == ""               # eval 2 failed -> NaN -> blank, NOT stale 1.23
 
 
 def test_select_loader_is_split_aware(monkeypatch):

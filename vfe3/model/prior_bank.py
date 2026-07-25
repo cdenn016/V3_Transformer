@@ -833,8 +833,25 @@ class PriorBank(nn.Module):
         return self.decode_mu_embed if self.untie_decode_bank else self._prior_mu_table()
 
     def _decode_sigma_log_table(self) -> torch.Tensor:
-        r"""The (V, K) log-variance decode table; the sigma sibling of _decode_mu_table (see there)."""
-        return self.decode_sigma_log_embed if self.untie_decode_bank else self._prior_sigma_log_table()
+        r"""The (V, K) log-variance decode table; the sigma sibling of _decode_mu_table (see there).
+
+        When the shared prior table is a PACKED Cholesky (``gaussian_full`` with
+        ``prior_source='model_channel'``), its stored values are log squared Cholesky pivots, not log
+        marginal variances. The decode needs a log-variance, so it must read
+        ``log(diag(L L^T))``; reading the raw table understated every marginal variance by the
+        row's off-diagonal energy, so the encode prior (``L L^T``, via
+        :func:`_encode_prior_sigma`) and the decode prior (``diag(pivot^2)``) diverged as soon as the
+        packed table trained away from its zero init (audit 2026-07-25 F8). Untied decode tables are
+        genuine log-variances and are returned unchanged.
+        """
+        if self.untie_decode_bank:
+            return self.decode_sigma_log_embed
+        packed = getattr(self, "s_sigma_lower_embed", None)
+        if packed is not None and self.prior_source == "model_channel":
+            from vfe3.families.covariance_tables import marginal_log_variance_from_packed
+            return marginal_log_variance_from_packed(
+                self._prior_sigma_log_table(), packed, eps=self.eps)
+        return self._prior_sigma_log_table()
 
     @torch.no_grad()
     def set_unigram_log_prior(

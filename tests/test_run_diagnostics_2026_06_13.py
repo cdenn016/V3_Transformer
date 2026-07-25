@@ -238,7 +238,7 @@ def test_val_diagnostics_columns_rectangular_and_finite() -> None:
     assert all(set(r.keys()) == cols for r in rows), "CSV not rectangular"
     # after the step-24 eval the held-out probes are finite
     last = rows[-1]
-    for k in ("val_free_energy_total", "estep_f_drop", "val_future_leakage", "pos_loss_ratio",
+    for k in ("val_inner_alignment_energy_total", "estep_f_drop", "val_future_leakage", "pos_loss_ratio",
               "val_head_redundancy_js"):
         assert math.isfinite(float(last[k])), f"{k} not finite: {last[k]!r}"
     # the soft causal prior must not leak future tokens

@@ -44,6 +44,34 @@ def covariance_from_packed(
     return chol @ chol.transpose(-1, -2)
 
 
+def marginal_log_variance_from_packed(
+    log_diag:     torch.Tensor,          # (..., K) log Cholesky PIVOTS squared (not log marginal variances)
+    packed_lower: torch.Tensor,          # (..., K*(K-1)//2) strict-lower Cholesky entries
+
+    *,
+    eps:          float = 1e-6,
+) -> torch.Tensor:                       # (..., K) log of diag(L L^T)
+    r"""Log of the MARGINAL variances of ``L L^T``, i.e. ``log(diag(L L^T))``.
+
+    ``log_diag`` is not a log marginal variance: :func:`covariance_from_packed` sets
+    ``L_ii = sqrt(bounded_variance_from_log(log_diag_i))``, so ``L_ii^2 = exp(log_diag_i)`` is the
+    squared Cholesky PIVOT, while the covariance's marginal diagonal is
+
+        (L L^T)_ii = L_ii^2 + sum_{j<i} L_ij^2,
+
+    which exceeds the pivot whenever any packed entry in row ``i`` is nonzero. The two coincide only
+    for a zero packed vector -- exactly the zero-init pure path, which is why the discrepancy stays
+    invisible until the packed table trains (audit 2026-07-25 F8). Any consumer that needs a
+    log-VARIANCE from a packed table must come through here rather than reading ``log_diag`` directly.
+    """
+    k = log_diag.shape[-1]
+    row, _col = torch.tril_indices(k, k, offset=-1, device=log_diag.device)
+    variance = bounded_variance_from_log(log_diag, eps=eps)               # pivot^2, (..., K)
+    off = log_diag.new_zeros(variance.shape)
+    off.index_add_(-1, row, packed_lower.square())                        # sum_{j<i} L_ij^2 per row i
+    return torch.log((variance + off).clamp(min=eps))
+
+
 def packed_from_covariance(
     covariance: torch.Tensor,            # (..., K, K) SPD covariance
 

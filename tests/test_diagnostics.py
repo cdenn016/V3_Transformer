@@ -101,9 +101,10 @@ def test_eval_diagnostics_builds_one_snapshot(monkeypatch) -> None:
     assert calls == 1
     assert training_modes == [False]
     assert math.isfinite(diagnostics.metrics["val_inner_alignment_energy_total"])
-    assert diagnostics.metrics["val_free_energy_total"] == diagnostics.metrics[
-        "val_inner_alignment_energy_total"
-    ]
+    # The "val_free_energy_total" alias is retired (audit 2026-07-25 F7): it duplicated
+    # val_inner_alignment_energy_total under a name that claimed to include -E_q[log p(o|x)],
+    # which that value never carried. Nothing to compare it against now.
+    assert "val_free_energy_total" not in diagnostics.metrics
     assert math.isfinite(diagnostics.metrics["estep_f_drop"])
     assert math.isfinite(diagnostics.metrics["pos_loss_ratio"])
 
