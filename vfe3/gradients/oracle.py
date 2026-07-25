@@ -20,7 +20,7 @@ import torch
 
 from vfe3.alpha_i import self_coupling_alpha
 from vfe3.families.base import get_family
-from vfe3.free_energy import free_energy, pairwise_energy, self_divergence_for_alpha
+from vfe3.free_energy import free_energy, self_divergence_for_alpha
 # Forward transport containers are named in the `omega` forward-ref annotation below; import them
 # at runtime (alongside the transport helpers this module already imports) so
 # typing.get_type_hints resolves the annotation. transport.py does not import this module, so there
@@ -30,7 +30,6 @@ from vfe3.geometry.transport import (
     DirectLinkTransport,
     FactoredTransport,
     RopeTransport,
-    transport_mean,
 )
 
 
@@ -120,7 +119,7 @@ def belief_gradients_autograd(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:   # (grad_mu, grad_sigma), each (N, K)
     r"""Autograd of canonical F_red w.r.t. (mu, sigma). See module docstring for modes.
 
-    ``irrep_dims`` (when multi-block) routes the per-head energy through ``pairwise_energy``;
+    ``irrep_dims`` (when multi-block) routes the per-head energy through the family coupling seam;
     autograd then yields the correct per-head belief gradient with no special-casing here.
 
     ``omega_builder`` (audit 2026-06-10 F1/F2; None = unchanged pre-built ``omega``): a callable
@@ -192,40 +191,34 @@ def belief_gradients_autograd(
         # (query slots live; key slots follow the filtering/smoothing key-role split above).
         omega = omega_builder(mu_q, sigma_q, mu_k, sigma_k)
     fam = get_family(family)
-    mu_t = transport_mean(omega, mu_k)                  # rank-agnostic: (N,N,K) or (B,N,N,K)
+    # The whole transported pair grid dispatches through the FAMILY's coupling seam, so a family that
+    # evaluates the transported divergence differently (the frame-intrinsic identity transport, the
+    # exact-congruence backward pull) is honored here by its registration alone. The default seam
+    # composes transport_location + transport_dispersion + pairwise_energy exactly as this call site
+    # used to inline them, so every family that does not override it is byte-identical.
+    #
     # diagonal_out from the BELIEF shape (diagonal iff sigma has the same rank as mu) -- family-agnostic
     # (covers laplace_diagonal etc., not just gaussian_diagonal), so the batch-collapsed (N,N,K,K)
     # regime_ii_link omega routes correctly against a batched diagonal sigma (its rank gap vs the omega
     # would otherwise misinfer the full sandwich); behavior-identical for a batched dense omega.
-    sigma_t = fam.transport_dispersion(
-        sigma_k,
-        omega,
-        diagonal_out=(sigma_k.dim() == mu_k.dim()),
-    )
-
     sd = self_divergence_for_alpha(fam(mu_q, sigma_q), fam(mu_p, sigma_p), alpha=renyi_order, kl_max=kl_max, eps=eps,
                                    divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
     alpha, reg = self_coupling_alpha(sd, mode=lambda_alpha_mode, value=value, b0=b0, c0=c0)
-    energy = pairwise_energy(fam(mu_q, sigma_q), fam.from_transported(mu_t, sigma_t, sigma_k),
-                             alpha=renyi_order, kl_max=kl_max, eps=eps,
-                             divergence_family=divergence_family, irrep_dims=irrep_dims)
+    energy = fam.coupling_energy(mu_q, sigma_q, mu_k, sigma_k, omega,
+                                 alpha=renyi_order, kl_max=kl_max, eps=eps,
+                                 divergence_family=divergence_family, irrep_dims=irrep_dims,
+                                 diagonal_out=(sigma_k.dim() == mu_k.dim()))
     # Value-gauge decoupling (RopeTransport.on_value=False): beta comes from the rotated SCORE energy
     # above, but the coupling sum the belief descends uses the UN-rotated base transport -- RoPE's
     # position-independent value aggregation (GL(K)_attention.tex:1909). None on the coherent default
     # path (byte-identical). Autograd carries the extra d beta/d mu term the broken envelope leaves.
     coupling_energy = None
     if isinstance(omega, RopeTransport) and not omega.on_value:
-        mu_tv = transport_mean(omega.base, mu_k)
-        sigma_tv = fam.transport_dispersion(
-            sigma_k,
-            omega.base,
-            diagonal_out=(sigma_k.dim() == mu_k.dim()),
-        )
-        coupling_energy = pairwise_energy(fam(mu_q, sigma_q),
-                                          fam.from_transported(mu_tv, sigma_tv, sigma_k),
-                                          alpha=renyi_order,
-                                          kl_max=kl_max, eps=eps, divergence_family=divergence_family,
-                                          irrep_dims=irrep_dims)
+        coupling_energy = fam.coupling_energy(mu_q, sigma_q, mu_k, sigma_k, omega.base,
+                                              alpha=renyi_order, kl_max=kl_max, eps=eps,
+                                              divergence_family=divergence_family,
+                                              irrep_dims=irrep_dims,
+                                              diagonal_out=(sigma_k.dim() == mu_k.dim()))
     F = free_energy(
         sd, energy, alpha, tau=tau, lambda_beta=lambda_beta, lambda_twohop=lambda_twohop,
         include_attention_entropy=include_attention_entropy,

@@ -655,7 +655,7 @@ class VFE3Config:
 
     # Periodic-evaluation and finalization controls.
     eval_max_batches:                      Optional[int] = None
-    evaluate_zero_e_steps_counterfactual:  bool          = False
+    evaluate_zero_e_steps_counterfactual:  bool          = True
     generate_figures:                      bool          = True
 
     # Memory-guard override for full-vocabulary reporting inputs (audit 2026-07-01 F9): the two

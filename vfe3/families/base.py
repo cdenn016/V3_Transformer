@@ -270,6 +270,28 @@ class BeliefParams(ABC):
         return cls(mu, dispersion)
 
     @classmethod
+    def transport_location(
+        cls,
+        mu:    torch.Tensor,              # (..., N, K) source (key, index j) locations
+        omega: object,                    # dense/factored/direct-link/RoPE transport container
+    ) -> torch.Tensor:                    # (..., N, N, K) transported locations
+        r"""Transport the family's location parameter under ``omega``.
+
+        .. math::
+            \mu_t[i, j] = \Omega_{ij}\,\mu_j.
+
+        The location-side twin of :meth:`transport_dispersion`. Families whose stored location
+        lives in the FIXED basis inherit the gauge action unchanged. A family whose location is
+        already expressed in its own fiber frame overrides this seam, because for the pure frame
+        coboundary :math:`\Omega_{ij} = U_i U_j^{-1}` the receiver frame cancels,
+        :math:`U_i^{-1}\Omega_{ij}\mu_j = U_j^{-1}\mu_j`, leaving the transport an identity.
+        The lazy import avoids a module cycle while keeping family selection in the family
+        registry rather than hard-coding family names into geometry or inference call sites.
+        """
+        from vfe3.geometry.transport import transport_mean
+        return transport_mean(omega, mu)
+
+    @classmethod
     def transport_dispersion(
         cls,
         dispersion: torch.Tensor,         # (..., N, K) diagonal or (..., N, K, K) full parameter
@@ -287,6 +309,52 @@ class BeliefParams(ABC):
         """
         from vfe3.geometry.transport import transport_covariance
         return transport_covariance(omega, dispersion, diagonal_out=diagonal_out)
+
+    @classmethod
+    def coupling_energy(
+        cls,
+        mu_q:         torch.Tensor,       # (..., N, K) query locations
+        dispersion_q: torch.Tensor,       # (..., N, K) or (..., N, K, K) query dispersion
+        mu_k:         torch.Tensor,       # (..., N, K) key locations, PRE-transport
+        dispersion_k: torch.Tensor,       # (..., N, K) or (..., N, K, K) key dispersion, PRE-transport
+        omega:        object,             # dense/factored/direct-link/RoPE transport container
+
+        *,
+        alpha:             float = 1.0,
+        kl_max:            float = 100.0,
+        eps:               float = 1e-6,
+        divergence_family: str   = "renyi",
+
+        irrep_dims:        Optional[List[int]] = None,
+        diagonal_out:      Optional[bool]      = None,
+    ) -> torch.Tensor:                    # (..., N, N) or (..., H, N, N)
+        r"""Per-pair belief-coupling energy :math:`E_{ij} = D(q_i \| \Omega_{ij\#} q_j)`.
+
+        The single seam every consumer of the coupling grid dispatches through -- the belief-gradient
+        oracle, the phi E-step objective, the reported free energy, the model channel's gamma
+        coupling, and the attention-map diagnostics -- so a family that computes the transported
+        divergence DIFFERENTLY is honored everywhere by its registration alone.
+
+        The default composes the two transport seams with :func:`~vfe3.free_energy.pairwise_energy`,
+        pushing the KEY forward and evaluating the family divergence against the untransported query.
+        For a diagonal covariance under a general :math:`\mathrm{GL}(K)` congruence that pushforward
+        is TRUNCATED to its diagonal (diagonal covariance is not closed under congruence), so the
+        default energy is the divergence of the projected key, not of the exact pushforward. A family
+        that can evaluate the exact transported divergence overrides this seam; see
+        ``vfe3.families.exact_congruence``.
+
+        ``diagonal_out`` is forwarded to :meth:`transport_dispersion` verbatim so each call site keeps
+        its established diagonal-vs-full resolution.
+        """
+        from vfe3.free_energy import pairwise_energy
+        mu_t = cls.transport_location(mu_k, omega)
+        dispersion_t = cls.transport_dispersion(dispersion_k, omega, diagonal_out=diagonal_out)
+        return pairwise_energy(
+            cls(mu_q, dispersion_q),
+            cls.from_transported(mu_t, dispersion_t, dispersion_k),
+            alpha=alpha, kl_max=kl_max, eps=eps,
+            divergence_family=divergence_family, irrep_dims=irrep_dims,
+        )
 
 
 _FAMILIES: Dict[str, Type[BeliefParams]] = {}

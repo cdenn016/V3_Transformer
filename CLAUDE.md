@@ -92,6 +92,23 @@ Example:
         eps:     float = 1e-6,
     ) -> torch.Tensor:
 
+## CUDA test lane (project-specific; the interpreter rule is global)
+
+The global rule in `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` covers WHICH interpreter to use:
+bare `python` is the CPU-only torch build, so anything touching torch or CUDA must run under
+`"$CUDA_PYTHON"` (literal `C:/anaconda/python.exe`). What is specific to THIS repo:
+
+- **`VFE3_TEST_DEVICE=cuda` is required in addition to the CUDA interpreter.** Marker selection and
+  in-test device gating are independent here. Measured: the CUDA interpreter alone collects 7
+  `cuda`-marked tests (5 passed, 2 skipped); adding the variable collects **24 and passes all 24**.
+  ```bash
+  VFE3_TEST_DEVICE=cuda "$CUDA_PYTHON" -m pytest -m "cuda" --junitxml=out.xml
+  ```
+- `check_gpu_tests.py` is the canonical GPU-lane runner (it sets `VFE3_TEST_DEVICE=cuda` and selects
+  the `cuda` marker). Run it with `"$CUDA_PYTHON"`, never bare `python`.
+- `run_cpu_tests.py` is the CPU lane and is correct as-is: it deliberately sets
+  `CUDA_VISIBLE_DEVICES=-1` and excludes the `cuda` marker. Ordinary unit tests belong there.
+
 ## Testing
 Golden regression tests pin every kernel to its reference values;
 finite-difference gradient checks against the autograd-of-F oracle (later

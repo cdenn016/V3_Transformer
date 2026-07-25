@@ -1843,10 +1843,8 @@ class VFEModel(nn.Module):
         (the gamma_ij figure), so all three read the SAME energy/temperature/prior.
         """
         from vfe3.families.base import get_family
-        from vfe3.free_energy import attention_tau, pairwise_energy
-        from vfe3.geometry.transport import (
-            _TRANSPORT_NEEDS_MU, _TRANSPORT_NEEDS_SIGMA, transport_mean,
-        )
+        from vfe3.free_energy import attention_tau
+        from vfe3.geometry.transport import _TRANSPORT_NEEDS_MU, _TRANSPORT_NEEDS_SIGMA
         from vfe3.inference.e_step import build_belief_transport
         cfg = self.cfg
         pb = self.prior_bank
@@ -1878,18 +1876,16 @@ class VFEModel(nn.Module):
                                        validity_max_norm=cfg.transport_chart_max_norm,
                                        exactness_out=self._transport_status,
                                        **self._model_channel_transport_kwargs())
-        s_mu_t = transport_mean(omega, s_mu)                         # (B, N, N, K)
         # diagonal_out resolves the diagonal (B,N,K) vs full (B,N,K,K) sandwich EXACTLY as the belief
         # channel does (gradients/kernels.py, oracle.py: diagonal_out=(sigma.dim()==mu.dim())). This is
         # load-bearing for the batch-independent bare link, whose batch-collapsed operator makes the
         # rank-gap heuristic mis-read a batched diagonal sigma as full; harmless (same branch) elsewhere.
-        s_sigma_t = fam.transport_dispersion(                        # (B,N,N,K) diag or (B,N,N,K,K) full
-            s_sigma, omega, diagonal_out=(s_sigma.dim() == s_mu.dim()))
-        e_s = pairwise_energy(
-            fam(s_mu, s_sigma), fam.from_transported(s_mu_t, s_sigma_t, s_sigma),
+        e_s = fam.coupling_energy(                                   # (B,H,N,N) block_glk; (B,N,N) single-block
+            s_mu, s_sigma, s_mu, s_sigma, omega,
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
-        )                                                            # (B,H,N,N) block_glk; (B,N,N) single-block
+            diagonal_out=(s_sigma.dim() == s_mu.dim()),
+        )
         gamma_log_prior = self._attention_log_prior(
             n_pos, token_ids.device, prior=cfg.gamma_attention_prior,
         )                                                            # (N, N), cached buffer
@@ -2499,31 +2495,31 @@ class VFEModel(nn.Module):
         rope:      Optional[torch.Tensor],
     ) -> torch.Tensor:                         # (H, N, N)
         r"""Compute beta from an already captured block output, without replaying inference."""
-        from vfe3.geometry.transport import transport_mean
         from vfe3.families.base import get_family
-        from vfe3.free_energy import pairwise_energy, attention_weights, attention_tau
+        from vfe3.free_energy import attention_weights, attention_tau
 
         cfg = self.cfg
         fam = get_family(cfg.family)
         omega = self._diagnostic_transport(belief)
         if rope is not None:
-            rope_omega = RopeTransport(
+            effective = RopeTransport(
                 base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
                 on_value=cfg.rope_on_value,
                 same_frame_flat_cocycle=getattr(
                     omega, "same_frame_flat_cocycle", False))
-            mu_t = transport_mean(rope_omega, belief.mu)
-            sigma_t = fam.transport_dispersion(belief.sigma, rope_omega)
+            mu, sigma = belief.mu, belief.sigma
+            batched = False
         else:
-            mu_t = transport_mean(omega.unsqueeze(0), belief.mu.unsqueeze(0))[0]
-            sigma_t = fam.transport_dispersion(
-                belief.sigma.unsqueeze(0), omega.unsqueeze(0))[0]
-        energy = pairwise_energy(
-            fam(belief.mu, belief.sigma),
-            fam.from_transported(mu_t, sigma_t, belief.sigma),
+            effective = omega.unsqueeze(0)
+            mu, sigma = belief.mu.unsqueeze(0), belief.sigma.unsqueeze(0)
+            batched = True
+        energy = fam.coupling_energy(
+            mu, sigma, mu, sigma, effective,
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
         )
+        if batched:
+            energy = energy[0]
         base_tau = attention_tau(
             self.effective_kappa_beta(belief.mu.device), self.group.irrep_dims)
         beta = attention_weights(
@@ -2663,9 +2659,9 @@ class VFEModel(nn.Module):
         ``observation_likelihood`` fields (nats; ``effective_rank`` is the per-token
         belief-variance spectrum effective rank, not an attention rank).
         """
-        from vfe3.geometry.transport import transport_mean, compute_transport_operators
+        from vfe3.geometry.transport import compute_transport_operators
         from vfe3.families.base import get_family
-        from vfe3.free_energy import pairwise_energy, self_divergence_for_alpha, attention_weights, attention_tau
+        from vfe3.free_energy import self_divergence_for_alpha, attention_weights, attention_tau
         from vfe3.alpha_i import self_coupling_alpha
         from vfe3 import metrics
         from vfe3 import numerics
@@ -2734,34 +2730,36 @@ class VFEModel(nn.Module):
         # reads the converged means out.mu and the learned connection_W; flat ignores both.
         # (rope was computed above and now also shaped the converged belief.)
         omega = self._diagnostic_transport(out)
-        mu_tv = sigma_tv = None
+        base_omega = None
         if rope is not None:
-            rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                       on_value=cfg.rope_on_value,
-                                       same_frame_flat_cocycle=getattr(
-                                           omega, "same_frame_flat_cocycle", False))
-            mu_t    = transport_mean(rope_omega, out.mu)             # (N, N, K)
-            sigma_t = fam.transport_dispersion(out.sigma, rope_omega) # (N, N, K)
+            effective = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
+                                      on_value=cfg.rope_on_value,
+                                      same_frame_flat_cocycle=getattr(
+                                          omega, "same_frame_flat_cocycle", False))
+            mu, sigma = out.mu, out.sigma
+            batched = False
             if not cfg.rope_on_value:
-                mu_tv    = transport_mean(omega, out.mu)
-                sigma_tv = fam.transport_dispersion(out.sigma, omega)
+                base_omega = omega
         else:
-            mu_t    = transport_mean(omega.unsqueeze(0), out.mu.unsqueeze(0))[0]
-            sigma_t = fam.transport_dispersion(out.sigma.unsqueeze(0), omega.unsqueeze(0))[0]
-        energy = pairwise_energy(                                    # (N, N) or (H, N, N)
-            fam(out.mu, out.sigma), fam.from_transported(mu_t, sigma_t, out.sigma),
+            effective = omega.unsqueeze(0)
+            mu, sigma = out.mu.unsqueeze(0), out.sigma.unsqueeze(0)
+            batched = True
+        energy = fam.coupling_energy(                                # (N, N) or (H, N, N)
+            mu, sigma, mu, sigma, effective,
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family,
             irrep_dims=self.group.irrep_dims,
         )
         coupling_energy = None
-        if mu_tv is not None:
-            coupling_energy = pairwise_energy(
-                fam(out.mu, out.sigma), fam.from_transported(mu_tv, sigma_tv, out.sigma),
+        if base_omega is not None:
+            coupling_energy = fam.coupling_energy(
+                mu, sigma, mu, sigma, base_omega,
                 alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family,
                 irrep_dims=self.group.irrep_dims,
             )
+        if batched:
+            energy = energy[0]
         # query_adaptive_tau (default OFF): _beta_tau returns the base tau unchanged, else the
         # per-query tau from the CONVERGED belief sigma (the state this diagnostic scores).
         _tau_b = self._beta_tau(out.sigma, out.mu,
@@ -2990,7 +2988,14 @@ class VFEModel(nn.Module):
         #   FLAT path: pairwise cond(Omega_ij) = cond(exp_phi_i exp(-phi_j)) <= vertex_cond_max^2. Under
         #   regime_ii the edge factor exp(delta_ij) adds conditioning NOT captured here -- sandwich_absmax
         #   below is the direct (Omega Sigma Omega^T) overflow signal that DOES see it.
-        d["sandwich_absmax"]  = float(sigma_t.abs().max())          # |Omega Sigma Omega^T| overflow vs fp32 ~1e7
+        # The forward sandwich is an overflow probe on the TRANSPORT itself, so it is built here
+        # rather than reused from the coupling energy: a family that evaluates the transported
+        # divergence some other way (the backward pull of gaussian_diagonal_exact, the frame-cancelling
+        # identity of gaussian_frame_diagonal) never forms Omega Sigma Omega^T, and this diagnostic
+        # must still report it.
+        sandwich = fam.transport_dispersion(sigma, effective,
+                                            diagonal_out=(sigma.dim() == mu.dim()))
+        d["sandwich_absmax"]  = float(sandwich.abs().max())          # |Omega Sigma Omega^T| overflow vs fp32 ~1e7
         d["transport_asymmetry"]  = float(metrics.transport_asymmetry(omega).mean())
         _ed = metrics.energy_directedness(energy)
         d["energy_abs_asymmetry"] = float(_ed["abs_asymmetry"])
@@ -3144,9 +3149,8 @@ class VFEModel(nn.Module):
         """
         if snapshot is not None:
             return self._validate_diagnostic_snapshot(token_ids, snapshot).beta_maps
-        from vfe3.geometry.transport import transport_mean
         from vfe3.families.base import get_family
-        from vfe3.free_energy import pairwise_energy, attention_weights, attention_tau
+        from vfe3.free_energy import attention_weights, attention_tau
 
         cfg = self.cfg
         enc = self.prior_bank.encode(token_ids[:1])                   # (1, N, ...)
@@ -3203,22 +3207,23 @@ class VFEModel(nn.Module):
             # (flat ignores both), and the energy is per-irrep-block (per-head).
             omega = self._diagnostic_transport(belief)
             if rope is not None:
-                rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                           on_value=cfg.rope_on_value,
-                                           same_frame_flat_cocycle=getattr(
-                                               omega, "same_frame_flat_cocycle", False))
-                mu_t    = transport_mean(rope_omega, belief.mu)          # (N, N, K)
-                sigma_t = fam.transport_dispersion(belief.sigma, rope_omega) # (N, N, K)
+                effective = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
+                                          on_value=cfg.rope_on_value,
+                                          same_frame_flat_cocycle=getattr(
+                                              omega, "same_frame_flat_cocycle", False))
+                mu, sigma = belief.mu, belief.sigma
+                batched = False
             else:
-                mu_t    = transport_mean(omega.unsqueeze(0), belief.mu.unsqueeze(0))[0]
-                sigma_t = fam.transport_dispersion(
-                    belief.sigma.unsqueeze(0), omega.unsqueeze(0))[0]
-            energy = pairwise_energy(                                 # (N, N) or (H, N, N)
-                fam(belief.mu, belief.sigma),
-                fam.from_transported(mu_t, sigma_t, belief.sigma),
+                effective = omega.unsqueeze(0)
+                mu, sigma = belief.mu.unsqueeze(0), belief.sigma.unsqueeze(0)
+                batched = True
+            energy = fam.coupling_energy(                             # (N, N) or (H, N, N)
+                mu, sigma, mu, sigma, effective,
                 alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
             )
+            if batched:
+                energy = energy[0]
             beta = attention_weights(energy, tau=self._beta_tau(belief.sigma, belief.mu, _base_tau),
                                      log_prior=log_prior)            # converged-belief tau (as diagnostics)
             if beta.dim() == 2:                                      # single-block group -> add an H=1 axis
@@ -3261,9 +3266,9 @@ class VFEModel(nn.Module):
         ``gauge_invariant_spread``, ``effective_rank``, ``attn_entropy``, ``belief_cond_median``,
         ``phi_norm_mean``.
         """
-        from vfe3.geometry.transport import transport_mean, compute_transport_operators
+        from vfe3.geometry.transport import compute_transport_operators
         from vfe3.families.base import get_family
-        from vfe3.free_energy import (pairwise_energy, self_divergence_for_alpha,
+        from vfe3.free_energy import (self_divergence_for_alpha,
                                       attention_weights, attention_tau)
         from vfe3.alpha_i import self_coupling_alpha
         from vfe3 import metrics
@@ -3334,36 +3339,35 @@ class VFEModel(nn.Module):
                 cap = {"converged": _sequence_belief(snapshot.layer_converged[layer_index])}
             _tau_c = self._beta_tau(belief.sigma, belief.mu, _tau)   # converged-belief tau (as diagnostics)
             omega = self._diagnostic_transport(belief)
-            mu_tv = sigma_tv = None
+            base_omega = None
             if rope is not None:
-                rope_omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                           on_value=cfg.rope_on_value,
-                                           same_frame_flat_cocycle=getattr(
-                                               omega, "same_frame_flat_cocycle", False))
-                mu_t    = transport_mean(rope_omega, belief.mu)
-                sigma_t = fam.transport_dispersion(belief.sigma, rope_omega)
+                effective = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
+                                          on_value=cfg.rope_on_value,
+                                          same_frame_flat_cocycle=getattr(
+                                              omega, "same_frame_flat_cocycle", False))
+                mu, sigma = belief.mu, belief.sigma
+                batched = False
                 if not cfg.rope_on_value:
-                    mu_tv    = transport_mean(omega, belief.mu)
-                    sigma_tv = fam.transport_dispersion(belief.sigma, omega)
+                    base_omega = omega
             else:
-                mu_t    = transport_mean(omega.unsqueeze(0), belief.mu.unsqueeze(0))[0]
-                sigma_t = fam.transport_dispersion(
-                    belief.sigma.unsqueeze(0), omega.unsqueeze(0))[0]
-            energy = pairwise_energy(                                 # (N, N) or (H, N, N)
-                fam(belief.mu, belief.sigma),
-                fam.from_transported(mu_t, sigma_t, belief.sigma),
+                effective = omega.unsqueeze(0)
+                mu, sigma = belief.mu.unsqueeze(0), belief.sigma.unsqueeze(0)
+                batched = True
+            energy = fam.coupling_energy(                             # (N, N) or (H, N, N)
+                mu, sigma, mu, sigma, effective,
                 alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
             )
             coupling_energy = None
-            if mu_tv is not None:
-                coupling_energy = pairwise_energy(
-                    fam(belief.mu, belief.sigma),
-                    fam.from_transported(mu_tv, sigma_tv, belief.sigma),
+            if base_omega is not None:
+                coupling_energy = fam.coupling_energy(
+                    mu, sigma, mu, sigma, base_omega,
                     alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                     divergence_family=cfg.divergence_family,
                     irrep_dims=self.group.irrep_dims,
                 )
+            if batched:
+                energy = energy[0]
             if snapshot is None:
                 beta = attention_weights(energy, tau=_tau_c, log_prior=log_prior)
             else:

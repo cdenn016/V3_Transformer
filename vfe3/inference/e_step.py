@@ -20,7 +20,7 @@ from vfe3.alpha_i import self_coupling_alpha
 from vfe3.belief import BeliefState
 from vfe3.contracts import EStepGradientRecord
 from vfe3.families.base import get_family, kl
-from vfe3.free_energy import attention_weights, free_energy, pairwise_energy, reduced_free_energy, self_divergence_for_alpha
+from vfe3.free_energy import attention_weights, free_energy, reduced_free_energy, self_divergence_for_alpha
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.lie_ops import CompactBlockElement
 from vfe3.geometry.phi_preconditioner import precondition_phi_gradient
@@ -40,7 +40,6 @@ from vfe3.geometry.transport import (
     get_transport,
     get_transport_registration,
     merge_legacy_transport_state,
-    transport_mean,
 )
 from vfe3.gradients.kernels import belief_gradients, mm_exact_update, uses_kernel_route
 
@@ -604,11 +603,13 @@ def free_energy_value(
             k_sign = key_belief.reflection if key_belief.reflection is not None else torch.ones_like(keys.phi[..., 0])
             omega = _apply_reflection(omega, q_sign, key_reflection=k_sign)
     fam = get_family(family)
-    mu_tv = sigma_tv = None
+    # Both energies go through the family coupling seam (BeliefParams.coupling_energy), so the logged
+    # F is built from the SAME transported divergence the beliefs descend under any family.
+    base_omega = None
     if rope is not None:
         # Mirror the model path: R_i Omega_ij R_j^T on the means (and the covariance sandwich
         # under the full gauge). The Rope einsums are rank-agnostic, so no unsqueeze dance.
-        wrapped = RopeTransport(
+        effective = RopeTransport(
             base=omega,
             rope=rope,
             on_cov=rope_on_cov,
@@ -619,34 +620,35 @@ def free_energy_value(
                 and omega.same_frame_flat_cocycle
             ),
         )
-        mu_t = transport_mean(wrapped, key_belief.mu)
-        sigma_t = fam.transport_dispersion(key_belief.sigma, wrapped)
+        q_mu, q_sigma = belief.mu, belief.sigma
+        k_mu, k_sigma = key_belief.mu, key_belief.sigma
+        batched = False
         if not rope_on_value:
             # Diagnostic fidelity: log the DECOUPLED F the beliefs actually descend -- beta from the
-            # rotated SCORE energy (mu_t/sigma_t), coupling sum from the UN-rotated base VALUE energy.
-            mu_tv = transport_mean(wrapped.base, key_belief.mu)
-            sigma_tv = fam.transport_dispersion(key_belief.sigma, wrapped.base)
+            # rotated SCORE energy, coupling sum from the UN-rotated base VALUE energy.
+            base_omega = effective.base
     else:
-        mu_t = transport_mean(omega.unsqueeze(0), key_belief.mu.unsqueeze(0))[0]
-        sigma_t = fam.transport_dispersion(
-            key_belief.sigma.unsqueeze(0),
-            omega.unsqueeze(0),
-        )[0]
+        # Unbatched diagnostic transport: lift every argument to a leading batch axis exactly as the
+        # transported moments were lifted before, and drop it again after the energy.
+        effective = omega.unsqueeze(0)
+        q_mu, q_sigma = belief.mu.unsqueeze(0), belief.sigma.unsqueeze(0)
+        k_mu, k_sigma = key_belief.mu.unsqueeze(0), key_belief.sigma.unsqueeze(0)
+        batched = True
 
     sd = self_divergence_for_alpha(fam(belief.mu, belief.sigma), fam(mu_p, sigma_p), alpha=renyi_order, kl_max=kl_max,
                                    eps=eps, divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
     alpha, reg = self_coupling_alpha(sd, value=value, mode=lambda_alpha_mode, b0=b0, c0=c0)
-    energy = pairwise_energy(fam(belief.mu, belief.sigma),
-                             fam.from_transported(mu_t, sigma_t, key_belief.sigma),
-                             alpha=renyi_order, kl_max=kl_max, eps=eps,
-                             divergence_family=divergence_family, irrep_dims=group.irrep_dims)
+    energy = fam.coupling_energy(q_mu, q_sigma, k_mu, k_sigma, effective,
+                                 alpha=renyi_order, kl_max=kl_max, eps=eps,
+                                 divergence_family=divergence_family, irrep_dims=group.irrep_dims)
     coupling_energy = None
-    if mu_tv is not None:
-        coupling_energy = pairwise_energy(fam(belief.mu, belief.sigma),
-                                          fam.from_transported(mu_tv, sigma_tv, key_belief.sigma),
-                                          alpha=renyi_order,
-                                          kl_max=kl_max, eps=eps, divergence_family=divergence_family,
-                                          irrep_dims=group.irrep_dims)
+    if base_omega is not None:
+        coupling_energy = fam.coupling_energy(q_mu, q_sigma, k_mu, k_sigma, base_omega,
+                                              alpha=renyi_order, kl_max=kl_max, eps=eps,
+                                              divergence_family=divergence_family,
+                                              irrep_dims=group.irrep_dims)
+    if batched:
+        energy = energy[0]
     F = free_energy(
         sd, energy, alpha, tau=tau, lambda_beta=lambda_beta,
         include_attention_entropy=include_attention_entropy,
@@ -760,11 +762,12 @@ def phi_alignment_loss(
                                    exactness_out=transport_status,
                                    rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value)
     fam = get_family(family)
-    mu_t = transport_mean(omega, mu)              # rank-agnostic: (N,N,K) or (B,N,N,K)
-    sigma_t = fam.transport_dispersion(sigma, omega)
-    score_energy = pairwise_energy(fam(mu, sigma), fam.from_transported(mu_t, sigma_t, sigma), alpha=renyi_order,
-                                   kl_max=kl_max, eps=eps, divergence_family=divergence_family,
-                                   irrep_dims=group.irrep_dims)
+    # The family coupling seam owns the whole transport + divergence composition (see
+    # BeliefParams.coupling_energy), so the phi step descends the SAME energy the belief step does
+    # under any family, including one that evaluates the transported divergence exactly.
+    score_energy = fam.coupling_energy(mu, sigma, mu, sigma, omega, alpha=renyi_order,
+                                       kl_max=kl_max, eps=eps, divergence_family=divergence_family,
+                                       irrep_dims=group.irrep_dims)
     mass = 0.5 * mass_phi * (phi ** 2).sum() if mass_phi > 0.0 else 0.0
     # value_energy is the coupling-sum energy grid: the SCORE energy on the coherent default, the
     # UN-rotated base VALUE energy under the decoupled RoPE gauge. Both the base coupling block and
@@ -772,11 +775,10 @@ def phi_alignment_loss(
     value_energy = score_energy
     has_decoupled_value = isinstance(omega, RopeTransport) and not omega.on_value
     if has_decoupled_value:
-        mu_tv = transport_mean(omega.base, mu)
-        sigma_tv = fam.transport_dispersion(sigma, omega.base)
-        value_energy = pairwise_energy(fam(mu, sigma), fam.from_transported(mu_tv, sigma_tv, sigma), alpha=renyi_order,
-                                       kl_max=kl_max, eps=eps, divergence_family=divergence_family,
-                                       irrep_dims=group.irrep_dims)
+        value_energy = fam.coupling_energy(mu, sigma, mu, sigma, omega.base, alpha=renyi_order,
+                                           kl_max=kl_max, eps=eps,
+                                           divergence_family=divergence_family,
+                                           irrep_dims=group.irrep_dims)
         zero = score_energy.new_zeros(score_energy.shape[:-1])
         base = free_energy(
             zero, score_energy, zero,
