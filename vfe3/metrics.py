@@ -1378,6 +1378,9 @@ def free_energy_full_decomposition(
     lambda_beta:     'float | torch.Tensor' = 1.0,
     lambda_h:        float = 0.0,
     lambda_gamma:    float = 0.0,
+
+    hyper_prior:     'Optional[float | torch.Tensor]' = None,   # lambda_h-weighted KL(s||h) rows, summed
+    model_coupling:  'Optional[float | torch.Tensor]' = None,   # lambda_gamma-weighted gamma block, summed
 ) -> Dict[str, 'float | torch.Tensor']:
     r"""Close the free-energy stack: add the data/likelihood term and the lambda_beta scaling.
 
@@ -1388,24 +1391,38 @@ def free_energy_full_decomposition(
     carries no s-channel term); a nonzero value means the displayed total UNDERCOUNTS the
     hierarchical h->s->p->q F, so warn loudly. Accepts scalars or per-step arrays elementwise.
     """
-    if lambda_h != 0.0 or lambda_gamma != 0.0:
+    # Audit 2026-07-25 F7: the model-channel rows are now ACCEPTED rather than merely warned about.
+    # Previously any nonzero lambda_h/lambda_gamma -- which is the live configuration -- warned and
+    # then returned an undercounting total anyway, so every real run produced a RuntimeWarning next to
+    # a number the caller could not fix. Supply the rows and the stack closes; omit them with nonzero
+    # weights and the warning still fires, because the total genuinely undercounts.
+    missing_rows = (hyper_prior is None and model_coupling is None)
+    if (lambda_h != 0.0 or lambda_gamma != 0.0) and missing_rows:
         import warnings
         warnings.warn(
             f"free_energy_full_decomposition: lambda_h={lambda_h}, lambda_gamma={lambda_gamma} "
-            f"are nonzero, but free_energy_terms carries NO model-channel (s) term, so the returned "
-            f"'total' UNDERCOUNTS the hierarchical free energy. The stack closes to the runtime F "
-            f"only at lambda_h = lambda_gamma = 0.",
+            f"are nonzero but no hyper_prior/model_coupling rows were supplied, so the returned "
+            f"'total' UNDERCOUNTS the hierarchical free energy. Pass hyper_prior= and "
+            f"model_coupling= (the lambda-weighted, summed rows) to close the stack.",
             RuntimeWarning, stacklevel=2,
         )
     belief_scaled = lambda_beta * belief_coupling
     entropy_scaled = lambda_beta * attention_ent
-    return {
+    total = self_coupling + belief_scaled + entropy_scaled + data_term
+    out: Dict[str, 'float | torch.Tensor'] = {
         "self_coupling":   self_coupling,
         "belief_coupling": belief_scaled,
         "attention_entropy": entropy_scaled,
         "data_term":       data_term,
-        "total":           self_coupling + belief_scaled + entropy_scaled + data_term,
     }
+    if hyper_prior is not None:
+        out["hyper_prior_weighted"] = hyper_prior
+        total = total + hyper_prior
+    if model_coupling is not None:
+        out["model_coupling_weighted"] = model_coupling
+        total = total + model_coupling
+    out["total"] = total
+    return out
 
 
 def self_coupling_profile(

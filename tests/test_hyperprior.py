@@ -302,7 +302,7 @@ def test_learnable_r_grouped_under_pullback_group_optimizer():
 # lambda_h weights KL(s_i||r) the way lambda_alpha weights KL(q_i||p_i); the manuscript names the
 # state-dependent lambda_h "a parallel extension not developed here" (Participatory ~3766).
 # ---------------------------------------------------------------------------
-from vfe3.lambda_h_i import hyper_prior_lambda_h, _LAMBDA_H_MODES
+from vfe3.lambda_h_i import hyper_prior_lambda_h, lambda_h_modes
 
 
 def _scored_model(lambda_h: float, *, lambda_h_mode: str = "constant",

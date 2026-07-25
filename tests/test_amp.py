@@ -138,7 +138,7 @@ def test_bf16_head_mixer_validation_diagnostics_run_in_fp32():
     assert snapshot.stack_output.sigma.dtype == torch.float32
     assert snapshot.beta_maps.dtype == torch.float32
     assert torch.isfinite(torch.tensor(diagnostics["total"]))
-    assert torch.isfinite(torch.tensor(val_diagnostics.metrics["val_free_energy_total"]))
+    assert torch.isfinite(torch.tensor(val_diagnostics.metrics["val_inner_alignment_energy_total"]))
 
 
 # ---------------------------------------------------------------------------------------------

@@ -1246,12 +1246,20 @@ def s_channel_refinement(
             raise RuntimeError("diagnostic snapshot is missing the active model-channel beliefs")
     s0_mu, s0_sigma = (tensor[0] for tensor in s0)                    # (N, K) static
     s1_mu, s1_sigma = (tensor[0] for tensor in s1)                    # (N, K) refined
-    r_mu    = pb.r_mu.expand_as(s1_mu)                             # (N, K) frozen hyper-prior centroid
-    r_sigma = bounded_variance_from_log(pb.r_sigma_log, eps=cfg.eps).expand_as(s1_sigma)
+    # Family-keyed, like every sibling extraction here (extract.py:830, 976, 1076, 1292) and like
+    # e_step.py:1414 / model.py:1762 (audit 2026-07-25 F10). This site alone hardcoded
+    # DiagonalGaussian and read pb.r_sigma_log directly instead of going through pb.r_parameters(),
+    # so under family='gaussian_full' -- where encode_s returns (B,N,K,K) and r_parameters returns
+    # (K,K) -- it silently produced the wrong shape when N == K and raised otherwise, for a config
+    # that constructs without complaint (gaussian_full with s_e_step=True).
+    fam = get_family(cfg.family)
+    r_mu, r_sigma_raw = pb.r_parameters()
+    r_mu = r_mu.expand_as(s1_mu)
+    r_sigma = r_sigma_raw.expand_as(s1_sigma)
     kl = get_functional("renyi")                                  # KL = renyi at alpha=1
-    r  = DiagonalGaussian(r_mu, r_sigma)
-    kl_s0_r = kl(DiagonalGaussian(s0_mu, s0_sigma), r, alpha=1.0, kl_max=cfg.kl_max, eps=cfg.eps)  # (N,)
-    kl_s1_r = kl(DiagonalGaussian(s1_mu, s1_sigma), r, alpha=1.0, kl_max=cfg.kl_max, eps=cfg.eps)  # (N,)
+    r  = fam(r_mu, r_sigma)
+    kl_s0_r = kl(fam(s0_mu, s0_sigma), r, alpha=1.0, kl_max=cfg.kl_max, eps=cfg.eps)  # (N,)
+    kl_s1_r = kl(fam(s1_mu, s1_sigma), r, alpha=1.0, kl_max=cfg.kl_max, eps=cfg.eps)  # (N,)
     return {
         "mu_delta":       (s1_mu - s0_mu).norm(dim=-1).cpu(),
         "logsigma_delta": (s1_sigma.clamp(min=cfg.eps).log()

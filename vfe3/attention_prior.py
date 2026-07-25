@@ -9,6 +9,8 @@ and the normalized prior used in the attention-entropy term is pi = softmax_j(B)
   causal_alibi  B_ij = -slope*(i-j) (j<=i), -inf (j>i) -> causal + ALiBi (Press et al.).
   causal_noself / causal_alibi_noself -> the same with the self key j=i also masked
     (except (0,0); see prior_causal_noself for the attention-sink rationale).
+  windowed / causal_windowed -> hard local band |i-j| <= window (bidirectional / causal).
+  t5_relative_bias -> learned or fixed per-bucket relative-position bias.
 Config-selected so a new prior (learned bias, windowed, ...) slots in by
 register_prior without editing the free-energy call site.
 """
@@ -227,9 +229,11 @@ def prior_windowed(
         B_ij = 0      for |i - j| <= window,
              = -inf   otherwise,
     a hard local-attention restriction (a mask-like prior, like `causal`). The bidirectional
-    band; for the autoregressive form use `causal_windowed`. ``window`` defaults to a moderate
-    local span; tuning it per run is the call-site-threading item (the model invokes the prior at
-    its default, mirroring `alibi`'s default slope)."""
+    band; for the autoregressive form use `causal_windowed`. ``window`` IS threaded from the model
+    (``model.py`` forwards ``window=cfg.attention_window``, validated in ``config.py``), so it is a
+    per-run knob; the former claim that it was default-only was stale (audit 2026-07-25 F21).
+    NOTE it is inert at ``attention_window >= max_seq_len - 1``, where every entry is allowed and
+    the prior is byte-identical to plain ``causal``."""
     i = torch.arange(n_query, device=device).unsqueeze(-1)
     j = torch.arange(n_key, device=device).unsqueeze(0)
     allowed = (i - j).abs() <= window

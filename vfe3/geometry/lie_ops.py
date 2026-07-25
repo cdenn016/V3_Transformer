@@ -881,8 +881,15 @@ def _omega_retract_cayley(algebra_step: torch.Tensor) -> torch.Tensor:
     K = algebra_step.shape[-1]
     eye = torch.eye(K, dtype=algebra_step.dtype, device=algebra_step.device)
     max_fro = 1.9
-    fro = algebra_step.norm(dim=(-2, -1), keepdim=True)
-    algebra_step = algebra_step * (max_fro / fro.clamp(min=max_fro))
+    # The norm and its scale factor are computed under no_grad (audit 2026-07-25 F18), exactly as the
+    # structurally identical clamp in stable_matrix_exp_pair does and for the same stated reason: a
+    # graph-connected Frobenius norm is non-differentiable at zero, so an exactly-zero algebra step
+    # produced a non-finite DOUBLE backward here (lie_exp does not). Only reachable today because the
+    # sole call site is @torch.no_grad(), but this is a public geometry primitive.
+    with torch.no_grad():
+        fro   = algebra_step.norm(dim=(-2, -1), keepdim=True)
+        scale = max_fro / fro.clamp(min=max_fro)
+    algebra_step = algebra_step * scale
     return torch.linalg.solve(eye - 0.5 * algebra_step, eye + 0.5 * algebra_step)
 
 

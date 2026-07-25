@@ -93,7 +93,7 @@ CONFIG: Dict[str, Any] = {
     "with_offset":                     True,                    # False -> A*N^-alpha; True -> E + A*N^-alpha
     "n_bootstrap":                     2000,                    # nested points-by-seeds bootstrap
     "min_points":                      2,                       # sizes required for a per-route fit
-    "force_accept_code_identity_drift": True,                  # analysis-only; all other checks stay strict
+    "force_accept_code_identity_drift": False,                  # analysis-only; all other checks stay strict
 }
 
 _CSV_COLUMNS = [

@@ -273,6 +273,16 @@ def _apply_reflection(
                 built.same_frame_flat_cocycle and shared_reflection
             ),
         )
+    # Fail loudly rather than by AttributeError on a missing .clone (audit 2026-07-25 F18).
+    # CompactFactoredTransport is a dataclass with no clone, so it would reach this dense fallthrough
+    # and raise an opaque AttributeError. Unreachable today -- every call site gates compact storage
+    # on reflection being absent -- but the incompatibility should name itself if a caller drops the gate.
+    if not hasattr(built, "clone"):
+        raise TypeError(
+            f"_apply_reflection has no branch for {type(built).__name__}; compact block storage and "
+            "phi_reflection are mutually exclusive, so the caller must gate compact_blocks on "
+            "reflection is None (see block.py / e_step.py transport builds)"
+        )
     omega = built.clone()                                                      # (..., i, j, K, K) dense
     omega[..., 0, :] *= reflection[..., :, None, None]                         # R_i: row 0 by s_i (over j)
     omega[..., :, 0] *= key_reflection[..., None, :, None]                     # (.) R_j: col 0 by s_j (over i)

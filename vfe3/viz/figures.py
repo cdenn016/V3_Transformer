@@ -338,13 +338,13 @@ def umap_embed(
 
 def plot_embedding(
     coords,                              # (N, 2) 2-D coordinates
-    labels=None,                         # (N,) optional integer/float labels for colour
+    labels=None,                         # (N,) optional integer/float labels for color
 
     *,
     title: str = "Belief embedding",
     path:  Optional[str] = None,
 ):
-    """Scatter a 2-D embedding, coloured by ``labels``; returns (and optionally saves) the Figure."""
+    """Scatter a 2-D embedding, colored by ``labels``; returns (and optionally saves) the Figure."""
     c = _np(coords)
     fig, ax = plt.subplots(figsize=(5, 4))
     kw = {} if labels is None else {"c": _np(labels), "cmap": "viridis"}
@@ -451,7 +451,7 @@ def _attn_imshow(ax, B: np.ndarray, *, vmin: float, vmax: float, log: bool = Tru
     r"""imshow one (N, N) attention map. ``log`` (default) uses ``LogNorm`` to resolve the peaky
     off-diagonal structure a linear scale washes to black; exact-zero (causal-masked) entries are
     non-positive, so ``LogNorm`` masks them and ``set_bad`` renders them black. ``cmap`` selects the
-    colour family so the channels read apart: belief beta = 'magma' (warm), model gamma = 'viridis' (cool)."""
+    color family so the channels read apart: belief beta = 'magma' (warm), model gamma = 'viridis' (cool)."""
     cmap_obj = plt.get_cmap(cmap).copy()
     cmap_obj.set_bad("black")
     if log:
@@ -476,7 +476,7 @@ def plot_attention_heatmap(
     Attention is a peaky causal softmax (most mass on a few keys, exact zeros above the diagonal),
     so the default ``log`` scale (matplotlib ``LogNorm`` on beta) resolves the off-diagonal
     structure a linear scale collapses to black; the causal-masked zeros render as the 'bad'
-    colour. Pass shared ``vmin``/``vmax`` to make several panels comparable; otherwise the positive
+    color. Pass shared ``vmin``/``vmax`` to make several panels comparable; otherwise the positive
     entries set the scale (log floor at 1e-4). ``cmap``/``symbol`` select the
     channel identity: belief beta ('magma', \beta) vs model gamma ('viridis', \gamma).
     """
@@ -501,7 +501,7 @@ def plot_attention_grid(
     """Grid of attention heatmaps: rows = layers, cols = heads (rows query i, cols key j).
 
     Accepts a per-layer/per-head stack ``(L, H, N, N)`` (as :meth:`VFEModel.attention_maps`
-    returns), a single layer ``(H, N, N)``, or a single map ``(N, N)``. A shared LOG colour scale
+    returns), a single layer ``(H, N, N)``, or a single map ``(N, N)``. A shared LOG color scale
     across all panels (default ``log``) makes heads/layers comparable and resolves the peaky
     off-diagonal structure; ``squeeze=False`` keeps the L==1 / H==1 axes array 2-D so indexing is
     uniform. For one figure per (layer, head) instead of a grid, call :func:`plot_attention_heatmap`
@@ -1809,7 +1809,7 @@ def plot_belief_trajectories(
     r"""F4: belief trajectories across E-step iterations (mean-space path) and across layers (SPD).
 
     Panel A: a shared-PCA 2-D quiver of the belief means as inference iterates (arrows mu_t ->
-    mu_{t+1}, coloured by token position). Panel B: the across-layer cumulative affine-invariant SPD
+    mu_{t+1}, colored by token position). Panel B: the across-layer cumulative affine-invariant SPD
     geodesic distance and mean effective rank. The across-training axis is out of scope (needs
     per-checkpoint replay).
     """
@@ -2813,7 +2813,7 @@ def plot_spd_ellipses(
     family:   Optional[str]  = None,
     path:     Optional[str]  = None,
 ):
-    r"""F9 (companion): correlation-bearing SPD covariance ellipses, coloured by effective rank.
+    r"""F9 (companion): correlation-bearing SPD covariance ellipses, colored by effective rank.
 
     For a full covariance the ellipse orientation and axes come from the eigendecomposition of the
     2x2 coordinate sub-block (the old ellipse used diagonal variances only, showing no correlation);
@@ -3326,7 +3326,7 @@ def plot_scaling_routes(
     ``N`` (embed_dim / gauge block size / depth / ...), each route's own power-law fit, and a dashed
     pooled fit. Routes that fall on one line share a frontier; a route offset above/below it (or a
     different slope) does not -- the visual companion to the analyzer's ANCOVA test. Marker shape
-    duplicates the color so the routes survive greyscale printing."""
+    duplicates the color so the routes survive grayscale printing."""
     routes = sorted({str(p.get("route", "?")) for p in points})
     route_stats = []
     for r in routes:

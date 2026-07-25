@@ -110,6 +110,13 @@ def test_default_adamw_one_step_is_byte_identical_to_golden():
         data = tensor.detach().cpu().contiguous().numpy().tobytes()
         return hashlib.sha256(data).hexdigest()
 
+    # These digests are UNCHANGED by audit 2026-07-25 F3, and that is a deliberate property worth
+    # stating. F3 makes the factored diagonal congruence escalate to float64 when its (mixed-sign,
+    # non-manifestly-nonnegative) regrouping actually loses nonnegativity. A well-conditioned step
+    # like this one never triggers the escalation, so it still runs entirely in float32 and remains
+    # bit-identical. An UNCONDITIONAL float64 upcast would have moved every digest here while leaving
+    # `loss` bit-identical -- same forward value, different low-order gradient bits -- which is
+    # precisely the golden churn the data-driven escalation avoids.
     assert digest(model.prior_bank.mu_embed) == "75c40d1b09a080c392223ff5160794c886e371193b7ba79a18fcab05febfd288"
     assert digest(model.prior_bank.sigma_log_embed) == "6f5f7fe389ec74bc1a27b0a162defce8b50aedc1ebbcd601bcfea12442c1cb33"
     assert digest(model.prior_bank.phi_embed) == "0526f6ab4e6fc547285a40cdabb36444f16e3b6523d79c5e5766861fcc661adb"

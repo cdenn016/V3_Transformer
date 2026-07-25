@@ -47,7 +47,7 @@ from vfe3.train import _fmt_tau, evaluate, train
 
 # Cached tokenized corpus (gpt2/tiktoken -> vocab_size 50257). Caches live in
 # ~/.cache/tokenized_cache; a missing cache raises (no synthetic substitution).
-#   "wikitext-103" | "wikitext-2" | "wiki-en" | "wiki-ja" | "wiki-ar"
+#   "wikitext-103" | "wikitext-2" | "wiki-en" | "wiki-ja" | "wiki-ar" 100277
 DATASET = "wikitext-103"
 
 # Cap the *training* stream for fast smoke runs (the validation split is always read
@@ -84,8 +84,8 @@ config = dict(
     
     max_seq_len               = 128,                 # N, context length
     
-    batch_size                = 256,
-    max_steps                 = 105000,
+    batch_size                = 64,
+    max_steps                 = 15000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
@@ -108,8 +108,10 @@ config = dict(
     mu_init_std               = 0.065,     # std of the random mean table mu_embed
     sigma_init                = 4,         # constant initial coordinate variance (sigma_log = log of this)
     phi_scale                 = 0.06,      # std
+    pos_phi_scale             = 0.02,                # learned-table init scale AND frozen per-position step
     
     
+    e_step_mu_precond         = "fisher",       # "fisher" | "raw"
     #################################
     #        Encode/Decode          #
     #################################
@@ -154,9 +156,12 @@ config = dict(
     
     
     m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group"
+    transport_chart_max_norm  = None, 
     m_phi_group_trust_radius  = 0.1,          # embedded Frobenius bound on the group factor
     
     phi_precond_mode          = "pullback_per_block",  # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
+                                                       # needs e_phi_lr>0
+    
     phi_retract_mode          = "bch",                # "euclidean" | "bch"
     spd_retract_mode          = "spd_affine",         # SPD covariance retraction (registry: "spd_affine" | "log_euclidean")
 
@@ -208,9 +213,8 @@ config = dict(
 
     pos_phi                   = "learned",           # "none" (pure path) | "learned" | "frozen"
     pos_rotation              = "none",              # "none" | "rope" (block-diagonal positional rotation folded into transport)
-    pos_phi_compose           = "bch",               # composition chart: "bch" | "euclidean"
+    pos_phi_compose           = "group_product",     # composition chart: "bch" | "euclidean" |"group_product"
                
-    pos_phi_scale             = 0.02,                # learned-table init scale AND frozen per-position step
     
     rope_base                 = 100.0,               # rotary frequency base
     rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES family="gaussian_full")
@@ -235,7 +239,7 @@ config = dict(
 
     # Further Regularizers
     mass_phi                   = 0.0,       # (mass_phi/2) ||phi||^2 penalty
-    mstep_self_coupling_weight = 0.0,      # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF)
+    mstep_self_coupling_weight = 0.0,      # alpha_hat * sum_i KL(q_i*||p_i) M-step term (0 = OFF) 0.25
     
     
     ##################################################
@@ -252,18 +256,20 @@ config = dict(
     #            & Temperatures
     ########################################
     
-    kappa_beta                = 1, #[1, 0.5],        # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
-    kappa_gamma               = 1, #[1, 0.5],        # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
+    kappa_beta                   = 1, #[1, 0.5],        # tau = kappa * sqrt(d_head); kappa=1 -> Vaswani temperature
+    kappa_gamma                  = 1, #[1, 0.5],        # model-channel temperature tau_gamma = kappa_gamma*sqrt(d_head)
 
-    learnable_kappa_beta      = False,       # learn per-head kappa_beta = exp(log_kappa_beta), init from kappa_beta above
+    learnable_kappa_beta         = False,       # learn per-head kappa_beta = exp(log_kappa_beta), init from kappa_beta above
                                              # (t5-exception family; freezes under detach/straight_through E-step)
-    learnable_kappa_gamma     = False,       # learn per-head kappa_gamma (trains under any estimator on the scored
+    learnable_kappa_gamma        = False,       # learn per-head kappa_gamma (trains under any estimator on the scored
                                              # lambda_gamma>0 path; under s_e_step needs an 'unroll' E-step)
 
-    beta_attention_prior      = "causal_alibi_noself",        # "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
-    gamma_attention_prior     = "causal_alibi_noself",        # model-channel prior pi^s_ij (same 7 keys): "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
+    beta_attention_prior         = "causal_alibi_noself",        # "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
+    gamma_attention_prior        = "causal_alibi_noself",        # model-channel prior pi^s_ij (same 7 keys): "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
 
-    t5_learnable_bias         = False,           # learn the per-bucket T5 bias table b_{i-j} (sanctioned NN exception, default OFF; needs a t5_relative_bias channel)
+    alibi_slope                  = 1.0,
+
+    t5_learnable_bias            = False,           # learn the per-bucket T5 bias table b_{i-j} (sanctioned NN exception, default OFF; needs a t5_relative_bias channel)
 
     precision_weighted_attention = False,        # down-weight high-variance keys: fold detached -log(b0 + tr Sigma_j)
                                                  # into the attention prior (diagnostic; OFF = position-only prior)
@@ -299,14 +305,16 @@ config = dict(
     #        Learning Rates
     #################################
         
-    m_p_mu_lr                 = 0.015,     #0.015
+    m_p_mu_lr                 = 0.015,     
     m_p_sigma_lr              = 0.01,     
     m_phi_lr                  = 0.01,
     
-    m_s_phi_lr                = 0.007,         # M-step LR for independent model-channel frame (phi_tilde)
+    m_s_phi_lr                = 0.007,         
     
-    weight_decay              = 0.02,   #0.03
-    phi_weight_decay          = 0.03, #0.03
+    weight_decay              = 0.02,   
+    phi_weight_decay          = 0.03,   
+    sigma_weight_decay        = 0.01,           # AdamW decay for log-variance tables (None = inherit weight_decay;
+                                             # 0.0 exempts sigma from the unintended log-sigma->0 pull)
     
     min_lr                    = 0,       # absolute cosine-decay LR floor (0.0 = pure cosine)
     min_lr_frac               = 0.01,    # proportional LR floor, max(min_lr, frac*base); OFF
@@ -334,7 +342,7 @@ config = dict(
     #################################
     #         Misc/Logging
     #################################     
-    amp_dtype                 = None,      # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
+    amp_dtype                 = 'bf16',      # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
         
     log_interval              = 100,       # console log every N steps (0 = off)
     eval_interval             = 1500,      # periodic validation every N steps (0 = off)
@@ -377,8 +385,7 @@ config = dict(
     # log N(mu_q; mu_v, Sigma_q + Sigma_v) - select it above under use_prior_bank=True.
     untie_decode_bank         = False,       # use_prior_bank=True only: decode reads its OWN cloned (V,K) tables
     z_loss_weight             = 0,           # z-loss on the decode partition: w * mean(logsumexp^2) (0 = OFF)
-    sigma_weight_decay        = 0.01,           # AdamW decay for log-variance tables (None = inherit weight_decay;
-                                             # 0.0 exempts sigma from the unintended log-sigma->0 pull)
+   
 
     # --- attention / coupling ---
     gamma_as_beta_prior       = True,        # fold DETACHED gamma posterior into beta's prior (h->s->p->q);
@@ -406,6 +413,9 @@ config = dict(
     share_refine_s_transport  = True,        # build the flat transport ONCE per forward, share s-refine + belief
                                              # E-step (+ all layers); valid on flat/e_phi_lr=0/no-rope configs
     compile_pair_kernel       = False,       # torch.compile the closed-form pair kernel (eager fallback + warn)
+    
+    evaluate_zero_e_steps_counterfactual = False
+
 )
 
 # kl_max is the numerical safety-net clamp on EVERY divergence (KL(q||p), KL(s||r), pairwise energy),

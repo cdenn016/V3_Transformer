@@ -37,7 +37,12 @@ class GaugeGroup:
     name:                 str
     generators:           torch.Tensor                       # (n_gen, K, K) Lie-algebra basis
     irrep_dims:           List[int]                          # block sizes; sum == K
-    skew_symmetric:       bool                               # exp(-M) = exp(M)^T fast path
+    # NOT a transpose-for-inverse fast path: no such path exists (audit 2026-07-25 F21). Every
+    # inverse routes through _checked_group_inverse's float64 solve, and group_element_inverse
+    # explicitly discards the group before inverting. What this flag actually gates: max_norm=inf on
+    # the exp clamp (exp of a skew matrix is orthogonal at any norm), the float64-island key, the
+    # omega_reorth cadence, and retraction defaults.
+    skew_symmetric:       bool                               # algebra is skew (exp lands in O(K))
     omega_direct_capable: bool                   = False     # stored group-element frame U_i is implemented
     pullback_capability:  Optional[str]          = None      # certified strict M-step route, if any
     invariant_families:   Tuple[str, ...]        = ()        # registry-declared exact families; empty fails closed
