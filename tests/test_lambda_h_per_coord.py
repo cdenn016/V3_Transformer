@@ -24,7 +24,7 @@ import torch
 from vfe3.config import VFE3Config
 from vfe3.families.gaussian import DiagonalGaussian
 from vfe3.free_energy import self_divergence_per_coord
-from vfe3.lambda_h_i import hyper_prior_lambda_h, _LAMBDA_H_MODES
+from vfe3.lambda_h_i import hyper_prior_lambda_h, lambda_h_modes
 from vfe3.model.model import VFEModel
 
 PC = "state_dependent_per_coord"
@@ -46,7 +46,7 @@ def _pc_model(lambda_h: float = 0.5, *, lambda_h_mode: str = PC,
 
 def test_per_coord_in_lambda_h_modes():
     # The new mode must be a valid lambda_h_mode (so _require accepts it at config construction).
-    assert PC in _LAMBDA_H_MODES
+    assert PC in lambda_h_modes()
 
 
 def test_lambda_h_is_per_coord_flag():

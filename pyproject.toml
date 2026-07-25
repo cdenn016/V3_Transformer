@@ -33,6 +33,13 @@ include = ["vfe3", "vfe3.*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-config --strict-markers"
+# xunit1, not the xunit2 default (audit 2026-07-25 F20): record_property is incompatible with
+# xunit2, so pytest dropped every recorded diagnostic ("PytestWarning: record_property is
+# incompatible with junit_family 'xunit2'"). The float64/float32 residuals and chart norms that
+# tests/test_gauge_optim.py and tests/test_phi_outer_objective_gradient.py record therefore never
+# reached the JUnit XML that this project's verification discipline treats as the only admissible
+# evidence source.
+junit_family = "xunit1"
 markers = [
     "slow: heavy figure or artifact integration test; skipped unless --runslow",
     "cuda: test that requires a CUDA device",

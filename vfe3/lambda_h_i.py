@@ -30,9 +30,20 @@ from typing import Tuple
 
 import torch
 
-from vfe3.alpha_i import alpha_is_per_coord, self_coupling_alpha
+from vfe3.alpha_i import _ALPHAS, alpha_is_per_coord, self_coupling_alpha
 
-_LAMBDA_H_MODES: Tuple[str, ...] = ("constant", "state_dependent", "state_dependent_per_coord")
+
+def lambda_h_modes() -> Tuple[str, ...]:
+    r"""The admissible ``lambda_h_mode`` keys: exactly the registered alpha forms.
+
+    This seam delegates its whole implementation to :func:`vfe3.alpha_i.self_coupling_alpha`, so its
+    admissible keys ARE the alpha registry's keys. It previously carried a hard-coded tuple, which
+    made the write-and-register contract hold for the belief fiber (``lambda_alpha_mode``, validated
+    against ``_ALPHAS``) and silently fail for its mirror: a newly registered alpha form was accepted
+    by ``lambda_alpha_mode`` and rejected by both this module's dispatcher and ``config.py``'s
+    validator, so exposing it on the model fiber required editing two call sites (audit 2026-07-25 F9).
+    """
+    return tuple(sorted(_ALPHAS))
 
 
 def hyper_prior_lambda_h(
@@ -49,14 +60,15 @@ def hyper_prior_lambda_h(
 
     The model-fiber mirror of :func:`vfe3.alpha_i.self_coupling_alpha`, to which it delegates so the
     envelope ``lambda_h* = c0_h/(b0_h + KL)``, its per-coordinate form, and the regularizer ``R_h``
-    share alpha's single verified implementation. ``mode`` in :data:`_LAMBDA_H_MODES`; ``b0_h``/``c0_h``
+    share alpha's single verified implementation. ``mode`` in :func:`lambda_h_modes`; ``b0_h``/``c0_h``
     are the hyper-prior's OWN precision-shape hyperparameters (distinct from alpha's ``b0``/``c0``;
     scalar, or ``(K,)`` per-coordinate for the per-coord form). The returned regularizer is zero for
     ``constant`` and ``R_h`` for the two state-dependent forms (the caller adds it to F,
     and SUMS over coordinates for the per-coord form, so the stationary-point/envelope cancellation holds).
     """
-    if mode not in _LAMBDA_H_MODES:
-        raise KeyError(f"no lambda_h_mode {mode!r}; available: {_LAMBDA_H_MODES}")
+    modes = lambda_h_modes()
+    if mode not in modes:
+        raise KeyError(f"no lambda_h_mode {mode!r}; available: {modes}")
     return self_coupling_alpha(kl, mode=mode, value=value, b0=b0_h, c0=c0_h)
 
 
@@ -64,10 +76,11 @@ def lambda_h_is_per_coord(mode: str) -> bool:
     r"""Whether lambda_h_mode ``mode`` consumes a per-coordinate (unsummed) hyper-prior divergence
     of shape ``(..., N, K)`` rather than the per-token summed ``(..., N)``.
 
-    Validates membership in :data:`_LAMBDA_H_MODES`, then defers to :func:`vfe3.alpha_i.alpha_is_per_coord`
+    Validates membership in :func:`lambda_h_modes`, then defers to :func:`vfe3.alpha_i.alpha_is_per_coord`
     so the ``per_coord`` flag has one source of truth (lambda_h delegates to the shared alpha registry).
     The diagnostics / s-E-step routing reads this flag to supply the correctly-shaped divergence.
     """
-    if mode not in _LAMBDA_H_MODES:
-        raise KeyError(f"no lambda_h_mode {mode!r}; available: {_LAMBDA_H_MODES}")
+    modes = lambda_h_modes()
+    if mode not in modes:
+        raise KeyError(f"no lambda_h_mode {mode!r}; available: {modes}")
     return alpha_is_per_coord(mode)
