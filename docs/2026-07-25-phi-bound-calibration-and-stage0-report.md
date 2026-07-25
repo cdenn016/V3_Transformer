@@ -353,3 +353,65 @@ constant at the top.
 `FloatingPointError` from `_checked_group_inverse`; M3 and M4 were therefore run separately. All
 mutations are in-memory on a GPU copy of the weights, with `phi_embed` restored from a pristine
 clone and verified to reproduce the baseline exactly.
+
+## M6 beta decomposition: which channel of the attention weight carries the prediction?
+
+`beta_ij = softmax_j( log_prior_ij - E_ij / tau )`. Under this run's config `log_prior` carries three
+things -- the `causal_alibi_noself` positional prior, a detached precision bias, and (because
+`gamma_as_beta_prior=True` with `lambda_gamma=0.75`) a detached fold of the model-channel gamma
+posterior -- while `E_ij` is the belief-coupling energy, the only content-dependent channel.
+
+The run uses `e_step_update='mm_exact'` and `e_phi_lr=0.0`, so the ONLY beta softmax on the eval path
+is `gradients/kernels.py::mm_exact_update`. Patching the module-level `attention_weights` binding
+there isolates the belief beta exactly and leaves the gamma weights (resolved through `model.py`'s
+own local import) untouched. Full wikitext-103 test set, same loader as M1-M4.
+
+| arm | beta | CE | PPL | delta PPL | delta CE (nats) |
+|---|---|---|---|---|---|
+| A full (as trained) | `softmax(log_prior - E/tau)` | 4.012327 | **55.275** | — | — |
+| B energy ablated | `softmax(log_prior)` | 4.222406 | 68.197 | +12.92 | +0.210 |
+| C prior flattened | `softmax(-E/tau)` on the causal/no-self support | 4.624550 | 101.957 | +46.68 | +0.612 |
+| D gamma fold removed | `log_prior` without the gamma term | 4.015244 | 55.437 | +0.16 | +0.0029 |
+| E gamma removed AND energy ablated | ALiBi + precision only | 4.279532 | 72.207 | +16.93 | +0.267 |
+
+Arm A reproduces M1's baseline (CE 4.012327 / PPL 55.275) to every digit, which validates the harness.
+
+**The positional prior carries roughly three times what the content channel does.** Flattening
+`log_prior` costs 0.612 nats; ablating the entire belief-coupling energy costs 0.210. The
+content-dependent part of attention is worth about 12.5% of what context is worth in total (M4: 1.68
+nats), and about 5% of the model's cross-entropy.
+
+**The gamma fold into beta is worth 0.0029 nats.** `lambda_gamma=0.75` plus `gamma_as_beta_prior=True`
+buys 0.16 PPL through this path. SCOPE, because this is easy to over-read: arm D removes only gamma's
+fold into beta's prior. The model channel ALSO sets the initial belief through `s_e_step=True`
+(`_refine_s` replaces `q0`), and it shaped the learned tables during training. D is therefore a
+measurement of one gamma pathway at inference, NOT of the model channel's total contribution.
+
+With the energy already gone, removing gamma costs 0.057 nats (B 0.210 -> E 0.267), so the two are
+mildly compensating rather than independent: the energy partially covers for the missing gamma fold.
+
+**Read against M3.** Zeroing `phi_embed` costs ~1.9 nats (55.3 -> 375.5), roughly nine times what the
+whole content channel of attention is worth. The gauge therefore earns its keep mainly through the
+VALUE path -- transporting `mu_j` into the query frame -- not through the attention scores it also
+feeds. Functionally the model is an ALiBi-weighted average of gauge-transported values with a modest
+content-dependent reweighting on top.
+
+**Why the content channel is weak, and how it connects to the E-step.** `free_energy()`'s
+`log_likelihood` argument is a gated stub with no production caller (its docstring says so), so the
+E-step descends `alpha KL(q||p) + sum_j beta KL(q||Omega q) + entropy` with NO data term. `E_ij` is
+therefore a measure of belief AGREEMENT, not of predictive relevance, and nothing in the objective
+asks it to be discriminative for the next token. That is consistent with `estep_depth_sensitivity.json`
+on the same run, where free energy falls monotonically with E-step depth while cross-entropy rises:
+
+| E-step depth | CE | F / token |
+|---|---|---|
+| 0 | 5.868 | 433.1 |
+| 1 (trained) | 3.774 | 386.4 |
+| 2 | 4.137 | 376.5 |
+| 3 | 5.027 | 372.6 |
+| 5 | 7.009 | 370.4 |
+| 8 | 7.968 | 371.0 |
+
+One root cause covers both observations: the belief-coupling energy is not connected to the
+predictive objective. Better minimization of F does not mean better prediction, and the score built
+from that energy is a weak router compared with a fixed positional decay.
