@@ -8,7 +8,7 @@ variant swaps without editing call sites.
 
 import math
 import warnings
-from dataclasses import dataclass, fields
+from dataclasses import MISSING, dataclass, fields
 from numbers import Real
 from typing import Any, List, Mapping, Optional, Tuple
 
@@ -568,6 +568,19 @@ class VFE3Config:
     # Optional post-M-step chart guard. AdamW projects rows back along their algebra ray after the
     # optimizer step. The pullback-group route instead treats this value as an in-optimizer candidate
     # bound and rejects atomically; when None, that route uses the fixed factor radius 5.0.
+    #
+    # AUDIT 2026-07-25 F4 -- when this is None under m_phi_update_mode='adamw' with e_phi_lr=0.0,
+    # NOTHING bounds ||phi||: train.py gates the chart projection on this field being set, the 'adamw'
+    # phi policy registers no manifold hook, and retract_phi's own cap (max_norm=5.0) is reachable only
+    # from the E-step phi substep. TRANSPORT_CLAMP_MAX_NORM bounds the EXPONENTIATED operator, not the
+    # parameter. Archived runs show phi_matrix_norm_median rising 0.86 -> ~7.4 with vertex_cond_max
+    # reaching ~4e3, and transport conditioning grows with ||phi||; 5.0 (the GL retraction's own radius)
+    # is a reasonable bound. Left at None because it is the shipped default and every value the
+    # pullback_group validator admits (5.0 < bound < 20.0) could hard-abort a run whose observed
+    # ||M||_F already reaches 18. Deliberately NOT a construction warning: the condition is true for a
+    # bare VFE3Config(), and this project keeps a clean config warning-free. Runtime detection belongs
+    # in train.py's _warn_phi_transport_clamp, which currently keys on 20.0 and measures each stored
+    # table separately rather than the composed frame actually exponentiated.
     phi_mstep_max_matrix_norm: Optional[float] = None
 
 
@@ -2484,14 +2497,13 @@ class VFE3Config:
         _require(self.amp_dtype, (None, "bf16", "fp16"), "amp_dtype")
 
         # --- Tier-1/Tier-2 improvement toggles (2026-07-05) ---
-        _require(
-            self.e_step_update,
-            ("gradient", "mm_exact", "frozen_surrogate_exact"),
-            "e_step_update",
-        )
-        canonical_e_step_update = (
-            "mm_exact" if self.e_step_update == "frozen_surrogate_exact" else self.e_step_update
-        )
+        # Registry-driven, like every other *_mode field in this validator (audit 2026-07-25 F11): the
+        # key set AND the alias collapse both live in vfe3/inference/e_step.py, which e_step.py:879 and
+        # extract.py:870 already consume via canonical_e_step_update(). Duplicating them here meant
+        # adding an updater required editing config.py as well as registering it.
+        from vfe3.inference.e_step import _E_STEP_UPDATE_ALIASES, canonical_e_step_update as _canon
+        _require(self.e_step_update, tuple(sorted(_E_STEP_UPDATE_ALIASES)), "e_step_update")
+        canonical_e_step_update = _canon(self.e_step_update)
         if canonical_e_step_update == "mm_exact":
             # The closed-form MM minimizer is derived from the diagonal-Gaussian KL filtering
             # kernel; every other route lacks the closed form (the same eligibility predicate as
@@ -2589,6 +2601,122 @@ class VFE3Config:
                 "untie_decode_bank=True is inert under use_prior_bank=False (the linear decode is "
                 "already untied by construction); the toggle is read only by the KL-to-bank decode.",
                 UserWarning, stacklevel=2,
+            )
+
+        # ------------------------------------------------------------------------------------------
+        # Audit 2026-07-25 F4/F12/F13/F14/F16 -- detection only. NOTHING below changes a config VALUE
+        # or a default; each block reports a condition that was previously silent. The audits found
+        # that this validator warns for eight dependent fields (decode_bias, decode_tau,
+        # precision_attention_per_head, untie_decode_bank, lambda_h_mode, learnable_r, r_update_mode,
+        # learnable_kappa_*) while 24 of 26 other dependent fields fired nothing at all -- so a knob
+        # could be turned with no observable effect and no way to distinguish that from an ineffective
+        # mechanism. CLAUDE.md notes the owner changes toggles constantly, which is exactly the
+        # condition under which silence is expensive.
+        # ------------------------------------------------------------------------------------------
+        # Only report a setting the caller actually CHANGED from its own dataclass default. Several
+        # defaults are non-trivial (e_steps_min=1, unigram_kappa=1.0, cocycle_relaxation=1.0,
+        # ema_decay=0.999, prior_handoff_rho=1.0), so an absolute test would fire on a bare
+        # VFE3Config() and break this project's deliberate invariant that a clean/pure config
+        # constructs with zero warnings (pinned by test_default_config_constructs_silently).
+        _defaults = {f.name: f.default for f in fields(self) if f.default is not MISSING}
+
+        def _changed(*names: str) -> bool:
+            return any(name in _defaults and getattr(self, name) != _defaults[name] for name in names)
+
+        _inert: List[str] = []
+        if canonical_e_step_update != "mm_exact" and _changed("mm_damping"):
+            _inert.append(f"mm_damping={self.mm_damping} (only read by e_step_update='mm_exact')")
+        if not self.randomize_e_steps and _changed("e_steps_min", "e_steps_max"):
+            _inert.append("e_steps_min/e_steps_max (only read by randomize_e_steps=True)")
+        if not self.decode_unigram_prior and _changed("unigram_kappa"):
+            _inert.append(f"unigram_kappa={self.unigram_kappa} (needs decode_unigram_prior=True)")
+        if not self.gamma_as_beta_prior and _changed("gamma_prior_weight"):
+            _inert.append(
+                f"gamma_prior_weight={self.gamma_prior_weight} (needs gamma_as_beta_prior=True)")
+        if self.transport_mode == "flat" and _changed("cocycle_relaxation"):
+            _inert.append(
+                f"cocycle_relaxation={self.cocycle_relaxation} (flat transport has no edge factor)")
+        if self.lambda_alpha_mode == "constant" and _changed("b0", "c0"):
+            _inert.append("b0/c0 (only read by a state_dependent lambda_alpha_mode)")
+        if self.lambda_h_mode == "constant" and _changed("b0_h", "c0_h"):
+            _inert.append("b0_h/c0_h (only read by a state_dependent lambda_h_mode)")
+        if self.gauge_parameterization == "phi" and _changed("omega_reorth_every"):
+            _inert.append(
+                f"omega_reorth_every={self.omega_reorth_every} "
+                "(only read by gauge_parameterization='omega_direct')")
+        if self.pos_rotation == "none" and _changed("rope_on_value"):
+            _inert.append("rope_on_value (only read by pos_rotation='rope')")
+        if self.pos_phi == "none" and _changed("pos_phi_project_slk"):
+            _inert.append("pos_phi_project_slk (only read by a non-'none' pos_phi)")
+        if not self.use_ema and _changed("ema_decay"):
+            _inert.append(f"ema_decay={self.ema_decay} (only read by use_ema=True)")
+        if not self.s_e_step and _changed("e_s_mu_lr", "e_s_sigma_lr"):
+            _inert.append("e_s_mu_lr/e_s_sigma_lr (only read by s_e_step=True)")
+        # A window at or above the context length allows EVERY entry, so the sliding-window prior is
+        # byte-identical to plain causal -- measured torch.equal(...) True.
+        if (self.beta_attention_prior in ("windowed", "causal_windowed")
+                or self.gamma_attention_prior in ("windowed", "causal_windowed")):
+            if self.attention_window >= self.max_seq_len - 1:
+                _inert.append(
+                    f"attention_window={self.attention_window} >= max_seq_len-1="
+                    f"{self.max_seq_len - 1}: the windowed prior allows every entry and is "
+                    "byte-identical to plain 'causal'")
+        # The only parameter m_s_phi_lr steps, s_phi_embed, exists solely under phi_tilde.
+        if self.s_frame_mode != "phi_tilde" and _changed("m_s_phi_lr"):
+            _inert.append(
+                f"m_s_phi_lr={self.m_s_phi_lr} (its table s_phi_embed is created only under "
+                "s_frame_mode='phi_tilde'); the run banner reports it as a live M-step LR regardless")
+        # The handoff blend is the LAST statement of the per-layer loop body and nothing after the loop
+        # reads mu_p/sigma_p, so at n_layers=1 its output is dead.
+        if self.n_layers == 1 and _changed("prior_handoff_rho", "prior_handoff_sigma"):
+            _inert.append(
+                f"prior_handoff_rho={self.prior_handoff_rho}/"
+                f"prior_handoff_sigma={self.prior_handoff_sigma} (the handoff blend closes each layer "
+                "and nothing reads it after the loop, so it is dead at n_layers=1)")
+        # The phi preconditioner is consumed only by the E-step phi substep (e_phi_lr>0) or the
+        # pullback_group M-step policy.
+        if (self.phi_precond_mode != "none" and self.e_phi_lr == 0.0
+                and self.m_phi_update_mode != "pullback_group"):
+            _inert.append(
+                f"phi_precond_mode={self.phi_precond_mode!r} (reached only by e_phi_lr>0 or "
+                "m_phi_update_mode='pullback_group')")
+        if _inert:
+            import warnings
+            warnings.warn(
+                "inert configuration setting(s) -- these values are read by no active path, so "
+                "changing them will have no effect:\n  - " + "\n  - ".join(_inert),
+                UserWarning, stacklevel=2,
+            )
+
+        # F12: a phi update policy whose optimizer-group metadata overrides weight_decay silently
+        # replaces the configured phi_weight_decay AFTER train.py sets it, and phi_weight_decay has no
+        # consumer in run_artifacts, so config.json records a decay the optimizer never used.
+        if self.phi_weight_decay != 0.0:
+            from vfe3.gauge_optim import get_phi_update_policy
+            _meta = get_phi_update_policy(self.m_phi_update_mode).optimizer_group_metadata
+            if "weight_decay" in _meta and _meta["weight_decay"] != self.phi_weight_decay:
+                import warnings
+                warnings.warn(
+                    f"phi_weight_decay={self.phi_weight_decay} is OVERRIDDEN to "
+                    f"{_meta['weight_decay']} by the m_phi_update_mode={self.m_phi_update_mode!r} "
+                    "policy metadata, for every phi-role group (phi_embed, pos_phi_free, "
+                    "s_phi_embed). The configured value is what gets persisted, so treat the "
+                    "recorded phi_weight_decay as nominal for this run.",
+                    UserWarning, stacklevel=2,
+                )
+
+        # F16: the two-hop block reuses the DIRECT edge energy E_ik as the composed two-step energy,
+        # an identity that holds only for a flat connection (Omega_ij Omega_jk == Omega_ik). Under a
+        # regime_ii* connection the cocycle residual is O(10) where flat is 2e-16, and the resulting
+        # energy error reached 126 on an |E| scale of 43, so F, the mu/sigma kernel and the phi step
+        # would all descend a quantity that is not the two-hop coupling energy.
+        if self.lambda_twohop != 0.0 and self.transport_mode != "flat":
+            raise ValueError(
+                f"lambda_twohop={self.lambda_twohop} requires transport_mode='flat': the two-hop "
+                f"block reuses the direct edge energy as the composed two-step energy, which is exact "
+                f"only for a flat cocycle. transport_mode={self.transport_mode!r} is non-flat "
+                f"(path-dependent transport), so that substitution is invalid. Set lambda_twohop=0.0 "
+                f"or use the flat connection."
             )
         if self.skip_belief_sigma_update and self.use_prior_bank:
             import warnings
