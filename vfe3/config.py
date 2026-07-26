@@ -83,7 +83,17 @@ class VFE3Config:
     vocab_size:                int   = 50257
     embed_dim:                 int   = 64           # K (total belief dimension)
     max_seq_len:               int   = 128          # N (context length)
-    
+    # Held-out (validation/test) window stride. None -> stride == max_seq_len: disjoint windows, the
+    # historic path, byte-identical. An int < max_seq_len selects the standard sliding-window
+    # evaluation -- every window runs on its full context but only its final `eval_stride` targets
+    # are scored, so each transition is counted exactly ONCE at `max_seq_len - eval_stride` tokens
+    # of context or better (see TokenWindows). It costs max_seq_len/eval_stride times more eval
+    # forward passes and reports a LOWER perplexity than the disjoint windows, because it removes
+    # the context starvation at each window's head rather than because the model improved. The two
+    # are DIFFERENT METRICS: do not compare a strided number against a disjoint one. Train is never
+    # strided (it shuffles and drops the tail; the eval contract does not apply).
+    eval_stride:               Optional[int] = None
+
     batch_size:                int   = 64
     max_steps:                 int   = 15000
     warmup_steps:              int   = 100
@@ -984,6 +994,16 @@ class VFE3Config:
             raise ValueError(
                 "s_e_step_n_iter must be None (follow n_e_steps) or a nonnegative int, got "
                 f"{self.s_e_step_n_iter!r}")
+        # eval_stride above max_seq_len would skip transitions between consecutive held-out windows,
+        # which no target mask can recover, so the exactly-once eval contract rejects it (TokenWindows
+        # raises on the same condition). Equal to max_seq_len is the disjoint default spelled out.
+        if self.eval_stride is not None and (
+                type(self.eval_stride) is not int
+                or self.eval_stride < 1
+                or self.eval_stride > self.max_seq_len):
+            raise ValueError(
+                f"eval_stride must be None (disjoint windows) or an int in [1, max_seq_len="
+                f"{self.max_seq_len}], got {self.eval_stride!r}")
         if self.embed_dim % self.n_heads != 0:
             raise ValueError(
                 f"embed_dim={self.embed_dim} must be divisible by n_heads={self.n_heads}"

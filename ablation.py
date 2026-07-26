@@ -2298,19 +2298,27 @@ def get_loader(
     *,
     max_tokens:  Optional[int] = None,
     vocab_size:  Optional[int] = None,
+    eval_stride: Optional[int] = None,
 ) -> Any:
     r"""DataLoader for ``dataset``/``split``. A missing cache raises ``FileNotFoundError``.
 
-    Memoized on ``(dataset, seq_len, batch_size, split, cap, vocab_size)`` so runs that do not change
-    those reuse the already-loaded immutable dataset and its attached byte identity, while a sweep over
-    ``batch_size`` / ``max_seq_len`` / ``vocab_size`` correctly builds a distinct, matching loader.
-    ``max_tokens`` caps only the train split (validation is always full). The loader never
-    substitutes synthetic data for a missing real corpus -- that would mislabel synthetic numbers
-    as a corpus measurement.
+    Memoized on ``(dataset, seq_len, batch_size, split, cap, vocab_size, stride)`` so runs that do not
+    change those reuse the already-loaded immutable dataset and its attached byte identity, while a
+    sweep over ``batch_size`` / ``max_seq_len`` / ``vocab_size`` / ``eval_stride`` correctly builds a
+    distinct, matching loader. ``max_tokens`` caps only the train split (validation is always full).
+    The loader never substitutes synthetic data for a missing real corpus -- that would mislabel
+    synthetic numbers as a corpus measurement.
+
+    ``eval_stride`` mirrors ``train_vfe3._select_loader``: it applies to validation/test only and is
+    ignored for train (which shuffles and drops its tail, so the exactly-once eval contract that
+    makes a stride meaningful does not apply). It MUST stay in the memo key -- a sweep over
+    ``eval_stride`` would otherwise be served the first arm's loader and every arm would silently
+    report the same windows.
     """
     data_seed_override = _validated_data_seed_override()
     cap = max_tokens if split == "train" else None
-    key = (dataset, seq_len, batch_size, split, cap, vocab_size)
+    stride = None if split == "train" else eval_stride
+    key = (dataset, seq_len, batch_size, split, cap, vocab_size, stride)
     if key in _LOADER_CACHE:
         return _LOADER_CACHE[key]
     # Split-aware loader semantics, mirroring train_vfe3._select_loader: only the train stream is
@@ -2326,7 +2334,7 @@ def get_loader(
     )
     loader = make_dataloader(dataset, split, seq_len, batch_size,
                              shuffle=(split == "train"), drop_last=(split == "train"),
-                             max_tokens=cap, vocab_size=vocab_size, generator=gen)
+                             max_tokens=cap, stride=stride, vocab_size=vocab_size, generator=gen)
     _LOADER_CACHE[key] = loader
     return loader
 
@@ -2503,8 +2511,11 @@ def _eval_at_growing_n(
     for n in n_list:
         effective_batch_size = max(1, int(cfg.batch_size) * base // n)
         try:
+            # Same eval contract as the cell's own validation metric, so the CE-vs-N curve and the
+            # headline PPL are the same measurement at different N. cfg.eval_stride <= max_seq_len <= n
+            # holds for every extrapolation length, so the stride stays valid as N grows.
             loader = get_loader(dataset, n, effective_batch_size, "validation",
-                                vocab_size=cfg.vocab_size)
+                                vocab_size=cfg.vocab_size, eval_stride=cfg.eval_stride)
             m = evaluate(model, loader, device=device)
             ce = float(m["ce"])
             ppl = float(m["ppl"])
@@ -2586,7 +2597,7 @@ def run_single(
     train_loader = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "train",
                               max_tokens=max_tokens, vocab_size=cfg.vocab_size)
     val_loader   = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "validation",
-                              vocab_size=cfg.vocab_size)
+                              vocab_size=cfg.vocab_size, eval_stride=cfg.eval_stride)
     loaded_data_sources = _loader_ablation_source_identities(
         train_loader,
         val_loader,

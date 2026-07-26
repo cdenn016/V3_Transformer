@@ -159,7 +159,8 @@ def test_growing_n_preserves_failed_tail_and_effective_batch_size(
         "evaluate",
         lambda model, loader, **kwargs: {"ce": loader / 100.0, "ppl": loader / 10.0},
     )
-    cfg = SimpleNamespace(max_seq_len=128, batch_size=32, vocab_size=50_257)
+    cfg = SimpleNamespace(max_seq_len=128, batch_size=32, vocab_size=50_257,
+                          eval_stride=None)
 
     curve = ablation._eval_at_growing_n(
         object(),
@@ -192,7 +193,8 @@ def test_growing_n_records_nonfinite_metrics_as_a_failed_point(
         "evaluate",
         lambda model, loader, **kwargs: {"ce": float("nan"), "ppl": 20.0},
     )
-    cfg = SimpleNamespace(max_seq_len=128, batch_size=32, vocab_size=50_257)
+    cfg = SimpleNamespace(max_seq_len=128, batch_size=32, vocab_size=50_257,
+                          eval_stride=None)
 
     curve = ablation._eval_at_growing_n(
         object(),

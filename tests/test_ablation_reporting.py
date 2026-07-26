@@ -247,7 +247,8 @@ def _tiny_train_loader(seed=7, n=64, seq_len=8, bs=4):
     return DataLoader(ds, batch_size=bs, shuffle=True, drop_last=True, generator=g)
 
 
-def _fake_get_loader(dataset, seq_len, batch_size, split, *, max_tokens=None, vocab_size=None):
+def _fake_get_loader(dataset, seq_len, batch_size, split, *, max_tokens=None,
+                     vocab_size=None, eval_stride=None):
     if split == "train":
         return _tiny_train_loader(seq_len=seq_len, bs=batch_size)
     base = torch.arange(3).repeat(48 // 3 + 2)

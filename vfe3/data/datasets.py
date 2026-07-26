@@ -527,7 +527,32 @@ def tokens_per_char(
 
 
 class TokenWindows(Dataset):
-    """Causal-LM windows over a 1-D token stream: item ``i`` -> (input_L, target_L)."""
+    r"""Causal-LM windows over a 1-D token stream: item ``i`` -> (input_L, target_L).
+
+    ``pad_final`` selects the EVALUATION contract: cover every transition of the stream exactly
+    once, padding the final window and marking any position that must not be scored with the
+    ``-100`` ignore target. Training leaves it off and simply walks the stream by ``stride``.
+
+    STRIDE UNDER THE EVAL CONTRACT. With the default ``stride == seq_len`` the windows are
+    disjoint, so the first target of every window is predicted from a single token of context, the
+    second from two, and so on: the reported cross-entropy is inflated by that context starvation,
+    and the inflation grows as ``seq_len`` shrinks. Setting ``stride < seq_len`` gives the standard
+    sliding-window evaluation instead -- each window still runs on its full ``seq_len`` of context,
+    but only its final ``stride`` targets are scored and the overlapping prefix is masked to
+    ``-100``, so every transition is counted exactly ONCE and at ``seq_len - stride`` tokens of
+    context or better. The masked prefix is context, not padding: ``train.evaluate`` runs the model
+    on the whole window and weights it by the count of non-ignored targets, so the masked positions
+    inform the prediction without entering the average. This is the recipe in HuggingFace's
+    fixed-length-model perplexity documentation; it costs ``seq_len / stride`` times more forward
+    passes and always reports a LOWER perplexity than the disjoint windows, so the two are different
+    metrics and must not be mixed inside one comparison.
+
+    Window ``i`` starts at ``i * stride`` and scores transitions ``[max(0, i*stride + seq_len -
+    stride), i*stride + seq_len)``, which tile the stream contiguously from zero; ``n`` is the
+    smallest count whose last window reaches the final transition. At ``stride == seq_len`` every
+    formula below reduces to the disjoint case exactly (the mask covers zero positions and
+    ``n == ceil(transitions / seq_len)``), so the default path is byte-identical.
+    """
 
     def __init__(
         self,
@@ -535,7 +560,7 @@ class TokenWindows(Dataset):
         seq_len:   int,
 
         *,
-        pad_final: bool          = False,  # eval: pad the final partial window, target pad=-100
+        pad_final: bool          = False,  # eval: cover every transition once, ignore target = -100
 
         stride:    Optional[int] = None,   # None -> non-overlapping seq_len stride
     ) -> None:
@@ -549,13 +574,23 @@ class TokenWindows(Dataset):
         self.pad_final = pad_final
         if self.seq_len <= 0 or self.stride <= 0:
             raise ValueError("seq_len and stride must be positive")
-        if self.pad_final and self.stride != self.seq_len:
-            raise ValueError("pad_final requires stride == seq_len for exactly-once transitions")
+        # A stride ABOVE seq_len would skip transitions between consecutive windows, which no
+        # masking can recover, so the exactly-once contract still rejects it. Below seq_len the
+        # windows overlap and the prefix mask below restores exactly-once.
+        if self.pad_final and self.stride > self.seq_len:
+            raise ValueError(
+                f"pad_final needs stride <= seq_len so consecutive windows leave no gap; got "
+                f"stride={self.stride}, seq_len={self.seq_len}")
+        # Positions of every window after the first that repeat the previous window's transitions.
+        self.overlap_prefix = (self.seq_len - self.stride) if self.pad_final else 0
         if self.pad_final:
             transitions = self.tokens.numel() - 1
             if transitions <= 0:
                 raise ValueError("a padded evaluation stream must contain at least two tokens")
-            self.n = (transitions + self.stride - 1) // self.stride
+            # Window i ends at transition i*stride + seq_len; take the fewest windows reaching the
+            # last one. At stride == seq_len this is exactly ceil(transitions / seq_len) as before.
+            remaining = transitions - self.seq_len
+            self.n = max(1, -(-remaining // self.stride) + 1)
             return
         usable = self.tokens.numel() - seq_len - 1
         if usable < 0:
@@ -580,8 +615,16 @@ class TokenWindows(Dataset):
             if n_real:
                 inputs[:n_real] = window[:-1]
                 targets[:n_real] = window[1:]
-            return inputs, targets
-        return window[:-1], window[1:]
+        else:
+            inputs, targets = window[:-1], window[1:]
+        if self.overlap_prefix and idx > 0:
+            # Clone first: ``.to(torch.long)`` is a no-op for an int64 stream, so ``targets`` is a
+            # VIEW into self.tokens and masking in place would corrupt the corpus for every later
+            # window. Window 0 keeps its full target row -- it is the only one whose prefix is not
+            # a repeat, and dropping it would leave the first seq_len-stride transitions unscored.
+            targets = targets.clone()
+            targets[:self.overlap_prefix] = -100
+        return inputs, targets
 
 
 def make_dataloader(
