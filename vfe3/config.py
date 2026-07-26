@@ -412,6 +412,7 @@ class VFE3Config:
     s_e_step:                  bool  = False
     e_s_mu_lr:                 float = 0.1
     e_s_sigma_lr:              float = 0.1
+    
     # Model-channel refine depth. None (default) = follow n_e_steps, which is byte-identical to the
     # historical behavior. Set it to drive the s-channel E-step INDEPENDENTLY of the belief E-step:
     # the two loops both read n_e_steps (model.py::_refine_s and model/block.py::vfe_block), and
@@ -2697,6 +2698,22 @@ class VFE3Config:
             _inert.append(f"ema_decay={self.ema_decay} (only read by use_ema=True)")
         if not self.s_e_step and _changed("e_s_mu_lr", "e_s_sigma_lr"):
             _inert.append("e_s_mu_lr/e_s_sigma_lr (only read by s_e_step=True)")
+        # `generate_figures=False` is a wholesale end-of-run probe opt-out (finalize_run gates the
+        # whole mechanism-diagnostic block on it), so the expensive-diagnostics toggle has nothing
+        # to enable there. Silent before the 2026-07-26 audit (B-04/E-09).
+        if self.emit_expensive_diagnostics and not self.generate_figures:
+            _inert.append(
+                "emit_expensive_diagnostics=True with generate_figures=False: the end-of-run "
+                "mechanism probes are gated on generate_figures, so no diagnostic is emitted")
+        # s_e_step_n_iter reaches only model.py::_refine_s, which runs solely under s_e_step.
+        if not self.s_e_step and _changed("s_e_step_n_iter"):
+            _inert.append(
+                f"s_e_step_n_iter={self.s_e_step_n_iter} (only read by s_e_step=True; with the "
+                "model channel off, n_e_steps drives the belief loop alone)")
+        # query_tau_c scales the per-query adaptive temperature, which query_adaptive_tau gates.
+        if not self.query_adaptive_tau and _changed("query_tau_c"):
+            _inert.append(
+                f"query_tau_c={self.query_tau_c} (only read by query_adaptive_tau=True)")
         # A window at or above the context length allows EVERY entry, so the sliding-window prior is
         # byte-identical to plain causal -- measured torch.equal(...) True.
         if (self.beta_attention_prior in ("windowed", "causal_windowed")
