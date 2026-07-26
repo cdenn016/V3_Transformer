@@ -13,7 +13,7 @@ A registry (``register_figure``) lets a new figure slot in by name.
 import os
 from pathlib import Path
 from types import TracebackType
-from typing import Callable, Dict, Mapping, Optional, Sequence
+from typing import Callable, Dict, List, Mapping, Optional, Sequence
 from uuid import uuid4
 
 import matplotlib
@@ -162,50 +162,140 @@ _UMAP_WORKER_SRC = (
 )
 
 
-class UMAPWorker:
-    r"""One lazily started, crash-isolated UMAP interpreter reusable within a report."""
+# Cap on concurrent UMAP interpreters. Each fit is single-threaded by construction (random_state
+# forces it), so the pool is the ONLY parallelism available and one core per fit is the right unit.
+_UMAP_MAX_WORKERS = 8
 
-    def __init__(self, *, timeout: float = 1200.0) -> None:
+
+def _numba_cache_dir() -> Optional[str]:
+    r"""A PERSISTENT numba cache for the UMAP workers; None means "inherit numba's own default".
+
+    The worker used to point ``NUMBA_CACHE_DIR`` at its request tempdir, which ``close`` then
+    removed, so umap-learn's numba kernels were JIT-compiled from scratch on every report and the
+    cache never survived a single run. An explicitly set ``NUMBA_CACHE_DIR`` in the parent
+    environment wins; otherwise the first writable candidate is used.
+    """
+    import os
+    import tempfile
+    inherited = os.environ.get("NUMBA_CACHE_DIR")
+    if inherited:
+        return inherited
+    candidates = (Path.home() / ".cache" / "vfe3" / "numba",
+                  Path(tempfile.gettempdir()) / "vfe3-numba-cache")
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
+class UMAPWorker:
+    r"""A lazily started, crash-isolated POOL of UMAP interpreters reusable within a report.
+
+    One process was enough while embeddings were requested one at a time. The controlled multi-seed
+    protocol requests five fits of the SAME features per channel and fifteen per report, and each is
+    single-threaded, so a single worker left 23 of 24 cores idle while UMAP accounted for nearly all
+    of the figure wall clock. Processes are started on demand up to ``max_workers`` and reused, so a
+    caller that only ever asks for one embedding still pays for exactly one interpreter.
+    """
+
+    def __init__(
+        self,
+
+        *,
+        timeout:     float         = 1200.0,
+        max_workers: Optional[int] = None,
+    ) -> None:
+        cores = os.cpu_count() or 1
         self.timeout = timeout
+        self.max_workers = (max(1, min(_UMAP_MAX_WORKERS, cores - 1)) if max_workers is None
+                            else max(1, int(max_workers)))
         self._counter = 0
-        self._proc = None
-        self._stderr_handle = None
+        self._procs: List[object] = []
+        self._stderr_handles: List[object] = []
         self._workdir = None
 
-    def _start(self) -> None:
-        if self._proc is not None:
-            return
-        import os
+    def _ensure(self, count: int) -> None:
+        r"""Guarantee at least ``count`` live interpreters (never more than ``max_workers``)."""
         import subprocess
         import sys
         import tempfile
-        self._workdir = tempfile.mkdtemp(prefix="vfe3_umap_")
-        stderr_path = os.path.join(self._workdir, "stderr.log")
-        worker_env = os.environ.copy()
-        worker_env["NUMBA_CACHE_DIR"] = os.path.join(self._workdir, "numba_cache")
-        self._stderr_handle = open(stderr_path, "w+b")
-        self._proc = subprocess.Popen(
-            [sys.executable, "-c", _UMAP_WORKER_SRC],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=self._stderr_handle,
-            text=True,
-            env=worker_env,
-        )
+        if self._workdir is None:
+            self._workdir = tempfile.mkdtemp(prefix="vfe3_umap_")
+        cache_dir = _numba_cache_dir()
+        while len(self._procs) < min(count, self.max_workers):
+            index = len(self._procs)
+            worker_env = os.environ.copy()
+            if cache_dir is None:
+                worker_env.pop("NUMBA_CACHE_DIR", None)
+            else:
+                worker_env["NUMBA_CACHE_DIR"] = cache_dir
+            handle = open(os.path.join(self._workdir, f"stderr_{index}.log"), "w+b")
+            self._stderr_handles.append(handle)
+            self._procs.append(subprocess.Popen(
+                [sys.executable, "-c", _UMAP_WORKER_SRC],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=handle,
+                text=True,
+                env=worker_env,
+            ))
 
-    def _error_tail(self) -> str:
-        import os
-        if self._stderr_handle is None or self._workdir is None:
+    def _error_tail(self, index: int) -> str:
+        if self._workdir is None or index >= len(self._stderr_handles):
             return ""
-        self._stderr_handle.flush()
-        path = os.path.join(self._workdir, "stderr.log")
+        self._stderr_handles[index].flush()
         try:
-            with open(path, "rb") as handle:
+            with open(os.path.join(self._workdir, f"stderr_{index}.log"), "rb") as handle:
                 handle.seek(0, os.SEEK_END)
                 handle.seek(max(0, handle.tell() - 1000), os.SEEK_SET)
                 return handle.read().decode(errors="replace")
         except OSError:
             return ""
+
+    def _submit(self, index: int, request: Dict[str, object]) -> None:
+        import json
+        proc = self._procs[index]
+        try:
+            proc.stdin.write(json.dumps(request) + "\n")
+            proc.stdin.flush()
+        except BrokenPipeError as exc:
+            tail = self._error_tail(index)
+            if "ModuleNotFoundError" in tail and "umap" in tail:
+                raise ImportError("umap_embed needs umap-learn (pip install umap-learn)") from exc
+            raise OSError(f"UMAP worker pipe closed: {tail[-500:]}") from exc
+
+    def _collect(self, index: int, status: str, fout: str) -> np.ndarray:
+        r"""Block on one submitted request. The timeout starts HERE, matching the serial contract.
+
+        A queued request (more seeds than workers) therefore gets its full timeout from the moment
+        it is awaited rather than sharing one budget with the whole batch.
+        """
+        import json
+        import time
+        proc = self._procs[index]
+        deadline = time.monotonic() + self.timeout
+        while not os.path.exists(status):
+            returncode = proc.poll()
+            if returncode is not None:
+                tail = self._error_tail(index)
+                if "ModuleNotFoundError" in tail and "umap" in tail:
+                    raise ImportError("umap_embed needs umap-learn (pip install umap-learn)")
+                raise OSError(f"UMAP worker exited (rc={returncode}): {tail[-500:]}")
+            if time.monotonic() >= deadline:
+                proc.kill()
+                raise TimeoutError(f"UMAP worker exceeded {self.timeout:.0f} seconds")
+            time.sleep(0.05)
+        with open(status, encoding="utf-8") as handle:
+            response = json.load(handle)
+        if not response.get("ok"):
+            error = str(response.get("error", "unknown worker failure"))
+            if "ModuleNotFoundError" in error and "umap" in error:
+                raise ImportError("umap_embed needs umap-learn (pip install umap-learn)")
+            raise OSError(f"UMAP embedding worker failed: {error[-500:]}")
+        return np.load(fout)
 
     def embed(
         self,
@@ -217,48 +307,51 @@ class UMAPWorker:
         n_components: int,
         seed:         int,
     ) -> np.ndarray:
-        import json
-        import os
-        import time
-        self._start()
-        assert self._proc is not None and self._proc.stdin is not None and self._workdir is not None
+        return self.embed_many(features, seeds=(seed,), n_neighbors=n_neighbors,
+                               min_dist=min_dist, n_components=n_components)[int(seed)]
+
+    def embed_many(
+        self,
+        features: np.ndarray,
+
+        *,
+        seeds:        Sequence[int],
+        n_neighbors:  int,
+        min_dist:     float,
+        n_components: int,
+    ) -> Dict[int, np.ndarray]:
+        r"""Embed ONE feature bank under several seeds, one concurrent interpreter per seed.
+
+        Every fit is seeded and single-threaded exactly as the serial path ran it, and the features
+        are written once and read by each worker, so the returned coordinates are bit-identical to
+        embedding the seeds one at a time. Only the wall clock changes.
+        """
+        ordered = [int(seed) for seed in seeds]
+        if not ordered:
+            raise ValueError("embed_many needs at least one seed")
+        if len(set(ordered)) != len(ordered):
+            raise ValueError(f"embed_many needs distinct seeds, got {ordered!r}")
+        self._ensure(len(ordered))
+        assert self._workdir is not None
         self._counter += 1
         stem = os.path.join(self._workdir, f"request_{self._counter}")
-        fin, fout, status = f"{stem}_in.npy", f"{stem}_out.npy", f"{stem}_status.json"
+        fin = f"{stem}_in.npy"
         np.save(fin, features)
-        request = dict(input=fin, output=fout, status=status, n_neighbors=n_neighbors,
-                       min_dist=min_dist, n_components=n_components, seed=seed)
+        paths = [fin]
+        jobs = []
         try:
-            try:
-                self._proc.stdin.write(json.dumps(request) + "\n")
-                self._proc.stdin.flush()
-            except BrokenPipeError as exc:
-                tail = self._error_tail()
-                if "ModuleNotFoundError" in tail and "umap" in tail:
-                    raise ImportError("umap_embed needs umap-learn (pip install umap-learn)") from exc
-                raise OSError(f"UMAP worker pipe closed: {tail[-500:]}") from exc
-            deadline = time.monotonic() + self.timeout
-            while not os.path.exists(status):
-                returncode = self._proc.poll()
-                if returncode is not None:
-                    tail = self._error_tail()
-                    if "ModuleNotFoundError" in tail and "umap" in tail:
-                        raise ImportError("umap_embed needs umap-learn (pip install umap-learn)")
-                    raise OSError(f"UMAP worker exited (rc={returncode}): {tail[-500:]}")
-                if time.monotonic() >= deadline:
-                    self._proc.kill()
-                    raise TimeoutError(f"UMAP worker exceeded {self.timeout:.0f} seconds")
-                time.sleep(0.05)
-            with open(status, encoding="utf-8") as handle:
-                response = json.load(handle)
-            if not response.get("ok"):
-                error = str(response.get("error", "unknown worker failure"))
-                if "ModuleNotFoundError" in error and "umap" in error:
-                    raise ImportError("umap_embed needs umap-learn (pip install umap-learn)")
-                raise OSError(f"UMAP embedding worker failed: {error[-500:]}")
-            return np.load(fout)
+            for position, seed in enumerate(ordered):
+                index = position % len(self._procs)
+                fout, status = f"{stem}_{seed}_out.npy", f"{stem}_{seed}_status.json"
+                paths += [fout, status, f"{status}.tmp"]
+                self._submit(index, dict(input=fin, output=fout, status=status,
+                                         n_neighbors=n_neighbors, min_dist=min_dist,
+                                         n_components=n_components, seed=seed))
+                jobs.append((index, seed, fout, status))
+            return {seed: self._collect(index, status, fout)
+                    for index, seed, fout, status in jobs}
         finally:
-            for path in (fin, fout, status, f"{status}.tmp"):
+            for path in paths:
                 try:
                     os.remove(path)
                 except FileNotFoundError:
@@ -266,22 +359,23 @@ class UMAPWorker:
 
     def close(self) -> None:
         import shutil
-        if self._proc is not None:
-            if self._proc.stdin is not None:
+        for proc in self._procs:
+            if proc.stdin is not None:
                 try:
-                    self._proc.stdin.close()
+                    proc.stdin.close()
                 except OSError:
                     pass
             try:
-                self._proc.wait(timeout=5.0)
+                proc.wait(timeout=5.0)
             except Exception:
-                self._proc.kill()
-                self._proc.wait()
-            self._proc = None
-        if self._stderr_handle is not None:
-            self._stderr_handle.close()
-            self._stderr_handle = None
+                proc.kill()
+                proc.wait()
+        self._procs = []
+        for handle in self._stderr_handles:
+            handle.close()
+        self._stderr_handles = []
         if self._workdir is not None:
+            # The numba cache lives OUTSIDE this tree on purpose; only the request scratch goes.
             shutil.rmtree(self._workdir, ignore_errors=True)
             self._workdir = None
 
@@ -295,6 +389,28 @@ class UMAPWorker:
         _tb:       Optional[TracebackType],
     ) -> None:
         self.close()
+
+
+def _umap_prepare(
+    features,                            # (N, D) tensor/array
+    n_neighbors:  int,
+    n_components: int,
+) -> 'tuple[np.ndarray, int, int, Optional[np.ndarray]]':
+    r"""Shared clamping and degenerate-input handling for the two UMAP entry points.
+
+    Returns ``(X, n_neighbors, n_components, degenerate)``; a non-None ``degenerate`` is the layout
+    to return instead of fitting.
+    """
+    X = _np(features)
+    # PCA init raises when n_components exceeds the feature dim or N-1 (e.g. the phi channel of a
+    # small algebra, tiny CPU test banks), so clamp it the same way n_neighbors is clamped below.
+    n_components = max(1, min(n_components, X.shape[1], max(1, X.shape[0] - 1)))
+    # A fully collapsed channel (every point identical -> zero variance) has no embedding, and PCA
+    # init would divide by total variance 0 and yield NaN. Return a trivial finite layout so the
+    # downstream clustering / KDE stay valid (faithful: constant features carry no 2-D structure).
+    if X.shape[0] < 3 or float(np.ptp(X, axis=0).max()) <= 0.0:
+        return X, n_neighbors, n_components, np.zeros((X.shape[0], n_components), dtype=float)
+    return X, min(n_neighbors, max(2, X.shape[0] - 1)), n_components, None
 
 
 def umap_embed(
@@ -318,22 +434,46 @@ def umap_embed(
     worker for several embeddings without reimporting numba. A failing subprocess (numba genuinely
     unsupported, umap-learn absent) raises the OSError/ImportError the UMAP consumers were already
     written to handle (audit 2026-07-05 verification fix)."""
-    X = _np(features)
-    # PCA init raises when n_components exceeds the feature dim or N-1 (e.g. the phi channel of a
-    # small algebra, tiny CPU test banks), so clamp it the same way n_neighbors is clamped below.
-    n_components = max(1, min(n_components, X.shape[1], max(1, X.shape[0] - 1)))
-    # A fully collapsed channel (every point identical -> zero variance) has no embedding, and PCA
-    # init would divide by total variance 0 and yield NaN. Return a trivial finite layout so the
-    # downstream clustering / KDE stay valid (faithful: constant features carry no 2-D structure).
-    if X.shape[0] < 3 or float(np.ptp(X, axis=0).max()) <= 0.0:
-        return np.zeros((X.shape[0], n_components), dtype=float)
-    n_neighbors = min(n_neighbors, max(2, X.shape[0] - 1))
+    X, n_neighbors, n_components, degenerate = _umap_prepare(features, n_neighbors, n_components)
+    if degenerate is not None:
+        return degenerate
     if worker is not None:
         return worker.embed(X, n_neighbors=n_neighbors, min_dist=min_dist,
                             n_components=n_components, seed=seed)
-    with UMAPWorker() as isolated_worker:
+    with UMAPWorker(max_workers=1) as isolated_worker:
         return isolated_worker.embed(X, n_neighbors=n_neighbors, min_dist=min_dist,
                                      n_components=n_components, seed=seed)
+
+
+def umap_embed_many(
+    features,                            # (N, D) tensor/array
+
+    *,
+    seeds:        Sequence[int],
+    n_neighbors:  int = _UMAP_N_NEIGHBORS,
+    min_dist:     float = _UMAP_MIN_DIST,
+    n_components: int = 2,
+    worker:       Optional[UMAPWorker] = None,
+) -> Dict[int, np.ndarray]:
+    r"""``umap_embed`` for several seeds of ONE feature bank, fitted concurrently.
+
+    The controlled multi-seed protocol embeds the same channel under every seed in
+    ``embedding_comparison.CONTROLLED_SEEDS``. Those fits are independent and each is pinned
+    single-threaded by its ``random_state``, so running them in parallel interpreters returns
+    bit-identical coordinates and is purely a wall-clock change. Validation and the degenerate-input
+    short circuit are shared with ``umap_embed``, so a channel that collapses returns the same
+    trivial layout under every seed rather than differing by entry point.
+    """
+    ordered = [int(seed) for seed in seeds]
+    X, n_neighbors, n_components, degenerate = _umap_prepare(features, n_neighbors, n_components)
+    if degenerate is not None:
+        return {seed: degenerate.copy() for seed in ordered}
+    if worker is not None:
+        return worker.embed_many(X, seeds=ordered, n_neighbors=n_neighbors,
+                                 min_dist=min_dist, n_components=n_components)
+    with UMAPWorker() as isolated_worker:
+        return isolated_worker.embed_many(X, seeds=ordered, n_neighbors=n_neighbors,
+                                          min_dist=min_dist, n_components=n_components)
 
 
 def plot_embedding(
@@ -2261,15 +2401,17 @@ def plot_belief_umap(
         display_seed = int(seeds_used[0])
         n_disp = embedding_comparison.CONTROLLED_N_NEIGHBORS
         min_dist = embedding_comparison.CONTROLLED_MIN_DIST
+        # One fit per seed, run CONCURRENTLY (2026-07-26). Each is seeded and single-threaded, so
+        # the coordinates are bit-identical to the serial loop this replaced; only wall clock moves.
         coords_by_seed = {
-            int(projection_seed): _np(umap_embed(
+            int(projection_seed): _np(coordinates).astype(float)
+            for projection_seed, coordinates in umap_embed_many(
                 feats,
+                seeds=seeds_used,
                 n_neighbors=n_disp,
                 min_dist=min_dist,
-                seed=int(projection_seed),
                 worker=umap_worker,
-            )).astype(float)
-            for projection_seed in seeds_used
+            ).items()
         }
         coords = coords_by_seed[display_seed]
         cluster_coords, cluster_space = embedding_comparison.cluster_coordinates(X)
