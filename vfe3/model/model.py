@@ -3132,9 +3132,27 @@ class VFEModel(nn.Module):
         token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
 
         *,
+        score_at:  str                          = "converged",   # "converged" | "entry" | "prior"
         snapshot:  Optional[DiagnosticSnapshot] = None,
     ) -> torch.Tensor:                     # (L, H, N, N) per-layer, per-head attention beta_ij
         r"""Per-layer, per-head attention weights ``beta_ij`` for sequence 0 (no_grad).
+
+        ``score_at`` selects WHERE in the block the pattern is read (audit 2026-07-26 R-3):
+
+        - ``"converged"`` (default, unchanged) scores at each block's OUTPUT belief, after the
+          E-step has run and after ``head_mixer``/``block_norm``. This is what ``diagnostics``
+          reads and what the shipped ``attention/`` heatmaps have always plotted.
+        - ``"entry"`` scores at the belief ENTERING the block -- the pattern the E-step's first
+          iteration actually used to aggregate. At ``n_e_steps=1`` this IS the model's attention;
+          the converged map is a post-hoc re-score of a belief the E-step already moved, and the
+          two differ by up to the full row mass.
+        - ``"prior"`` scores with the coupling BELIEF energy zeroed, leaving
+          ``softmax_j(log_prior)`` alone -- the reference for how much of a map is the attention
+          prior rather than content. Note this is the prior AS FOLDED: it is purely positional only
+          when ``gamma_as_beta_prior=False`` and ``precision_weighted_attention=False``; otherwise
+          it still carries the hierarchical gamma and precision-bias folds.
+
+        ``snapshot`` short-circuits to the stored maps and is only valid for ``"converged"``.
 
         Replays the :func:`vfe_stack` block loop one block at a time -- mirroring its
         ``mu_p``/``sigma_p`` handoff (``prior_handoff_rho``/``prior_handoff_sigma``) line for
@@ -3152,7 +3170,13 @@ class VFEModel(nn.Module):
         diagnostics folds the FINAL belief into the handoff while this replay uses each block's
         own output -- the EXACT trajectory the model ran).
         """
+        if score_at not in ("converged", "entry", "prior"):
+            raise ValueError(f"score_at must be 'converged', 'entry' or 'prior', got {score_at!r}")
         if snapshot is not None:
+            if score_at != "converged":
+                raise ValueError(
+                    f"a diagnostic snapshot stores only the converged maps; score_at={score_at!r} "
+                    "must be replayed from the model")
             return self._validate_diagnostic_snapshot(token_ids, snapshot).beta_maps
         from vfe3.families.base import get_family
         from vfe3.free_energy import attention_weights, attention_tau
@@ -3189,8 +3213,41 @@ class VFEModel(nn.Module):
         mu_p, sigma_p = belief.mu, belief.sigma
 
         _base_tau = attention_tau(self.effective_kappa_beta(belief.mu.device), self.group.irrep_dims)
+
+        def _score(state) -> torch.Tensor:                            # (H, N, N) beta at `state`
+            # Attention at `state`, recomputed exactly as diagnostics does: the transport regime is
+            # matched so regime_ii reads the means + learned connection_W (flat ignores both), and
+            # the energy is per-irrep-block (per-head). Shared by the entry and converged scoring
+            # points so the two can only differ by WHERE they are called (audit 2026-07-26 R-3).
+            tau = self._beta_tau(state.sigma, state.mu, _base_tau)
+            omega = self._diagnostic_transport(state)
+            if rope is not None:
+                effective = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
+                                          on_value=cfg.rope_on_value,
+                                          same_frame_flat_cocycle=getattr(
+                                              omega, "same_frame_flat_cocycle", False))
+                mu, sigma = state.mu, state.sigma
+                batched = False
+            else:
+                effective = omega.unsqueeze(0)
+                mu, sigma = state.mu.unsqueeze(0), state.sigma.unsqueeze(0)
+                batched = True
+            energy = fam.coupling_energy(                             # (N, N) or (H, N, N)
+                mu, sigma, mu, sigma, effective,
+                alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+                divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
+            )
+            if batched:
+                energy = energy[0]
+            if score_at == "prior":
+                energy = torch.zeros_like(energy)                     # positional channel alone
+            beta = attention_weights(energy, tau=tau, log_prior=log_prior)
+            return beta.unsqueeze(0) if beta.dim() == 2 else beta     # single-block group -> H=1
+
         maps = []
         for _ in range(cfg.n_layers):
+            if score_at != "converged":
+                maps.append(_score(belief))                           # BEFORE the E-step runs
             belief = vfe_block(                                       # converged belief at this block
                 belief, mu_p, sigma_p, self.group, cfg, log_prior=log_prior,
                 block_norm=self.block_norm,
@@ -3207,33 +3264,8 @@ class VFEModel(nn.Module):
                 # the tau vfe_block would compute itself).
                 tau=self._beta_tau(belief.sigma, belief.mu, _base_tau),
             )
-            # Attention at the converged belief, recomputed exactly as diagnostics does: the
-            # transport regime is matched so regime_ii reads the means + learned connection_W
-            # (flat ignores both), and the energy is per-irrep-block (per-head).
-            omega = self._diagnostic_transport(belief)
-            if rope is not None:
-                effective = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                          on_value=cfg.rope_on_value,
-                                          same_frame_flat_cocycle=getattr(
-                                              omega, "same_frame_flat_cocycle", False))
-                mu, sigma = belief.mu, belief.sigma
-                batched = False
-            else:
-                effective = omega.unsqueeze(0)
-                mu, sigma = belief.mu.unsqueeze(0), belief.sigma.unsqueeze(0)
-                batched = True
-            energy = fam.coupling_energy(                             # (N, N) or (H, N, N)
-                mu, sigma, mu, sigma, effective,
-                alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
-                divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
-            )
-            if batched:
-                energy = energy[0]
-            beta = attention_weights(energy, tau=self._beta_tau(belief.sigma, belief.mu, _base_tau),
-                                     log_prior=log_prior)            # converged-belief tau (as diagnostics)
-            if beta.dim() == 2:                                      # single-block group -> add an H=1 axis
-                beta = beta.unsqueeze(0)
-            maps.append(beta)                                        # (H, N, N)
+            if score_at == "converged":
+                maps.append(_score(belief))                          # (H, N, N) at the block OUTPUT
 
             mu_p = (1.0 - rho) * mu_p + rho * belief.mu              # handoff (mirrors vfe_stack)
             sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma

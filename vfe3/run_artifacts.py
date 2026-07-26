@@ -642,7 +642,21 @@ def _run_attention_maps_isolated(
     r"""Render periodic attention maps in a child that may safely suffer a native plotting abort."""
     try:
         tensor = maps.detach().cpu() if isinstance(maps, torch.Tensor) else torch.as_tensor(maps)
-        if channel == "beta":
+        if channel == "estep":
+            # (3, L, H, N, N): the E-step's own pattern, the converged re-score, and the prior
+            # alone, stacked so one worker call renders the heatmaps AND the distance profile that
+            # compares them (audit 2026-07-26 R-3). Written to attention_estep/, never to
+            # attention/ -- the shipped maps are left exactly as they are.
+            if tensor.ndim != 5 or tensor.shape[0] != 3:
+                raise ValueError(
+                    f"estep maps must be (3, L, H, N, N); got {tuple(tensor.shape)}"
+                )
+            expected = [
+                run_dir / "attention_estep" / f"step_{step}_layer{layer}_head{head}.png"
+                for layer in range(tensor.shape[1])
+                for head in range(tensor.shape[2])
+            ] + [run_dir / "attention_estep" / f"step_{step}_profile.png"]
+        elif channel == "beta":
             if tensor.ndim == 2:
                 tensor = tensor[None, None]
             elif tensor.ndim == 3:
@@ -1439,6 +1453,41 @@ class RunArtifacts:
             self.run_dir,
             logger or logging.getLogger(__name__),
             channel="beta",
+            step=step,
+        )
+
+    def save_estep_attention_maps(
+        self,
+        step:   int,
+        maps:   'Optional[torch.Tensor]',     # (3, L, H, N, N) entry / converged / prior, or None
+        logger: Optional[logging.Logger] = None,
+    ) -> Optional[List[Path]]:
+        r"""The attention the E-step ACTUALLY used, written beside the shipped maps.
+
+        Writes ``attention_estep/step_<N>_layer<l>_head<h>.png`` (the ENTRY-belief beta -- the
+        pattern the E-step's first iteration aggregated with) plus one
+        ``attention_estep/step_<N>_profile.png`` per step: row-mean beta against key distance
+        ``|i - j|``, with the converged re-score and the attention prior overlaid on the same axes.
+
+        The shipped ``attention/`` heatmaps score at each block's OUTPUT belief, after the E-step
+        has moved it and after ``head_mixer``/``block_norm`` -- a post-hoc re-score, not the
+        pattern that produced the aggregation (audit 2026-07-26 R-3, measured max row difference
+        1.0 on a trained checkpoint). Both are kept: the converged map is what ``diagnostics``
+        reports, so it stays the reference, and this is the mechanism.
+
+        The profile panel is the one that makes positional pathology legible -- a rotary schedule
+        whose kernel revives at long lag shows up as off-diagonal bumps here that are invisible in
+        a log-scaled heatmap, and a beta that has collapsed onto its prior shows up as the two
+        curves lying on top of each other. ``maps`` is None -> no-op. Errors are logged and
+        swallowed, never fatal to the run.
+        """
+        if maps is None:
+            return None
+        return _run_attention_maps_isolated(
+            maps,
+            self.run_dir,
+            logger or logging.getLogger(__name__),
+            channel="estep",
             step=step,
         )
 

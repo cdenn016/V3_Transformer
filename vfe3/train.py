@@ -1094,7 +1094,13 @@ def _save_eval_attention_maps(
     *,
     step:      int,
 ) -> None:
-    r"""Save beta/gamma maps from one post-step, post-EMA diagnostic snapshot."""
+    r"""Save beta/gamma maps from one post-step, post-EMA diagnostic snapshot.
+
+    The shipped ``attention/`` set is emitted from the snapshot unchanged. The ``attention_estep/``
+    set is a REPLAY (audit 2026-07-26 R-3): the snapshot stores only the converged maps, so the
+    entry-belief and prior arms have to be re-scored from the model. A replay failure is swallowed
+    like every other figure -- the shipped maps and the run itself do not depend on it.
+    """
     artifacts.save_attention_maps(
         step,
         model.attention_maps(token_ids, snapshot=snapshot),
@@ -1105,6 +1111,16 @@ def _save_eval_attention_maps(
         model.gamma_attention_maps(token_ids, snapshot=snapshot),
         logger=logger,
     )
+    try:
+        estep_maps = torch.stack([
+            model.attention_maps(token_ids, score_at="entry"),
+            model.attention_maps(token_ids, score_at="converged"),
+            model.attention_maps(token_ids, score_at="prior"),
+        ])                                                   # (3, L, H, N, N)
+    except Exception as exc:                                 # noqa: BLE001 - figures are best-effort
+        logger.warning("E-step attention replay failed (%s); attention_estep skipped", exc)
+        return
+    artifacts.save_estep_attention_maps(step, estep_maps, logger=logger)
 
 
 class TrainingTerminalState(NamedTuple):
