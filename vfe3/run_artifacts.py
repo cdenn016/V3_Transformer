@@ -4074,6 +4074,17 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             "pos_rotation":                 cfg.pos_rotation,
             "rope_full_gauge":              bool(cfg.rope_full_gauge),
             "rope_on_value":                bool(cfg.rope_on_value),
+            # WHICH RoPE transport regime the pair energy actually used (audit 2026-07-26 A-02),
+            # recorded in the same spirit as regime_ii_covariant_exactness. Means-only rotates the
+            # MEAN by R_i Omega_ij R_j^T while the covariance keeps the bare Omega_ij, so the
+            # transported pair is the pushforward of the key under no single operator and
+            # E_ij = D(q_i || Omega_ij# q_j) does not hold literally -- deliberate (R Sigma R^T is
+            # dense, hence rope_full_gauge=True requiring gaussian_full) but previously unrecorded.
+            "rope_pair_energy_exactness":   (
+                "not_applicable" if cfg.pos_rotation == "none"
+                else "exact_rope_congruence" if cfg.rope_full_gauge
+                else "means_only_unrotated_covariance"
+            ),
             "lambda_gamma":                 float(cfg.lambda_gamma),
             "s_e_step":                     bool(cfg.s_e_step),
             "skip_belief_sigma_update":      bool(cfg.skip_belief_sigma_update),

@@ -493,3 +493,104 @@ def test_zero_n_e_steps_warns_that_inference_is_disabled():
 def test_negative_n_e_steps_is_still_rejected():
     with pytest.raises(ValueError, match="n_e_steps must be >= 0"):
         _pure_cfg(n_e_steps=-1)
+
+
+# --- A-02: means-only RoPE is a hybrid, and the run record says so ------------------------
+
+def _rope_pair(seed: int = 0, n: int = 4, k: int = 4, heads: int = 2):
+    r"""A flat block cocycle plus a block-diagonal orthogonal RoPE rotation."""
+    from vfe3.geometry.transport import FactoredTransport, RopeTransport
+
+    d = k // heads
+    torch.manual_seed(seed)
+    algebra = 0.3 * torch.randn(n, k, k)
+    block_mask = torch.zeros(k, k)
+    for h in range(heads):
+        block_mask[h * d:(h + 1) * d, h * d:(h + 1) * d] = 1.0
+    algebra = algebra * block_mask
+    base = FactoredTransport(torch.matrix_exp(algebra), torch.matrix_exp(-algebra),
+                             irrep_dims=[d] * heads, same_frame_flat_cocycle=True)
+    angles = torch.randn(n, heads)
+    rope = torch.zeros(n, k, k)
+    for i in range(n):
+        for h in range(heads):
+            cos, sin = torch.cos(angles[i, h]), torch.sin(angles[i, h])
+            rope[i, h * d:h * d + 2, h * d:h * d + 2] = torch.tensor([[cos, -sin], [sin, cos]])
+    return (base,
+            RopeTransport(base=base, rope=rope, on_cov=False, same_frame_flat_cocycle=True),
+            RopeTransport(base=base, rope=rope, on_cov=True, same_frame_flat_cocycle=True))
+
+
+def test_means_only_rope_rotates_the_mean_but_not_the_covariance():
+    r"""The transported pair is the pushforward of the key under NO single operator.
+
+    This is the half of A-02 the challenge tier re-scoped and left open: "the mean transports under
+    R_i Omega_ij R_j^T while the covariance transports under bare Omega_ij -- no single frame works.
+    Needs its own check; neither side established it." Established here.
+    """
+    from vfe3.geometry.transport import transport_covariance, transport_mean
+
+    base, hybrid, full = _rope_pair()
+    mu = torch.randn(4, 4)
+    sigma = torch.rand(4, 4) + 0.5
+
+    mu_hybrid = transport_mean(hybrid, mu)
+    mu_rotated = transport_mean(full, mu)
+    mu_plain = transport_mean(base, mu)
+    sigma_hybrid = transport_covariance(hybrid, sigma, diagonal_out=True)
+    sigma_plain = transport_covariance(base, sigma, diagonal_out=True)
+
+    assert torch.equal(mu_hybrid, mu_rotated)               # the MEAN is rotated ...
+    assert float((mu_hybrid - mu_plain).abs().max()) > 1e-3
+    assert torch.equal(sigma_hybrid, sigma_plain)           # ... and the COVARIANCE is not.
+
+
+def test_means_only_rope_preserves_the_structural_self_pair():
+    r"""What the asymmetry must NOT break: Omega_ii = I and R_i R_i^T = I, so the self-link is exact
+    on both slots and the structural E_ii = 0 (and the pair_mask keyed off it) is untouched.
+    """
+    from vfe3.geometry.transport import transport_covariance, transport_mean
+
+    _, hybrid, _ = _rope_pair()
+    mu = torch.randn(4, 4)
+    sigma = torch.rand(4, 4) + 0.5
+    index = torch.arange(4)
+
+    assert torch.equal(transport_mean(hybrid, mu)[index, index], mu)
+    assert torch.equal(
+        transport_covariance(hybrid, sigma, diagonal_out=True)[index, index], sigma)
+
+
+def test_means_only_covariance_is_not_the_truncated_rotated_pushforward():
+    # It is a DIFFERENT object, not a diagonal projection of the right one -- so it cannot be
+    # explained away as the same controlled truncation the diagonal congruence already documents.
+    from vfe3.geometry.transport import transport_covariance
+
+    base, hybrid, _ = _rope_pair()
+    sigma = torch.rand(4, 4) + 0.5
+    shipped = transport_covariance(hybrid, sigma, diagonal_out=True)
+    omega = torch.einsum("ikl,jlm->ijkm", base.exp_phi, base.exp_neg_phi)
+    rotated = torch.einsum("ikl,ijlm,jnm->ijkn", hybrid.rope, omega, hybrid.rope)
+    truncated = torch.einsum("ijkl,ijkl,jl->ijk", rotated, rotated, sigma)
+    assert float((truncated - shipped).abs().max()) > 1e-2
+
+
+@pytest.mark.parametrize(
+    "pos_rotation,full_gauge,expected",
+    [
+        ("none", False, "not_applicable"),
+        ("rope", False, "means_only_unrotated_covariance"),
+        ("rope", True, "exact_rope_congruence"),
+    ],
+)
+def test_run_report_records_which_rope_regime_the_energy_used(pos_rotation, full_gauge, expected):
+    from vfe3.run_artifacts import _pure_path_report
+
+    kwargs = dict(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1, n_e_steps=1,
+                  gauge_group="block_glk", pos_rotation=pos_rotation, rope_full_gauge=full_gauge)
+    if full_gauge:                        # R Sigma R^T is dense: full gauge needs the full family
+        kwargs.update(family="gaussian_full", e_step_update="gradient", decode_mode="full")
+    report = _pure_path_report(VFE3Config(**kwargs), [])
+    assert report["config_toggles"]["rope_pair_energy_exactness"] == expected
+    if pos_rotation != "none":            # a RoPE run is already off the gauge-pure path
+        assert report["gauge_flags"]["no_positional_rotation"] is False
