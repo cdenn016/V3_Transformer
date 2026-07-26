@@ -2608,6 +2608,52 @@ class VFE3Config:
                     "gamma_as_beta_prior=True requires lambda_gamma > 0 (the model-channel s "
                     f"tables and gamma energy must exist), got lambda_gamma={self.lambda_gamma}"
                 )
+            # Causal-support gate (audit 2026-07-26 E-01). model._fold_gamma_prior normalizes gamma
+            # over its OWN key row and only then masks the mixture to beta's support. A convex mixture
+            # is not proportional to a single exponential, so gamma's row normalizer Z_i does not
+            # cancel: when gamma may attend a key j > i that beta forbids, that future key enters Z_i
+            # and changes the belief log-prior at STRICTLY PAST entries. Measured on log_prior[i<4,
+            # j<=i] for two sequences differing only in the last token (beta='causal', K=4, N=6):
+            # gamma='causal' 0.0 and 'causal_alibi_noself' 0.0, against 'uniform' 4.8e-07,
+            # 'alibi' 4.8e-07, 'windowed' 5.9e-05. Under s_e_step the leak is worse than the
+            # normalizer alone -- a non-causal gamma also refines s_i itself against future tokens,
+            # which no masking at the fold site can undo -- so the combination fails closed here.
+            # The supports are read from the REGISTRY builders at max_seq_len with the same kwargs
+            # model._attention_log_prior passes, so a newly registered prior is covered without
+            # editing this check, and a window-style support is evaluated at the length it is used at.
+            # Only FUTURE keys count: a gamma allowing a past key beta forbids (e.g. the self key,
+            # which beta='causal_alibi_noself' masks and gamma='causal' does not) shifts the mixture
+            # weight but carries no future information, and the shipped configs pair exactly there.
+            import torch
+
+            from vfe3.attention_prior import attention_log_prior
+
+            def _prior_support(_name: str) -> 'torch.Tensor':      # (Nq, Nk) bool allowed set
+                _bias = attention_log_prior(
+                    _name, self.max_seq_len, self.max_seq_len,
+                    device="cpu", dtype=torch.float32,
+                    n_heads=self.n_heads, alibi_slope=self.alibi_slope,
+                    window=self.attention_window,
+                    num_buckets=self.t5_num_buckets, max_distance=self.t5_max_distance,
+                )
+                _allowed = torch.isfinite(_bias)
+                return _allowed.any(dim=0) if _allowed.dim() == 3 else _allowed
+
+            _pos    = torch.arange(self.max_seq_len)
+            _future = _pos.unsqueeze(0) > _pos.unsqueeze(-1)       # (Nq, Nk) keys j > i
+            _leak   = (_prior_support(self.gamma_attention_prior)
+                       & ~_prior_support(self.beta_attention_prior)
+                       & _future)
+            if bool(_leak.any()):
+                raise ValueError(
+                    f"gamma_as_beta_prior=True with gamma_attention_prior="
+                    f"{self.gamma_attention_prior!r} and beta_attention_prior="
+                    f"{self.beta_attention_prior!r} leaks future tokens into the belief attention "
+                    f"prior: gamma allows {int(_leak.sum())} key(s) at j > i that beta forbids, and "
+                    f"gamma's row normalizer does not cancel out of the renormalized mixture. Use a "
+                    f"gamma prior whose future keys are a subset of beta's (e.g. the same causal "
+                    f"prior), or set gamma_as_beta_prior=False."
+                )
         if not (math.isfinite(self.gamma_prior_weight)
                 and 0.0 <= self.gamma_prior_weight <= 1.0):
             raise ValueError(

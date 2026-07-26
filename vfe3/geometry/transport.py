@@ -1617,7 +1617,16 @@ def compute_transport_operators(
         clamp_monitor=clamp_monitor,
         validity_max_norm=validity_max_norm,
     )
-    omega = torch.einsum("bikl,bjlm->bijkm", exp_phi, exp_neg_phi)
+    # fp32 island on the pair product (audit 2026-07-26 C-05). The vertex factors above are already
+    # pinned to float32 by _embed_algebra_fp32_floor + the exp's own upcasts, but einsum is
+    # autocast-eligible, so under AMP the dense Omega was rebuilt in bf16 -- measured
+    # ||Omega_ii - I||_inf = 4.76e-03 against 1.19e-07 at fp32. Omega_ii = I is the identity that
+    # makes the structural self energy E_ii = 0 and keeps the self pair out of pair_mask, so this is
+    # not a rounding nuisance. The compact/factored siblings never lost it: they carry their own
+    # autocast(enabled=False) islands. Reachable on the flat path, where _can_fuse_flat returns
+    # False for a single-block group and this dense operator is what the E-step consumes.
+    with torch.amp.autocast(phi.device.type, enabled=False):
+        omega = torch.einsum("bikl,bjlm->bijkm", exp_phi, exp_neg_phi)
     return {"exp_phi": exp_phi, "exp_neg_phi": exp_neg_phi, "Omega": omega}
 
 
@@ -2173,7 +2182,16 @@ def transport_covariance(
         )
     is_diag = sigma.dim() == omega.dim() - 2 if diagonal_out is None else diagonal_out
     if is_diag:
-        return torch.einsum("...ijkl,...ijkl,...jl->...ijk", omega, omega, sigma)
+        # fp32 island, matching the compact/factored diagonal siblings (audit 2026-07-26 C-05): this
+        # einsum is autocast-eligible, so under AMP the whole congruence was evaluated in bf16 --
+        # measured max relative error 4.63e-03 against the fp64 reference. Unlike those siblings the
+        # dense form is the manifestly nonnegative sum_l Omega_kl^2 sigma_l, so it needs no
+        # escalation or floor; only the working precision was missing.
+        with torch.amp.autocast(sigma.device.type, enabled=False):
+            work = sigma.dtype if sigma.dtype in (torch.float32, torch.float64) else torch.float32
+            out = torch.einsum("...ijkl,...ijkl,...jl->...ijk",
+                               omega.to(work), omega.to(work), sigma.to(work))
+        return out.to(sigma.dtype)
     # Rank-gap dispatch hardening (audit 2026-07-05 m7): a batch-INDEPENDENT (N, N, K, K) omega with
     # a BATCHED diagonal (B, N, K) sigma satisfies sigma.dim() == omega.dim() - 1 and previously fell
     # through to the full-covariance einsum -- a shape error at best, a silent mis-broadcast when
@@ -2295,24 +2313,50 @@ def _direct_link_diagonal_covariance(
     direct: DirectLinkTransport,
     sigma:  torch.Tensor,               # (..., N, K) diagonal variances
 ) -> torch.Tensor:                      # (..., N, N, K) diagonal congruence
-    r"""Diagonal congruence from live edge/vertex factors without pairwise ``Omega``."""
-    if direct.exp_phi is None:
-        return torch.einsum(
-            "ijka,ijka,...ja->...ijk",
-            direct.exp_link,
-            direct.exp_link,
-            sigma,
-        )
-    key_cov = _direct_link_key_covariance(direct, sigma, diagonal=True)
-    # One output row at a time keeps the live pairwise object at (...,N,N,K), never
-    # (...,N,N,K,K). Each row is (exp_phi_i[k,:] exp_link_ij), then r C_j r^T.
-    parts: List[torch.Tensor] = []
-    for k in range(direct.exp_link.shape[-1]):
-        linked_row = torch.einsum(
-            "...ia,ijab->...ijb", direct.exp_phi[..., k, :], direct.exp_link)
-        parts.append(torch.einsum(
-            "...ijb,...jbc,...ijc->...ij", linked_row, key_cov, linked_row))
-    return torch.stack(parts, dim=-1)
+    r"""Diagonal congruence from live edge/vertex factors without pairwise ``Omega``.
+
+    Precision (audit 2026-07-26 C-04): the charted branch below is the same mixed-sign regrouping
+    the compact and factored siblings carry -- ``r_ij^T C_j r_ij`` with ``C_j = U_j^-1 diag(sigma_j)
+    U_j^-T``, PSD in exact arithmetic but reachable below zero by cancellation -- and it was the one
+    route with no autocast island, no float64 escalation and no floor. Measured (N=3, K=4, 300 draws,
+    ``||phi||_F`` in [6,10], anisotropic sigma): under bf16 autocast 29/300 draws returned a NEGATIVE
+    transported variance, worst -2.85e+09, max relative error 4.64e+02 against the fp64 dense
+    reference; in float32 no draw went negative but the relative error still reached 1.8e-02. A
+    negative reaches the divergence kernel's ``clamp(min=eps)`` = 1e-6, inverting that key's precision
+    weight by ~6 orders of magnitude, saturating ``E_ij`` at ``kl_max`` and dropping the pair from the
+    coupling via ``pair_mask``. This route now gets the island, the escalation and the floor its two
+    siblings have. The bare-link branch is the manifestly nonnegative squared form and needs only the
+    island.
+    """
+    with torch.amp.autocast(sigma.device.type, enabled=False):
+        work = sigma.dtype if sigma.dtype in (torch.float32, torch.float64) else torch.float32
+        if direct.exp_phi is None:
+            return torch.einsum(
+                "ijka,ijka,...ja->...ijk",
+                direct.exp_link.to(work),
+                direct.exp_link.to(work),
+                sigma.to(work),
+            ).to(sigma.dtype)
+
+        def _reduce(dtype: torch.dtype) -> torch.Tensor:
+            ep, en = direct.exp_phi.to(dtype), direct.exp_neg_phi.to(dtype)
+            link = direct.exp_link.to(dtype)
+            # C_j = U_j^-1 diag(sigma_j) U_j^-T, the diagonal branch of
+            # _direct_link_key_covariance (both vertex factors exist together on this branch).
+            key_cov = torch.einsum("...jkl,...jml,...jl->...jkm", en, en, sigma.to(dtype))
+            # One output row at a time keeps the live pairwise object at (...,N,N,K), never
+            # (...,N,N,K,K). Each row is (exp_phi_i[k,:] exp_link_ij), then r C_j r^T.
+            rows: List[torch.Tensor] = []
+            for k in range(link.shape[-1]):
+                linked_row = torch.einsum("...ia,ijab->...ijb", ep[..., k, :], link)
+                rows.append(torch.einsum(
+                    "...ijb,...jbc,...ijc->...ij", linked_row, key_cov, linked_row))
+            return torch.stack(rows, dim=-1)
+
+        out = _reduce(work)
+        if work is not torch.float64:
+            out = _escalate_if_negative(out, _reduce)
+        return out.clamp(min=0.0).to(sigma.dtype)
 
 
 def _direct_link_full_covariance(
