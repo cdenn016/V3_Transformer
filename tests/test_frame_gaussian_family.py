@@ -52,11 +52,21 @@ def test_default_family_location_transport_is_unchanged() -> None:
     assert torch.equal(DiagonalGaussian.transport_location(mu, omega), transport_mean(omega, mu))
 
 
+def _certified_flat_cocycle(n: int, k: int) -> object:
+    r"""A transport container that certifies Omega_ij = U_i U_j^{-1}, the family's precondition."""
+    from vfe3.geometry.groups import get_group
+    from vfe3.geometry.transport import build_factored_transport
+
+    group = get_group("block_glk")(k, 2)                        # K=k, 2 equal blocks
+    phi = 0.1 * torch.randn(n, group.generators.shape[0])   # group generators are fp32
+    return build_factored_transport(phi, group)
+
+
 def test_frame_transports_are_query_broadcasts() -> None:
     r"""Both frame-intrinsic transports drop the query index: entry [i, j] equals the input at j."""
     torch.manual_seed(0)
     n, k = 3, 4
-    omega = torch.randn(n, n, k, k, dtype=torch.float64)          # ignored by this family
+    omega = _certified_flat_cocycle(n, k)                          # values unused; certification is not
     mu = torch.randn(n, k, dtype=torch.float64)
     sigma = torch.rand(n, k, dtype=torch.float64) + 0.5
 
@@ -178,3 +188,24 @@ def test_entropy_matches_the_diagonal_parent() -> None:
     sigma = torch.rand(k, dtype=torch.float64) + 0.5
     expected = 0.5 * (torch.log(sigma) + math.log(2.0 * math.pi * math.e)).sum()
     assert FrameDiagonalGaussian(mu, sigma).entropy().item() == pytest.approx(expected.item())
+
+
+def test_frame_family_refuses_a_transport_whose_frames_do_not_cancel() -> None:
+    r"""Fail closed off the coboundary (audit 2026-07-26 A-01).
+
+    The frame-intrinsic identity `U_i^-1 Omega_ij U_j = I` holds only for `Omega_ij = U_i U_j^-1`.
+    Under a learned connection the edge factor sits between the frames and the residual is not the
+    identity, so returning the flat answer silently discards the whole connection -- measured as a
+    bit-identical pair energy and `connection_W.grad is None`. An uncertified transport must raise
+    rather than answer.
+    """
+    torch.manual_seed(0)
+    n, k = 3, 4
+    dense = torch.randn(n, n, k, k, dtype=torch.float64)           # certifies nothing
+    mu = torch.randn(n, k, dtype=torch.float64)
+    sigma = torch.rand(n, k, dtype=torch.float64) + 0.5
+
+    for seam, argument in ((FrameDiagonalGaussian.transport_location, mu),
+                           (FrameDiagonalGaussian.transport_dispersion, sigma)):
+        with pytest.raises(TypeError, match="same-frame flat cocycle"):
+            seam(argument, dense)

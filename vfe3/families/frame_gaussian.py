@@ -98,17 +98,47 @@ class FrameDiagonalGaussian(DiagonalGaussian):
             torch.stack([p.sigma for p in parts], dim=dim),
         )
 
+    @staticmethod
+    def _require_coboundary(omega: object, seam: str) -> None:
+        r"""Fail closed unless the frame cancellation this family is built on actually holds.
+
+        The identity transport below is valid ONLY for the Regime-I coboundary
+        :math:`\Omega_{ij} = U_iU_j^{-1}`, where :math:`U_i^{-1}\Omega_{ij}U_j = I`. Under a learned
+        connection the edge factor sits between the frames --
+        :math:`\exp(\phi_i G)\exp(\delta_{ij}G)\exp(-\phi_j G)` -- and the residual is not the
+        identity (measured 3.37 at K=4 against 2.4e-07 for flat, audit 2026-07-26 A-01). Returning
+        the flat answer there silently discards the entire connection: the pair energy came out
+        bit-identical to Regime I and ``connection_W`` received no gradient at all, so a sweep arm
+        whose stated purpose is connection trainability could never do its job while the run record
+        still reported ``transport_mode: regime_ii`` as active.
+
+        The sibling exact-congruence family guards the same contract; this one did not.
+        """
+        from vfe3.geometry.transport import _certifies_same_frame_flat_cocycle
+
+        if not _certifies_same_frame_flat_cocycle(omega):
+            raise TypeError(
+                f"family='gaussian_frame_diagonal' cannot {seam} through transport "
+                f"{type(omega).__name__!r}: the frame-intrinsic identity needs a certified "
+                "same-frame flat cocycle (Omega_ij = U_i U_j^{-1}), because the receiver frame "
+                "cancels only for that coboundary. A learned-connection (regime_ii*), direct-link "
+                "or query/key-split transport leaves a residual exp(delta_ij G) that this family "
+                "would silently drop. Use transport_mode='flat', or select "
+                "family='gaussian_diagonal' / 'gaussian_diagonal_exact'.")
+
     @classmethod
     def transport_location(
         cls,
         mu:    torch.Tensor,             # (..., N, K) frame-intrinsic locations a_j
-        omega: object,                   # transport container; unused, the frame cancels
+        omega: object,                   # transport container; must certify a flat cocycle
     ) -> torch.Tensor:                   # (..., N, N, K) transported locations
         r"""Identity transport: :math:`U_i^{-1}\Omega_{ij}\mu_j = U_j^{-1}\mu_j = a_j`.
 
-        ``omega`` is accepted for interface symmetry with the base seam and is intentionally
-        unused -- the receiver frame cancels exactly for the Regime-I coboundary.
+        ``omega`` is not read for its values -- the receiver frame cancels exactly for the Regime-I
+        coboundary -- but it IS checked, because that cancellation is a precondition rather than an
+        identity (see :meth:`_require_coboundary`).
         """
+        cls._require_coboundary(omega, "transport a location")
         return _broadcast_over_queries(mu)
 
     @classmethod
@@ -123,8 +153,10 @@ class FrameDiagonalGaussian(DiagonalGaussian):
         r"""Identity transport: :math:`\Omega_{ij}\Sigma_j\Omega_{ij}^{\top}
         = U_i \operatorname{diag}(\sigma_j) U_i^{\top}`, i.e. ``sigma_j`` in the receiver frame.
 
-        ``omega`` and ``diagonal_out`` are accepted for interface symmetry with the base seam and
-        are intentionally unused: this family is diagonal by declaration and the sandwich is never
-        formed.
+        ``diagonal_out`` is accepted for interface symmetry with the base seam and is intentionally
+        unused: this family is diagonal by declaration and the sandwich is never formed. ``omega``
+        is not read for its values but IS checked -- the cancellation is a precondition
+        (see :meth:`_require_coboundary`).
         """
+        cls._require_coboundary(omega, "transport a dispersion")
         return _broadcast_over_queries(dispersion)
