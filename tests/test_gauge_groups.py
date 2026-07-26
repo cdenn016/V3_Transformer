@@ -143,7 +143,7 @@ def test_unknown_group_raises():
 
 def test_gaussian_admissibility_is_declared():
     grp = get_group("glk")(K=4)
-    assert grp.invariant_for("gaussian") is True
+    assert grp.invariant_for("gaussian_full") is True
 
 
 @pytest.mark.parametrize("spec", [
@@ -181,7 +181,7 @@ def test_full_kl_invariant_under_group_pushforward(spec):
     S_p2 = g @ S_p @ g.transpose(-1, -2)
     moved = kl(FullGaussian(mu_q2, S_q2), FullGaussian(mu_p2, S_p2))
 
-    assert grp.invariant_for("gaussian")
+    assert grp.invariant_for("gaussian_full")
     assert torch.allclose(base, moved, atol=1e-3, rtol=1e-3)
 
 

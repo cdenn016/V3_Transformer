@@ -47,6 +47,7 @@ def test_register_transport_override_replaces_metadata_atomically():
             needs_mu=True,
             needs_sigma=True,
             batch_independent=True,
+            pair_transport_kind="pair_inverse",
             override=True,
         )
         def _dummy_mu(phi, group, **kwargs):
@@ -57,6 +58,7 @@ def test_register_transport_override_replaces_metadata_atomically():
         assert replaced.needs_sigma is True
         assert replaced.batch_independent is True
         assert replaced.covariance_class == "replacement-a"
+        assert replaced.pair_transport_kind == "pair_inverse"
         assert "flat" in _TRANSPORT_NEEDS_MU
         assert "flat" in _TRANSPORT_NEEDS_SIGMA
         assert "flat" in _TRANSPORT_BATCH_INDEPENDENT
@@ -71,6 +73,9 @@ def test_register_transport_override_replaces_metadata_atomically():
         assert replaced.needs_sigma is False
         assert replaced.batch_independent is False
         assert replaced.covariance_class == "replacement-b"
+        # The capability ladder resets to the weakest level with the rest of the record, so a stale
+        # 'pair_inverse' cannot survive into a registration that never claimed it (audit 2026-07-26).
+        assert replaced.pair_transport_kind == "opaque"
         assert "flat" not in _TRANSPORT_NEEDS_MU
         assert "flat" not in _TRANSPORT_NEEDS_SIGMA
         assert "flat" not in _TRANSPORT_BATCH_INDEPENDENT
@@ -81,6 +86,7 @@ def test_register_transport_override_replaces_metadata_atomically():
             needs_mu=orig.needs_mu,
             needs_sigma=orig.needs_sigma,
             batch_independent=orig.batch_independent,
+            pair_transport_kind=orig.pair_transport_kind,
             override=True,
         )(orig.callable)
     assert _TRANSPORTS["flat"] == orig
@@ -138,6 +144,7 @@ def test_build_belief_transport_gates_mu_to_none_for_flat():
             needs_mu=orig.needs_mu,
             needs_sigma=orig.needs_sigma,
             batch_independent=orig.batch_independent,
+            pair_transport_kind=orig.pair_transport_kind,
             override=True,
         )(orig.callable)
     assert _TRANSPORTS["flat"] == orig

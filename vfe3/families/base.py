@@ -62,11 +62,36 @@ class BeliefParams(ABC):
       - Optional hooks: ``renyi_closed_form(other, *, alpha, kl_max, eps)`` (a pinned closed form
         that bypasses the generic A-path) and ``renyi_per_coord(other, ...)`` (the unsummed
         per-coordinate divergence, defined only for families whose divergence decomposes).
+
+    CAPABILITY DECLARATIONS (audit 2026-07-26 E-03/E-04). A family whose coupling energy is defined
+    only on part of the config space declares that scope HERE, so ``VFE3Config.__post_init__`` can
+    reject an unsupported pairing at construction instead of letting the family raise mid-forward --
+    where ``ablation.py`` misfiles the cell as a training error. Declaring on the class also keeps the
+    add-by-registering contract: config validation queries the registry, never a family-name literal.
     """
 
     cov_kind:                 ClassVar[str]
     dispersion_is_covariance: ClassVar[bool] = False
     effective_rank_rescale:   ClassVar[bool] = False
+
+    # Whether the family's POINTWISE law -- self-divergence, moments, entropy, decode readout -- is
+    # the Gaussian one of its ``cov_kind``, so the Gaussian closed forms elsewhere (the moment-matched
+    # barycenter r-update, the fixed alpha=1 KL decode kernels) are exact for it. A family that differs
+    # only in its transport/coupling seams inherits True from its Gaussian base and is served correctly
+    # by both; a genuinely non-Gaussian family (laplace_diagonal) leaves it False and is routed to the
+    # family-consistent alternatives.
+    gaussian_pointwise_algebra: ClassVar[bool] = False
+
+    # Whether the coupling energy is defined only at the KL point (divergence_family='renyi',
+    # renyi_order=1). Set by a family whose transported-divergence identity is KL-specific.
+    requires_kl_divergence: ClassVar[bool] = False
+
+    # The weakest pairwise transport this family's coupling energy accepts, as a level of
+    # ``vfe3.geometry.transport.PAIR_TRANSPORT_KINDS``:
+    #   'any'          -- consumes whatever the transport seams return (the default families),
+    #   'pair_inverse' -- needs Omega_ij^{-1} (a certified cocycle, or a dense operator to invert),
+    #   'coboundary'   -- needs Omega_ij = U_i U_j^{-1} exactly (frame cancellation).
+    transport_requirement: ClassVar[str] = "any"
 
     @abstractmethod
     def coordinate_dim(self) -> int:
@@ -252,6 +277,29 @@ class BeliefParams(ABC):
             f"{cls.__name__} does not override stack, the family-agnostic batching primitive "
             f"(stack each part's underlying tensor along a new axis). Provide it to batch the "
             f"per-block loop."
+        )
+
+    @classmethod
+    def from_covariance(
+        cls,
+        mu:         torch.Tensor,         # (..., K) locations
+        covariance: torch.Tensor,         # (..., K, K) FULL covariance
+    ) -> "BeliefParams":
+        r"""This family's belief at ``mu`` with the full covariance ``covariance``.
+
+        The family's READOUT of a full second moment into its own stored dispersion, and the hook
+        :func:`vfe3.geometry.groups.check_admissible` dispatches through to push a belief forward by
+        the GL(K) congruence ``mu -> g mu, Sigma -> g Sigma g^T`` (audit 2026-07-26 E-05). Before this
+        hook that verifier -- the project's only executable invariance certificate -- branched on three
+        hardcoded family names and raised for everything else, so neither family registered in 2026-07
+        could be covered by any invariance test. A family with no full-covariance readout (a location
+        family whose dispersion is not a second moment) leaves this unimplemented and the verifier
+        reports the gap, which is the documented extension point.
+        """
+        raise NotImplementedError(
+            f"{cls.__name__} does not provide from_covariance, the family's readout of a full "
+            f"covariance into its stored dispersion. Provide it to extend the executable "
+            f"gauge-invariance check to this family."
         )
 
     @classmethod
