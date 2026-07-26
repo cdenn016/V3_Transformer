@@ -322,9 +322,9 @@ config = dict(
     ####################################
     
     r_update_mode             = "gradient",          # "gradient" (AdamW M-step; correct under s_e_step) | "barycenter" (closed-form forward-KL centroid of s; exact M-step in the scored s_e_step=False regime)
-    prior_source              = "model_channel",    # belief prior p_i: "token" or "model_channel"
+    prior_source              = "token",    # belief prior p_i: "token" or "model_channel"
     learnable_r               = False,               # un-freeze hyper-prior centroid r (empirical-Bayes)
-    s_e_step                  = True,
+    s_e_step                  = False,
     
     e_s_mu_lr                 = 0.85,
     e_s_sigma_lr              = 0.1,

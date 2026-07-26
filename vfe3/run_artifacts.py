@@ -2995,8 +2995,22 @@ def collect_estep_depth_sensitivity(
 ) -> Dict[str, object]:
     r"""Evaluate current weights at several inference depths on one fixed batch.
 
-    This is a sensitivity probe, not a retrained-depth comparison. Model mode, configured depth,
+    This is a sensitivity probe, not a retrained-depth comparison. Model mode, configured depths,
     and global CPU/CUDA RNG state are restored exactly before return.
+
+    TWO LOOPS, SWEPT SEPARATELY (2026-07-25). ``cfg.n_e_steps`` is read by the belief E-step
+    (``model/block.py``) AND by the model-channel refinement (``model/model.py::_refine_s``), and
+    under ``prior_source='model_channel'`` the refined s IS the belief's prior. Driving the single
+    field therefore moves the prior and the belief together, and the earlier form of this probe
+    attributed the whole effect to "inference depth" when the belief loop supplied 0.012 nats of it
+    and the model channel 3.48 (docs/2026-07-25-shadow-prior-investigation.md Sec. 8). ``points``
+    now sweeps the BELIEF loop with the model channel pinned at its trained depth; when the model
+    channel is live, ``model_channel_points`` sweeps it with the belief loop pinned. Each point
+    records both depths, so neither series can be misread as the other.
+
+    ``free_energy_per_token`` comes from ``e_step_belief_trace``, which uses SEQUENCE 0 only, while
+    ``ce`` is over every sequence in ``tokens``; the key is duplicated as
+    ``free_energy_per_token_seq0`` to keep that explicit, and ``n_sequences`` records the CE sample.
     """
     import torch.nn.functional as F
     from vfe3.viz.extract import e_step_belief_trace
@@ -3006,39 +3020,66 @@ def collect_estep_depth_sensitivity(
         raise ValueError(f"depths must contain nonnegative integers, got {requested!r}")
     ordered = sorted(set(requested))
     trained_depth = int(model.cfg.n_e_steps)
+    trained_s_depth = model.cfg.s_e_step_n_iter
+    model_channel_live = bool(model.cfg.s_e_step)
     was_training = bool(model.training)
     cpu_rng = torch.get_rng_state().clone()
     cuda_rng = ([state.clone() for state in torch.cuda.get_rng_state_all()]
                 if torch.cuda.is_available() else None)
+
+    def _score(belief_depth: int, s_depth: int) -> Dict[str, float | int]:
+        model.cfg.n_e_steps = belief_depth
+        model.cfg.s_e_step_n_iter = s_depth
+        logits = model(tokens)
+        ce = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]).float(),
+            targets.reshape(-1),
+            ignore_index=-100,
+        )
+        trace = e_step_belief_trace(model, tokens, n_iter=belief_depth)
+        free_energy = float(trace["free_energy"][-1]) / max(1, int(tokens.shape[1]))
+        return {
+            "depth":                      belief_depth,   # legacy key: the swept axis of `points`
+            "belief_depth":               belief_depth,
+            "s_depth":                    s_depth,
+            "ce":                         float(ce),
+            "free_energy_per_token":      free_energy,
+            "free_energy_per_token_seq0": free_energy,
+        }
+
     points: List[Dict[str, float | int]] = []
+    model_channel_points: List[Dict[str, float | int]] = []
     try:
         model.eval()
+        # Belief-loop sweep: the model channel is held at the depth the weights were trained with.
         for depth in ordered:
-            model.cfg.n_e_steps = depth
-            logits = model(tokens)
-            ce = F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]).float(),
-                targets.reshape(-1),
-                ignore_index=-100,
-            )
-            trace = e_step_belief_trace(model, tokens, n_iter=depth)
-            points.append({
-                "depth":                 depth,
-                "ce":                    float(ce),
-                "free_energy_per_token": float(trace["free_energy"][-1]) / max(1, int(tokens.shape[1])),
-            })
+            points.append(_score(depth, trained_depth))
+        if model_channel_live:
+            # Model-channel sweep: the belief loop is held at its trained depth instead.
+            for depth in ordered:
+                row = _score(trained_depth, depth)
+                row["depth"] = depth                      # the swept axis of THIS series
+                model_channel_points.append(row)
     finally:
         model.cfg.n_e_steps = trained_depth
+        model.cfg.s_e_step_n_iter = trained_s_depth
         model.train(was_training)
         torch.set_rng_state(cpu_rng)
         if cuda_rng is not None:
             torch.cuda.set_rng_state_all(cuda_rng)
     return {
         "trained_depth": trained_depth,
+        "model_channel_live": model_channel_live,
+        "n_sequences": int(tokens.shape[0]),
         "interpretation": (
-            "current-weight inference-depth sensitivity; depths other than trained_depth were not retrained"
+            "current-weight depth sensitivity at fixed weights; no depth other than trained_depth "
+            "was retrained. 'points' varies the BELIEF E-step with the model channel pinned at "
+            "trained_depth; 'model_channel_points' varies the model-channel refine with the belief "
+            "loop pinned (empty when s_e_step=False, where n_e_steps drives the belief loop alone). "
+            "free_energy_per_token is sequence 0 only; ce is over all n_sequences."
         ),
         "points": points,
+        "model_channel_points": model_channel_points,
     }
 
 

@@ -861,7 +861,12 @@ class VFEModel(nn.Module):
             BeliefState(mu=s_mu, sigma=s_sigma, phi=phi0, omega=omega_s,
                         reflection=reflection_s, right_phi=self._pos_phi_right(phi0)),
             r_mu, r_sigma, grp,
-            n_iter=cfg.n_e_steps,         tau=gamma_tau,
+            # s_e_step_n_iter=None (default) follows n_e_steps -- byte-identical. Setting it drives
+            # this loop independently of the belief E-step, which the depth diagnostic needs: both
+            # loops read n_e_steps, and under prior_source='model_channel' the refined s below IS
+            # the belief's prior, so sweeping n_e_steps alone cannot attribute a change to either.
+            n_iter=(cfg.n_e_steps if cfg.s_e_step_n_iter is None else cfg.s_e_step_n_iter),
+            tau=gamma_tau,
             e_q_mu_lr=cfg.e_s_mu_lr,      e_q_sigma_lr=cfg.e_s_sigma_lr, e_phi_lr=0.0,
             # The s-channel self-coupling weight IS lambda_h (the hyper-prior precision): route it
             # through the lambda_h_mode registry, not a hardcoded constant. e_step's self_coupling_alpha

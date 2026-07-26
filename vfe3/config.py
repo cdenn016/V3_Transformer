@@ -412,6 +412,15 @@ class VFE3Config:
     s_e_step:                  bool  = False
     e_s_mu_lr:                 float = 0.1
     e_s_sigma_lr:              float = 0.1
+    # Model-channel refine depth. None (default) = follow n_e_steps, which is byte-identical to the
+    # historical behavior. Set it to drive the s-channel E-step INDEPENDENTLY of the belief E-step:
+    # the two loops both read n_e_steps (model.py::_refine_s and model/block.py::vfe_block), and
+    # under prior_source='model_channel' the refined s IS the belief's prior, so a sweep over
+    # n_e_steps moves the prior and the belief together and cannot attribute a change to either.
+    # Measured 2026-07-25 (docs/2026-07-25-shadow-prior-investigation.md Sec. 8): over eight
+    # iterations the belief loop accounts for 0.012 nats of CE and the model channel for 3.48, so
+    # a diagnostic that varies both reports almost entirely the latter.
+    s_e_step_n_iter:           Optional[int] = None
 
     
     
@@ -962,6 +971,11 @@ class VFE3Config:
             raise ValueError(f"n_layers must be >= 1, got {self.n_layers}")
         if self.n_e_steps < 1:
             raise ValueError(f"n_e_steps must be >= 1, got {self.n_e_steps}")
+        if self.s_e_step_n_iter is not None and (
+                type(self.s_e_step_n_iter) is not int or self.s_e_step_n_iter < 0):
+            raise ValueError(
+                "s_e_step_n_iter must be None (follow n_e_steps) or a nonnegative int, got "
+                f"{self.s_e_step_n_iter!r}")
         if self.embed_dim % self.n_heads != 0:
             raise ValueError(
                 f"embed_dim={self.embed_dim} must be divisible by n_heads={self.n_heads}"
