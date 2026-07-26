@@ -237,6 +237,17 @@ class ExactCongruenceDiagonalGaussian(DiagonalGaussian):
 
     cov_kind = "diagonal"
     dispersion_is_covariance = True
+    # Pointwise algebra is DiagonalGaussian's, unchanged: only coupling_energy is overridden, so the
+    # Gaussian moment-matched barycenter and the fixed alpha=1 KL decode kernels are exact here
+    # (audit 2026-07-26 E-04) -- inherited True, restated because the scope declarations below are the
+    # point of this block.
+    gaussian_pointwise_algebra = True
+    # The module SCOPE section, declared for config validation (audit 2026-07-26 E-03): the pullback
+    # identity is KL-specific, and it needs Omega_ij^{-1} -- from the pair transpose of a certified
+    # cocycle, or by inverting a dense operator. A direct-link container offers neither, and reached
+    # `_pullback_query`'s TypeError only at the first forward.
+    requires_kl_divergence = True
+    transport_requirement = "pair_inverse"
 
     def block(self, start: int, end: int) -> "ExactCongruenceDiagonalGaussian":
         return ExactCongruenceDiagonalGaussian(

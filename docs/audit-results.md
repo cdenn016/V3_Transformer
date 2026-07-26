@@ -1046,10 +1046,9 @@ produced to prefer one.
 
 Ranked by decision impact. **Nothing here had been fixed at the time this report was written; the
 audit itself modified no source.** Remediation since then is tracked in `docs/2026-07-26-edits.md`:
-items 1-9 (B-01, A-01, B-02, B-03, E-01, C-04, C-05, C-06, D-02) are fixed on
-`fix/2026-07-26-audit-remediation`; item 10 (C-01/C-02/C-03) is held on its stated open obligation,
-item 11 (B-04) was investigated and deliberately not applied, and item 12 (E-02) is fixed with
-E-03/E-04/E-05 still open.
+items 1-9 (B-01, A-01, B-02, B-03, E-01, C-04, C-05, C-06, D-02) and item 12
+(E-02/E-03/E-04/E-05) are fixed on `fix/2026-07-26-audit-remediation`; item 10 (C-01/C-02/C-03) is
+held on its stated open obligation, and item 11 (B-04) was investigated and deliberately not applied.
 
 1. **[high] B-01 — `collect_estep_character` measures the wrong channel.** `run_artifacts.py:3251`,
    `:3279-3283`. `recorded[0]` is the s-channel fusion under `s_e_step=True`, and its `mu_p` is the

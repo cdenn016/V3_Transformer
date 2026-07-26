@@ -1447,6 +1447,33 @@ class VFE3Config:
         from vfe3.divergence import divergence_families, family_cov_kind
         _require(self.family, divergence_families(), "family")
         family_is_diagonal = family_cov_kind(self.family) == "diagonal"
+        # Family SCOPE gate (audit 2026-07-26 E-03). A family whose coupling energy is defined only on
+        # part of the config space declares that scope on its class; reject an unsupported pairing HERE
+        # rather than at the first forward, where `ablation.py` catches config errors only around
+        # `VFE3Config(**cfg_dict)` and a mid-forward raise falls to the outer handler and is misfiled as
+        # error_kind="train". Both checks read the family and transport REGISTRIES, so a newly
+        # registered family or transport is covered without editing this validator.
+        from vfe3.families.base import get_family
+        _family_cls = get_family(self.family)
+        if _family_cls.requires_kl_divergence and (
+                self.divergence_family != "renyi" or self.renyi_order != 1.0):
+            raise ValueError(
+                f"family={self.family!r} implements its coupling energy for KL only "
+                f"(divergence_family='renyi', renyi_order=1.0); got "
+                f"divergence_family={self.divergence_family!r}, renyi_order={self.renyi_order}. "
+                f"Use family='gaussian_diagonal' for a noncanonical divergence."
+            )
+        if _family_cls.transport_requirement != "any":
+            from vfe3.geometry.transport import get_transport_registration
+            _registration = get_transport_registration(self.transport_mode)
+            if not _registration.satisfies(_family_cls.transport_requirement):
+                raise ValueError(
+                    f"family={self.family!r} needs a "
+                    f"{_family_cls.transport_requirement!r} pairwise transport, but "
+                    f"transport_mode={self.transport_mode!r} provides "
+                    f"{_registration.pair_transport_kind!r}. Use transport_mode='flat', or a family "
+                    f"whose coupling energy consumes this transport (e.g. 'gaussian_diagonal')."
+                )
 
         # free-energy coupling
         for _name in ("kappa_beta", "kappa_gamma"):
@@ -1588,12 +1615,18 @@ class VFE3Config:
         # families (gaussian_diagonal diagonal moments, gaussian_full full moments, PB-11); a
         # non-Gaussian family (e.g. laplace_diagonal) has no registered barycenter, so reject the
         # pair at construction (before model build) rather than silently mis-updating r.
-        if self.r_update_mode == "barycenter" and self.family not in ("gaussian_diagonal", "gaussian_full"):
+        # Keyed off the family's declared `gaussian_pointwise_algebra`, not a name literal (audit
+        # 2026-07-26 E-04): `barycenter_r_` branches only on cov_kind and implements the Gaussian
+        # moment match, so it is exact for ANY family whose pointwise law is Gaussian -- including the
+        # two registered in 2026-07, which override only their transport/coupling seams and inherit
+        # DiagonalGaussian's moments verbatim. The old literal rejected them for no reason and made
+        # registering a Gaussian family require editing this file.
+        if self.r_update_mode == "barycenter" and not _family_cls.gaussian_pointwise_algebra:
             raise ValueError(
                 f"r_update_mode='barycenter' has no registered closed-form barycenter for "
-                f"family={self.family!r}: the moment-matched m-projection is implemented only for the "
-                f"Gaussian families (gaussian_diagonal, gaussian_full). Use r_update_mode='gradient' "
-                f"for {self.family!r}."
+                f"family={self.family!r}: the moment-matched m-projection is implemented only for a "
+                f"family whose pointwise law is Gaussian (gaussian_pointwise_algebra). Use "
+                f"r_update_mode='gradient' for {self.family!r}."
             )
         # A per-coordinate alpha form (state_dependent_per_coord) weights each coordinate's
         # self-divergence by its own alpha^(k), which needs a per-coordinate self-divergence.
@@ -2110,7 +2143,10 @@ class VFE3Config:
         # enforces family_cov_kind(family) in registration.covariance_kinds.
         if self.use_prior_bank:
             noncanonical = self.renyi_order != 1.0 or self.divergence_family != "renyi"
-            non_gaussian = self.family not in ("gaussian_diagonal", "gaussian_full")
+            # Same registry query as the barycenter gate above (audit 2026-07-26 E-04): what the fast
+            # decode kernels assume is the Gaussian POINTWISE readout, which a family overriding only
+            # its coupling/transport seams still satisfies.
+            non_gaussian = not _family_cls.gaussian_pointwise_algebra
             if (noncanonical or non_gaussian) and not decode_registration.family_consistent:
                 raise ValueError(
                     f"use_prior_bank=True with family={self.family!r}/"

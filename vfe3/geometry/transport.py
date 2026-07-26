@@ -333,6 +333,15 @@ def _rope_dense_omega(
 # under 'flat' (:func:`_build_flat`, the no-NN pure default) and the non-flat edge-relaxed Regime II
 # under 'regime_ii' (:func:`_build_regime_ii` below, the sanctioned default-OFF learned-connection
 # exception; spec docs/superpowers/specs/2026-06-01-regime-ii-connection-design.md).
+# What a built transport container offers a family's coupling energy, weakest first (audit
+# 2026-07-26 E-03). 'opaque' is the direct-link container: it contracts into means and covariances
+# but exposes no pairwise operator to invert. 'pair_inverse' is a dense (..., N, N, K, K) tensor,
+# which can be inverted outright. 'coboundary' is the certified same-frame flat cocycle
+# Omega_ij = U_i U_j^{-1}, whose inverse is the pair transpose and whose receiver frame cancels.
+# Each level subsumes the ones before it, so a requirement is satisfiable by index comparison.
+PAIR_TRANSPORT_KINDS: Tuple[str, ...] = ("opaque", "pair_inverse", "coboundary")
+
+
 @dataclass(frozen=True)
 class TransportRegistration:
     """A transport builder and every routing/reporting declaration attached to it."""
@@ -342,9 +351,17 @@ class TransportRegistration:
     needs_sigma:                bool
     batch_independent:          bool
     covariance_class:           str
+    pair_transport_kind:        str
     state_builder:              'Optional[TransportStateBuilder]'
     serialization_keys:         Tuple[str, ...]
     offdiag_serialization_keys: Tuple[str, ...]
+
+    def satisfies(self, requirement: str) -> bool:
+        r"""Whether this transport meets a family's ``transport_requirement``."""
+        if requirement == "any":
+            return True
+        return (PAIR_TRANSPORT_KINDS.index(self.pair_transport_kind)
+                >= PAIR_TRANSPORT_KINDS.index(requirement))
 
 
 TransportState = Mapping[str, torch.Tensor]
@@ -388,6 +405,7 @@ def register_transport(
     needs_sigma:                bool                              = False,
     batch_independent:          bool                              = False,
     override:                   bool                              = False,
+    pair_transport_kind:        str                               = "opaque",
     state_builder:              'Optional[TransportStateBuilder]' = None,
     serialization_keys:         Tuple[str, ...]                   = (),
     offdiag_serialization_keys: Tuple[str, ...]                   = (),
@@ -410,6 +428,11 @@ def register_transport(
     ``offdiag_serialization_keys`` declaration identifies edge tables whose first two axes have a
     meaningful off-diagonal norm; shape alone cannot distinguish them from square coefficient tables.
 
+    ``pair_transport_kind`` declares what the built container offers a family's coupling energy (see
+    :data:`PAIR_TRANSPORT_KINDS`), so a family whose energy needs an invertible or coboundary operator
+    is validated against the registry instead of a mode-name literal. It defaults to the WEAKEST level
+    so a new registration must claim a stronger capability deliberately.
+
     ``batch_independent`` declares that the builder's ``Omega`` does NOT depend on the batch (it is a
     function of a model parameter only -- the bare direct link ``regime_ii_link``), so the builder
     returns a batch-collapsed ``(N, N, K, K)`` Omega that ``transport_mean`` / ``transport_covariance``
@@ -424,6 +447,10 @@ def register_transport(
     """
     if not isinstance(covariance_class, str) or not covariance_class:
         raise ValueError("transport covariance_class must be a nonempty string")
+    if pair_transport_kind not in PAIR_TRANSPORT_KINDS:
+        raise ValueError(
+            f"transport pair_transport_kind must be one of {PAIR_TRANSPORT_KINDS}, got "
+            f"{pair_transport_kind!r}")
     if state_builder is None and serialization_keys:
         raise ValueError("transport serialization_keys require a state_builder")
     if state_builder is not None and not serialization_keys:
@@ -450,6 +477,7 @@ def register_transport(
             needs_sigma=needs_sigma,
             batch_independent=batch_independent,
             covariance_class=covariance_class,
+            pair_transport_kind=pair_transport_kind,
             state_builder=state_builder,
             serialization_keys=serialization_keys,
             offdiag_serialization_keys=offdiag_serialization_keys,
@@ -654,7 +682,11 @@ def _record_covariant_feature_exactness(
     exactness_out[key] = current & update
 
 
-@register_transport("flat", covariance_class="covariant (flat)")
+@register_transport(
+    "flat",
+    covariance_class="covariant (flat)",
+    pair_transport_kind="coboundary",   # builds Omega_ij = U_i U_j^{-1} from ONE vertex table
+)
 def _build_flat(
     phi:        torch.Tensor,             # (B, N, n_gen) gauge frames
     group:      GaugeGroup,               # supplies generators, skew flag, irrep_dims
@@ -684,6 +716,7 @@ def _build_flat(
 @register_transport(
     "regime_ii",
     covariance_class="gauge-fixed (non-covariant)",
+    pair_transport_kind="pair_inverse",   # dense (..., N, N, K, K); invertible, not a coboundary
     needs_mu=True,
     state_builder=_build_regime_ii_state,
     serialization_keys=("connection_W",),
@@ -873,6 +906,7 @@ def _regime_ii_query_chunk(
 @register_transport(
     "regime_ii_covariant",
     covariance_class="covariant",
+    pair_transport_kind="pair_inverse",   # dense (..., N, N, K, K); invertible, not a coboundary
     needs_mu=True,
     needs_sigma=True,
     state_builder=_build_regime_ii_covariant_state,
@@ -1101,6 +1135,7 @@ def _direct_link_edge_exp(
 @register_transport(
     "regime_ii_link",
     covariance_class="gauge-fixed",
+    pair_transport_kind="opaque",   # DirectLinkTransport: contracts, never exposes a pairwise Omega
     batch_independent=True,
     state_builder=_build_regime_ii_link_state,
     serialization_keys=("connection_L",),
@@ -1169,6 +1204,7 @@ def _build_regime_ii_link(
 @register_transport(
     "regime_ii_link_charted",
     covariance_class="covariant",
+    pair_transport_kind="opaque",   # DirectLinkTransport: contracts, never exposes a pairwise Omega
     state_builder=_build_regime_ii_link_state,
     serialization_keys=("connection_L",),
     offdiag_serialization_keys=("connection_L",),

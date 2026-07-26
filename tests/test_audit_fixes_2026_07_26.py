@@ -213,3 +213,150 @@ def test_gamma_prior_support_gate_reads_the_registry_not_a_name_list():
             _gamma_prior_cfg("causal", "_audit_20260726_probe_future")
     finally:
         _PRIORS.pop("_audit_20260726_probe_future", None)
+
+
+# --- E-03: the family scope gate fires at config validation, not mid-forward ------------
+
+def _scope_cfg(**kw) -> VFE3Config:
+    base = dict(vocab_size=7, embed_dim=4, max_seq_len=4, n_layers=1,
+                gauge_group="glk", n_heads=1)
+    base.update(kw)
+    return VFE3Config(**base)
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        (dict(family="gaussian_diagonal_exact", renyi_order=0.5), "KL only"),
+        (dict(family="gaussian_diagonal_exact", divergence_family="squared_hellinger",
+              decode_mode="family"), "KL only"),
+        (dict(family="gaussian_diagonal_exact", transport_mode="regime_ii_link"),
+         "pair_inverse"),
+        (dict(family="gaussian_frame_diagonal", transport_mode="regime_ii"), "coboundary"),
+        (dict(family="gaussian_frame_diagonal", transport_mode="regime_ii_link"), "coboundary"),
+    ],
+)
+def test_family_scope_violations_are_rejected_at_config_construction(kwargs, match):
+    # Every one of these was ACCEPTED by the config and raised at the FIRST FORWARD, where
+    # ablation.py catches config errors only around VFE3Config(**cfg_dict) and the mid-forward raise
+    # falls to the outer handler, misfiling the cell as error_kind="train".
+    with pytest.raises(ValueError, match=match):
+        _scope_cfg(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(family="gaussian_diagonal_exact"),                                # flat: coboundary
+        dict(family="gaussian_diagonal_exact", transport_mode="regime_ii"),    # dense: invertible
+        dict(family="gaussian_frame_diagonal"),                                # flat: coboundary
+        dict(family="gaussian_diagonal", transport_mode="regime_ii_link"),     # no requirement
+    ],
+)
+def test_family_scope_gate_leaves_supported_pairings_alone(kwargs):
+    assert _scope_cfg(**kwargs) is not None
+
+
+def test_scope_gate_reads_the_transport_registry_not_a_mode_name_list():
+    # The requirement is satisfied by capability LEVEL, so a newly registered transport that
+    # declares 'coboundary' serves the frame family without editing config.py.
+    from vfe3.geometry.transport import (
+        PAIR_TRANSPORT_KINDS,
+        _TRANSPORTS,
+        get_transport_registration,
+        register_transport,
+    )
+
+    assert PAIR_TRANSPORT_KINDS == ("opaque", "pair_inverse", "coboundary")
+    flat = get_transport_registration("flat")
+    assert flat.pair_transport_kind == "coboundary"
+    assert flat.satisfies("coboundary") and flat.satisfies("pair_inverse") and flat.satisfies("any")
+    link = get_transport_registration("regime_ii_link")
+    assert not link.satisfies("pair_inverse") and not link.satisfies("coboundary")
+    assert link.satisfies("any")
+
+    @register_transport("_audit_20260726_probe_coboundary",
+                        covariance_class="probe", pair_transport_kind="coboundary")
+    def _probe(phi, group, **kwargs):
+        return get_transport_registration("flat").callable(phi, group, **kwargs)
+
+    try:
+        cfg = _scope_cfg(family="gaussian_frame_diagonal",
+                         transport_mode="_audit_20260726_probe_coboundary")
+        assert cfg.transport_mode == "_audit_20260726_probe_coboundary"
+    finally:
+        _TRANSPORTS.pop("_audit_20260726_probe_coboundary", None)
+
+
+def test_register_transport_rejects_an_unknown_capability_level():
+    from vfe3.geometry.transport import register_transport
+
+    with pytest.raises(ValueError, match="pair_transport_kind"):
+        register_transport("_audit_20260726_bad", covariance_class="probe",
+                           pair_transport_kind="invertible")
+
+
+# --- E-04: the registry capability replaces the two hardcoded family tuples --------------
+
+@pytest.mark.parametrize(
+    "family,expected",
+    [
+        ("gaussian_diagonal", True),
+        ("gaussian_full", True),
+        ("gaussian_diagonal_exact", True),      # overrides coupling_energy only
+        ("gaussian_frame_diagonal", True),      # overrides the two transport seams only
+        ("laplace_diagonal", False),
+    ],
+)
+def test_gaussian_pointwise_algebra_is_declared_on_the_family(family, expected):
+    from vfe3.families.base import get_family
+
+    assert get_family(family).gaussian_pointwise_algebra is expected
+
+
+@pytest.mark.parametrize("family", ["gaussian_diagonal_exact", "gaussian_frame_diagonal"])
+def test_barycenter_r_update_accepts_a_gaussian_pointwise_family(family):
+    # Both were rejected by the old literal though barycenter_r_ branches only on cov_kind and
+    # implements exactly the diagonal moment match these families inherit.
+    assert _scope_cfg(family=family, r_update_mode="barycenter") is not None
+
+
+def test_barycenter_r_update_still_rejects_a_non_gaussian_family():
+    with pytest.raises(ValueError, match="gaussian_pointwise_algebra"):
+        _scope_cfg(family="laplace_diagonal", r_update_mode="barycenter",
+                   decode_mode="family", divergence_family="renyi")
+
+
+@pytest.mark.parametrize("family", ["gaussian_diagonal_exact", "gaussian_frame_diagonal"])
+def test_fast_decode_kernels_accept_a_gaussian_pointwise_family(family):
+    # The fast decode kernels assume the Gaussian POINTWISE readout, which both satisfy.
+    assert _scope_cfg(family=family, use_prior_bank=True, decode_mode="diagonal") is not None
+
+
+# --- E-05: the invariance verifier covers the whole family registry ---------------------
+
+def test_check_admissible_dispatches_through_the_family_registry():
+    from vfe3.families.base import divergence_families
+    from vfe3.geometry.groups import check_admissible, get_group
+
+    grp = get_group("glk")(K=4)
+    covered, gaps = [], []
+    for family in divergence_families():
+        try:
+            check_admissible(grp, family, n_samples=3)
+            covered.append(family)
+        except NotImplementedError:
+            gaps.append(family)
+    # Before E-05 the verifier raised for everything but three hardcoded names, one of which
+    # ('gaussian') is not even registered -- so neither 2026-07 family could be reached.
+    assert "gaussian_diagonal_exact" in covered
+    assert "gaussian_frame_diagonal" in covered
+    assert gaps == ["laplace_diagonal"]      # no full-covariance readout: the extension point
+
+
+def test_dead_gaussian_declaration_is_gone():
+    from vfe3.geometry.groups import declared_invariant_families, get_group
+
+    for name in ("glk", "block_glk", "tied_block_glk", "so_k", "so_n", "sp", "sp_n"):
+        assert declared_invariant_families(name) == ("gaussian_full",)
+        assert get_group(name).invariant_families == ("gaussian_full",)

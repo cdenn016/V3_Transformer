@@ -547,7 +547,7 @@ def test_diagonal_gl_route_reports_not_exactly_gauge_invariant():
     assert diagonal["on_gauge_pure_path"] is False
     assert full["gauge_flags"]["family_group_invariant"] is True
     assert full["on_gauge_pure_path"] is True
-    assert diagonal["config_toggles"]["group_invariant_families"] == ["gaussian", "gaussian_full"]
+    assert diagonal["config_toggles"]["group_invariant_families"] == ["gaussian_full"]
 
 
 def test_pure_path_queries_builder_metadata_without_constructing_group():
@@ -612,7 +612,9 @@ def test_shipped_group_builders_declare_full_gaussian_invariance():
     from vfe3.geometry.groups import get_group
 
     for name in ("glk", "block_glk", "tied_block_glk", "so_k", "so_n", "sp", "sp_n"):
-        assert get_group(name).invariant_families == ("gaussian", "gaussian_full")
+        # 'gaussian' was dead data -- no such family is registered, so it could never match
+        # cfg.family at the one production consumer (audit 2026-07-26 E-05).
+        assert get_group(name).invariant_families == ("gaussian_full",)
 
 
 def test_train_with_artifacts_writes_files(trained_artifact_evidence):

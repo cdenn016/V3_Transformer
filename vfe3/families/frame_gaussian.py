@@ -78,6 +78,13 @@ class FrameDiagonalGaussian(DiagonalGaussian):
 
     cov_kind = "diagonal"
     dispersion_is_covariance = True
+    # Pointwise algebra is DiagonalGaussian's, unchanged: only the two transport seams are overridden
+    # (audit 2026-07-26 E-04).
+    gaussian_pointwise_algebra = True
+    # ``_require_coboundary`` below is this declaration's runtime half; config validation reads the
+    # declaration so a non-flat transport_mode is rejected at construction rather than at the first
+    # forward (audit 2026-07-26 E-03).
+    transport_requirement = "coboundary"
 
     def block(self, start: int, end: int) -> "FrameDiagonalGaussian":
         return FrameDiagonalGaussian(self.mu[..., start:end], self.sigma[..., start:end])

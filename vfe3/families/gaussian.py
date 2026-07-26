@@ -82,6 +82,7 @@ class DiagonalGaussian(BeliefParams):
 
     cov_kind = "diagonal"
     dispersion_is_covariance = True
+    gaussian_pointwise_algebra = True
 
     def __init__(self, mu: torch.Tensor, sigma: torch.Tensor) -> None:
         self.mu = mu
@@ -89,6 +90,15 @@ class DiagonalGaussian(BeliefParams):
 
     def coordinate_dim(self) -> int:
         return self.mu.shape[-1]
+
+    @classmethod
+    def from_covariance(cls, mu: torch.Tensor, covariance: torch.Tensor) -> "DiagonalGaussian":
+        r"""Read a full covariance out as its variances -- the diagonal family's projection.
+
+        This is precisely why the diagonal family is NOT GL(K)-admissible: re-diagonalizing
+        ``g Sigma g^T`` discards the off-diagonal mass a non-diagonal ``g`` creates.
+        """
+        return cls(mu, torch.diagonal(covariance, dim1=-2, dim2=-1))
 
     def block(self, start: int, end: int) -> "DiagonalGaussian":
         return DiagonalGaussian(self.mu[..., start:end], self.sigma[..., start:end])
@@ -339,6 +349,12 @@ class FullGaussian(BeliefParams):
 
     cov_kind = "full"
     dispersion_is_covariance = True
+    gaussian_pointwise_algebra = True
+
+    @classmethod
+    def from_covariance(cls, mu: torch.Tensor, covariance: torch.Tensor) -> "FullGaussian":
+        r"""The full covariance IS this family's stored dispersion -- an exact readout."""
+        return cls(mu, covariance)
 
     def __init__(
         self,

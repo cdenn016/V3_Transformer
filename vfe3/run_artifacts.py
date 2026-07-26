@@ -3948,11 +3948,10 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             if isinstance(v, (int, float)) and math.isfinite(v):
                 return float(v)
         return None
-    from vfe3.geometry.groups import get_group
+    from vfe3.geometry.groups import declared_invariant_families
     from vfe3.geometry.transport import get_transport_registration
 
-    group_builder = get_group(cfg.gauge_group)
-    invariant_families = tuple(getattr(group_builder, "invariant_families", ()))
+    invariant_families = declared_invariant_families(cfg.gauge_group)
     family_group_invariant = cfg.family in invariant_families
     transport_registration = get_transport_registration(cfg.transport_mode)
     fixed_prior_surrogate = bool(cfg.precision_weighted_attention)

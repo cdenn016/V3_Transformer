@@ -131,7 +131,7 @@ def test_so_n_builder_errors():
 
 def test_so_n_full_gaussian_admissible():
     grp = get_group("so_n")(9, group_n=3, irrep_spec=[("l0", 1), ("l1", 1), ("l2", 1)])
-    assert check_admissible(grp, "gaussian", n_samples=4) is True
+    assert check_admissible(grp, "gaussian_full", n_samples=4) is True
 
 
 # ---------------------------------------------------------------- per-head tau
