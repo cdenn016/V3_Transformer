@@ -261,3 +261,42 @@ energy clamp. Three things in order:
 
 R-5 is a design question rather than a bug and should be settled last, on evidence: at `d_head = 10`
 there is no `rope_base` that produces a monotone kernel.
+
+---
+
+## Follow-up, same day: R-1 confirmed by re-run, and it unmasked R-4
+
+Re-running with `oracle_unroll_grad=True` and nothing else changed took the rope arm from **339.73 to
+163.99** test PPL. Every predicted downstream effect resolved:
+
+| `pos_rot` | `pos_phi` | `oracle_unroll_grad` | PPL | `phi_embed` std | `guard_energy_klmax_frac` | `gauge_invariant_spread` | wall (s) |
+|---|---|---|---|---|---|---|---|
+| none | learned | – | 138.40 | 0.232 | 0.000 | 6.96 | 1521 |
+| none | learned | – | 141.38 | 0.228 | 0.000 | 7.46 | 1728 |
+| rope | none | **True** | **163.99** | **0.236** | **0.000** | 1.95 | 1782 |
+| rope | none | False | 339.73 | 0.060 | 0.936 | 0.33 | 1378 |
+
+The gauge table trains (0.060 to 0.236, inside the 0.228-0.246 band of every healthy run) and R-2's
+`kl_max` saturation went 0.936 to **0.000**, so it was entirely downstream of the freeze rather than an
+independent defect. Cost of the flag is about **+3%** wall against the comparable gradient-route run
+(1782 vs 1728 s); the frozen run's 1378 s was fast only because a whole parameter group was inert.
+
+**R-4 measured on the trained checkpoint.** With the frame now at std 0.236 instead of pinned at 0.060,
+the left-insertion contamination was re-measured directly rather than extrapolated. Periodic token
+content with period 8, belief moments held constant across positions so every residual is positional; a
+relative scheme must satisfy `E[i+P, j+P] == E[i, j]`:
+
+| variant | mean abs dE | E std | ratio | max row TV(beta) |
+|---|---|---|---|---|
+| no rope (control) | 0.0000 | 1.7012 | 0.000 | 0.0000 |
+| SHIPPED `R_i O R_j^T` | 2.1731 | 3.1337 | **0.693** | **0.3250** |
+| PROPOSED `O R_i R_j^T` | 0.0000 | 3.2226 | 0.000 | 0.0000 |
+
+The control reading exactly 0.0000 validates the harness; the proposed right insertion reaching exactly
+0.0000 on the SAME trained weights proves the placement is the sole cause. 69% of the pair energy's
+spread is absolute-position contamination, and up to a third of the attention mass in a row moves for
+content that did not change — worse than the 56% the synthetic-phi probe projected at this frame size.
+
+So the ordering is now established rather than conjectured: R-1 held the frame at 0.060 where R-4 was
+mild (21%), and fixing R-1 scaled R-4 up to dominant (69%). The residual 163.99 vs 141.38 gap is R-4's
+prime suspect, still confounded with `pos_phi='none'` until the control in step 2 below is run.
