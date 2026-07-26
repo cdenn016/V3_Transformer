@@ -300,3 +300,46 @@ content that did not change — worse than the 56% the synthetic-phi probe proje
 So the ordering is now established rather than conjectured: R-1 held the frame at 0.060 where R-4 was
 mild (21%), and fixing R-1 scaled R-4 up to dominant (69%). The residual 163.99 vs 141.38 gap is R-4's
 prime suspect, still confounded with `pos_phi='none'` until the control in step 2 below is run.
+
+---
+
+## The control lands: rope contributes approximately nothing, and `pos_phi` was the whole gap
+
+The missing control from step 2 above was run. It is a TRUE single-field change from the fixed rope
+arm -- only `pos_rotation` differs (rope -> none); `pos_phi='none'`, `oracle_unroll_grad=True`,
+`e_step_update='gradient'`, `n_layers=1`, `seed=6` are identical.
+
+| `pos_phi` | `pos_rotation` | `oracle_unroll_grad` | `e_step` | test PPL | val PPL |
+|---|---|---|---|---|---|
+| learned | none | False | mm_exact | **138.40** | 139.30 |
+| learned | none | False | mm_exact (2 layers) | 139.97 | 140.34 |
+| learned | none | False | gradient | **141.38** | 142.09 |
+| learned | none | False | mm_exact, `use_head_mixer=False` | 148.25 | 149.52 |
+| none | **rope** | True | gradient | **163.99** | 166.19 |
+| none | none | True | gradient | **164.12** | 167.43 |
+| none | rope | False | gradient | 339.73 | 337.98 |
+
+**Rope buys 0.13 test PPL (and 1.24 val).** Against the gradient-route baseline the rope arm is
++22.6 PPL, and the control shows essentially all of it is the loss of `pos_phi='learned'`, not rope.
+The learned positional gauge is load-bearing to the tune of ~22.7 PPL and rope does not replace it.
+
+> [!note] No seed replicate exists anywhere in this set, so the noise floor is unmeasured and a
+> 0.13 PPL difference cannot be called nonzero. Rope is marginally ahead on BOTH splits, which is
+> weakly suggestive, but the honest statement is that rope's effect is too small to resolve. Note
+> also that the two nominally-identical baseline rows differ only in `use_head_mixer` (the
+> `ema_decay` difference is inert at `use_ema=False`), so that 10-PPL spread is a real ablation,
+> not run-to-run variance -- it says the head mixer is worth ~10 PPL and says nothing about noise.
+
+**This does not vindicate the rope implementation.** "Rope adds nothing" is equally consistent with
+all three of the open findings, and the control cannot separate them:
+
+- R-4, the left insertion, puts 69% of the rotary energy into absolute-position contamination
+  (measured on the trained checkpoint), so a correct rope might carry real signal this one destroys.
+- The `causal_alibi_noself` prior at `alibi_slope=1.0` may already supply whatever positional
+  information the model can use, making any rope redundant.
+- R-5, five frequency bands at `d_head=10`, may be too coarse to encode usable position at all.
+
+**The decisive experiment is now R-4.** Fixing the insertion and re-running is the only way to tell
+"rope is broken here" from "rope is redundant here". If the corrected rope still lands near 164, the
+direction closes on evidence and rope can be retired as a positional mechanism at this scale. If it
+moves toward 141, the placement bug was the blocker the whole time.
