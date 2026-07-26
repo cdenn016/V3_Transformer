@@ -150,7 +150,13 @@ def _load_worker_config(run_dir: Path) -> VFE3Config:
 
 def _render_saved_probe_figures(run_dir: Path, logger: logging.Logger) -> List[Path]:
     """Render every persisted depth/phi probe, isolating one failed plot from the next."""
-    from vfe3.viz.figures import plot_estep_depth_sensitivity, plot_phi_numerics_reference
+    from vfe3.viz.figures import (
+        plot_beta_channel_decomposition,
+        plot_context_sensitivity,
+        plot_estep_character,
+        plot_estep_depth_sensitivity,
+        plot_phi_numerics_reference,
+    )
 
     saved_probes = (
         (
@@ -158,6 +164,13 @@ def _render_saved_probe_figures(run_dir: Path, logger: logging.Logger) -> List[P
             "estep_depth_sensitivity.png",
             plot_estep_depth_sensitivity,
         ),
+        ("estep_character.json", "estep_character.png", plot_estep_character),
+        (
+            "beta_channel_decomposition.json",
+            "beta_channel_decomposition.png",
+            plot_beta_channel_decomposition,
+        ),
+        ("context_sensitivity.json", "context_sensitivity.png", plot_context_sensitivity),
         ("phi_numerics.json", "phi_numerics_reference.png", plot_phi_numerics_reference),
     )
     written: List[Path] = []
