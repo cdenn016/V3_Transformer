@@ -373,7 +373,7 @@ def test_phi_twohop_gradient_matches_scalar_free_energy(decoupled_rope):
     n = mu.shape[0]
     kw = dict(tau=1.3, lambda_beta=0.7, lambda_twohop=0.2, log_prior=log_prior)
     if decoupled_rope:
-        kw.update(rope=_rope_for(group, n, phi), rope_on_value=False)
+        kw.update(rope=_rope_for(group, n, phi), rope_on_value=False, rope_insertion="left")
 
     phi_loss = phi.clone().requires_grad_(True)
     loss = phi_alignment_loss(mu, sigma, phi_loss, group, **kw)
@@ -400,7 +400,7 @@ def test_phi_twohop_zero_weight_is_exact_identity(decoupled_rope):
     phi_ext = phi.clone().requires_grad_(True)
     ext = phi_alignment_loss(mu, sigma, phi_ext, group, tau=tau, lambda_beta=lambda_beta,
                              lambda_twohop=0.0, log_prior=log_prior,
-                             rope=rope, rope_on_value=rope_on_value)
+                             rope=rope, rope_on_value=rope_on_value, rope_insertion="left")
     grad_ext, = torch.autograd.grad(ext, phi_ext)
 
     phi_old = phi.clone().requires_grad_(True)
@@ -494,8 +494,7 @@ def _scorer_F(m, belief, context, *, mode) -> float:
             link_soft_cap=cfg.link_soft_cap, clamp_monitor=cfg.transport_clamp_monitor,
             transport_mean_per_head=True, rope=context.rope,
             rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
-            exp_fp64_mode=cfg.exp_fp64_mode, exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
-        )
+            exp_fp64_mode=cfg.exp_fp64_mode, exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold, rope_insertion="left")
         if cfg.lambda_h > 0.0 or cfg.lambda_gamma > 0.0:
             s_belief = (
                 (context.prior.s_mu, context.prior.s_sigma)

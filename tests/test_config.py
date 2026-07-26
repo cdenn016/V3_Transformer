@@ -214,8 +214,7 @@ def test_gauge_transport_off_rejects_rope():
     """A RoPE rotation folded into the transport makes Omega != I, so it is incompatible with the
     Omega=I contract of gauge_transport='off'."""
     with pytest.raises(ValueError, match="pos_rotation"):
-        VFE3Config(gauge_transport="off", pos_rotation="rope")
-        rope_insertion="left",   # legacy composition under test
+        VFE3Config(gauge_transport="off", pos_rotation="rope", rope_insertion="left")
 
 
 def test_gauge_transport_off_rejects_regime_ii():
@@ -725,8 +724,7 @@ def test_rope_with_sp_gauge_warns_structure_group():
     # transport leaves the symplectic group. The GL(K)-congruence divergence invariance survives, so
     # this is a WARNING (not an error): the operator is still a valid GL(K) element, just not in Sp.
     with pytest.warns(UserWarning, match="symplectic"):
-        VFE3Config(gauge_group="sp", pos_rotation="rope")
-        rope_insertion="left",   # legacy composition under test
+        VFE3Config(gauge_group="sp", pos_rotation="rope", rope_insertion="left")
 
 
 def test_tied_block_glk_rejects_killing_per_block():
@@ -1158,8 +1156,7 @@ def test_rope_warning_names_only_registered_positional_modes():
     from vfe3.model.positional_phi import _POS_PHI
 
     with pytest.warns(UserWarning) as caught:
-        VFE3Config(pos_rotation="rope")
-        rope_insertion="left",   # legacy composition under test
+        VFE3Config(pos_rotation="rope", rope_insertion="left")
     messages = " ".join(str(item.message) for item in caught)
 
     assert "sinusoidal" not in messages

@@ -140,8 +140,7 @@ def test_free_energy_terms_metric_forwards_all_knobs():
 
 def test_rope_warns_gauge_fixing_for_every_group():
     with pytest.warns(UserWarning, match="gauge-FIXING"):
-        VFE3Config(embed_dim=4, n_heads=2, pos_rotation="rope")
-        rope_insertion="left",   # legacy composition under test
+        VFE3Config(embed_dim=4, n_heads=2, pos_rotation="rope", rope_insertion="left")
 
 
 def test_state_dependent_lambda_h_nontrivial_value_warns():

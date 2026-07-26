@@ -1009,8 +1009,8 @@ def test_compact_full_gauge_rope_covariance_matches_dense_oracle():
     A = torch.randn(N, K, K, generator=gen)
     sigma = A @ A.transpose(-1, -2) + 0.5 * torch.eye(K)
 
-    got = transport_covariance(RopeTransport(compact, rope, on_cov=True), sigma, insertion="left")
-    expected = transport_covariance(RopeTransport(dense, rope, on_cov=True), sigma, insertion="left")
+    got = transport_covariance(RopeTransport(compact, rope, on_cov=True, insertion="left"), sigma)
+    expected = transport_covariance(RopeTransport(dense, rope, on_cov=True, insertion="left"), sigma)
     assert torch.allclose(got, expected, atol=2e-5, rtol=1e-5)
 
 

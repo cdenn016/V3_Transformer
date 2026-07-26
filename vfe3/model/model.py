@@ -931,8 +931,7 @@ class VFEModel(nn.Module):
             rope=rope,
             rope_on_cov=cfg.rope_full_gauge,
             rope_on_value=cfg.rope_on_value,
-            prebuilt_transport=prebuilt_transport,
-        )
+            prebuilt_transport=prebuilt_transport, rope_insertion=cfg.rope_insertion)
         return out.mu, out.sigma
 
     @torch.no_grad()
@@ -1125,7 +1124,8 @@ class VFEModel(nn.Module):
                 transport_state=transport_state,
                 e_step_gradient=e_step_gradient,
                 rope=rope, rope_on_cov=self.cfg.rope_full_gauge,
-                rope_on_value=self.cfg.rope_on_value, training=training,
+                rope_on_value=self.cfg.rope_on_value, rope_insertion=self.cfg.rope_insertion,
+                training=training,
                 capture=capture, grad_record=grad_rec,
                 transport_status=self._transport_status,
                 prebuilt_transport=shared_omega,
@@ -1285,6 +1285,7 @@ class VFEModel(nn.Module):
                 clamp_monitor=cfg.transport_clamp_monitor,
                 transport_mean_per_head=True,
                 rope=context.rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+                rope_insertion=cfg.rope_insertion,
                 exp_fp64_mode=cfg.exp_fp64_mode, exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
                 transport_chart_max_norm=cfg.transport_chart_max_norm,
                 transport_status=self._transport_status,
@@ -1878,6 +1879,7 @@ class VFEModel(nn.Module):
                                        rope=self._rope_rotation(n_pos, token_ids.device),
                                        rope_on_cov=cfg.rope_full_gauge,
                                        rope_on_value=cfg.rope_on_value,
+                                       rope_insertion=cfg.rope_insertion,
                                        validity_max_norm=cfg.transport_chart_max_norm,
                                        exactness_out=self._transport_status,
                                        **self._model_channel_transport_kwargs())
@@ -2142,6 +2144,7 @@ class VFEModel(nn.Module):
             lambda_beta=self.cfg.lambda_beta,
             transport_state=self.transport_state,
             rope=rope, rope_on_cov=self.cfg.rope_full_gauge, rope_on_value=self.cfg.rope_on_value,
+            rope_insertion=self.cfg.rope_insertion,
             transport_status=self._transport_status,
             gauge_parameterization=self.cfg.gauge_parameterization,
             kappa_beta_override=self.effective_kappa_beta(belief.mu.device),
@@ -2708,8 +2711,7 @@ class VFEModel(nn.Module):
                 capture=cap,
                 transport_status=self._transport_status,
                 gauge_parameterization=cfg.gauge_parameterization,
-                kappa_beta_override=self.effective_kappa_beta(belief.mu.device),
-            )
+                kappa_beta_override=self.effective_kappa_beta(belief.mu.device), rope_insertion=cfg.rope_insertion)
         else:
             snapshot = self._validate_diagnostic_snapshot(token_ids, snapshot)
             belief = _sequence_belief(snapshot.initial_belief)
@@ -3262,8 +3264,7 @@ class VFEModel(nn.Module):
                 # query_adaptive_tau replay fidelity: the ENTERING belief's per-query tau, exactly as
                 # vfe_stack passes the forward E-step; OFF path returns _base_tau (value-identical to
                 # the tau vfe_block would compute itself).
-                tau=self._beta_tau(belief.sigma, belief.mu, _base_tau),
-            )
+                tau=self._beta_tau(belief.sigma, belief.mu, _base_tau), rope_insertion=cfg.rope_insertion)
             if score_at == "converged":
                 maps.append(_score(belief))                          # (H, N, N) at the block OUTPUT
 
@@ -3364,6 +3365,7 @@ class VFEModel(nn.Module):
                     lambda_beta=cfg.lambda_beta,
                     transport_state=self.transport_state,
                     rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+                    rope_insertion=cfg.rope_insertion,
                     transport_status=self._transport_status,
                     gauge_parameterization=cfg.gauge_parameterization,
                     tau=self._beta_tau(belief.sigma, belief.mu, _tau),

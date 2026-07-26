@@ -303,8 +303,7 @@ def test_phi_gradient_matches_scalar_f_under_decoupled_rope() -> None:
     loss = phi_alignment_loss(
         mu, sigma, phi_loss, group,
         tau=tau, lambda_beta=lambda_beta, log_prior=log_prior,
-        rope=rope, rope_on_value=False,
-    )
+        rope=rope, rope_on_value=False, rope_insertion="left")
     grad_loss, = torch.autograd.grad(loss, phi_loss)
 
     phi_scalar = phi.clone().requires_grad_(True)
@@ -312,8 +311,7 @@ def test_phi_gradient_matches_scalar_f_under_decoupled_rope() -> None:
         BeliefState(mu=mu, sigma=sigma, phi=phi_scalar),
         mu_p, sigma_p, group,
         tau=tau, lambda_beta=lambda_beta, log_prior=log_prior,
-        rope=rope, rope_on_value=False,
-    )
+        rope=rope, rope_on_value=False, rope_insertion="left")
     grad_scalar, = torch.autograd.grad(scalar, phi_scalar)
 
     torch.testing.assert_close(grad_loss, grad_scalar, atol=2e-5, rtol=2e-5)
@@ -341,8 +339,7 @@ def test_phi_gradient_matches_scalar_f_with_mixed_reflection() -> None:
     loss = phi_alignment_loss(
         mu, sigma, phi_loss, group,
         tau=tau, lambda_beta=lambda_beta, log_prior=log_prior,
-        rope=rope, rope_on_value=False, reflection=reflection,
-    )
+        rope=rope, rope_on_value=False, reflection=reflection, rope_insertion="left")
     grad_loss, = torch.autograd.grad(loss, phi_loss)
 
     phi_scalar = phi.clone().requires_grad_(True)
@@ -350,8 +347,7 @@ def test_phi_gradient_matches_scalar_f_with_mixed_reflection() -> None:
         BeliefState(mu=mu, sigma=sigma, phi=phi_scalar, reflection=reflection),
         mu_p, sigma_p, group,
         tau=tau, lambda_beta=lambda_beta, log_prior=log_prior,
-        rope=rope, rope_on_value=False,
-    )
+        rope=rope, rope_on_value=False, rope_insertion="left")
     grad_scalar, = torch.autograd.grad(scalar, phi_scalar)
 
     torch.testing.assert_close(grad_loss, grad_scalar, atol=2e-5, rtol=2e-5)

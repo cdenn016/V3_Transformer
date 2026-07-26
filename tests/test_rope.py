@@ -113,6 +113,7 @@ def test_global_free_energy_rope_matches_certified_compact_oracle(
     kwargs = {
         "tau": 1.3,
         "rope": rope,
+        "rope_insertion": "left",   # legacy composition under test
         "rope_on_cov": True,
         "compact_phi_block_transport": True,
         "transport_mean_per_head": True,
@@ -148,6 +149,7 @@ def test_free_energy_rope_certificate_is_global_only(
     kwargs = {
         "tau": 1.3,
         "rope": rope,
+        "rope_insertion": "left",   # legacy composition under test
         "rope_on_cov": True,
         "compact_phi_block_transport": True,
         "transport_mean_per_head": True,
@@ -179,15 +181,13 @@ def _rope_cfg(**kw):
 
 
 def test_rope_cache_key_tracks_mutated_rope_base():
-    model = VFEModel(_rope_cfg(pos_rotation="rope", rope_base=100.0, n_heads=1))
-    rope_insertion="left",   # legacy composition under test
+    model = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left", rope_base=100.0, n_heads=1))
     device = model.prior_bank.mu_embed.device
     first = model._rope_rotation(8, device)
 
     model.cfg.rope_base = 2.0
     second = model._rope_rotation(8, device)
-    fresh = VFEModel(_rope_cfg(pos_rotation="rope", rope_base=2.0, n_heads=1))._rope_rotation(8, device)
-    rope_insertion="left",   # legacy composition under test
+    fresh = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left", rope_base=2.0, n_heads=1))._rope_rotation(8, device)
 
     assert not torch.equal(first, second)
     assert torch.equal(second, fresh)
@@ -210,8 +210,7 @@ def test_rope_cache_key_tracks_mutated_pos_rotation():
         )
 
     try:
-        model = VFEModel(_rope_cfg(pos_rotation="rope"))
-        rope_insertion="left",   # legacy composition under test
+        model = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left"))
         device = model.prior_bank.mu_embed.device
         first = model._rope_rotation(8, device)
 
@@ -225,8 +224,7 @@ def test_rope_cache_key_tracks_mutated_pos_rotation():
 
 
 def test_runtime_length_caches_retain_only_the_latest_shape():
-    model = VFEModel(_rope_cfg(pos_rotation="rope", n_heads=1))
-    rope_insertion="left",   # legacy composition under test
+    model = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left", n_heads=1))
     device = model.prior_bank.mu_embed.device
 
     for length in range(1, model.cfg.max_seq_len + 1):
@@ -241,8 +239,7 @@ def test_rope_changes_logits_vs_no_rope():
     torch.manual_seed(0)
     x = torch.randint(0, 6, (2, 8))
     base = VFEModel(_rope_cfg(pos_rotation="none"))
-    roped = VFEModel(_rope_cfg(pos_rotation="rope"))
-    rope_insertion="left",   # legacy composition under test
+    roped = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left"))
     roped.load_state_dict(base.state_dict())
     assert not torch.allclose(base(x), roped(x), atol=1e-5)   # RoPE perturbs attention -> logits
 
@@ -251,8 +248,7 @@ def test_attention_maps_reflect_rope():
     torch.manual_seed(0)
     x = torch.randint(0, 6, (1, 8))
     base = VFEModel(_rope_cfg(pos_rotation="none"))
-    roped = VFEModel(_rope_cfg(pos_rotation="rope"))
-    rope_insertion="left",   # legacy composition under test
+    roped = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left"))
     roped.load_state_dict(base.state_dict())
     a = base.attention_maps(x)
     b = roped.attention_maps(x)
@@ -267,8 +263,7 @@ def test_diagnostics_runs_under_rope():
     # (abs(v) < inf is False for both +/-inf and NaN).
     torch.manual_seed(0)
     x = torch.randint(0, 6, (1, 8))
-    roped = VFEModel(_rope_cfg(pos_rotation="rope"))
-    rope_insertion="left",   # legacy composition under test
+    roped = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left"))
     diag = roped.diagnostics(x)
     assert diag and all(abs(v) < float("inf") for v in diag.values())
 
@@ -318,7 +313,7 @@ def test_rope_full_gauge_covariance_equals_manual_sandwich():
     omega = torch.randn(N, N, K, K, dtype=torch.float64)
     A = torch.randn(N, K, K, dtype=torch.float64)
     sigma = A @ A.transpose(-1, -2) + K * torch.eye(K, dtype=torch.float64)   # SPD full cov
-    got = transport_covariance(RopeTransport(base=omega, rope=R, on_cov=True), sigma, insertion="left")
+    got = transport_covariance(RopeTransport(base=omega, rope=R, on_cov=True, insertion="left"), sigma)
     Op = torch.einsum("ikl,ijlm,jnm->ijkn", R, omega, R)                      # R_i Omega_ij R_j^T
     manual = torch.einsum("ijkl,jlm,ijnm->ijkn", Op, sigma, Op)
     assert torch.allclose(got, manual, atol=1e-9)
@@ -326,8 +321,7 @@ def test_rope_full_gauge_covariance_equals_manual_sandwich():
 
 def test_full_gauge_model_runs_forward_backward():
     # Reachability: a full-covariance rope_full_gauge model trains (finite gradients) end to end.
-    cfg = _full_cov_cfg(pos_rotation="rope", rope_full_gauge=True)
-    rope_insertion="left",   # legacy composition under test
+    cfg = _full_cov_cfg(pos_rotation="rope", rope_insertion="left", rope_full_gauge=True)
     torch.manual_seed(0)
     m = VFEModel(cfg)
     x = torch.randint(0, 6, (1, 6)); y = torch.randint(0, 6, (1, 6))
@@ -357,10 +351,8 @@ def test_rope_on_value_false_decouples_and_changes_logits():
     # different forward than the coherent single-gauge default -- the value aggregation drops RoPE.
     torch.manual_seed(0)
     x = torch.randint(0, 6, (2, 8))
-    coupled = VFEModel(_rope_cfg(pos_rotation="rope", rope_on_value=True))
-    rope_insertion="left",   # legacy composition under test
-    decoupled = VFEModel(_rope_cfg(pos_rotation="rope", rope_on_value=False))
-    rope_insertion="left",   # legacy composition under test
+    coupled = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left", rope_on_value=True))
+    decoupled = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left", rope_on_value=False))
     decoupled.load_state_dict(coupled.state_dict())
     assert not torch.allclose(coupled(x), decoupled(x), atol=1e-5)
 
@@ -380,8 +372,7 @@ def test_rope_on_value_false_model_trains_end_to_end():
     # Decoupled value gauge routes the belief gradient to the autograd oracle; the model must still
     # train (finite loss and prior-table gradients) end to end.
     torch.manual_seed(0)
-    m = VFEModel(_rope_cfg(pos_rotation="rope", rope_on_value=False))
-    rope_insertion="left",   # legacy composition under test
+    m = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left", rope_on_value=False))
     x = torch.randint(0, 6, (1, 8)); y = torch.randint(0, 6, (1, 8))
     _, loss, _ = m(x, y); loss.backward()
     assert torch.isfinite(loss)

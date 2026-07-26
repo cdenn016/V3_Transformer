@@ -332,6 +332,7 @@ def _iter_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor]) -
         transport_status=model._transport_status,
         log_prior=log_prior,
         rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+        rope_insertion=cfg.rope_insertion,
     )
     return kw
 
@@ -356,6 +357,7 @@ def _fe_kwargs(model, log_prior: torch.Tensor, rope: Optional[torch.Tensor] = No
         transport_status=model._transport_status,
         log_prior=log_prior,
         rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+        rope_insertion=cfg.rope_insertion,
     )
     return kw
 
@@ -529,8 +531,7 @@ def belief_ce_bank(
                 kappa_beta_override=model.effective_kappa_beta(device),   # learned tau, not init (audit M1)
                 transport_state=model.transport_state,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
-                gauge_parameterization=cfg.gauge_parameterization,
-            )
+                gauge_parameterization=cfg.gauge_parameterization, rope_insertion=cfg.rope_insertion)
             trs = metrics.sigma_trace(
                 out.sigma,
                 diagonal=cfg.diagonal_covariance,
@@ -667,8 +668,7 @@ def belief_bank(
                 kappa_beta_override=model.effective_kappa_beta(device),   # learned tau, not init (audit M1)
                 transport_state=model.transport_state,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
-                gauge_parameterization=cfg.gauge_parameterization,
-            )
+                gauge_parameterization=cfg.gauge_parameterization, rope_insertion=cfg.rope_insertion)
             b = tokens.shape[0]
             mus.append(_cpu_bank_value(out.mu.reshape(b * n, -1)))
             sigmas.append(_cpu_bank_value(out.sigma.reshape(b * n, *out.sigma.shape[2:])))
@@ -905,8 +905,7 @@ def across_layer_belief_trace(
                 cg_coupling=model.cg_coupling,                       # replay the trained model
                 lambda_beta=cfg.lambda_beta, transport_state=model.transport_state,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
-                gauge_parameterization=cfg.gauge_parameterization,
-            )
+                gauge_parameterization=cfg.gauge_parameterization, rope_insertion=cfg.rope_insertion)
             mus.append(belief.mu)
             sigmas.append(belief.sigma)
             mu_p = (1.0 - rho) * mu_p + rho * belief.mu
@@ -1060,8 +1059,7 @@ def converged_state(
                 transport_state=model.transport_state,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
                 capture=cap,
-                gauge_parameterization=cfg.gauge_parameterization,
-            )
+                gauge_parameterization=cfg.gauge_parameterization, rope_insertion=cfg.rope_insertion)
         else:
             snapshot = model._validate_diagnostic_snapshot(token_ids, snapshot)
             belief = _snapshot_sequence(snapshot.initial_belief)
