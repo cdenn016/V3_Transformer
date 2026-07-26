@@ -110,10 +110,24 @@ def _vertex_log_abs_det(
     (:math:`\det` of a block-diagonal matrix is the product of its blocks).
     """
     from vfe3.geometry.lie_ops import _equal_diag_blocks
-    from vfe3.geometry.transport import CompactFactoredTransport, FactoredTransport
+    from vfe3.geometry.transport import (
+        CompactFactoredTransport,
+        FactoredTransport,
+        RopeTransport,
+    )
+
+    # A gauge-RoPE wrapper rotates by an ORTHOGONAL R (rope.py builds it block-diagonally from 2x2
+    # rotations), so |det(R_i Omega_ij R_j^T)| = |det Omega_ij| and the per-vertex ell_i - ell_j
+    # identity is unchanged. `_certifies_same_frame_flat_cocycle` already recurses into the wrapper
+    # and returns True, so `_pullback_query` takes the fast route -- and then landed on the "no
+    # vertex factors" raise below, making family='gaussian_diagonal_exact' + pos_rotation='rope' a
+    # config-accepted first-forward crash (audit 2026-07-26 E-02). Unwrap to the base instead.
+    if isinstance(omega, RopeTransport):
+        omega = omega.base
 
     if isinstance(omega, CompactFactoredTransport):
         blocks = omega.exp_blocks                                   # (..., N, H_t, d, d)
+        transport_block_dims = [int(blocks.shape[-1])] * int(blocks.shape[-3])
     elif isinstance(omega, FactoredTransport):
         transport_dims = list(omega.irrep_dims)
         if len(set(transport_dims)) != 1:
@@ -122,6 +136,7 @@ def _vertex_log_abs_det(
                 f"determinants; got irrep_dims={transport_dims}")
         blocks = _equal_diag_blocks(                                # (..., N, H_t, d, d)
             omega.exp_phi, len(transport_dims), transport_dims[0])
+        transport_block_dims = list(transport_dims)
     else:
         raise TypeError(f"no vertex factors on transport {type(omega).__name__!r}")
 
@@ -129,10 +144,16 @@ def _vertex_log_abs_det(
     n_transport_blocks = ell.shape[-1]
     if len(irrep_dims) == 1:
         return ell.sum(dim=-1, keepdim=True)                        # (..., N, 1) full-K block
-    if len(irrep_dims) != n_transport_blocks:
+    # Compare the block SIZES, not just how many there are (audit 2026-07-26 D-05). Counting alone
+    # let transport blocks [2,2] pair with energy blocks [1,3]: the guard passed, and each block's
+    # log-determinant was then matched to the wrong coordinate slice, returning a silently wrong
+    # divergence (measured max error 11.5) against this family's fail-closed contract. The dense
+    # route already rejected the identical input.
+    if list(irrep_dims) != list(transport_block_dims):
         raise ValueError(
-            f"exact-congruence coupling needs the energy blocks ({len(irrep_dims)}) to match the "
-            f"transport blocks ({n_transport_blocks}); mixed partitions are not supported")
+            f"exact-congruence coupling needs the energy block partition {list(irrep_dims)} to "
+            f"match the transport block partition {list(transport_block_dims)}; mixed partitions "
+            "are not supported because each vertex determinant is sliced per block")
     return ell                                                      # (..., N, H)
 
 
@@ -161,10 +182,14 @@ def _pullback_query(
             raise ValueError(
                 "exact-congruence coupling needs a square token transport, got "
                 f"{tuple(omega.shape)}")
-        inverse = torch.linalg.inv(                                 # (..., N, N, K, K)
-            omega.to(_linalg_dtype(omega.dtype))).to(omega.dtype)
-        a = torch.einsum("...ijkl,...il->...ijk", inverse, mu_q)
-        s_tilde = torch.einsum("...ijkl,...il->...ijk", inverse ** 2, sigma_q)
+        # Keep the inverse at linalg precision (audit 2026-07-26 C-06). Casting it back to the
+        # caller's dtype before `inverse ** 2` squares the rounding error: measured s_tilde relative
+        # error 9.4e-03 with the cast-back against 2.2e-07 without, and up to 0.235 nats of energy
+        # error. `_slogdet` deliberately returns at fp32 for the same reason.
+        work = _linalg_dtype(omega.dtype)
+        inverse = torch.linalg.inv(omega.to(work))                  # (..., N, N, K, K)
+        a = torch.einsum("...ijkl,...il->...ijk", inverse, mu_q.to(work))
+        s_tilde = torch.einsum("...ijkl,...il->...ijk", inverse ** 2, sigma_q.to(work))
         if len(irrep_dims) == 1:
             log_abs_det = _slogdet(omega).unsqueeze(-1)                         # (..., N, N, 1)
         else:
@@ -212,6 +237,17 @@ class ExactCongruenceDiagonalGaussian(DiagonalGaussian):
 
     cov_kind = "diagonal"
     dispersion_is_covariance = True
+    # Pointwise algebra is DiagonalGaussian's, unchanged: only coupling_energy is overridden, so the
+    # Gaussian moment-matched barycenter and the fixed alpha=1 KL decode kernels are exact here
+    # (audit 2026-07-26 E-04) -- inherited True, restated because the scope declarations below are the
+    # point of this block.
+    gaussian_pointwise_algebra = True
+    # The module SCOPE section, declared for config validation (audit 2026-07-26 E-03): the pullback
+    # identity is KL-specific, and it needs Omega_ij^{-1} -- from the pair transpose of a certified
+    # cocycle, or by inverting a dense operator. A direct-link container offers neither, and reached
+    # `_pullback_query`'s TypeError only at the first forward.
+    requires_kl_divergence = True
+    transport_requirement = "pair_inverse"
 
     def block(self, start: int, end: int) -> "ExactCongruenceDiagonalGaussian":
         return ExactCongruenceDiagonalGaussian(

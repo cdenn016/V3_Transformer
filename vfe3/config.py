@@ -412,6 +412,7 @@ class VFE3Config:
     s_e_step:                  bool  = False
     e_s_mu_lr:                 float = 0.1
     e_s_sigma_lr:              float = 0.1
+    
     # Model-channel refine depth. None (default) = follow n_e_steps, which is byte-identical to the
     # historical behavior. Set it to drive the s-channel E-step INDEPENDENTLY of the belief E-step:
     # the two loops both read n_e_steps (model.py::_refine_s and model/block.py::vfe_block), and
@@ -1446,6 +1447,33 @@ class VFE3Config:
         from vfe3.divergence import divergence_families, family_cov_kind
         _require(self.family, divergence_families(), "family")
         family_is_diagonal = family_cov_kind(self.family) == "diagonal"
+        # Family SCOPE gate (audit 2026-07-26 E-03). A family whose coupling energy is defined only on
+        # part of the config space declares that scope on its class; reject an unsupported pairing HERE
+        # rather than at the first forward, where `ablation.py` catches config errors only around
+        # `VFE3Config(**cfg_dict)` and a mid-forward raise falls to the outer handler and is misfiled as
+        # error_kind="train". Both checks read the family and transport REGISTRIES, so a newly
+        # registered family or transport is covered without editing this validator.
+        from vfe3.families.base import get_family
+        _family_cls = get_family(self.family)
+        if _family_cls.requires_kl_divergence and (
+                self.divergence_family != "renyi" or self.renyi_order != 1.0):
+            raise ValueError(
+                f"family={self.family!r} implements its coupling energy for KL only "
+                f"(divergence_family='renyi', renyi_order=1.0); got "
+                f"divergence_family={self.divergence_family!r}, renyi_order={self.renyi_order}. "
+                f"Use family='gaussian_diagonal' for a noncanonical divergence."
+            )
+        if _family_cls.transport_requirement != "any":
+            from vfe3.geometry.transport import get_transport_registration
+            _registration = get_transport_registration(self.transport_mode)
+            if not _registration.satisfies(_family_cls.transport_requirement):
+                raise ValueError(
+                    f"family={self.family!r} needs a "
+                    f"{_family_cls.transport_requirement!r} pairwise transport, but "
+                    f"transport_mode={self.transport_mode!r} provides "
+                    f"{_registration.pair_transport_kind!r}. Use transport_mode='flat', or a family "
+                    f"whose coupling energy consumes this transport (e.g. 'gaussian_diagonal')."
+                )
 
         # free-energy coupling
         for _name in ("kappa_beta", "kappa_gamma"):
@@ -1587,12 +1615,18 @@ class VFE3Config:
         # families (gaussian_diagonal diagonal moments, gaussian_full full moments, PB-11); a
         # non-Gaussian family (e.g. laplace_diagonal) has no registered barycenter, so reject the
         # pair at construction (before model build) rather than silently mis-updating r.
-        if self.r_update_mode == "barycenter" and self.family not in ("gaussian_diagonal", "gaussian_full"):
+        # Keyed off the family's declared `gaussian_pointwise_algebra`, not a name literal (audit
+        # 2026-07-26 E-04): `barycenter_r_` branches only on cov_kind and implements the Gaussian
+        # moment match, so it is exact for ANY family whose pointwise law is Gaussian -- including the
+        # two registered in 2026-07, which override only their transport/coupling seams and inherit
+        # DiagonalGaussian's moments verbatim. The old literal rejected them for no reason and made
+        # registering a Gaussian family require editing this file.
+        if self.r_update_mode == "barycenter" and not _family_cls.gaussian_pointwise_algebra:
             raise ValueError(
                 f"r_update_mode='barycenter' has no registered closed-form barycenter for "
-                f"family={self.family!r}: the moment-matched m-projection is implemented only for the "
-                f"Gaussian families (gaussian_diagonal, gaussian_full). Use r_update_mode='gradient' "
-                f"for {self.family!r}."
+                f"family={self.family!r}: the moment-matched m-projection is implemented only for a "
+                f"family whose pointwise law is Gaussian (gaussian_pointwise_algebra). Use "
+                f"r_update_mode='gradient' for {self.family!r}."
             )
         # A per-coordinate alpha form (state_dependent_per_coord) weights each coordinate's
         # self-divergence by its own alpha^(k), which needs a per-coordinate self-divergence.
@@ -2109,7 +2143,10 @@ class VFE3Config:
         # enforces family_cov_kind(family) in registration.covariance_kinds.
         if self.use_prior_bank:
             noncanonical = self.renyi_order != 1.0 or self.divergence_family != "renyi"
-            non_gaussian = self.family not in ("gaussian_diagonal", "gaussian_full")
+            # Same registry query as the barycenter gate above (audit 2026-07-26 E-04): what the fast
+            # decode kernels assume is the Gaussian POINTWISE readout, which a family overriding only
+            # its coupling/transport seams still satisfies.
+            non_gaussian = not _family_cls.gaussian_pointwise_algebra
             if (noncanonical or non_gaussian) and not decode_registration.family_consistent:
                 raise ValueError(
                     f"use_prior_bank=True with family={self.family!r}/"
@@ -2607,6 +2644,52 @@ class VFE3Config:
                     "gamma_as_beta_prior=True requires lambda_gamma > 0 (the model-channel s "
                     f"tables and gamma energy must exist), got lambda_gamma={self.lambda_gamma}"
                 )
+            # Causal-support gate (audit 2026-07-26 E-01). model._fold_gamma_prior normalizes gamma
+            # over its OWN key row and only then masks the mixture to beta's support. A convex mixture
+            # is not proportional to a single exponential, so gamma's row normalizer Z_i does not
+            # cancel: when gamma may attend a key j > i that beta forbids, that future key enters Z_i
+            # and changes the belief log-prior at STRICTLY PAST entries. Measured on log_prior[i<4,
+            # j<=i] for two sequences differing only in the last token (beta='causal', K=4, N=6):
+            # gamma='causal' 0.0 and 'causal_alibi_noself' 0.0, against 'uniform' 4.8e-07,
+            # 'alibi' 4.8e-07, 'windowed' 5.9e-05. Under s_e_step the leak is worse than the
+            # normalizer alone -- a non-causal gamma also refines s_i itself against future tokens,
+            # which no masking at the fold site can undo -- so the combination fails closed here.
+            # The supports are read from the REGISTRY builders at max_seq_len with the same kwargs
+            # model._attention_log_prior passes, so a newly registered prior is covered without
+            # editing this check, and a window-style support is evaluated at the length it is used at.
+            # Only FUTURE keys count: a gamma allowing a past key beta forbids (e.g. the self key,
+            # which beta='causal_alibi_noself' masks and gamma='causal' does not) shifts the mixture
+            # weight but carries no future information, and the shipped configs pair exactly there.
+            import torch
+
+            from vfe3.attention_prior import attention_log_prior
+
+            def _prior_support(_name: str) -> 'torch.Tensor':      # (Nq, Nk) bool allowed set
+                _bias = attention_log_prior(
+                    _name, self.max_seq_len, self.max_seq_len,
+                    device="cpu", dtype=torch.float32,
+                    n_heads=self.n_heads, alibi_slope=self.alibi_slope,
+                    window=self.attention_window,
+                    num_buckets=self.t5_num_buckets, max_distance=self.t5_max_distance,
+                )
+                _allowed = torch.isfinite(_bias)
+                return _allowed.any(dim=0) if _allowed.dim() == 3 else _allowed
+
+            _pos    = torch.arange(self.max_seq_len)
+            _future = _pos.unsqueeze(0) > _pos.unsqueeze(-1)       # (Nq, Nk) keys j > i
+            _leak   = (_prior_support(self.gamma_attention_prior)
+                       & ~_prior_support(self.beta_attention_prior)
+                       & _future)
+            if bool(_leak.any()):
+                raise ValueError(
+                    f"gamma_as_beta_prior=True with gamma_attention_prior="
+                    f"{self.gamma_attention_prior!r} and beta_attention_prior="
+                    f"{self.beta_attention_prior!r} leaks future tokens into the belief attention "
+                    f"prior: gamma allows {int(_leak.sum())} key(s) at j > i that beta forbids, and "
+                    f"gamma's row normalizer does not cancel out of the renormalized mixture. Use a "
+                    f"gamma prior whose future keys are a subset of beta's (e.g. the same causal "
+                    f"prior), or set gamma_as_beta_prior=False."
+                )
         if not (math.isfinite(self.gamma_prior_weight)
                 and 0.0 <= self.gamma_prior_weight <= 1.0):
             raise ValueError(
@@ -2697,6 +2780,22 @@ class VFE3Config:
             _inert.append(f"ema_decay={self.ema_decay} (only read by use_ema=True)")
         if not self.s_e_step and _changed("e_s_mu_lr", "e_s_sigma_lr"):
             _inert.append("e_s_mu_lr/e_s_sigma_lr (only read by s_e_step=True)")
+        # `generate_figures=False` is a wholesale end-of-run probe opt-out (finalize_run gates the
+        # whole mechanism-diagnostic block on it), so the expensive-diagnostics toggle has nothing
+        # to enable there. Silent before the 2026-07-26 audit (B-04/E-09).
+        if self.emit_expensive_diagnostics and not self.generate_figures:
+            _inert.append(
+                "emit_expensive_diagnostics=True with generate_figures=False: the end-of-run "
+                "mechanism probes are gated on generate_figures, so no diagnostic is emitted")
+        # s_e_step_n_iter reaches only model.py::_refine_s, which runs solely under s_e_step.
+        if not self.s_e_step and _changed("s_e_step_n_iter"):
+            _inert.append(
+                f"s_e_step_n_iter={self.s_e_step_n_iter} (only read by s_e_step=True; with the "
+                "model channel off, n_e_steps drives the belief loop alone)")
+        # query_tau_c scales the per-query adaptive temperature, which query_adaptive_tau gates.
+        if not self.query_adaptive_tau and _changed("query_tau_c"):
+            _inert.append(
+                f"query_tau_c={self.query_tau_c} (only read by query_adaptive_tau=True)")
         # A window at or above the context length allows EVERY entry, so the sliding-window prior is
         # byte-identical to plain causal -- measured torch.equal(...) True.
         if (self.beta_attention_prior in ("windowed", "causal_windowed")

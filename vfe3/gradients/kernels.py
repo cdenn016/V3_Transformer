@@ -591,6 +591,30 @@ def mm_exact_update(
                 log_prior=(log_prior.float() if log_prior is not None else None),
             )
 
+    # Route predicate (audit 2026-07-26 D-02). The fusion below is the stationary point of the
+    # diagonal-Gaussian-KL kernel: alpha = 1 is hardcoded (there is no renyi_order argument at all),
+    # the precision expressions are the hand-written diagonal-KL ones, and the grid is built from
+    # ``pairwise_energy`` rather than ``fam.coupling_energy`` -- so a family whose coupling energy is
+    # NOT that truncated form silently received the wrong grid (``gaussian_diagonal_exact`` returned a
+    # mu* bit-identical to ``gaussian_diagonal``), and a non-Renyi divergence drove beta and pair_mask
+    # before being fused with diagonal-Gaussian-KL algebra. The sibling ``belief_gradients`` gates on
+    # this same predicate at :377 and hands an uncovered config to the oracle; there is no oracle for a
+    # closed-form minimizer, so this seam fails closed instead. Both live callers (e_step.py:994,
+    # config.py) already gate, so no shipped config changes. The gradient_mode / entropy / renyi_order
+    # arguments are the values this derivation assumes rather than caller inputs; ``transport_mode`` is
+    # not among this seam's arguments, so the belief-dependent-transport exclusion stays with the
+    # callers that own that name.
+    if not uses_kernel_route(
+            renyi_order=1.0, gradient_mode="filtering", family=family,
+            divergence_family=divergence_family, include_attention_entropy=True,
+            decoupled_value_gauge=(isinstance(omega, RopeTransport) and not omega.on_value)):
+        raise ValueError(
+            f"mm_exact_update is the closed-form minimizer of the diagonal-Gaussian-KL kernel and "
+            f"does not cover family={family!r}, divergence_family={divergence_family!r} "
+            f"(coupled value gauge required); its precision fusion would score one objective and "
+            f"fuse another. Use e_step_update='gradient' for this configuration."
+        )
+
     mu_k, sigma_k = mu.detach(), sigma.detach()
     mu_t    = transport_mean(omega, mu_k)                        # (..., N, N, K) transported keys
     sigma_t = transport_covariance(omega, sigma_k, diagonal_out=(sigma_k.dim() == mu_k.dim()))

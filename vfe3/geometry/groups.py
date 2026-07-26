@@ -9,7 +9,10 @@ Admissibility: a (family, group) pair is valid iff the family's divergence is
 invariant under common pushforward by the group's representation,
 D(rho(g) q || rho(g) p) = D(q || p). For the Gaussian family with the GL(K)
 congruence action (mu -> g mu, Sigma -> g Sigma g^T) this holds for every
-g in G <= GL(K), so every group here is admissible for "gaussian".
+g in G <= GL(K), so every group here is admissible for "gaussian_full" -- the
+one registered family that keeps the whole pushed covariance. A diagonal family
+re-diagonalizes g Sigma g^T and is admissible only for the diagonal-scaling
+subgroup; check_admissible measures which is which, family by family.
 """
 
 from dataclasses import dataclass, field
@@ -154,12 +157,24 @@ class GaugeGroup:
             )
 
     def invariant_for(self, family: str) -> bool:
-        """Whether the divergence of ``family`` is invariant under this group."""
+        """Whether the divergence of ``family`` is invariant under this group.
+
+        The cheap declaration lookup; :func:`check_admissible` is its executable certificate, and
+        ``tests/test_admissibility_verifier.py`` pins the two against each other for every registered
+        (group, family) pair, so the declaration cannot drift from the measured behavior.
+        """
         return family in self.invariant_families
 
 
 _GROUPS: Dict[str, Callable[..., GaugeGroup]] = {}
-_GAUSSIAN_INVARIANT_FAMILIES = ("gaussian", "gaussian_full")
+# Registered family names whose stored-parameter divergence is exactly GL(K)-congruence invariant.
+# The legacy "gaussian" key was DEAD DATA (audit 2026-07-26 E-05): no such family is registered, so it
+# could never match `cfg.family` at the one production consumer (`run_artifacts._pure_path_report`)
+# and only ever masked the fact that the declaration was untested against the registry. The full
+# Gaussian keeps the whole congruence; every diagonal family re-diagonalizes `g Sigma g^T` and is
+# admissible only for the diagonal-scaling subgroup. `check_admissible` verifies this list executably,
+# and `test_admissibility_verifier` pins declaration against verifier for every registered pair.
+_GAUSSIAN_INVARIANT_FAMILIES = ("gaussian_full",)
 
 
 def register_group(
@@ -353,9 +368,19 @@ def _build_so_k(
     )
 
 
+def declared_invariant_families(group_name: str) -> Tuple[str, ...]:
+    r"""The ``invariant_families`` declaration of the group registered under ``group_name``.
+
+    Reads the declaration WITHOUT building the group (the builder carries it as an attribute), so a
+    run-artifact purity report can consult it without materializing generators. The single production
+    reader of the declaration; :meth:`GaugeGroup.invariant_for` is the same lookup on a built group.
+    """
+    return tuple(getattr(get_group(group_name), "invariant_families", ()))
+
+
 def check_admissible(
     group:      GaugeGroup,
-    family:     str   = "gaussian",
+    family:     str   = "gaussian_full",
 
     *,
     functional: str   = "renyi",
@@ -376,12 +401,21 @@ def check_admissible(
     sample, else ``False`` -- so it turns ``GaugeGroup.invariant_for``'s string declaration into a
     verified invariant and catches a wrongly-declared ``invariant_families``.
 
-    The representation is family-specific. The FULL Gaussian uses the GL(K) congruence
-    ``mu -> g mu, Sigma -> g Sigma g^T``, under which the divergence is invariant for every
-    ``g in GL(K)``. The DIAGONAL Gaussian re-diagonalizes ``g Sigma g^T``, which is NOT invariant
-    under a non-diagonal ``g`` (the verifier returns ``False``, correctly) -- the diagonal family is
-    admissible only for the diagonal-scaling subgroup. A family with no implemented representation
-    raises ``NotImplementedError`` (the extension point: expose its pushforward to widen this check).
+    The congruence itself is family-INDEPENDENT; what varies is how the family reads the pushed
+    covariance back into its own dispersion, so the pushforward dispatches through the family
+    registry's ``from_covariance`` hook (audit 2026-07-26 E-05). The FULL Gaussian keeps
+    ``g Sigma g^T`` intact and its divergence is invariant for every ``g in GL(K)``. A DIAGONAL family
+    re-diagonalizes it, which is NOT invariant under a non-diagonal ``g`` (the verifier returns
+    ``False``, correctly) -- those families are admissible only for the diagonal-scaling subgroup. A
+    family with no full-covariance readout raises ``NotImplementedError`` (the extension point).
+
+    Before the hook this branched on three hardcoded family names, of which one (``"gaussian"``) was
+    not even registered, so NEITHER family registered in 2026-07 could be exercised by any invariance
+    test -- which is how ``gaussian_frame_diagonal`` shipped silently discarding its transport (A-01).
+    Note the SCOPE this measures: the family's stored-parameter divergence under a global gauge, not
+    the gauge equivariance of its coupling energy. ``gaussian_diagonal_exact``'s coupling energy is the
+    exact congruence divergence, but its self-divergence readout is the diagonal one, so it reports
+    ``False`` here -- correctly for what is being measured, and not a verdict on its coupling seam.
 
     USAGE (audit 2026-06-13 L6): this is a VERIFICATION TOOL, exercised by the admissibility tests
     (test_admissibility_verifier.py), not a runtime guard wired into model/config construction --
@@ -390,19 +424,9 @@ def check_admissible(
     a new ``invariant_families`` entry; ``invariant_for`` is the cheap string-membership check used at
     runtime.
     """
-    if family in ("gaussian", "gaussian_full"):
-        diagonal_readout = False
-    elif family == "gaussian_diagonal":
-        diagonal_readout = True
-    else:
-        raise NotImplementedError(
-            f"check_admissible implements only the Gaussian GL(K)-congruence representation; "
-            f"family={family!r} needs its own pushforward map (expose it on the (family, group) "
-            f"admissibility object to extend this check)."
-        )
-    from vfe3.families.base import get_functional                 # local import: avoid an import cycle
-    from vfe3.families.gaussian import DiagonalGaussian, FullGaussian
+    from vfe3.families.base import get_family, get_functional     # local import: avoid an import cycle
 
+    fam = get_family(family)
     fn = get_functional(functional)
     G = group.generators
     K = sum(group.irrep_dims)
@@ -411,13 +435,9 @@ def check_admissible(
     eye = torch.eye(K, device=dev, dtype=dt)
 
     def _div(mu_q, S_q, mu_p, S_p):
-        if diagonal_readout:                                      # diagonal family reads only the variances
-            q = DiagonalGaussian(mu_q, torch.diagonal(S_q, dim1=-2, dim2=-1))
-            p = DiagonalGaussian(mu_p, torch.diagonal(S_p, dim1=-2, dim2=-1))
-        else:
-            q = FullGaussian(mu_q, S_q)
-            p = FullGaussian(mu_p, S_p)
-        return fn(q, p, alpha=alpha, kl_max=1e12)                 # kl_max high so no clamp masks invariance
+        # The family's own readout of the full second moment; kl_max high so no clamp masks invariance.
+        return fn(fam.from_covariance(mu_q, S_q), fam.from_covariance(mu_p, S_p),
+                  alpha=alpha, kl_max=1e12)
 
     for _ in range(n_samples):
         coeff = scale * torch.randn(G.shape[0], generator=gen, device=dev, dtype=dt)

@@ -23,8 +23,8 @@ from vfe3.run_artifacts import (
 def _model(**overrides) -> VFEModel:
     cfg = VFE3Config(
         embed_dim=4, n_heads=2, vocab_size=11, max_seq_len=6, batch_size=2,
-        n_layers=1, n_e_steps=2, max_steps=1, lambda_alpha_mode="constant",
-        **overrides,
+        n_e_steps=2, max_steps=1, lambda_alpha_mode="constant",
+        **{"n_layers": 1, **overrides},
     )
     torch.manual_seed(0)
     return VFEModel(cfg)
@@ -253,3 +253,82 @@ def test_expensive_diagnostics_default_off_and_must_be_a_real_bool() -> None:
     with pytest.raises(ValueError, match="emit_expensive_diagnostics"):
         VFE3Config(embed_dim=4, n_heads=2, vocab_size=11, max_seq_len=6, batch_size=2,
                    n_layers=1, max_steps=1, emit_expensive_diagnostics="False")
+
+
+# ------------------------------------------------------- audit 2026-07-26 regressions
+#
+# Every test above runs `s_e_step=False`, which is why none of them caught B-01: the model
+# channel's own E-step threads `cfg.e_step_update` and runs BEFORE the belief stack, so an
+# untagged spy read the s-channel's fusion as the belief's. These pin the channel/layer
+# attribution directly.
+
+
+def _two_channel_model(**overrides) -> VFEModel:
+    r"""A model whose model channel is LIVE, so s-channel calls exist to be misattributed."""
+    return _model(prior_source="model_channel", s_e_step=True, lambda_gamma=0.5,
+                  e_step_update="mm_exact", **overrides)
+
+
+def test_character_probe_counts_belief_calls_only_when_the_model_channel_is_live() -> None:
+    r"""The realized count must be the BELIEF depth, not belief + s (audit 2026-07-26 B-01).
+
+    With `s_e_step_n_iter=3` and a swept belief depth of 2, an untagged probe sees 5 fusion calls
+    and reads `recorded[0]` from the s-channel. The fixed probe reports 2.
+    """
+    model = _two_channel_model(s_e_step_n_iter=3)
+    tokens, _ = _batch()
+
+    record = collect_estep_character(model, tokens, depths=[1, 2])
+
+    assert record["measured_channel"] == "belief"
+    assert record["measured_layer"] == 0
+    assert [p["n_belief_calls"] for p in record["points"]] == [1, 2]
+
+
+def test_character_probe_ignores_layers_past_the_first() -> None:
+    r"""At `n_layers=2` the window must not span the stack (audit 2026-07-26 B-01)."""
+    model = _two_channel_model(n_layers=2, s_e_step_n_iter=1)
+    tokens, _ = _batch()
+
+    record = collect_estep_character(model, tokens, depths=[2])
+
+    assert record["points"][0]["n_belief_calls"] == 2       # layer 0 only, not 4 across two layers
+
+
+def test_beta_probe_intercepts_the_phi_substep_binding() -> None:
+    r"""`inference/e_step.py` binds `attention_weights` itself (audit 2026-07-26 B-02).
+
+    Under `e_phi_lr > 0` with `lambda_twohop != 0` the phi substep called that unpatched binding,
+    so all three arms ran the TRUE beta while the record still claimed `available: True`. Patching
+    the definition site makes the interception total; the observable consequence is that the
+    ablated arms now actually differ from `full` on a config that exercises the phi substep.
+    """
+    from vfe3 import free_energy as free_energy_module
+    from vfe3.inference import e_step as e_step_module
+
+    # The seam under test: every binder must alias the same object before patching.
+    assert e_step_module.attention_weights is free_energy_module.attention_weights
+
+    model = _model(e_step_update="gradient", e_phi_lr=0.05, lambda_twohop=0.3,
+                   beta_attention_prior="causal_alibi_noself")
+    tokens, targets = _batch()
+
+    record = collect_beta_channel_decomposition(model, tokens, targets)
+
+    assert record["available"] is True
+    assert record["ce"]["no_energy"] != record["ce"]["full"]
+
+
+def test_character_probe_restores_the_patched_helpers_it_installs() -> None:
+    r"""The probe now patches `_refine_s` and `vfe_block` too; all must be restored."""
+    from vfe3.model import stack as stack_module
+
+    model = _two_channel_model()
+    before_refine = VFEModel._refine_s
+    before_block = stack_module.vfe_block
+    tokens, _ = _batch()
+
+    collect_estep_character(model, tokens, depths=[1])
+
+    assert VFEModel._refine_s is before_refine
+    assert stack_module.vfe_block is before_block
