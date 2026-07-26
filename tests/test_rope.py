@@ -40,10 +40,10 @@ def test_rope_mean_at_identity_omega_is_relative():
                             device=torch.device("cpu"), dtype=torch.float32)
     omega_I = torch.eye(K).expand(N, N, K, K).contiguous()
     mu = torch.randn(N, K)
-    rt = RopeTransport(base=omega_I, rope=R, on_cov=False)
+    rt = RopeTransport(base=omega_I, rope=R, on_cov=False, insertion="left")
     mu_t = transport_mean(rt, mu)                            # (N, N, K)
     mu_const = torch.ones(N, K)
-    rt_c = RopeTransport(base=omega_I, rope=R, on_cov=False)
+    rt_c = RopeTransport(base=omega_I, rope=R, on_cov=False, insertion="left")
     t = transport_mean(rt_c, mu_const)                      # (N, N, K)
     # rows of equal (i-j) give equal transported vectors (relative-position property)
     assert torch.allclose(t[2, 1], t[3, 2], atol=1e-5)      # both are (i-j)=1
@@ -56,7 +56,7 @@ def test_rope_mean_only_leaves_covariance_unrotated():
                             device=torch.device("cpu"), dtype=torch.float32)
     omega_I = torch.eye(K).expand(N, N, K, K).contiguous()
     sigma = torch.rand(N, K) + 0.5
-    rt = RopeTransport(base=omega_I, rope=R, on_cov=False)
+    rt = RopeTransport(base=omega_I, rope=R, on_cov=False, insertion="left")
     plain = transport_covariance(omega_I, sigma)            # un-rotated diagonal sandwich
     roped = transport_covariance(rt, sigma)                 # mu-only -> ignores rope
     assert torch.allclose(plain, roped, atol=1e-6)
@@ -71,7 +71,7 @@ def test_build_belief_transport_wraps_in_ropetransport_when_rope_set():
     phi = torch.randn(1, 6, g.generators.shape[0])
     R = build_rope_rotation(torch.arange(6), g.irrep_dims, base=100.0,
                             device=phi.device, dtype=phi.dtype)
-    out = build_belief_transport(phi, g, transport_mode="flat", rope=R, rope_on_cov=False)
+    out = build_belief_transport(phi, g, transport_mode="flat", rope=R, rope_on_cov=False, rope_insertion="left")
     assert isinstance(out, RopeTransport)
     # rope=None reproduces the plain build (no wrapper).
     plain = build_belief_transport(phi, g, transport_mode="flat")
@@ -113,6 +113,7 @@ def test_global_free_energy_rope_matches_certified_compact_oracle(
     kwargs = {
         "tau": 1.3,
         "rope": rope,
+        "rope_insertion": "left",   # legacy composition under test
         "rope_on_cov": True,
         "compact_phi_block_transport": True,
         "transport_mean_per_head": True,
@@ -148,6 +149,7 @@ def test_free_energy_rope_certificate_is_global_only(
     kwargs = {
         "tau": 1.3,
         "rope": rope,
+        "rope_insertion": "left",   # legacy composition under test
         "rope_on_cov": True,
         "compact_phi_block_transport": True,
         "transport_mean_per_head": True,
@@ -179,13 +181,13 @@ def _rope_cfg(**kw):
 
 
 def test_rope_cache_key_tracks_mutated_rope_base():
-    model = VFEModel(_rope_cfg(pos_rotation="rope", rope_base=100.0, n_heads=1))
+    model = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left", rope_base=100.0, n_heads=1))
     device = model.prior_bank.mu_embed.device
     first = model._rope_rotation(8, device)
 
     model.cfg.rope_base = 2.0
     second = model._rope_rotation(8, device)
-    fresh = VFEModel(_rope_cfg(pos_rotation="rope", rope_base=2.0, n_heads=1))._rope_rotation(8, device)
+    fresh = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left", rope_base=2.0, n_heads=1))._rope_rotation(8, device)
 
     assert not torch.equal(first, second)
     assert torch.equal(second, fresh)
@@ -208,7 +210,7 @@ def test_rope_cache_key_tracks_mutated_pos_rotation():
         )
 
     try:
-        model = VFEModel(_rope_cfg(pos_rotation="rope"))
+        model = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left"))
         device = model.prior_bank.mu_embed.device
         first = model._rope_rotation(8, device)
 
@@ -222,7 +224,7 @@ def test_rope_cache_key_tracks_mutated_pos_rotation():
 
 
 def test_runtime_length_caches_retain_only_the_latest_shape():
-    model = VFEModel(_rope_cfg(pos_rotation="rope", n_heads=1))
+    model = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left", n_heads=1))
     device = model.prior_bank.mu_embed.device
 
     for length in range(1, model.cfg.max_seq_len + 1):
@@ -237,7 +239,7 @@ def test_rope_changes_logits_vs_no_rope():
     torch.manual_seed(0)
     x = torch.randint(0, 6, (2, 8))
     base = VFEModel(_rope_cfg(pos_rotation="none"))
-    roped = VFEModel(_rope_cfg(pos_rotation="rope"))
+    roped = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left"))
     roped.load_state_dict(base.state_dict())
     assert not torch.allclose(base(x), roped(x), atol=1e-5)   # RoPE perturbs attention -> logits
 
@@ -246,7 +248,7 @@ def test_attention_maps_reflect_rope():
     torch.manual_seed(0)
     x = torch.randint(0, 6, (1, 8))
     base = VFEModel(_rope_cfg(pos_rotation="none"))
-    roped = VFEModel(_rope_cfg(pos_rotation="rope"))
+    roped = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left"))
     roped.load_state_dict(base.state_dict())
     a = base.attention_maps(x)
     b = roped.attention_maps(x)
@@ -261,7 +263,7 @@ def test_diagnostics_runs_under_rope():
     # (abs(v) < inf is False for both +/-inf and NaN).
     torch.manual_seed(0)
     x = torch.randint(0, 6, (1, 8))
-    roped = VFEModel(_rope_cfg(pos_rotation="rope"))
+    roped = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left"))
     diag = roped.diagnostics(x)
     assert diag and all(abs(v) < float("inf") for v in diag.values())
 
@@ -289,7 +291,7 @@ def test_rope_means_only_kernel_matches_oracle():
     phi = torch.randn(1, N, n_gen) * 0.1
     R = build_rope_rotation(torch.arange(N), g.irrep_dims, base=100.0,
                             device=phi.device, dtype=phi.dtype)
-    omega = build_belief_transport(phi, g, transport_mode="flat", rope=R, rope_on_cov=False)
+    omega = build_belief_transport(phi, g, transport_mode="flat", rope=R, rope_on_cov=False, rope_insertion="left")
     mu   = torch.randn(1, N, K); sigma   = torch.rand(1, N, K) + 0.5
     mu_p = torch.randn(1, N, K); sigma_p = torch.rand(1, N, K) + 0.5
     kw = dict(tau=1.0, renyi_order=1.0, kl_max=100.0, eps=1e-6, b0=1.0, c0=1.0, value=1.0,
@@ -311,7 +313,7 @@ def test_rope_full_gauge_covariance_equals_manual_sandwich():
     omega = torch.randn(N, N, K, K, dtype=torch.float64)
     A = torch.randn(N, K, K, dtype=torch.float64)
     sigma = A @ A.transpose(-1, -2) + K * torch.eye(K, dtype=torch.float64)   # SPD full cov
-    got = transport_covariance(RopeTransport(base=omega, rope=R, on_cov=True), sigma)
+    got = transport_covariance(RopeTransport(base=omega, rope=R, on_cov=True, insertion="left"), sigma)
     Op = torch.einsum("ikl,ijlm,jnm->ijkn", R, omega, R)                      # R_i Omega_ij R_j^T
     manual = torch.einsum("ijkl,jlm,ijnm->ijkn", Op, sigma, Op)
     assert torch.allclose(got, manual, atol=1e-9)
@@ -319,7 +321,7 @@ def test_rope_full_gauge_covariance_equals_manual_sandwich():
 
 def test_full_gauge_model_runs_forward_backward():
     # Reachability: a full-covariance rope_full_gauge model trains (finite gradients) end to end.
-    cfg = _full_cov_cfg(pos_rotation="rope", rope_full_gauge=True)
+    cfg = _full_cov_cfg(pos_rotation="rope", rope_insertion="left", rope_full_gauge=True)
     torch.manual_seed(0)
     m = VFEModel(cfg)
     x = torch.randint(0, 6, (1, 6)); y = torch.randint(0, 6, (1, 6))
@@ -349,8 +351,8 @@ def test_rope_on_value_false_decouples_and_changes_logits():
     # different forward than the coherent single-gauge default -- the value aggregation drops RoPE.
     torch.manual_seed(0)
     x = torch.randint(0, 6, (2, 8))
-    coupled = VFEModel(_rope_cfg(pos_rotation="rope", rope_on_value=True))
-    decoupled = VFEModel(_rope_cfg(pos_rotation="rope", rope_on_value=False))
+    coupled = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left", rope_on_value=True))
+    decoupled = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left", rope_on_value=False))
     decoupled.load_state_dict(coupled.state_dict())
     assert not torch.allclose(coupled(x), decoupled(x), atol=1e-5)
 
@@ -370,7 +372,7 @@ def test_rope_on_value_false_model_trains_end_to_end():
     # Decoupled value gauge routes the belief gradient to the autograd oracle; the model must still
     # train (finite loss and prior-table gradients) end to end.
     torch.manual_seed(0)
-    m = VFEModel(_rope_cfg(pos_rotation="rope", rope_on_value=False))
+    m = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left", rope_on_value=False))
     x = torch.randint(0, 6, (1, 8)); y = torch.randint(0, 6, (1, 8))
     _, loss, _ = m(x, y); loss.backward()
     assert torch.isfinite(loss)

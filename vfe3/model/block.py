@@ -91,6 +91,7 @@ def vfe_block(
     rope:            Optional[torch.Tensor]                  = None,      # (N, K, K) gauge-RoPE rotation (None -> off)
     rope_on_cov:     bool                                    = False,     # full-gauge: rotate covariance too
     rope_on_value:   bool                                    = True,      # False -> value aggregation uses the un-rotated base
+    rope_insertion:  str                                     = "right",   # "right" (pure, folded frame) | "left" (legacy)
     training:        bool                                    = False,     # explicit module mode for inner-loop controls
     tau:             'Optional[float | torch.Tensor]'        = None,      # softmax temperature
 
@@ -137,6 +138,7 @@ def vfe_block(
         grad_record=grad_record, state_record=state_record,
         log_prior=log_prior,
         rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+        rope_insertion=rope_insertion,
         transport_mean_per_head=True,
         compact_phi_block_transport=compact_phi_blocks,
         exp_fp64_mode=cfg.exp_fp64_mode,

@@ -398,6 +398,7 @@ def test_rope_is_not_inert_at_the_default_value_gauge():
     tokens = torch.randint(0, 6, (2, 8))
     plain = VFEModel(_cfg(pos_rotation="none"))
     roped = VFEModel(_cfg(pos_rotation="rope"))          # rope_on_value now defaults True
+    rope_insertion="left",   # legacy composition under test
     roped.load_state_dict(plain.state_dict())
     with torch.no_grad():
         assert float((plain(tokens) - roped(tokens)).abs().max()) > 1e-4
@@ -517,8 +518,8 @@ def _rope_pair(seed: int = 0, n: int = 4, k: int = 4, heads: int = 2):
             cos, sin = torch.cos(angles[i, h]), torch.sin(angles[i, h])
             rope[i, h * d:h * d + 2, h * d:h * d + 2] = torch.tensor([[cos, -sin], [sin, cos]])
     return (base,
-            RopeTransport(base=base, rope=rope, on_cov=False, same_frame_flat_cocycle=True),
-            RopeTransport(base=base, rope=rope, on_cov=True, same_frame_flat_cocycle=True))
+            RopeTransport(base=base, rope=rope, on_cov=False, same_frame_flat_cocycle=True, insertion="left"),
+            RopeTransport(base=base, rope=rope, on_cov=True, same_frame_flat_cocycle=True, insertion="left"))
 
 
 def test_means_only_rope_rotates_the_mean_but_not_the_covariance():

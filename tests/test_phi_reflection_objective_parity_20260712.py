@@ -340,7 +340,7 @@ def _phi_loss_pre_twohop(mu, sigma, phi, group, *, tau, lambda_beta, log_prior,
     branches), rebuilt from the same public primitives. The independent 'old form' the extended loss
     must reproduce EXACTLY at lambda_twohop=0.0 (defaults mirror phi_alignment_loss's)."""
     omega = build_belief_transport(phi, group, transport_mode="flat", mu=mu, sigma=sigma,
-                                   rope=rope, rope_on_value=rope_on_value)
+                                   rope=rope, rope_on_value=rope_on_value, rope_insertion="left")
     mu_t = transport_mean(omega, mu)
     sigma_t = transport_covariance(omega, sigma)
     fam = get_family("gaussian_diagonal")
@@ -373,7 +373,7 @@ def test_phi_twohop_gradient_matches_scalar_free_energy(decoupled_rope):
     n = mu.shape[0]
     kw = dict(tau=1.3, lambda_beta=0.7, lambda_twohop=0.2, log_prior=log_prior)
     if decoupled_rope:
-        kw.update(rope=_rope_for(group, n, phi), rope_on_value=False)
+        kw.update(rope=_rope_for(group, n, phi), rope_on_value=False, rope_insertion="left")
 
     phi_loss = phi.clone().requires_grad_(True)
     loss = phi_alignment_loss(mu, sigma, phi_loss, group, **kw)
@@ -400,7 +400,7 @@ def test_phi_twohop_zero_weight_is_exact_identity(decoupled_rope):
     phi_ext = phi.clone().requires_grad_(True)
     ext = phi_alignment_loss(mu, sigma, phi_ext, group, tau=tau, lambda_beta=lambda_beta,
                              lambda_twohop=0.0, log_prior=log_prior,
-                             rope=rope, rope_on_value=rope_on_value)
+                             rope=rope, rope_on_value=rope_on_value, rope_insertion="left")
     grad_ext, = torch.autograd.grad(ext, phi_ext)
 
     phi_old = phi.clone().requires_grad_(True)
@@ -494,8 +494,7 @@ def _scorer_F(m, belief, context, *, mode) -> float:
             link_soft_cap=cfg.link_soft_cap, clamp_monitor=cfg.transport_clamp_monitor,
             transport_mean_per_head=True, rope=context.rope,
             rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
-            exp_fp64_mode=cfg.exp_fp64_mode, exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
-        )
+            exp_fp64_mode=cfg.exp_fp64_mode, exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold, rope_insertion="left")
         if cfg.lambda_h > 0.0 or cfg.lambda_gamma > 0.0:
             s_belief = (
                 (context.prior.s_mu, context.prior.s_sigma)
@@ -577,8 +576,10 @@ def test_metropolis_delta_matches_active_objective(mode, fold):
 # --------------------------------------------------------------------------------------------------
 _TCFG = {
     "flat":           dict(),
-    "rope_decoupled": dict(pos_rotation="rope", rope_on_value=False),
+    "rope_decoupled": dict(pos_rotation="rope", rope_on_value=False,
+                           rope_insertion="left"),   # legacy composition under test
     "rope_on_cov":    dict(pos_rotation="rope", rope_full_gauge=True,
+                           rope_insertion="left",    # legacy composition under test
                            family="gaussian_full", decode_mode="full"),
 }
 
@@ -839,8 +840,10 @@ def test_metropolis_folds_off_delta_equals_raw_prior(mode):
 # The tied-gamma fold and each nonflat transport are pinned separately above; here they are CROSSED.
 # omega-direct Metropolis is flat-only, so the non-flat connection regimes are phi-reflection only.
 _NONFLAT_TCFG = {
-    "rope_decoupled":         dict(pos_rotation="rope", rope_on_value=False),
+    "rope_decoupled":         dict(pos_rotation="rope", rope_on_value=False,
+                                   rope_insertion="left"),   # legacy composition under test
     "rope_on_cov":            dict(pos_rotation="rope", rope_full_gauge=True,
+                                   rope_insertion="left",    # legacy composition under test
                                    family="gaussian_full", decode_mode="full"),
     "regime_ii":              dict(transport_mode="regime_ii"),
     "regime_ii_covariant":    dict(transport_mode="regime_ii_covariant"),

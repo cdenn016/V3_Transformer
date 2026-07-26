@@ -206,6 +206,9 @@ def test_single_head_forward_matches_recompute_dense_low_level_oracle(
         n_e_steps=1,
         pos_phi="none",
         pos_rotation=pos_rotation,
+        rope_insertion="left",   # n_heads=1 -> single block -> dense flat transport;
+                                 # the right insertion has no vertex frame to fold into
+
         e_step_update=e_step_update,
     )
     production = VFEModel(cfg).eval()

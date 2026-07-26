@@ -54,8 +54,7 @@ def _stack(model, belief, log_prior, rope):
         connection_W=getattr(model, "connection_W", None),
         connection_M=getattr(model, "connection_M", None),
         connection_L=getattr(model, "connection_L", None),
-        rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
-    )
+        rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value, rope_insertion=model.cfg.rope_insertion)
 
 
 def _forward_reference(model, tokens: torch.Tensor):
@@ -87,6 +86,7 @@ def _refined_rope_gamma_model() -> VFEModel:
             gamma_as_beta_prior=True,
             gamma_prior_weight=1.0,
             pos_rotation="rope",
+            rope_insertion="left",   # legacy composition under test
         )
     torch.manual_seed(23)
     model = VFEModel(cfg).to(DEVICE)

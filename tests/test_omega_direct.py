@@ -1009,8 +1009,8 @@ def test_compact_full_gauge_rope_covariance_matches_dense_oracle():
     A = torch.randn(N, K, K, generator=gen)
     sigma = A @ A.transpose(-1, -2) + 0.5 * torch.eye(K)
 
-    got = transport_covariance(RopeTransport(compact, rope, on_cov=True), sigma)
-    expected = transport_covariance(RopeTransport(dense, rope, on_cov=True), sigma)
+    got = transport_covariance(RopeTransport(compact, rope, on_cov=True, insertion="left"), sigma)
+    expected = transport_covariance(RopeTransport(dense, rope, on_cov=True, insertion="left"), sigma)
     assert torch.allclose(got, expected, atol=2e-5, rtol=1e-5)
 
 
@@ -1027,7 +1027,7 @@ def test_rope_transport_rejects_nonsquare_query_key_base(representation, L, M):
     rope = torch.eye(K).expand(L, K, K).clone()
 
     with pytest.raises(ValueError, match="square token transport"):
-        RopeTransport(base, rope)
+        RopeTransport(base, rope, insertion="left")
 
 
 @pytest.mark.parametrize("representation", ["compact", "dense"])
@@ -1039,7 +1039,7 @@ def test_rope_transport_rejects_mismatched_rotation_length(representation):
     rope = torch.eye(K).expand(N - 1, K, K).clone()
 
     with pytest.raises(ValueError, match="rope token length"):
-        RopeTransport(base, rope)
+        RopeTransport(base, rope, insertion="left")
 
 
 def test_rope_transport_rejects_dense_singleton_matrix_axis():
@@ -1048,7 +1048,7 @@ def test_rope_transport_rejects_dense_singleton_matrix_axis():
     rope = torch.eye(K).expand(N, K, K).clone()
 
     with pytest.raises(ValueError, match="dense base.*square K x K"):
-        RopeTransport(base, rope)
+        RopeTransport(base, rope, insertion="left")
 
 
 @pytest.mark.parametrize(
@@ -1066,7 +1066,7 @@ def test_rope_transport_rejects_malformed_factored_base(exp_shape, inv_shape, ma
     rope = torch.eye(4).expand(3, 4, 4).clone()
 
     with pytest.raises(ValueError, match=match):
-        RopeTransport(base, rope)
+        RopeTransport(base, rope, insertion="left")
 
 
 def test_compact_sampled_metrics_match_canonical_dense_operator():
@@ -1232,6 +1232,7 @@ def test_tied_compact_forward_backward_with_gamma_and_rope():
         gauge_parameterization="omega_direct", gauge_group="tied_block_glk", n_heads=2,
         omega_compact_storage=True, family="gaussian_full", decode_mode="full",
         n_e_steps=1, lambda_gamma=0.5, s_e_step=False, pos_rotation="rope",
+        rope_insertion="left",   # legacy composition under test
         rope_full_gauge=True, oracle_unroll_grad=True,
     ))
     token_ids = torch.tensor([[0, 1, 2, 3]])

@@ -236,8 +236,8 @@ def test_full_precision_flag_reaches_structural_transport_wrappers() -> None:
         DirectLinkTransport(_OMEGA),
         factored,
         compact,
-        RopeTransport(_OMEGA, rope, on_cov=False),
-        RopeTransport(_OMEGA, rope, on_cov=True),
+        RopeTransport(_OMEGA, rope, on_cov=False, insertion="left"),
+        RopeTransport(_OMEGA, rope, on_cov=True, insertion="left"),
     )
 
     for omega in transports:

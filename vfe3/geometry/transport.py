@@ -245,8 +245,37 @@ class RopeTransport:
     on_cov:                  bool = False
     on_value:                bool = True   # False -> value aggregation uses the UN-rotated base (RoPE Q/K only)
     same_frame_flat_cocycle: bool = False  # trusted same-table RoPE around an already certified base
+    insertion:               str  = "right"  # "right": V_i = U_i R_i^T (pure) | "left": R_i Omega R_j^T (legacy)
+
+    def score_operator(self):
+        r"""The operator the ATTENTION SCORE transports under, per ``insertion``.
+
+        RIGHT (the pure path) folds the rotation into the vertex frame, so the score operator is an
+        ordinary flat coboundary of :math:`V_i = U_i R_i^{T}` and every downstream contraction, fast
+        path and cocycle certification applies to it unchanged. LEFT keeps the shipped wrapper
+        semantics, where the rotation is applied around ``base`` at each contraction site instead.
+        Folded once and memoized: the fold is two matmuls on the vertex factors, but it is on the
+        per-iteration E-step path and there is no reason to repeat it.
+        """
+        if self.insertion == "left":
+            return None                                       # callers keep the wrapper arithmetic
+        cached = getattr(self, "_folded", None)
+        if cached is None:
+            if not isinstance(self.base,
+                              (FactoredTransport, CompactFactoredTransport, DirectLinkTransport)):
+                raise ValueError(
+                    "rope_insertion='right' folds the rotation into the vertex frame, which needs a "
+                    f"base that carries one; got {type(self.base).__name__}. A dense Omega exposes "
+                    "only the composed operator, from which the per-vertex frame cannot be "
+                    "recovered. Use rope_insertion='left' for those transports.")
+            cached = fold_rope_into_frame(self.base, self.rope)
+            object.__setattr__(self, "_folded", cached)
+        return cached
 
     def __post_init__(self) -> None:
+        if self.insertion not in ROPE_INSERTIONS:
+            raise ValueError(
+                f"RopeTransport insertion must be one of {ROPE_INSERTIONS}, got {self.insertion!r}")
         if type(self.same_frame_flat_cocycle) is not bool:
             raise ValueError(
                 "same_frame_flat_cocycle must be a bool, got "
@@ -310,11 +339,77 @@ class RopeTransport:
                 f"got rope N={self.rope.shape[-3]}, Nq=Nk={n_query}")
 
 
+ROPE_INSERTIONS: Tuple[str, ...] = ("right", "left")
+
+
+def fold_rope_into_frame(
+    base: 'FactoredTransport | CompactFactoredTransport',
+    rope: torch.Tensor,                   # (..., N, K, K) block-diagonal orthogonal rotation
+) -> 'FactoredTransport | CompactFactoredTransport':
+    r"""RIGHT insertion: return the transport whose vertex frame is :math:`V_i = U_i R_i^{T}`.
+
+    The resulting operator is :math:`\Omega_{ij} = U_i R_i^{T} R_j U_j^{-1} = U_i R(\theta_j-\theta_i)
+    U_j^{-1}` -- the relative rotation sits BETWEEN the query and key content factors, which is what
+    ``GL(K)_attention.tex`` specifies and what Su et al. 2021 Eq (16) requires (their sign: the score
+    cross term becomes :math:`Q_i^{T} R(\theta_j-\theta_i) K_j`).
+
+    Contrast the shipped LEFT insertion :math:`R_i \Omega_{ij} R_j^{T}`, the coboundary of
+    :math:`W_i = R_i U_i`, where the rotations sit OUTSIDE the content operator and never meet. That
+    conjugates the transport by the query's ABSOLUTE angle. Measured on the 2026-07-26 K=20 rope
+    checkpoint (audit R-4): 69% of the pair energy's spread is absolute-position contamination under
+    LEFT and exactly 0 under RIGHT, and gauge covariance ``Omega^g = g Omega g^-1`` holds to 1.4e-06
+    under RIGHT against a residual of 5.6 under LEFT.
+
+    Because :math:`V_i V_j^{-1}` is an ordinary flat coboundary, the folded transport is a plain
+    factored container: every downstream contraction, the cocycle certification, and the fast paths
+    all apply unchanged. That is the point of folding rather than wrapping.
+    """
+    rope_t = rope.transpose(-1, -2)
+    if isinstance(base, DirectLinkTransport):
+        # The CHARTED link stores its vertex chart, so the same fold applies and leaves the edge
+        # factor L_ij untouched between the frames: V_i L_ij V_j^-1 = U_i R_i^T L_ij R_j U_j^-1.
+        # The BARE link stores no vertex factors and cannot be folded into (caller must reject).
+        if base.exp_phi is None or base.exp_neg_phi is None:
+            raise ValueError(
+                "rope_insertion='right' needs a vertex chart to fold into; this DirectLinkTransport "
+                "is the BARE link (exp_phi is None). Use the charted link or rope_insertion='left'.")
+        return DirectLinkTransport(
+            exp_link=base.exp_link,
+            exp_phi=base.exp_phi @ rope_t,
+            exp_neg_phi=rope @ base.exp_neg_phi,
+        )
+    if isinstance(base, CompactFactoredTransport):
+        H, d = base.exp_blocks.shape[-3], base.exp_blocks.shape[-1]
+        # The rotation is block-diagonal on equal blocks, so its per-head blocks are the diagonal
+        # (d, d) sub-matrices; slicing them keeps the compact representation compact.
+        blocks = torch.stack([rope_t[..., h * d:(h + 1) * d, h * d:(h + 1) * d] for h in range(H)],
+                             dim=-3)                                      # (..., N, H, d, d)
+        inverse = blocks.transpose(-1, -2)                                # orthogonal -> inverse is transpose
+        return CompactFactoredTransport(
+            exp_blocks=base.exp_blocks @ blocks,
+            inv_blocks=inverse @ base.inv_blocks,
+            K=base.K,
+            mean_per_head=base.mean_per_head,
+            same_frame_flat_cocycle=base.same_frame_flat_cocycle,
+        )
+    return FactoredTransport(
+        exp_phi=base.exp_phi @ rope_t,
+        exp_neg_phi=rope @ base.exp_neg_phi,
+        irrep_dims=list(base.irrep_dims),
+        mean_per_head=base.mean_per_head,
+        same_frame_flat_cocycle=base.same_frame_flat_cocycle,
+    )
+
+
 def _rope_dense_omega(
     base: 'torch.Tensor | DirectLinkTransport | FactoredTransport | CompactFactoredTransport',
     rope: torch.Tensor,
 ) -> torch.Tensor:
-    r"""Effective dense Omega^RoPE_ij = R(theta_i) Omega_ij R(theta_j)^T (full-gauge / dense path)."""
+    r"""Effective dense Omega^RoPE_ij = R(theta_i) Omega_ij R(theta_j)^T (full-gauge / dense path).
+
+    LEFT insertion only. The RIGHT insertion's dense form comes from
+    :meth:`RopeTransport.score_operator`'s folded container via its own ``to_dense_omega``.
+    """
     omega = (
         base.to_dense_omega()
         if isinstance(base, (DirectLinkTransport, FactoredTransport, CompactFactoredTransport)) else base
@@ -352,6 +447,7 @@ class TransportRegistration:
     batch_independent:          bool
     covariance_class:           str
     pair_transport_kind:        str
+    rope_right_foldable:        bool
     state_builder:              'Optional[TransportStateBuilder]'
     serialization_keys:         Tuple[str, ...]
     offdiag_serialization_keys: Tuple[str, ...]
@@ -406,6 +502,7 @@ def register_transport(
     batch_independent:          bool                              = False,
     override:                   bool                              = False,
     pair_transport_kind:        str                               = "opaque",
+    rope_right_foldable:        bool                              = False,
     state_builder:              'Optional[TransportStateBuilder]' = None,
     serialization_keys:         Tuple[str, ...]                   = (),
     offdiag_serialization_keys: Tuple[str, ...]                   = (),
@@ -478,6 +575,7 @@ def register_transport(
             batch_independent=batch_independent,
             covariance_class=covariance_class,
             pair_transport_kind=pair_transport_kind,
+            rope_right_foldable=rope_right_foldable,
             state_builder=state_builder,
             serialization_keys=serialization_keys,
             offdiag_serialization_keys=offdiag_serialization_keys,
@@ -685,6 +783,7 @@ def _record_covariant_feature_exactness(
 @register_transport(
     "flat",
     covariance_class="covariant (flat)",
+    rope_right_foldable=True,
     pair_transport_kind="coboundary",   # builds Omega_ij = U_i U_j^{-1} from ONE vertex table
 )
 def _build_flat(
@@ -1204,6 +1303,7 @@ def _build_regime_ii_link(
 @register_transport(
     "regime_ii_link_charted",
     covariance_class="covariant",
+    rope_right_foldable=True,
     pair_transport_kind="opaque",   # DirectLinkTransport: contracts, never exposes a pairwise Omega
     state_builder=_build_regime_ii_link_state,
     serialization_keys=("connection_L",),
@@ -2060,8 +2160,12 @@ def transport_mean(
     un-rotated base, post-rotate by R_i.
     """
     if isinstance(omega, RopeTransport):
-        # mu_t[i,j] = R_i Omega_ij R_j^T mu_j: pre-rotate the key mean by R_j^T, transport on the
-        # un-rotated base, post-rotate the result by R_i. R_j^T mu_j = sum_l R[j,l,k] mu[j,l].
+        folded = omega.score_operator()
+        if folded is not None:                                        # RIGHT: an ordinary coboundary
+            out = transport_mean(folded, mu)
+            return _restore_certified_self_links_(out, mu, omega, event_ndim=1)
+        # LEFT: mu_t[i,j] = R_i Omega_ij R_j^T mu_j -- pre-rotate the key mean by R_j^T, transport
+        # on the un-rotated base, post-rotate the result by R_i. R_j^T mu_j = sum_l R[j,l,k] mu[j,l].
         m = torch.einsum("...jlk,...jl->...jk", omega.rope, mu)        # (..., N, K)
         t = transport_mean(omega.base, m)                             # (..., N, N, K)
         out = torch.einsum("...ikl,...ijl->...ijk", omega.rope, t)    # post-rotate by R_i
@@ -2145,6 +2249,14 @@ def transport_covariance(
                 retain_full_precision=retain_full_precision,
                 diagonal_out=diagonal_out,
             )   # mu-only
+        folded = omega.score_operator()
+        if folded is not None:                                # RIGHT: an ordinary coboundary
+            return transport_covariance(
+                folded,
+                sigma,
+                retain_full_precision=retain_full_precision,
+                diagonal_out=diagonal_out,
+            )
         if isinstance(omega.base, DirectLinkTransport):
             is_diag = _direct_link_is_diagonal(omega.base, sigma, diagonal_out)
             if omega.base.exp_phi is None:

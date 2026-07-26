@@ -693,8 +693,7 @@ def test_direct_link_factored_preserves_reflection_and_rope(mode, monkeypatch):
         link_alpha=1.0,
         reflection=reflection,
         rope=rope,
-        rope_on_cov=True,
-    )
+        rope_on_cov=True, rope_insertion="left")
 
     assert isinstance(wrapped, RopeTransport)
     assert isinstance(wrapped.base, DirectLinkTransport)

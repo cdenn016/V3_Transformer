@@ -116,8 +116,7 @@ def _belief_only_metropolis_energy(
             rope_on_cov=cfg.rope_full_gauge,
             rope_on_value=cfg.rope_on_value,
             exp_fp64_mode=cfg.exp_fp64_mode,
-            exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
-        ).item()
+            exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold, rope_insertion="left").item()
 
 
 def test_metropolis_uses_complete_joint_objective_when_gamma_reverses_belief_decision() -> None:
@@ -146,7 +145,7 @@ def test_metropolis_uses_complete_joint_objective_when_gamma_reverses_belief_dec
 
 
 def test_gamma_energy_changes_when_rope_transport_is_active() -> None:
-    rope = _model(lambda_gamma=1.0, pos_rotation="rope")
+    rope = _model(lambda_gamma=1.0, pos_rotation="rope", rope_insertion="left")
     plain = _model(lambda_gamma=1.0, pos_rotation="none")
     tokens = _tokens()
     belief_phi = rope._apply_pos_phi(rope.prior_bank.encode(tokens).phi)

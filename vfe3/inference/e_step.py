@@ -306,6 +306,7 @@ def build_belief_transport(
     # Tier-1 transport perf toggles (2026-07-05; default OFF = byte-identical: the dense einsum and
     # the 'dim' island rule stay the default code paths).
     exp_fp64_mode:               str                                         = "dim",    # stable_matrix_exp_pair island keying (flat builders; 'dim' | 'norm')
+    rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     exp_fp64_norm_threshold:     float                                       = 5.0,      # 'norm': upcast only when max clamped block ||M||_F >= this
     transport_mean_per_head:     bool                                        = False,    # factored transport_mean contracts per gauge block (fused path only)
     compact_phi_block_transport: bool                                        = False,    # packed phi factors for canonical flat block_glk
@@ -405,6 +406,7 @@ def build_belief_transport(
         rope=rope,
         on_cov=rope_on_cov,
         on_value=rope_on_value,
+        insertion=rope_insertion,
         same_frame_flat_cocycle=(
             isinstance(built, (CompactFactoredTransport, FactoredTransport))
             and built.same_frame_flat_cocycle
@@ -481,6 +483,7 @@ def free_energy_value(
     lambda_alpha_mode:         str  = "constant",
     gradient_mode:             str  = "filtering",     # accepted-and-ignored iteration-only knob
     exp_fp64_mode:             str  = "dim",           # HONORED: forwarded to the global-F _transport float64-island keying
+    rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     phi_precond_mode:          str  = "none",          # accepted-and-ignored iteration-only knob
     phi_retract_mode:          str  = "euclidean",     # accepted-and-ignored iteration-only knob
     spd_retract_mode:          str  = "spd_affine",    # accepted-and-ignored iteration-only knob
@@ -614,6 +617,7 @@ def free_energy_value(
             rope=rope,
             on_cov=rope_on_cov,
             on_value=rope_on_value,
+            insertion=rope_insertion,
             same_frame_flat_cocycle=(
                 keys is None
                 and isinstance(omega, (CompactFactoredTransport, FactoredTransport))
@@ -689,6 +693,7 @@ def phi_alignment_loss(
     link_soft_cap:             float = 6.0,           # direct-link embedded-Frobenius soft cap
     clamp_monitor:             bool  = False,         # opt-in: warn when the exp Frobenius clamp fires
     exp_fp64_mode:                 str   = "dim",  # flat phi-factor float64-island keying
+    rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     exp_fp64_norm_threshold:       float = 5.0,
     transport_mean_per_head:       bool  = False,
     compact_phi_block_transport:   bool  = False,
@@ -760,7 +765,7 @@ def phi_alignment_loss(
                                    compact_phi_block_transport=compact_phi_block_transport,
                                    validity_max_norm=transport_chart_max_norm,
                                    exactness_out=transport_status,
-                                   rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value)
+                                   rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value, rope_insertion=rope_insertion)
     fam = get_family(family)
     # The family coupling seam owns the whole transport + divergence composition (see
     # BeliefParams.coupling_energy), so the phi step descends the SAME energy the belief step does
@@ -844,6 +849,7 @@ def e_step_iteration(
     transport_mode:            str  = "flat",
     gauge_parameterization:    str  = "phi",                  # 'phi' (exp path) | 'omega_direct' (stored element)
     e_step_gradient:           str  = "unroll",               # backward estimator: unroll | straight_through | detach
+    rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     oracle_unroll_grad:        bool = False,                  # opt-in: oracle returns a differentiable grad (unroll)
     cocycle_relaxation:        float = 1.0,                    # regime_ii homotopy alpha; 0 -> flat (ignored by flat)
     link_alpha:                float = 1.0,                    # direct-link scale (regime_ii_link / _charted)
@@ -935,7 +941,7 @@ def e_step_iteration(
                 validity_max_norm=transport_chart_max_norm,
                 exactness_out=transport_status,
                 rope=rope, rope_on_cov=rope_on_cov,
-                rope_on_value=rope_on_value,
+                rope_on_value=rope_on_value, rope_insertion=rope_insertion,
             )
         omega_builder = _omega_builder
     else:
@@ -958,7 +964,7 @@ def e_step_iteration(
                 compact_phi_block_transport=compact_phi_block_transport,
                 validity_max_norm=transport_chart_max_norm,
                 exactness_out=transport_status,
-                rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+                rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value, rope_insertion=rope_insertion,
             )
         omega_builder = None
     # Runtime truncation warning (audit 2026-06-09 P8): under the 'unroll' estimator with a LIVE
@@ -1156,7 +1162,7 @@ def e_step_iteration(
                 # gauge-RoPE: the phi step must descend the SAME rotated belief-coupling block as the
                 # mu/sigma step, else under pos_rotation='rope' + e_phi_lr>0 phi optimizes a different
                 # free energy than mu/sigma (audit 2026-06-17 round 2 id15). None/off -> byte-identical.
-                rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+                rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value, rope_insertion=rope_insertion,
                 reflection=belief.reflection,
                 right_phi=belief.right_phi,
                 # INTENTIONAL asymmetry (audit 2026-06-09 D3): registry-owned transport state is
@@ -1214,7 +1220,7 @@ def e_step_iteration(
                     exactness_out=transport_status,
                     rope=rope,
                     rope_on_cov=rope_on_cov,
-                    rope_on_value=rope_on_value,
+                    rope_on_value=rope_on_value, rope_insertion=rope_insertion,
                 )
 
     # _replace (not a fresh BeliefState): carry the untouched channels (omega frame, s/r) through the
@@ -1247,6 +1253,7 @@ def e_step(
     e_steps_backprop_last:     int = 0,           # truncated backprop: no_grad prefix, detach at the boundary (0 = OFF)
 
     e_step_gradient:           str = "unroll",
+    rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     # Tier-1 transport perf toggles (2026-07-05; explicit, off the F_diag bag -- that diagnostic
     # deliberately keeps the default transport numerics). All default OFF/byte-identical.
     exp_fp64_mode:             str = "dim",       # flat-builder float64-island keying ('dim' | 'norm')
@@ -1344,7 +1351,7 @@ def e_step(
                 compact_phi_block_transport=compact_phi_block_transport,
                 validity_max_norm=transport_chart_max_norm,
                 exactness_out=transport_status,
-                rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+                rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value, rope_insertion=rope_insertion,
             )
 
     record_sequence_index = (
@@ -1385,7 +1392,7 @@ def e_step(
                     prior_eval = log_prior[sequence_index]
         with torch.no_grad():
             return free_energy_value(b_eval, mu_eval, sigma_eval, group, tau=tau_eval, log_prior=prior_eval,
-                                     rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+                                     rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value, rope_insertion=rope_insertion,
                                      gauge_parameterization=gauge_param_kw,
                                      compact_phi_block_transport=compact_phi_block_transport,
                                      transport_mean_per_head=transport_mean_per_head,
@@ -1443,7 +1450,7 @@ def e_step(
                     transport_status=transport_status,
                     grad_record=grad_record,
                     gauge_parameterization=gauge_param_kw,
-                    log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+                    log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value, rope_insertion=rope_insertion,
                     _prebuilt_omega=_hoisted_omega,
                     **kwargs,
                 )
@@ -1479,7 +1486,7 @@ def e_step(
                         compact_phi_block_transport=compact_phi_block_transport,
                         validity_max_norm=transport_chart_max_norm,
                         exactness_out=transport_status,
-                        rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+                        rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value, rope_insertion=rope_insertion,
                     )
         else:
             belief = e_step_iteration(
@@ -1493,7 +1500,7 @@ def e_step(
                 transport_status=transport_status,
                 grad_record=grad_record,                       # last iteration overwrites -> converged-ish grad
                 gauge_parameterization=gauge_param_kw,
-                log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
+                log_prior=log_prior, rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value, rope_insertion=rope_insertion,
                 _prebuilt_omega=_hoisted_omega,
                 **kwargs,
             )

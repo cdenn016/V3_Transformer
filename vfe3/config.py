@@ -239,6 +239,19 @@ class VFE3Config:
     # rope_full_gauge=True also rotates the covariance sandwich and REQUIRES full covariance.
     pos_rotation:              str   = "none"      # "none" | "rope" (the positional-rotation registry)
     rope_base:                 float = 100.0       # rotary frequency base
+    # Where the positional rotation sits relative to the learned gauge frame (audit 2026-07-26 R-4).
+    # "right" (default, the PURE path): the frame is V_i = U_i R_i^T, so the operator is
+    # Omega_ij = U_i R(theta_j - theta_i) U_j^-1 -- the relative rotation sits BETWEEN the query and
+    # key content factors, which is what GL(K)_attention.tex specifies and Su et al. 2021 Eq (16)
+    # requires. It is an ordinary flat coboundary: exactly relative-position dependent for any phi,
+    # and exactly gauge covariant (Omega^g = g Omega g^-1 to 1.4e-06).
+    # "left" (legacy, what shipped): Omega_ij = R_i U_i U_j^-1 R_j^T, the coboundary of W_i = R_i U_i.
+    # The rotations sit OUTSIDE the content operator and never meet, so the transport is conjugated
+    # by the query's ABSOLUTE angle: measured on the K=20 rope checkpoint, 69% of the pair energy's
+    # spread is absolute-position contamination and the gauge-covariance residual is 5.6.
+    # Retained so pre-2026-07-26 rope runs stay reproducible; requires a FACTORED transport under
+    # "right" (a dense/direct-link base exposes no per-vertex frame to fold into).
+    rope_insertion:            str   = "right"     # "right" (pure) | "left" (legacy shipped order)
     rope_full_gauge:           bool  = False       # rotate covariance too (needs family="gaussian_full")
     
     # rope_on_value=True (default) is the coherent single-gauge path: the gauge-RoPE rotation feeds
@@ -2058,6 +2071,57 @@ class VFE3Config:
         # preserved (executable probe, audit 2026-06-09 G2: invariant drift 0.18 -> 0.74, while
         # rope_full_gauge=True preserves it). It stays available as a deliberate cheap
         # approximation; warn so the non-coherent pairing is explicit.
+        from vfe3.geometry.transport import ROPE_INSERTIONS
+        if self.rope_insertion not in ROPE_INSERTIONS:
+            raise ValueError(
+                f"rope_insertion must be one of {ROPE_INSERTIONS}, got {self.rope_insertion!r}")
+        # FAIL CLOSED rather than falling back. The right insertion folds R into the VERTEX frame, so
+        # it needs a transport that carries one; a dense Omega exposes only the composed operator.
+        # Silently reverting to 'left' there would put the defective composition (69% absolute-position
+        # contamination, broken gauge covariance) on a config that asked for the pure path -- exactly
+        # the class of silent substitution that cost a 15000-step run on 2026-07-26.
+        if self.pos_rotation == "rope" and self.rope_insertion == "right":
+            from vfe3.geometry.groups import get_group
+            from vfe3.geometry.transport import get_transport_registration
+            _escapes = ("Use a transport and group that carry one, or set rope_insertion='left' to "
+                        "accept the legacy composition R_i Omega_ij R_j^T (which is NOT "
+                        "relative-position dependent once the gauge frame is nonzero).")
+            if not get_transport_registration(self.transport_mode).rope_right_foldable:
+                raise ValueError(
+                    f"rope_insertion='right' needs a transport carrying a per-vertex gauge chart to "
+                    f"fold the rotation into, but transport_mode={self.transport_mode!r} builds an "
+                    f"operator without one (a dense Omega, or the BARE direct link). {_escapes}")
+            # The flat FACTORED builder -- the thing that exposes the vertex frame -- is only
+            # selected for a block-diagonal group with MORE THAN ONE equal block. A single-block
+            # group (glk, so_k) falls to the dense pairwise Omega even on transport_mode='flat',
+            # so the registration flag alone does not settle it.
+            if self.transport_mode == "flat":
+                _builder = get_group(self.gauge_group)
+                try:                                 # builders differ: only the block groups take n_heads
+                    _dims = _builder(K=self.embed_dim, n_heads=self.n_heads).irrep_dims
+                except TypeError:
+                    _dims = _builder(K=self.embed_dim).irrep_dims
+                if len(_dims) < 2:
+                    raise ValueError(
+                        f"rope_insertion='right' with transport_mode='flat' needs a group whose "
+                        f"transport factors per block, but gauge_group={self.gauge_group!r} has a "
+                        f"single irrep block ({_dims}), so the flat transport is built as a dense "
+                        f"pairwise Omega with no per-vertex frame to fold into. {_escapes}")
+        if self.pos_rotation == "rope" and self.rope_insertion == "left":
+            import warnings
+            warnings.warn(
+                "rope_insertion='left' is the legacy shipped composition Omega_ij = "
+                "R_i U_i U_j^-1 R_j^T, whose rotations sit OUTSIDE the content operator: the "
+                "transport is conjugated by the query's ABSOLUTE angle, so the attention score is "
+                "NOT a function of (i-j) once the gauge frame is nonzero, and global gauge "
+                "equivariance is broken. Measured on the 2026-07-26 K=20 rope checkpoint: 69% of "
+                "the pair energy's spread is absolute-position contamination (exactly 0 under "
+                "'right'), and the gauge-covariance residual is 5.6 (1.4e-06 under 'right'). It is "
+                "retained only so pre-2026-07-26 rope runs reproduce; rope_insertion='right' is "
+                "the pure path.",
+                UserWarning,
+                stacklevel=2,
+            )
         if self.pos_rotation == "rope" and not self.rope_full_gauge:
             import warnings
             warnings.warn(
@@ -2820,6 +2884,10 @@ class VFE3Config:
                 "(only read by gauge_parameterization='omega_direct')")
         if self.pos_rotation == "none" and _changed("rope_on_value"):
             _inert.append("rope_on_value (only read by pos_rotation='rope')")
+        if self.pos_rotation == "none":
+            for _rope_field in ("rope_insertion", "rope_base", "rope_full_gauge"):
+                if _changed(_rope_field):
+                    _inert.append(f"{_rope_field} (only read by pos_rotation='rope')")
         if self.pos_phi == "none" and _changed("pos_phi_project_slk"):
             _inert.append("pos_phi_project_slk (only read by a non-'none' pos_phi)")
         if not self.use_ema and _changed("ema_decay"):
