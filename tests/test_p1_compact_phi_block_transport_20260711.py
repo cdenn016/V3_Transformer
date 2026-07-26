@@ -406,7 +406,7 @@ def test_direct_rope_wrapper_fails_closed_for_untrusted_rotation(rope_kind: str)
         rope[..., 0, 0] = 2.0
     else:
         rope[..., 0, 2] = 0.5
-    wrapped = RopeTransport(base=base, rope=rope, on_cov=True)
+    wrapped = RopeTransport(base=base, rope=rope, on_cov=True, insertion="left")
     mu = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4) + 1.0
     pre_rotated = torch.einsum("...jlk,...jl->...jk", rope, mu)
     expected_mean = torch.einsum(
@@ -433,6 +433,7 @@ def test_certified_rope_over_uncertified_compact_base_keeps_raw_full_self_transp
     base = CompactFactoredTransport(exp_blocks, inv_blocks, K)
     rope = torch.eye(K).expand(1, N, K, K).clone()
     wrapped = RopeTransport(
+        insertion="left",   # legacy composition under test
         base=base,
         rope=rope,
         on_cov=True,
@@ -464,6 +465,7 @@ def test_self_link_certificates_reject_non_boolean_values() -> None:
     base = FactoredTransport(dense, dense, [2, 2], same_frame_flat_cocycle=True)
     with pytest.raises(ValueError, match="same_frame_flat_cocycle must be a bool"):
         RopeTransport(
+            insertion="left",   # legacy composition under test
             base=base,
             rope=dense,
             same_frame_flat_cocycle=1,

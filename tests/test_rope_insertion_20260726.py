@@ -132,7 +132,7 @@ def test_right_insertion_rejects_a_base_it_cannot_fold_into() -> None:
     _group, _frame, _base, rope = _setup()
     dense_base = torch.eye(K).expand(N, N, K, K).contiguous()
 
-    with pytest.raises(ValueError, match="FACTORED"):
+    with pytest.raises(ValueError, match="per-vertex frame"):
         transport_mean(RopeTransport(base=dense_base, rope=rope, insertion="right"),
                        torch.zeros(N, K))
 

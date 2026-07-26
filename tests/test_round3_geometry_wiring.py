@@ -87,6 +87,7 @@ def test_register_transport_override_replaces_metadata_atomically():
             needs_sigma=orig.needs_sigma,
             batch_independent=orig.batch_independent,
             pair_transport_kind=orig.pair_transport_kind,
+            rope_right_foldable=orig.rope_right_foldable,
             override=True,
         )(orig.callable)
     assert _TRANSPORTS["flat"] == orig
@@ -145,6 +146,7 @@ def test_build_belief_transport_gates_mu_to_none_for_flat():
             needs_sigma=orig.needs_sigma,
             batch_independent=orig.batch_independent,
             pair_transport_kind=orig.pair_transport_kind,
+            rope_right_foldable=orig.rope_right_foldable,
             override=True,
         )(orig.callable)
     assert _TRANSPORTS["flat"] == orig

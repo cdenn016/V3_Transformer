@@ -394,8 +394,8 @@ def _defensive_nested_rope_chain(terminal: object) -> RopeTransport:
     N, K = 3, 4
     dense = torch.eye(K, dtype=torch.float32).expand(N, N, K, K).clone()
     rope = torch.eye(K, dtype=torch.float32).expand(N, K, K).clone()
-    inner = RopeTransport(base=dense, rope=rope)
-    outer = RopeTransport(base=dense, rope=rope)
+    inner = RopeTransport(base=dense, rope=rope, insertion="left")
+    outer = RopeTransport(base=dense, rope=rope, insertion="left")
     inner.base = terminal
     outer.base = inner
     return outer

@@ -2075,6 +2075,21 @@ class VFE3Config:
         if self.rope_insertion not in ROPE_INSERTIONS:
             raise ValueError(
                 f"rope_insertion must be one of {ROPE_INSERTIONS}, got {self.rope_insertion!r}")
+        # FAIL CLOSED rather than falling back. The right insertion folds R into the VERTEX frame, so
+        # it needs a transport that carries one; a dense Omega exposes only the composed operator.
+        # Silently reverting to 'left' there would put the defective composition (69% absolute-position
+        # contamination, broken gauge covariance) on a config that asked for the pure path -- exactly
+        # the class of silent substitution that cost a 15000-step run on 2026-07-26.
+        if self.pos_rotation == "rope" and self.rope_insertion == "right":
+            from vfe3.geometry.transport import get_transport_registration
+            if not get_transport_registration(self.transport_mode).rope_right_foldable:
+                raise ValueError(
+                    f"rope_insertion='right' needs a transport carrying a per-vertex gauge chart to "
+                    f"fold the rotation into, but transport_mode={self.transport_mode!r} builds an "
+                    "operator without one (a dense Omega, or the BARE direct link). Use "
+                    "transport_mode='flat' or 'regime_ii_link_charted', or set "
+                    "rope_insertion='left' to accept the legacy composition R_i Omega_ij R_j^T "
+                    "(which is NOT relative-position dependent once the gauge frame is nonzero).")
         if self.pos_rotation == "rope" and self.rope_insertion == "left":
             import warnings
             warnings.warn(

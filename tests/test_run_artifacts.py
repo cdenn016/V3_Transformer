@@ -532,6 +532,7 @@ def test_pure_path_report_reads_transport_registry_metadata():
             needs_sigma=original.needs_sigma,
             batch_independent=original.batch_independent,
             pair_transport_kind=original.pair_transport_kind,
+            rope_right_foldable=original.rope_right_foldable,
             override=True,
         )(original.callable)
 
@@ -546,6 +547,7 @@ def test_pure_path_report_reads_transport_registry_metadata():
             needs_sigma=original.needs_sigma,
             batch_independent=original.batch_independent,
             pair_transport_kind=original.pair_transport_kind,
+            rope_right_foldable=original.rope_right_foldable,
             override=True,
         )(original.callable)
     assert transport.get_transport_registration("flat") == original

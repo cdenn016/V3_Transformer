@@ -40,10 +40,10 @@ def test_rope_mean_at_identity_omega_is_relative():
                             device=torch.device("cpu"), dtype=torch.float32)
     omega_I = torch.eye(K).expand(N, N, K, K).contiguous()
     mu = torch.randn(N, K)
-    rt = RopeTransport(base=omega_I, rope=R, on_cov=False)
+    rt = RopeTransport(base=omega_I, rope=R, on_cov=False, insertion="left")
     mu_t = transport_mean(rt, mu)                            # (N, N, K)
     mu_const = torch.ones(N, K)
-    rt_c = RopeTransport(base=omega_I, rope=R, on_cov=False)
+    rt_c = RopeTransport(base=omega_I, rope=R, on_cov=False, insertion="left")
     t = transport_mean(rt_c, mu_const)                      # (N, N, K)
     # rows of equal (i-j) give equal transported vectors (relative-position property)
     assert torch.allclose(t[2, 1], t[3, 2], atol=1e-5)      # both are (i-j)=1
@@ -56,7 +56,7 @@ def test_rope_mean_only_leaves_covariance_unrotated():
                             device=torch.device("cpu"), dtype=torch.float32)
     omega_I = torch.eye(K).expand(N, N, K, K).contiguous()
     sigma = torch.rand(N, K) + 0.5
-    rt = RopeTransport(base=omega_I, rope=R, on_cov=False)
+    rt = RopeTransport(base=omega_I, rope=R, on_cov=False, insertion="left")
     plain = transport_covariance(omega_I, sigma)            # un-rotated diagonal sandwich
     roped = transport_covariance(rt, sigma)                 # mu-only -> ignores rope
     assert torch.allclose(plain, roped, atol=1e-6)
@@ -311,7 +311,7 @@ def test_rope_full_gauge_covariance_equals_manual_sandwich():
     omega = torch.randn(N, N, K, K, dtype=torch.float64)
     A = torch.randn(N, K, K, dtype=torch.float64)
     sigma = A @ A.transpose(-1, -2) + K * torch.eye(K, dtype=torch.float64)   # SPD full cov
-    got = transport_covariance(RopeTransport(base=omega, rope=R, on_cov=True), sigma)
+    got = transport_covariance(RopeTransport(base=omega, rope=R, on_cov=True), sigma, insertion="left")
     Op = torch.einsum("ikl,ijlm,jnm->ijkn", R, omega, R)                      # R_i Omega_ij R_j^T
     manual = torch.einsum("ijkl,jlm,ijnm->ijkn", Op, sigma, Op)
     assert torch.allclose(got, manual, atol=1e-9)

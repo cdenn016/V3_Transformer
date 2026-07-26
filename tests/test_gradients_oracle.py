@@ -142,8 +142,8 @@ def test_value_gauge_decoupling_changes_oracle_gradient():
     from vfe3.geometry.transport import RopeTransport
     mu, sigma, mu_p, sigma_p, omega = _setup(N=4, K=2)
     rope = _rope_rotation(4, 2)
-    coh = RopeTransport(base=omega, rope=rope, on_cov=False, on_value=True)
-    dec = RopeTransport(base=omega, rope=rope, on_cov=False, on_value=False)
+    coh = RopeTransport(base=omega, rope=rope, on_cov=False, on_value=True, insertion="left")
+    dec = RopeTransport(base=omega, rope=rope, on_cov=False, on_value=False, insertion="left")
     g_coh, _ = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, coh, tau=1.5, gradient_mode="filtering")
     g_dec, _ = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, dec, tau=1.5, gradient_mode="filtering")
     # Decoupling the value gauge from the score gauge genuinely changes the belief-coupling pull.
@@ -167,7 +167,7 @@ def test_value_gauge_decoupled_oracle_matches_fd_of_decoupled_F():
     from vfe3.geometry.transport import RopeTransport, transport_covariance, transport_mean
     mu, sigma, mu_p, sigma_p, omega = _setup(N=4, K=2)
     rope = _rope_rotation(4, 2)
-    dec = RopeTransport(base=omega, rope=rope, on_cov=False, on_value=False)
+    dec = RopeTransport(base=omega, rope=rope, on_cov=False, on_value=False, insertion="left")
     tau = 1.5
     gmu, _ = belief_gradients_autograd(mu, sigma, mu_p, sigma_p, dec, tau=tau, gradient_mode="filtering")
     # Frozen keys (filtering): score keys via the rotated transport, value keys via the base transport.

@@ -261,11 +261,12 @@ class RopeTransport:
             return None                                       # callers keep the wrapper arithmetic
         cached = getattr(self, "_folded", None)
         if cached is None:
-            if not isinstance(self.base, (FactoredTransport, CompactFactoredTransport)):
+            if not isinstance(self.base,
+                              (FactoredTransport, CompactFactoredTransport, DirectLinkTransport)):
                 raise ValueError(
                     "rope_insertion='right' folds the rotation into the vertex frame, which needs a "
-                    f"FACTORED base; got {type(self.base).__name__}. The dense/direct-link bases "
-                    "expose only the composed Omega_ij, from which the per-vertex frame cannot be "
+                    f"base that carries one; got {type(self.base).__name__}. A dense Omega exposes "
+                    "only the composed operator, from which the per-vertex frame cannot be "
                     "recovered. Use rope_insertion='left' for those transports.")
             cached = fold_rope_into_frame(self.base, self.rope)
             object.__setattr__(self, "_folded", cached)
@@ -364,6 +365,19 @@ def fold_rope_into_frame(
     all apply unchanged. That is the point of folding rather than wrapping.
     """
     rope_t = rope.transpose(-1, -2)
+    if isinstance(base, DirectLinkTransport):
+        # The CHARTED link stores its vertex chart, so the same fold applies and leaves the edge
+        # factor L_ij untouched between the frames: V_i L_ij V_j^-1 = U_i R_i^T L_ij R_j U_j^-1.
+        # The BARE link stores no vertex factors and cannot be folded into (caller must reject).
+        if base.exp_phi is None or base.exp_neg_phi is None:
+            raise ValueError(
+                "rope_insertion='right' needs a vertex chart to fold into; this DirectLinkTransport "
+                "is the BARE link (exp_phi is None). Use the charted link or rope_insertion='left'.")
+        return DirectLinkTransport(
+            exp_link=base.exp_link,
+            exp_phi=base.exp_phi @ rope_t,
+            exp_neg_phi=rope @ base.exp_neg_phi,
+        )
     if isinstance(base, CompactFactoredTransport):
         H, d = base.exp_blocks.shape[-3], base.exp_blocks.shape[-1]
         # The rotation is block-diagonal on equal blocks, so its per-head blocks are the diagonal
@@ -433,6 +447,7 @@ class TransportRegistration:
     batch_independent:          bool
     covariance_class:           str
     pair_transport_kind:        str
+    rope_right_foldable:        bool
     state_builder:              'Optional[TransportStateBuilder]'
     serialization_keys:         Tuple[str, ...]
     offdiag_serialization_keys: Tuple[str, ...]
@@ -487,6 +502,7 @@ def register_transport(
     batch_independent:          bool                              = False,
     override:                   bool                              = False,
     pair_transport_kind:        str                               = "opaque",
+    rope_right_foldable:        bool                              = False,
     state_builder:              'Optional[TransportStateBuilder]' = None,
     serialization_keys:         Tuple[str, ...]                   = (),
     offdiag_serialization_keys: Tuple[str, ...]                   = (),
@@ -559,6 +575,7 @@ def register_transport(
             batch_independent=batch_independent,
             covariance_class=covariance_class,
             pair_transport_kind=pair_transport_kind,
+            rope_right_foldable=rope_right_foldable,
             state_builder=state_builder,
             serialization_keys=serialization_keys,
             offdiag_serialization_keys=offdiag_serialization_keys,
@@ -766,6 +783,7 @@ def _record_covariant_feature_exactness(
 @register_transport(
     "flat",
     covariance_class="covariant (flat)",
+    rope_right_foldable=True,
     pair_transport_kind="coboundary",   # builds Omega_ij = U_i U_j^{-1} from ONE vertex table
 )
 def _build_flat(
@@ -1285,6 +1303,7 @@ def _build_regime_ii_link(
 @register_transport(
     "regime_ii_link_charted",
     covariance_class="covariant",
+    rope_right_foldable=True,
     pair_transport_kind="opaque",   # DirectLinkTransport: contracts, never exposes a pairwise Omega
     state_builder=_build_regime_ii_link_state,
     serialization_keys=("connection_L",),
