@@ -174,7 +174,9 @@ concluded the share was undefined because that run uses `e_step_update='gradient
 The research-wiki source note records the actual checkpoint as
 `vfe3_runs/ablations_single_seed/138.40_mstep-phi-norm=5` (K=20, 2 heads, validation PPL 139.3,
 `mm_exact`). `307.49` is a different, gradient-route run; its numbers (displacement 0.501 -> 0.571,
-`cos` +0.920) belong to that run alone and must not be read against the 2026-07-25 K=20 column.
+`cos` +0.920) belong to that run alone and must not be read against the 2026-07-25 K=20 column. Those
+two figures are additionally superseded by B-11 below: every gradient-route displacement measured
+before that fix is a POST-`head_mixer` number and is not comparable to any `mm_exact` column.
 
 **The published `0.190` is untraceable because its checkpoint is gone.** `ablations_single_seed/`
 has since been cleared, and no run before 2026-07-26 persisted an `estep_character.json`. So `0.190`
@@ -225,6 +227,48 @@ the gauge-transported neighbors at K=300, and 85%/15% at K=20. Functionally
 `mu* ~ 0.8 mu_p + 0.2 (attention-weighted transported neighbors)` — an attention layer with a strong
 residual path, computed as a VFE stationary point instead of a dot-product softmax. The premise that
 capacity comes from ITERATIVE minimization is not what carries the model; one aggregation is.
+
+### The route comparison, and the measurement defect that hid it (B-11, 2026-07-26)
+
+A `e_step_update='gradient'` K=20 run finished against the `mm_exact` sibling above. Their
+`config.json` files differ in exactly ONE field, `e_step_update`, so unlike the width pair this is a
+genuinely controlled comparison — the only single-variable ablation in this section.
+
+Its published displacement of 4.208 against `mm_exact`'s 0.213 was a measurement artifact. The probe
+reads the `mm_exact` fusion window where that spy fires and the block window otherwise, and the block
+window ended at `vfe_block`'s RETURN value — after `head_mixer`, `cg_coupling` and the block norm —
+while the `mm_exact` window reads `mu_star` before them. On the `mm_exact` checkpoint the same forward
+pass reads **0.2126 on one window and 4.5791 on the other**, with identical anchors, so the whole gap
+is the post-E-step transform. With `use_head_mixer=True` and `norm_type_block='none'` that transform
+is the head mixer, it moves the belief 4.43x its own norm, and 98.5% of the motion is a scalar gain of
+5.33 (cosine 0.985) — magnitude carrying no inferential content. Both windows now end at
+`capture['converged']`, and each point publishes `displacement_window`.
+
+| | `mm_exact` | `gradient` (published) | `gradient` (corrected) |
+|---|---|---|---|
+| displacement after 1 step | 0.2126 | ~~4.2084~~ | **0.3297** |
+| ...after 8 steps | 0.2220 | ~~4.2806~~ | **0.3915** |
+| `cos(direction_8, direction_1)` | +0.9843 | ~~+0.9320~~ | **+0.5988** |
+| share of displacement taken by step 1 | 96% | ~~98%~~ | **84%** |
+| test PPL | 138.40 | — | 141.38 |
+| converged E-step F/token | 32.327 | — | 31.853 |
+| zero-E-step CE penalty (nats) | 1.806 | — | 1.125 |
+
+The `mm_exact` column is untouched; its window was never the defective one.
+
+The corrected reading inverts the apparent one. The gradient route displaces about 55% further than
+`mm_exact` rather than twenty-fold, and its trajectory is genuinely curved — `cos` +0.599 against
++0.984 — so on that route depth changes DIRECTION and not merely magnitude. That is the one place in
+this section where the E-step looks iterative in the interesting sense.
+
+It does not pay. The gradient route reaches a LOWER converged free energy (31.85 against 32.33) with
+more iterative-looking inference, and still loses three points of test perplexity (141.38 against
+138.40) while extracting LESS from the E-step by the held-out depth-0 counterfactual (1.125 nats
+against 1.806). Better minimization of F, more curvature in the belief trajectory, worse language
+modeling. Both F/token figures are single-test-batch evaluations of the same canonical F at the
+converged belief, and both PPL figures are full held-out splits, so the dissociation is not a
+sampling artifact of the headline metric — though it is a single seed at one width and should not be
+generalized past that.
 
 **The width claim: SUPPORTED by two points, but not isolated to width.** The original wording, "the
 attention share RISES with scale (0.190 -> 0.298 from K=20 to K=300)", had both endpoints wrong and

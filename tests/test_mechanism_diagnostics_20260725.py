@@ -376,3 +376,97 @@ def test_mm_route_window_is_unchanged_by_the_block_fallback() -> None:
     for point in record["points"]:
         assert point["rel_displacement"] is not None
         assert point["pair_precision_share"] is not None
+
+
+# ------------------------------------------------- B-11: the two windows must measure one thing
+
+
+def _layer0_endpoints(
+    model:  VFEModel,
+    tokens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Independent oracle: (prior, E-step output, block return) for the belief block of layer 0.
+
+    Deliberately NOT a call into the probe -- it re-derives both candidate endpoints from
+    ``vfe_block`` so the assertions below can say which one the probe actually used.
+    """
+    from vfe3.model import stack as stack_module
+
+    original_block = stack_module.vfe_block
+    seen: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+    def _spy(*args, **kwargs):
+        capture = kwargs.get("capture")
+        if capture is None:
+            capture = kwargs["capture"] = {}
+        out = original_block(*args, **kwargs)
+        seen.append((args[1].detach().clone(),
+                     capture["converged"].mu.detach().clone(),
+                     out.mu.detach().clone()))
+        return out
+
+    try:
+        stack_module.vfe_block = _spy
+        with torch.no_grad():
+            model.eval()
+            model(tokens)
+    finally:
+        stack_module.vfe_block = original_block
+    return seen[0]
+
+
+def test_block_window_ends_at_the_estep_output_not_the_block_return() -> None:
+    r"""``rel_displacement`` must exclude head_mixer / cg_coupling / norm (audit 2026-07-26 B-11).
+
+    The B-01 fix gave the gradient route a displacement window by reading ``vfe_block``'s RETURN
+    value, but the mm_exact window reads ``mu_star`` BEFORE the block's post-inference transforms.
+    The two therefore measured different quantities, and the artifacts published them side by side:
+    on the K=20 pair the mm_exact run reported 0.213 and the gradient run 4.208, a gap that is the
+    head mixer's ~5.3x scalar gain rather than any property of the E-step. Both windows now end at
+    ``capture['converged']``.
+    """
+    model = _model(e_step_update="gradient", norm_type_block="layernorm")
+    tokens, _ = _batch()
+    mu_p, mu_estep, mu_block_return = _layer0_endpoints(model, tokens)
+    # The test is only meaningful if the block transform actually moves the belief.
+    assert not torch.allclose(mu_estep, mu_block_return)
+    from_estep = float((mu_estep - mu_p).norm() / mu_p.norm())
+    from_return = float((mu_block_return - mu_p).norm() / mu_p.norm())
+
+    # Swept at the model's own depth so the oracle's forward is the one the probe measures.
+    record = collect_estep_character(model, tokens, depths=[model.cfg.n_e_steps])
+    point = record["points"][0]
+
+    assert point["displacement_window"] == "block_capture"
+    assert point["rel_displacement"] == pytest.approx(from_estep, rel=1e-5)
+    assert point["rel_displacement"] != pytest.approx(from_return, rel=1e-3)
+
+
+def test_displacement_window_is_published_on_both_routes() -> None:
+    r"""A reader must be able to tell which window produced a number without guessing."""
+    tokens, _ = _batch()
+
+    mm = collect_estep_character(_model(e_step_update="mm_exact"), tokens, depths=[1, 2])
+    grad = collect_estep_character(_model(e_step_update="gradient"), tokens, depths=[1, 2])
+
+    assert [p["displacement_window"] for p in mm["points"]] == ["mm_exact_fusion"] * 2
+    assert [p["displacement_window"] for p in grad["points"]] == ["block_capture"] * 2
+
+
+def test_injected_capture_does_not_perturb_the_forward() -> None:
+    r"""The block window injects a ``capture`` mapping when the caller passed none.
+
+    ``vfe_block`` branches on ``capture is not None``, so the injection must select the same path an
+    absent capture does -- otherwise the probe would measure a forward the model never runs.
+    """
+    model = _model(e_step_update="gradient")
+    tokens, _ = _batch()
+    model.eval()
+    with torch.no_grad():
+        before = model(tokens).clone()
+
+    collect_estep_character(model, tokens, depths=[1, 2])
+
+    with torch.no_grad():
+        after = model(tokens)
+    assert torch.equal(before, after)
