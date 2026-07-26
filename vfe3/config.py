@@ -239,6 +239,19 @@ class VFE3Config:
     # rope_full_gauge=True also rotates the covariance sandwich and REQUIRES full covariance.
     pos_rotation:              str   = "none"      # "none" | "rope" (the positional-rotation registry)
     rope_base:                 float = 100.0       # rotary frequency base
+    # Where the positional rotation sits relative to the learned gauge frame (audit 2026-07-26 R-4).
+    # "right" (default, the PURE path): the frame is V_i = U_i R_i^T, so the operator is
+    # Omega_ij = U_i R(theta_j - theta_i) U_j^-1 -- the relative rotation sits BETWEEN the query and
+    # key content factors, which is what GL(K)_attention.tex specifies and Su et al. 2021 Eq (16)
+    # requires. It is an ordinary flat coboundary: exactly relative-position dependent for any phi,
+    # and exactly gauge covariant (Omega^g = g Omega g^-1 to 1.4e-06).
+    # "left" (legacy, what shipped): Omega_ij = R_i U_i U_j^-1 R_j^T, the coboundary of W_i = R_i U_i.
+    # The rotations sit OUTSIDE the content operator and never meet, so the transport is conjugated
+    # by the query's ABSOLUTE angle: measured on the K=20 rope checkpoint, 69% of the pair energy's
+    # spread is absolute-position contamination and the gauge-covariance residual is 5.6.
+    # Retained so pre-2026-07-26 rope runs stay reproducible; requires a FACTORED transport under
+    # "right" (a dense/direct-link base exposes no per-vertex frame to fold into).
+    rope_insertion:            str   = "right"     # "right" (pure) | "left" (legacy shipped order)
     rope_full_gauge:           bool  = False       # rotate covariance too (needs family="gaussian_full")
     
     # rope_on_value=True (default) is the coherent single-gauge path: the gauge-RoPE rotation feeds
@@ -2058,6 +2071,25 @@ class VFE3Config:
         # preserved (executable probe, audit 2026-06-09 G2: invariant drift 0.18 -> 0.74, while
         # rope_full_gauge=True preserves it). It stays available as a deliberate cheap
         # approximation; warn so the non-coherent pairing is explicit.
+        from vfe3.geometry.transport import ROPE_INSERTIONS
+        if self.rope_insertion not in ROPE_INSERTIONS:
+            raise ValueError(
+                f"rope_insertion must be one of {ROPE_INSERTIONS}, got {self.rope_insertion!r}")
+        if self.pos_rotation == "rope" and self.rope_insertion == "left":
+            import warnings
+            warnings.warn(
+                "rope_insertion='left' is the legacy shipped composition Omega_ij = "
+                "R_i U_i U_j^-1 R_j^T, whose rotations sit OUTSIDE the content operator: the "
+                "transport is conjugated by the query's ABSOLUTE angle, so the attention score is "
+                "NOT a function of (i-j) once the gauge frame is nonzero, and global gauge "
+                "equivariance is broken. Measured on the 2026-07-26 K=20 rope checkpoint: 69% of "
+                "the pair energy's spread is absolute-position contamination (exactly 0 under "
+                "'right'), and the gauge-covariance residual is 5.6 (1.4e-06 under 'right'). It is "
+                "retained only so pre-2026-07-26 rope runs reproduce; rope_insertion='right' is "
+                "the pure path.",
+                UserWarning,
+                stacklevel=2,
+            )
         if self.pos_rotation == "rope" and not self.rope_full_gauge:
             import warnings
             warnings.warn(
@@ -2820,6 +2852,10 @@ class VFE3Config:
                 "(only read by gauge_parameterization='omega_direct')")
         if self.pos_rotation == "none" and _changed("rope_on_value"):
             _inert.append("rope_on_value (only read by pos_rotation='rope')")
+        if self.pos_rotation == "none":
+            for _rope_field in ("rope_insertion", "rope_base", "rope_full_gauge"):
+                if _changed(_rope_field):
+                    _inert.append(f"{_rope_field} (only read by pos_rotation='rope')")
         if self.pos_phi == "none" and _changed("pos_phi_project_slk"):
             _inert.append("pos_phi_project_slk (only read by a non-'none' pos_phi)")
         if not self.use_ema and _changed("ema_decay"):

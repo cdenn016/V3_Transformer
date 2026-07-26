@@ -2509,7 +2509,7 @@ class VFEModel(nn.Module):
         if rope is not None:
             effective = RopeTransport(
                 base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                on_value=cfg.rope_on_value,
+                on_value=cfg.rope_on_value, insertion=cfg.rope_insertion,
                 same_frame_flat_cocycle=getattr(
                     omega, "same_frame_flat_cocycle", False))
             mu, sigma = belief.mu, belief.sigma
@@ -2738,7 +2738,7 @@ class VFEModel(nn.Module):
         base_omega = None
         if rope is not None:
             effective = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                      on_value=cfg.rope_on_value,
+                                      on_value=cfg.rope_on_value, insertion=cfg.rope_insertion,
                                       same_frame_flat_cocycle=getattr(
                                           omega, "same_frame_flat_cocycle", False))
             mu, sigma = out.mu, out.sigma
@@ -3223,7 +3223,7 @@ class VFEModel(nn.Module):
             omega = self._diagnostic_transport(state)
             if rope is not None:
                 effective = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                          on_value=cfg.rope_on_value,
+                                          on_value=cfg.rope_on_value, insertion=cfg.rope_insertion,
                                           same_frame_flat_cocycle=getattr(
                                               omega, "same_frame_flat_cocycle", False))
                 mu, sigma = state.mu, state.sigma
@@ -3379,7 +3379,7 @@ class VFEModel(nn.Module):
             base_omega = None
             if rope is not None:
                 effective = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                          on_value=cfg.rope_on_value,
+                                          on_value=cfg.rope_on_value, insertion=cfg.rope_insertion,
                                           same_frame_flat_cocycle=getattr(
                                               omega, "same_frame_flat_cocycle", False))
                 mu, sigma = belief.mu, belief.sigma

@@ -974,7 +974,7 @@ def numerical_health(
     fam = get_family(cfg.family)
     if rope is not None:
         effective = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                  on_value=cfg.rope_on_value,
+                                  on_value=cfg.rope_on_value, insertion=cfg.rope_insertion,
                                   same_frame_flat_cocycle=getattr(
                                       omega, "same_frame_flat_cocycle", False))
         mu, sigma = out.mu, out.sigma
@@ -1078,7 +1078,7 @@ def converged_state(
         fam = get_family(cfg.family)
         if rope is not None:
             effective = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                      on_value=cfg.rope_on_value,
+                                      on_value=cfg.rope_on_value, insertion=cfg.rope_insertion,
                                       same_frame_flat_cocycle=getattr(
                                           omega, "same_frame_flat_cocycle", False))
             mu, sigma = out.mu, out.sigma
@@ -1187,7 +1187,7 @@ def attention_entropy_cov_gap(
         )
         if rope is not None:
             omega = RopeTransport(base=omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                                  on_value=cfg.rope_on_value,
+                                  on_value=cfg.rope_on_value, insertion=cfg.rope_insertion,
                                   same_frame_flat_cocycle=getattr(
                                       omega, "same_frame_flat_cocycle", False))
     kw = dict(                                                    # the oracle's free-energy knob bag
