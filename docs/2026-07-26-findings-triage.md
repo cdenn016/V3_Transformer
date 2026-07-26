@@ -22,10 +22,15 @@ deferred findings were silently fixed by later work (B-05, B-06, B-07, B-09, D-0
 
 ## Ranked list
 
-### 1. Seven training runs from 2026-07-26 exist on disk and are recorded in no document
+### 1. Eight training runs from 2026-07-26 exist on disk and are recorded in no document — DONE
+
+**Resolved 2026-07-26.** The seven rope arms and the R-4/R-5 conclusions are now recorded in
+`docs/2026-07-26-rope-investigation.md`; the three `pos_phi='learned'` arms and the
+`oracle_unroll_grad` route detail are in `docs/2026-07-26-edits.md`. The count was seven on the first
+pass and is eight: `141.79_causal_noself` was missed.
 
 Two agents found this independently; I verified the configs directly. Among them is the R-4 decisive
-experiment, whose result answers a pre-registered question and is written down nowhere.
+experiment, whose result answers a pre-registered question and was written down nowhere.
 
 Single-field diffs, confirmed from each run's `config.json`:
 
@@ -66,12 +71,21 @@ This is a null result and carries no information about R-5 in either direction. 
 as support for rejecting "raise the base"; that rejection continues to rest on the `d_head=10`
 band-count argument alone.
 
-**Action:** record the seven runs and these three conclusions in `docs/`. Cost is prose only. Also
-verify `140.48_alibi-slope=2` and `141.95_1estep-2s-steps` before citing them — one agent reported a
-val figure inconsistent with the directory name, and the alibi arm may differ in `oracle_unroll_grad`
-as well as slope, which would make it a two-field comparison.
+**Action taken:** recorded, and the two arms flagged as possibly confounded were checked. Both
+`140.48_alibi-slope=2` and `141.95_1estep-2s-steps` do differ from the 138.40 baseline in
+`oracle_unroll_grad` as well as their named field, but that flag is **inert on the `mm_exact` route**:
+`e_step.py:991` branches on `e_step_update == "mm_exact"` into the closed-form fusion, and the flag's
+only functional consumer is `create_graph=(oracle_unroll_grad and e_step_gradient == "unroll")` at
+`e_step.py:1069`, inside that branch's `else`. All four runs are `mm_exact`, so both comparisons are
+single-field after all: `alibi_slope=2` costs 2.08 PPL and `s_e_step_n_iter=2` costs 3.55, both
+outside the noise band. The third arm, `141.79_causal_noself`, gives ALiBi's worth at the
+`pos_phi='learned'` operating point as 3.39 PPL.
 
-### 2. `docs/audit-results.md` is now the stalest artifact in the set
+### 2. `docs/audit-results.md` is now the stalest artifact in the set — DONE
+
+**Resolved 2026-07-26** by an addendum appended to `docs/audit-results.md`, which discharges the K=20
+obligation against the artifact, records why a top-level read made it look unmet, and restates the
+surviving K=300 provenance gap (item 3) as the open obligation.
 
 Lines 1121-1124 state that the K=20 pair-precision share "cannot be traced to any artifact on disk",
 that "attention share rises with width" **cannot be repaired**, and that re-establishing it "needs a

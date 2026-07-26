@@ -343,3 +343,67 @@ all three of the open findings, and the control cannot separate them:
 "rope is broken here" from "rope is redundant here". If the corrected rope still lands near 164, the
 direction closes on evidence and rope can be retired as a positional mechanism at this scale. If it
 moves toward 141, the placement bug was the blocker the whole time.
+
+---
+
+## The corrected-insertion arms: R-4 and the redundancy hypothesis settled, R-5 not
+
+The decisive experiment was run on the afternoon of 2026-07-26, along with five siblings. None of
+them was recorded until now; this section is that record. All are `K=20`, `seed=6`, `n_layers=1`,
+`e_step_update='gradient'`, `pos_phi='none'`, `oracle_unroll_grad=True`, 15000 steps, and every
+comparison below is a verified single-field diff of the two runs' `config.json`.
+
+| run directory | differing field | test PPL | val PPL |
+|---|---|---|---|
+| `164.12_no rope-no-pos-phi` | `pos_rotation='none'` (control) | 164.12 | 167.43 |
+| `163.99_left-rope-no-pos-phi` | legacy left composition | 163.99 | 166.19 |
+| `161.64_right-rope-no-pos-phi` | `rope_insertion='right'` | **161.64** | 163.53 |
+| `172.83_right-rope-on-value` | `rope_on_value=True` | 172.83 | 175.03 |
+| `181.19_...s6` | `causal_noself`, no rope (control) | 181.19 | 185.17 |
+| `178.17_right-rope-no-alibi` | `causal_noself`, right rope | 178.17 | 181.81 |
+| `178.78_RIGHT-ROPE-BASE=1000` | `rope_base=1000` | 178.78 | 181.98 |
+
+Read against the project's working multi-seed spread of ±0.75 PPL, three of the four questions the
+previous section left open now have answers.
+
+**R-4 was the blocker for rope's contribution, and the note above about the noise floor is why the
+earlier reading needs restating.** The corrected insertion buys 2.48 PPL over the no-rope control and
+2.35 over the legacy left composition, both a little over three times the half-spread and so outside
+noise. The left arm's 0.13 PPL was inside the band, which is to say it was zero, and "rope contributes
+approximately nothing" was a true statement about the left composition rather than about rope. With
+the rotation folded into the frame, rope contributes about 2.5 PPL.
+
+That splits the decision rule stated above into the two questions it had merged. Rope does not explain
+the ~22.7 PPL `pos_phi='learned'` gap: 161.64 sits far nearer 164 than 141, and on that reading the
+direction does close. But rope is not inert either. The honest summary is that rope is a real effect
+with a ceiling around 2.5 PPL at this scale, which retires it as a primary performance lever while
+leaving it a correct and mildly useful mechanism once inserted on the right side.
+
+**The redundancy hypothesis is refuted.** The conjecture was that `causal_alibi_noself` at
+`alibi_slope=1.0` already supplies whatever positional information the model can use, which would
+make any rope redundant. Removing ALiBi and running the same rope on/off pair gives 181.19 without
+rope against 178.17 with it, so rope buys 3.02 PPL in ALiBi's absence against 2.48 in its presence.
+Both clear the noise band and they are close to each other. ALiBi is worth roughly 17 PPL on its own
+(164.12 against 181.19), so it dominates rope by a wide margin, but it does not absorb rope's
+contribution.
+
+**R-5 is untouched by this sweep.** `rope_base=1000` against `100` is 178.78 versus 178.17, a
+difference of 0.61 PPL, which is inside the noise band and therefore carries no information in either
+direction. It is a null result and should not be cited as evidence for or against raising the base.
+R-5's rejection of the base as a remedy continues to rest on the band-count argument at `d_head=10`
+alone, and the count itself remains unprobed: nothing here varies the number of frequency bands.
+
+**`rope_on_value=True` costs 11.19 PPL.** This is the largest single-field effect in the sweep and it
+runs against the recommendation recorded in `docs/2026-07-26-edits.md`, which called
+`rope_on_value=True` "the better pairing". That recommendation was reasoned from the gradient path,
+where it is correct: keeping the config on the closed-form kernel route makes `mm_exact` legal and
+removes the detached oracle through which R-1 froze the gauge table. What it did not account for is
+what the rotation does to the value once it is applied there. Both statements can hold at once, and
+the resolution is that `rope_on_value=False` with `oracle_unroll_grad=True` is the pairing to use;
+the safety argument for `True` should not be read as a performance recommendation.
+
+Two limits worth stating. Every arm here is a single seed, so these deltas are read against a noise
+floor imported from the project's prior experience rather than measured in this sweep; a replicate at
+this configuration would confirm the floor holds here. And all seven arms run `pos_phi='none'` on the
+gradient route, so none of this transfers directly to the `pos_phi='learned'` operating point, where
+the positional gauge is already carrying 22.7 PPL and rope's marginal 2.5 may not survive.
