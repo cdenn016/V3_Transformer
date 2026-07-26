@@ -360,3 +360,237 @@ def test_dead_gaussian_declaration_is_gone():
     for name in ("glk", "block_glk", "tied_block_glk", "so_k", "so_n", "sp", "sp_n"):
         assert declared_invariant_families(name) == ("gaussian_full",)
         assert get_group(name).invariant_families == ("gaussian_full",)
+
+
+# --- E-07: rope_on_value's three contradicting defaults -----------------------------------
+
+def test_rope_on_value_default_agrees_across_every_seam():
+    r"""One value, four places. The config field was flipped to False by a live-config sweep
+    (`6dbfb58 "config: commit the live working-tree configuration as-is"`) while RopeTransport,
+    vfe_block and the e_step defaults all kept True, so a direct caller forwarding `rope=` without
+    `rope_on_value=` silently got the COUPLED gauge -- the opposite of what the config declared.
+    """
+    import inspect
+
+    from vfe3.geometry.transport import RopeTransport
+    from vfe3.model.block import vfe_block
+
+    config_default = VFE3Config().rope_on_value
+    assert config_default is True
+    assert RopeTransport.__dataclass_fields__["on_value"].default is config_default
+    assert inspect.signature(vfe_block).parameters["rope_on_value"].default is config_default
+
+
+def test_rope_is_not_inert_at_the_default_value_gauge():
+    r"""At rope_on_value=False the rotation barely reaches the logits (measured 7.9e-06 against
+    2.1e-02 coupled), which is why test_rope_changes_logits_vs_no_rope was red: RoPE was very nearly
+    a no-op on the shipped default. The coupled single-gauge path is the one that actually rotates.
+    """
+    from vfe3.model.model import VFEModel
+
+    def _cfg(**kw):
+        base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                    n_e_steps=2, gauge_group="block_glk", e_step_update="gradient")
+        base.update(kw)
+        return VFE3Config(**base)
+
+    torch.manual_seed(0)
+    tokens = torch.randint(0, 6, (2, 8))
+    plain = VFEModel(_cfg(pos_rotation="none"))
+    roped = VFEModel(_cfg(pos_rotation="rope"))          # rope_on_value now defaults True
+    roped.load_state_dict(plain.state_dict())
+    with torch.no_grad():
+        assert float((plain(tokens) - roped(tokens)).abs().max()) > 1e-4
+
+
+# --- D-03: the purity ledger records the E-step update axis --------------------------------
+
+def _pure_cfg(**kw) -> VFE3Config:
+    base = dict(vocab_size=7, embed_dim=4, n_heads=1, max_seq_len=5, n_layers=1, n_e_steps=1,
+                gauge_group="glk", use_prior_bank=True, lambda_alpha_mode="constant")
+    base.update(kw)
+    return VFE3Config(**base)
+
+
+def test_mm_exact_run_can_no_longer_publish_on_pure_path():
+    # mm_exact minimizes the STRICT-PAIR-MASKED surrogate, which drops the structural E_ii = 0
+    # self-pairs, so it is not the canonical objective. The ledger used to certify such a run as
+    # pure because no flag covered the update rule at all.
+    from vfe3.run_artifacts import _pure_path_report
+
+    report = _pure_path_report(_pure_cfg(e_step_update="mm_exact"), [])
+    assert report["pure_flags"]["gradient_e_step_update"] is False
+    assert report["on_pure_path"] is False
+    assert [k for k, v in report["pure_flags"].items() if not v] == ["gradient_e_step_update"]
+
+
+def test_gradient_run_is_still_certified_pure():
+    from vfe3.run_artifacts import _pure_path_report
+
+    report = _pure_path_report(_pure_cfg(e_step_update="gradient"), [])
+    assert report["pure_flags"]["gradient_e_step_update"] is True
+    assert report["on_pure_path"] is True
+
+
+@pytest.mark.parametrize("update,damping", [("gradient", 1.0), ("mm_exact", 0.5)])
+def test_config_toggles_record_the_update_rule_and_its_damping(update, damping):
+    from vfe3.run_artifacts import _pure_path_report
+
+    toggles = _pure_path_report(
+        _pure_cfg(e_step_update=update, mm_damping=damping), [])["config_toggles"]
+    assert toggles["e_step_update"] == update
+    assert toggles["mm_damping"] == pytest.approx(damping)
+
+
+# --- E-06: a length-1 tau is a scalar, not a one-head vector -------------------------------
+
+@pytest.mark.parametrize("gauge_group", ["glk", "so_k"])
+def test_learnable_kappa_beta_runs_on_a_single_irrep_block_group(gauge_group):
+    r"""``log_kappa_beta`` is built with shape ``(len(irrep_dims),) = (1,)`` on a single-block group,
+    and ``_broadcast_tau`` used to reshape any 1-d tau to ``(H, 1, 1)`` -- prepending a phantom head
+    to a HEADLESS ``(..., N, N)`` energy. It propagated into beta and grad_sigma and broke the
+    attention-map einsum outright, while the equivalent explicit per-head kappa list is rejected at
+    config time.
+    """
+    from vfe3.model.model import VFEModel
+
+    cfg = VFE3Config(vocab_size=7, embed_dim=4, n_heads=1, max_seq_len=5, n_layers=1,
+                     n_e_steps=1, gauge_group=gauge_group, learnable_kappa_beta=True)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    tokens = torch.randint(0, 7, (1, 5))
+
+    with torch.no_grad():
+        logits = model(tokens)
+        maps = model.attention_maps(tokens)
+
+    assert logits.shape == (1, 5, 7)
+    assert maps.shape[-2:] == (5, 5)
+
+
+def test_broadcast_tau_collapses_length_one_but_keeps_real_heads():
+    from vfe3.free_energy import _broadcast_tau
+
+    headless_energy = torch.zeros(5, 5)
+    assert _broadcast_tau(torch.tensor([2.0]), headless_energy).dim() == 0
+    multihead_energy = torch.zeros(3, 5, 5)
+    assert _broadcast_tau(torch.tensor([1.0, 2.0, 3.0]), multihead_energy).shape == (3, 1, 1)
+
+
+# --- E-17: the declared n_e_steps domain matches what the code does ------------------------
+
+def test_n_e_steps_domain_admits_the_zero_depth_probes_use():
+    # Two probes drive the field to 0 by direct assignment (the depth-sensitivity sweep and the
+    # zero-e-steps counterfactual), so a `>= 1` rule was false of live instances.
+    assert _pure_cfg(n_e_steps=0).n_e_steps == 0
+
+
+def test_zero_n_e_steps_warns_that_inference_is_disabled():
+    with pytest.warns(UserWarning, match="runs NO belief E-step"):
+        _pure_cfg(n_e_steps=0)
+
+
+def test_negative_n_e_steps_is_still_rejected():
+    with pytest.raises(ValueError, match="n_e_steps must be >= 0"):
+        _pure_cfg(n_e_steps=-1)
+
+
+# --- A-02: means-only RoPE is a hybrid, and the run record says so ------------------------
+
+def _rope_pair(seed: int = 0, n: int = 4, k: int = 4, heads: int = 2):
+    r"""A flat block cocycle plus a block-diagonal orthogonal RoPE rotation."""
+    from vfe3.geometry.transport import FactoredTransport, RopeTransport
+
+    d = k // heads
+    torch.manual_seed(seed)
+    algebra = 0.3 * torch.randn(n, k, k)
+    block_mask = torch.zeros(k, k)
+    for h in range(heads):
+        block_mask[h * d:(h + 1) * d, h * d:(h + 1) * d] = 1.0
+    algebra = algebra * block_mask
+    base = FactoredTransport(torch.matrix_exp(algebra), torch.matrix_exp(-algebra),
+                             irrep_dims=[d] * heads, same_frame_flat_cocycle=True)
+    angles = torch.randn(n, heads)
+    rope = torch.zeros(n, k, k)
+    for i in range(n):
+        for h in range(heads):
+            cos, sin = torch.cos(angles[i, h]), torch.sin(angles[i, h])
+            rope[i, h * d:h * d + 2, h * d:h * d + 2] = torch.tensor([[cos, -sin], [sin, cos]])
+    return (base,
+            RopeTransport(base=base, rope=rope, on_cov=False, same_frame_flat_cocycle=True),
+            RopeTransport(base=base, rope=rope, on_cov=True, same_frame_flat_cocycle=True))
+
+
+def test_means_only_rope_rotates_the_mean_but_not_the_covariance():
+    r"""The transported pair is the pushforward of the key under NO single operator.
+
+    This is the half of A-02 the challenge tier re-scoped and left open: "the mean transports under
+    R_i Omega_ij R_j^T while the covariance transports under bare Omega_ij -- no single frame works.
+    Needs its own check; neither side established it." Established here.
+    """
+    from vfe3.geometry.transport import transport_covariance, transport_mean
+
+    base, hybrid, full = _rope_pair()
+    mu = torch.randn(4, 4)
+    sigma = torch.rand(4, 4) + 0.5
+
+    mu_hybrid = transport_mean(hybrid, mu)
+    mu_rotated = transport_mean(full, mu)
+    mu_plain = transport_mean(base, mu)
+    sigma_hybrid = transport_covariance(hybrid, sigma, diagonal_out=True)
+    sigma_plain = transport_covariance(base, sigma, diagonal_out=True)
+
+    assert torch.equal(mu_hybrid, mu_rotated)               # the MEAN is rotated ...
+    assert float((mu_hybrid - mu_plain).abs().max()) > 1e-3
+    assert torch.equal(sigma_hybrid, sigma_plain)           # ... and the COVARIANCE is not.
+
+
+def test_means_only_rope_preserves_the_structural_self_pair():
+    r"""What the asymmetry must NOT break: Omega_ii = I and R_i R_i^T = I, so the self-link is exact
+    on both slots and the structural E_ii = 0 (and the pair_mask keyed off it) is untouched.
+    """
+    from vfe3.geometry.transport import transport_covariance, transport_mean
+
+    _, hybrid, _ = _rope_pair()
+    mu = torch.randn(4, 4)
+    sigma = torch.rand(4, 4) + 0.5
+    index = torch.arange(4)
+
+    assert torch.equal(transport_mean(hybrid, mu)[index, index], mu)
+    assert torch.equal(
+        transport_covariance(hybrid, sigma, diagonal_out=True)[index, index], sigma)
+
+
+def test_means_only_covariance_is_not_the_truncated_rotated_pushforward():
+    # It is a DIFFERENT object, not a diagonal projection of the right one -- so it cannot be
+    # explained away as the same controlled truncation the diagonal congruence already documents.
+    from vfe3.geometry.transport import transport_covariance
+
+    base, hybrid, _ = _rope_pair()
+    sigma = torch.rand(4, 4) + 0.5
+    shipped = transport_covariance(hybrid, sigma, diagonal_out=True)
+    omega = torch.einsum("ikl,jlm->ijkm", base.exp_phi, base.exp_neg_phi)
+    rotated = torch.einsum("ikl,ijlm,jnm->ijkn", hybrid.rope, omega, hybrid.rope)
+    truncated = torch.einsum("ijkl,ijkl,jl->ijk", rotated, rotated, sigma)
+    assert float((truncated - shipped).abs().max()) > 1e-2
+
+
+@pytest.mark.parametrize(
+    "pos_rotation,full_gauge,expected",
+    [
+        ("none", False, "not_applicable"),
+        ("rope", False, "means_only_unrotated_covariance"),
+        ("rope", True, "exact_rope_congruence"),
+    ],
+)
+def test_run_report_records_which_rope_regime_the_energy_used(pos_rotation, full_gauge, expected):
+    from vfe3.run_artifacts import _pure_path_report
+
+    kwargs = dict(vocab_size=7, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1, n_e_steps=1,
+                  gauge_group="block_glk", pos_rotation=pos_rotation, rope_full_gauge=full_gauge)
+    if full_gauge:                        # R Sigma R^T is dense: full gauge needs the full family
+        kwargs.update(family="gaussian_full", e_step_update="gradient", decode_mode="full")
+    report = _pure_path_report(VFE3Config(**kwargs), [])
+    assert report["config_toggles"]["rope_pair_energy_exactness"] == expected
+    if pos_rotation != "none":            # a RoPE run is already off the gauge-pure path
+        assert report["gauge_flags"]["no_positional_rotation"] is False

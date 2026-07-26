@@ -2112,6 +2112,27 @@ def transport_covariance(
     direct-link base remains factored through that congruence; other bases retain their established
     dense or compact dispatch.
 
+    MEANS-ONLY IS A HYBRID, NOT A PUSHFORWARD (audit 2026-07-26 A-02, the half the challenge tier
+    left open). At ``on_cov=False`` the mean transports under :math:`R_i\Omega_{ij}R_j^{\top}` while
+    the covariance transports under the bare :math:`\Omega_{ij}`, so the resulting pair
+    :math:`(\mu_t, \Sigma_t)` is the pushforward of the key under NO single linear operator. Measured
+    at K=4, N=4, two 2x2 blocks: the transported mean equals the fully-rotated one to 0.0 and differs
+    from the un-rotated one by 5.63, while the transported covariance equals the UN-rotated one to
+    0.0 and differs from the rotated one by 2.06. It is not the diagonal truncation of the rotated
+    pushforward either -- against ``diag(R_i Omega Sigma Omega^T R_i^T)`` the shipped covariance is
+    off by a relative 6.33, so it is a different object rather than a projection of the right one.
+
+    This is deliberate and forced, not an oversight: for a diagonal family :math:`R\Sigma R^{\top}`
+    is dense and unrepresentable, which is why ``rope_full_gauge=True`` requires
+    ``family='gaussian_full'``. What survives intact is the structural contract the machinery depends
+    on -- at :math:`i=j` both :math:`\Omega_{ii}` and :math:`R_iR_i^{\top}` are the identity, so
+    ``mu_t[i,i] == mu_i`` and ``sigma_t[i,i] == sigma_i`` EXACTLY (measured 0.0 for both) and the
+    structural :math:`E_{ii}=0` self-pair, with the ``pair_mask`` that keys off it, is unaffected.
+    What does NOT survive is the literal reading of the coupling-energy contract
+    :math:`E_{ij}=D(q_i\|\Omega_{ij\#}q_j)`: under means-only RoPE there is no such
+    :math:`\Omega_{ij}`. Runs record which of the two regimes they used through
+    ``rope_pair_energy_exactness`` in the run report.
+
     ``retain_full_precision=True`` keeps only a full-covariance sandwich in float64 after its
     existing float64 contraction. The default remains the source dtype, and every diagonal route
     ignores this opt-in so the default and compact hot paths remain unchanged.
