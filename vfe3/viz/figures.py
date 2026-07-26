@@ -1161,6 +1161,116 @@ def plot_estep_depth_sensitivity(
     return _save(fig, path)
 
 
+@register_figure("estep_character")
+def plot_estep_character(
+    record: Mapping[str, object],
+
+    *,
+    path:   Optional[str] = None,
+):
+    r"""Plot what the belief E-step does with depth: how far it moves, and how it is weighted.
+
+    Left axis is the relative belief displacement, right axis the PAIR (attention) share of the
+    fused ``mm_exact`` precision, whose complement is the prior residual. A flat displacement curve
+    with a high residual share is one aggregation, not convergent inference.
+    """
+    points = [p for p in record.get("points", []) if p.get("rel_displacement") is not None]
+    fig, ax_move = plt.subplots(figsize=(5.6, 3.6))
+    if not points:
+        ax_move.text(0.5, 0.5, "no mm_exact fusion recorded", ha="center", va="center",
+                     transform=ax_move.transAxes, fontsize=9)
+        ax_move.set_axis_off()
+        return _save(fig, path)
+    depths = np.asarray([p["belief_depth"] for p in points], dtype=float)
+    displacement = np.asarray([p["rel_displacement"] for p in points], dtype=float)
+    ax_move.plot(depths, displacement, "o-", color=_CB[0], label=r"$\|\Delta\mu\|/\|\mu_p\|$")
+    ax_share = ax_move.twinx()
+    shares = np.asarray([p["pair_precision_share"] if p.get("pair_precision_share") is not None
+                         else np.nan for p in points], dtype=float)
+    if np.isfinite(shares).any():
+        ax_share.plot(depths, shares, "s--", color=_CB[1], label="pair (attention) share")
+        ax_share.set_ylim(0.0, 1.0)
+    ax_share.set_ylabel("share of fused precision")
+    trained_depth = float(record.get("trained_depth", np.nan))
+    if np.isfinite(trained_depth):
+        ax_move.axvline(trained_depth, color="#555555", ls=":", lw=1.0, label="trained depth")
+    cosines = [p.get("cos_dir_vs_step1") for p in points if p.get("cos_dir_vs_step1") is not None]
+    if cosines:
+        ax_move.set_title(f"E-step character  (cos(dir, step 1) = {cosines[-1]:+.3f})")
+    else:
+        ax_move.set_title("E-step character")
+    ax_move.set(xlabel="belief E-step iterations", ylabel="relative belief displacement")
+    lines = ax_move.lines + ax_share.lines
+    ax_move.legend(lines, [line.get_label() for line in lines], frameon=False, fontsize=8,
+                   loc="center right")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("beta_channel_decomposition")
+def plot_beta_channel_decomposition(
+    record: Mapping[str, object],
+
+    *,
+    path:   Optional[str] = None,
+):
+    r"""Plot what each channel of the attention weight is worth, in nats of cross-entropy."""
+    fig, ax = plt.subplots(figsize=(5.0, 3.4))
+    deltas = record.get("delta_ce") or {}
+    labels, values = [], []
+    for key, label in (("positional_channel", "positional prior"),
+                       ("content_channel", "content energy")):
+        if deltas.get(key) is not None:
+            labels.append(label)
+            values.append(float(deltas[key]))
+    if not values:
+        ax.text(0.5, 0.5, "no live beta softmax intercepted", ha="center", va="center",
+                transform=ax.transAxes, fontsize=9)
+        ax.set_axis_off()
+        return _save(fig, path)
+    bars = ax.bar(labels, values, color=[_CB[1], _CB[0]][:len(values)], width=0.55)
+    for bar, value in zip(bars, values):
+        ax.annotate(f"{value:+.3f}", (bar.get_x() + bar.get_width() / 2.0, value),
+                    ha="center", va="bottom", fontsize=8)
+    ax.axhline(0.0, color="#555555", lw=0.8)
+    ax.set(ylabel=r"$\Delta$CE when ablated (nats)",
+           title="What each attention channel carries")
+    fig.tight_layout()
+    return _save(fig, path)
+
+
+@register_figure("context_sensitivity")
+def plot_context_sensitivity(
+    record: Mapping[str, object],
+
+    *,
+    path:   Optional[str] = None,
+):
+    r"""Plot where prefix context enters the belief, stage by stage.
+
+    The ``raw_prior`` control reads 0 for a pure per-token lookup; each later bar is cumulative, so
+    the increments attribute context injection to the model channel and the belief E-step.
+    """
+    fig, ax = plt.subplots(figsize=(5.0, 3.4))
+    stages = record.get("stages") or {}
+    labels = [name for name, value in stages.items() if value is not None]
+    values = [float(stages[name]) for name in labels]
+    if not values:
+        ax.text(0.5, 0.5, "context-sensitivity probe not run", ha="center", va="center",
+                transform=ax.transAxes, fontsize=9)
+        ax.set_axis_off()
+        return _save(fig, path)
+    bars = ax.bar(labels, values, color=_CB[:len(values)], width=0.55)
+    for bar, value in zip(bars, values):
+        ax.annotate(f"{value:.3f}", (bar.get_x() + bar.get_width() / 2.0, value),
+                    ha="center", va="bottom", fontsize=8)
+    ax.set(ylabel="relative belief shift (prefix randomized)",
+           title="Where context enters the belief")
+    ax.tick_params(axis="x", labelsize=8)
+    fig.tight_layout()
+    return _save(fig, path)
+
+
 @register_figure("phi_numerics_reference")
 def plot_phi_numerics_reference(
     record: Mapping[str, object],

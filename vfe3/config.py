@@ -667,6 +667,14 @@ class VFE3Config:
     evaluate_zero_e_steps_counterfactual:  bool          = True
     generate_figures:                      bool          = True
 
+    # End-of-run mechanism diagnostics (2026-07-25). The CHEAP tier -- E-step character (belief
+    # displacement, direction cosine, and the prior/pair split of the fused mm_exact precision) and
+    # the beta channel decomposition (positional prior vs content energy) -- runs with the other
+    # end-of-run probes whenever generate_figures is on, because each costs a handful of forward
+    # passes on one already-loaded batch. True additionally enables the EXPENSIVE tier, currently
+    # the context-sensitivity probe, which re-runs the forward once per randomized-prefix replicate.
+    emit_expensive_diagnostics:            bool          = False
+
     # Memory-guard override for full-vocabulary reporting inputs (audit 2026-07-01 F9): the two
     # extractors that materialize full (B, N, V) logits/probabilities are skipped above the guard,
     # while lighter figures still run. True opts those large inputs back in.
@@ -2506,7 +2514,8 @@ class VFE3Config:
         # way. `type(x) is not
         # bool` (not isinstance) rejects the int/str footguns. Deliberately NOT swept across every
         # bool field (over-validation risk) -- only the audit-called-out fields.
-        for _bname in ("trust_resume_checkpoint", "generate_figures", "force_large_figures", "use_ema"):
+        for _bname in ("trust_resume_checkpoint", "generate_figures", "force_large_figures", "use_ema",
+                       "emit_expensive_diagnostics"):
             _bval = getattr(self, _bname)
             if type(_bval) is not bool:
                 raise ValueError(f"{_bname} must be a bool, got {type(_bval).__name__}: {_bval!r}")

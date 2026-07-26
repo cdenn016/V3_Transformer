@@ -2887,6 +2887,34 @@ def finalize_run(
             artifacts.save_json("estep_depth_sensitivity.json", _depth_record)
         except Exception as exc:
             logger.warning("estep depth-sensitivity probe failed (%s); skipped", exc)
+        # Mechanism diagnostics (2026-07-25). CHEAP tier: a handful of forward passes on the batch
+        # already loaded above, so they ride along with the other end-of-run probes. Each is
+        # best-effort and logs its own headline, because reading these off a figure after the fact
+        # is exactly how the depth probe stayed misattributed for weeks.
+        _character_record = None
+        _beta_record = None
+        _context_record = None
+        try:
+            _character_record = collect_estep_character(
+                model, _depth_tokens, depths=(1, 2, 3, 5, 8))
+            artifacts.save_json("estep_character.json", _character_record)
+        except Exception as exc:
+            logger.warning("estep character probe failed (%s); skipped", exc)
+        try:
+            _beta_record = collect_beta_channel_decomposition(model, _depth_tokens, _depth_targets)
+            artifacts.save_json("beta_channel_decomposition.json", _beta_record)
+        except Exception as exc:
+            logger.warning("beta channel decomposition failed (%s); skipped", exc)
+        if bool(getattr(cfg, "emit_expensive_diagnostics", False)):
+            try:
+                _context_record = collect_context_sensitivity(model, _depth_tokens)
+                artifacts.save_json("context_sensitivity.json", _context_record)
+            except Exception as exc:
+                logger.warning("context-sensitivity probe failed (%s); skipped", exc)
+        else:
+            logger.info(
+                "Context-sensitivity probe skipped (set emit_expensive_diagnostics=True to run it)")
+        _log_mechanism_diagnostics(logger, _character_record, _beta_record, _context_record)
         try:
             _phi_batch = next(iter(depth_loader))
             _phi_tokens = (
@@ -3080,6 +3108,410 @@ def collect_estep_depth_sensitivity(
         ),
         "points": points,
         "model_channel_points": model_channel_points,
+    }
+
+
+def _log_mechanism_diagnostics(
+    logger:    'logging.Logger',
+    character: Optional[Dict[str, object]],
+    beta:      Optional[Dict[str, object]],
+    context:   Optional[Dict[str, object]],
+) -> None:
+    r"""Print the mechanism headlines to the run log so they are read, not buried in JSON.
+
+    Every number here answers one question about where the model's capacity actually is. A probe
+    that did not run prints nothing rather than a zero.
+    """
+    logger.info("---- mechanism diagnostics ----")
+    if character is not None and character.get("points"):
+        trained = int(character["trained_depth"])
+        rows = {int(p["belief_depth"]): p for p in character["points"]}
+        at_trained = rows.get(trained) or next(iter(rows.values()))
+        deepest = rows[max(rows)]
+        if at_trained.get("pair_precision_share") is not None:
+            logger.info(
+                "E-step fusion at trained depth %d: PAIR (attention) %.3f / PRIOR (residual) %.3f",
+                trained, at_trained["pair_precision_share"], at_trained["prior_precision_share"])
+        if at_trained.get("rel_displacement") is not None:
+            logger.info(
+                "Belief displacement ||dmu||/||mu_p||: %.4f at depth %d -> %.4f at depth %d",
+                at_trained["rel_displacement"], trained,
+                deepest["rel_displacement"], int(deepest["belief_depth"]))
+        if deepest.get("cos_dir_vs_step1") is not None:
+            logger.info(
+                "Trajectory straightness cos(dir_%d, dir_1) = %+.4f; step 1 takes %.0f%% of it",
+                int(deepest["belief_depth"]), deepest["cos_dir_vs_step1"],
+                100.0 * (deepest.get("step1_share_of_displacement") or 0.0))
+        if float(character.get("recompute_max_abs_err") or 0.0) > 1e-4:
+            logger.warning(
+                "E-step character replica error %.3e is NONZERO -- the probe no longer matches the "
+                "kernel fusion; treat its precision shares as stale",
+                character["recompute_max_abs_err"])
+    if beta is not None and beta.get("available"):
+        deltas = beta["delta_ce"]
+        logger.info(
+            "Attention channels (delta CE, nats): positional prior %+.4f vs content energy %+.4f",
+            deltas["positional_channel"], deltas["content_channel"])
+    if context is not None and context.get("stages"):
+        logger.info(
+            "Context injection (relative belief shift under prefix randomization): %s",
+            ", ".join(f"{name} {value:.4f}" for name, value in context["stages"].items()))
+    logger.info("-------------------------------")
+
+
+@torch.no_grad()
+def collect_estep_character(
+    model:  torch.nn.Module,
+    tokens: torch.Tensor,
+    depths: Iterable[int],
+) -> Dict[str, object]:
+    r"""Is the belief E-step convergent inference, or one aggregation with a residual?
+
+    Three questions, one fixed batch, current weights (2026-07-25):
+
+    1. **How far does the belief move?** ``rel_displacement`` is
+       :math:`\lVert\mu^{*}_d-\mu_p\rVert/\lVert\mu_p\rVert` at each depth d. A no-op reads 0.
+    2. **Is the trajectory a straight line?** ``cos_dir_vs_step1`` is the cosine between the total
+       displacement at depth d and the displacement after ONE step. Near +1 means every later step
+       pushes the same way, so depth buys magnitude rather than direction.
+    3. **How is the fixed point weighted?** ``mm_exact`` fuses
+       :math:`\mu^{*}=(a\mu_p/s_p+\sum_j w_{ij}\mu_t/s_t)/P`. ``pair_precision_share`` is the
+       transported-neighbor (ATTENTION) mass of ``P`` and ``prior_precision_share`` its complement
+       (the RESIDUAL). Measured 2026-07-25 at 0.190 (K=20) and 0.298 (K=300) under
+       ``prior_source='model_channel'``, i.e. the converged belief is a convex blend dominated by
+       its own prior, not a deep computation.
+
+    SELF-VALIDATING. The split is recomputed from the same public helpers the kernel uses and then
+    checked against the kernel's own returned ``mu_star``; ``recompute_max_abs_err`` is that residual
+    and is 0.0 when the replica is exact. If the kernel's fusion is ever changed without updating
+    this probe the residual grows, so the number is reported rather than asserted -- a drifted probe
+    is visible in the artifact instead of silently wrong.
+
+    Only the ``mm_exact`` kernel route is decomposed. On any other ``e_step_update`` the displacement
+    and cosine are still reported and the shares are ``None`` (``precision_split_available=False``);
+    nothing is fabricated for a route whose fusion does not exist.
+    """
+    from vfe3.alpha_i import alpha_gradient_coefficient, alpha_is_per_coord
+    from vfe3.free_energy import self_divergence_for_alpha
+    from vfe3.gradients import kernels as kernels_module
+    from vfe3.inference import e_step as e_step_module
+
+    requested = list(depths)
+    if any(type(depth) is not int or depth < 1 for depth in requested):
+        raise ValueError(f"depths must contain integers >= 1, got {requested!r}")
+    ordered = sorted(set(requested))
+    trained_depth = int(model.cfg.n_e_steps)
+    trained_s_depth = model.cfg.s_e_step_n_iter
+    was_training = bool(model.training)
+
+    # `inference/e_step.py` binds mm_exact_update at import, so patching `kernels` alone leaves the
+    # live call site pointing at the original and the probe silently records nothing. Patch every
+    # module that holds a reference, and restore each from its own saved value.
+    original_mm = kernels_module.mm_exact_update
+    holders = [module for module in (kernels_module, e_step_module)
+               if getattr(module, "mm_exact_update", None) is original_mm]
+    original_contract = kernels_module._pair_contract
+    contract_out: List[torch.Tensor] = []
+    recorded: List[Dict[str, object]] = []
+
+    def _contract_spy(w, x, irrep_dims):
+        out = original_contract(w, x, irrep_dims)
+        contract_out.append(out.detach())
+        return out
+
+    def _mm_spy(mu, sigma, mu_p, sigma_p, omega, **kw):
+        contract_out.clear()
+        mu_star, sigma_star = original_mm(mu, sigma, mu_p, sigma_p, omega, **kw)
+        if len(contract_out) < 2:                      # a route that skipped the pair contraction
+            return mu_star, sigma_star
+        pair_prec, pair_mean = contract_out[0], contract_out[1]
+        eps = kw.get("eps", 1e-6)
+        kl_max = kw.get("kl_max", 100.0)
+        mode = kw.get("lambda_alpha_mode", "constant")
+        family = kernels_module.get_family(kw.get("family", "gaussian_diagonal"))
+        self_divergence = self_divergence_for_alpha(
+            family(mu, sigma), family(mu_p, sigma_p), alpha=1.0, kl_max=kl_max, eps=eps,
+            divergence_family=kw.get("divergence_family", "renyi"), lambda_alpha_mode=mode)
+        coefficient = alpha_gradient_coefficient(
+            self_divergence, value=kw.get("value", 1.0),
+            b0=kw.get("b0", 1.0), c0=kw.get("c0", 1.0), mode=mode)
+        if alpha_is_per_coord(mode):
+            raw_self = kernels_module._raw_diag_kl_per_coord(mu, sigma, mu_p, sigma_p, eps=eps)
+            self_mask = (raw_self < kl_max).to(mu.dtype)
+        else:
+            coefficient = coefficient.unsqueeze(-1)
+            raw_self = kernels_module._raw_diag_kl(mu, sigma, mu_p, sigma_p, eps=eps)
+            self_mask = (raw_self < kl_max).to(mu.dtype).unsqueeze(-1)
+        a = self_mask * coefficient                                    # (..., N, 1) or (..., N, K)
+        sp = sigma_p.clamp(min=eps)
+        prior_prec = a / sp
+        precision = prior_prec + pair_prec
+        replica = torch.where(precision <= eps, mu,
+                              (a * mu_p / sp + pair_mean) / precision.clamp(min=eps))
+        recorded.append({
+            "prior_mass": float(prior_prec.sum()),
+            "pair_mass":  float(pair_prec.sum()),
+            "mu_p":       mu_p.detach(),
+            "mu_star":    mu_star.detach(),
+            "err":        float((replica - mu_star).abs().max()),
+        })
+        return mu_star, sigma_star
+
+    points: List[Dict[str, object]] = []
+    directions: Dict[int, torch.Tensor] = {}
+    split_available = False
+    max_err = 0.0
+    try:
+        model.eval()
+        for module in holders:
+            module.mm_exact_update = _mm_spy
+        kernels_module._pair_contract = _contract_spy
+        for depth in ordered:
+            model.cfg.n_e_steps = depth
+            model.cfg.s_e_step_n_iter = trained_s_depth if trained_s_depth is not None else trained_depth
+            recorded.clear()
+            model(tokens)
+            if not recorded:                            # non-mm_exact route: no fusion to decompose
+                points.append({"belief_depth": depth, "rel_displacement": None,
+                               "pair_precision_share": None, "prior_precision_share": None})
+                continue
+            split_available = True
+            first, last = recorded[0], recorded[-1]
+            max_err = max(max_err, max(float(call["err"]) for call in recorded))
+            displacement = last["mu_star"] - first["mu_p"]
+            directions[depth] = displacement.flatten()
+            prior_mass, pair_mass = float(first["prior_mass"]), float(first["pair_mass"])
+            total = prior_mass + pair_mass
+            points.append({
+                "belief_depth":          depth,
+                "rel_displacement":      float(displacement.norm() / first["mu_p"].norm()),
+                "pair_precision_share":  (pair_mass / total) if total > 0.0 else None,
+                "prior_precision_share": (prior_mass / total) if total > 0.0 else None,
+            })
+    finally:
+        for module in holders:
+            module.mm_exact_update = original_mm
+        kernels_module._pair_contract = original_contract
+        model.cfg.n_e_steps = trained_depth
+        model.cfg.s_e_step_n_iter = trained_s_depth
+        model.train(was_training)
+
+    step1 = directions.get(min(ordered)) if directions else None
+    for point in points:
+        vector = directions.get(int(point["belief_depth"]))
+        if step1 is None or vector is None:
+            point["cos_dir_vs_step1"] = None
+            point["step1_share_of_displacement"] = None
+            continue
+        point["cos_dir_vs_step1"] = float(
+            torch.nn.functional.cosine_similarity(vector, step1, dim=0))
+        norm = float(vector.norm())
+        point["step1_share_of_displacement"] = (float(step1.norm()) / norm) if norm > 0.0 else None
+
+    return {
+        "trained_depth":              trained_depth,
+        "e_step_update":              str(model.cfg.e_step_update),
+        "model_channel_live":         bool(model.cfg.s_e_step),
+        "n_sequences":                int(tokens.shape[0]),
+        "precision_split_available":  split_available,
+        "recompute_max_abs_err":      max_err,
+        "interpretation": (
+            "current-weight E-step character on one fixed batch. rel_displacement is "
+            "||mu*_d - mu_p|| / ||mu_p||; cos_dir_vs_step1 near +1 means depth adds magnitude, not "
+            "direction. pair_precision_share is the transported-neighbor (attention) mass of the "
+            "mm_exact fused precision and prior_precision_share its residual complement; both are "
+            "None off the mm_exact route. recompute_max_abs_err is the probe's replica error against "
+            "the kernel's own mu_star and must stay at 0."
+        ),
+        "points": points,
+    }
+
+
+@torch.no_grad()
+def collect_beta_channel_decomposition(
+    model:   torch.nn.Module,
+    tokens:  torch.Tensor,
+    targets: torch.Tensor,
+) -> Dict[str, object]:
+    r"""Which channel of the attention weight carries the prediction: position or content?
+
+    The belief attention weight is :math:`\beta_{ij}=\mathrm{softmax}_j(\log\pi_{ij}-E_{ij}/\tau)`,
+    where :math:`\log\pi` is the positional/precision/gamma prior and :math:`E_{ij}` is the
+    belief-coupling energy -- the only content-dependent channel. Three arms isolate them:
+
+    ============ ============================================ ==================================
+    arm          beta                                         reads
+    ============ ============================================ ==================================
+    ``full``     ``softmax(log_prior - E/tau)``                as trained; reproduces the baseline
+    ``no_energy``  ``softmax(log_prior)``                      the CONTENT channel's worth
+    ``no_prior``   ``softmax(-E/tau)``                         the POSITIONAL channel's worth
+    ============ ============================================ ==================================
+
+    Measured 2026-07-25 on the K=300 baseline: flattening the prior cost 0.612 nats against 0.210
+    for ablating the whole coupling energy, so the positional prior carried roughly three times the
+    content channel. ``full`` reproducing the headline CE is the harness check -- if it drifts, the
+    patch missed the live softmax and the other two arms mean nothing.
+
+    Patching the ``attention_weights`` binding inside ``gradients.kernels`` isolates the BELIEF beta
+    exactly: the model channel's gamma weights resolve through ``model.py``'s own import and are
+    untouched. Both belief routes read that binding -- ``belief_gradients`` and ``mm_exact_update``
+    each call it -- so this works under either ``e_step_update``. ``available`` records whether any
+    live softmax was actually intercepted; when it is False the arms are omitted rather than
+    reported as numbers that describe nothing.
+
+    ``no_prior`` preserves ``-inf`` entries of the log-prior so the causal / no-self MASK survives
+    while its graded positional shape is flattened. A configuration carrying no attention log-prior
+    at all therefore leaves ``no_prior`` equal to ``full``, correctly reporting that this model has
+    no positional channel to ablate.
+    """
+    import torch.nn.functional as F
+    from vfe3.gradients import kernels as kernels_module
+
+    was_training = bool(model.training)
+    original = kernels_module.attention_weights
+    mode = {"arm": "full"}
+
+    def _patched(energy, *, tau=1.0, log_prior=None):
+        if mode["arm"] == "no_energy":
+            return original(torch.zeros_like(energy), tau=tau, log_prior=log_prior)
+        if mode["arm"] == "no_prior":
+            keep = None if log_prior is None else torch.where(
+                torch.isneginf(log_prior), log_prior, torch.zeros_like(log_prior))
+            return original(energy, tau=tau, log_prior=keep)      # keep the causal/no-self support
+        return original(energy, tau=tau, log_prior=log_prior)
+
+    arms: Dict[str, Optional[float]] = {}
+    intercepted = {"n": 0}
+
+    def _counting(energy, *, tau=1.0, log_prior=None):
+        intercepted["n"] += 1
+        return _patched(energy, tau=tau, log_prior=log_prior)
+
+    try:
+        model.eval()
+        kernels_module.attention_weights = _counting
+        for arm in ("full", "no_energy", "no_prior"):
+            mode["arm"] = arm
+            logits = model(tokens)
+            arms[arm] = float(F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]).float(),
+                targets.reshape(-1),
+                ignore_index=-100,
+            ))
+    finally:
+        kernels_module.attention_weights = original
+        model.train(was_training)
+
+    available = intercepted["n"] > 0
+    baseline = arms.get("full")
+    return {
+        "available":     available,
+        "e_step_update": str(model.cfg.e_step_update),
+        "n_sequences":   int(tokens.shape[0]),
+        "ce":            arms if available else {},
+        "delta_ce": ({
+            "content_channel":    (arms["no_energy"] - baseline) if available else None,
+            "positional_channel": (arms["no_prior"] - baseline) if available else None,
+        } if available else {}),
+        "interpretation": (
+            "delta_ce.content_channel is the cost of ablating the belief-coupling energy from beta "
+            "(what CONTENT is worth); delta_ce.positional_channel is the cost of flattening the "
+            "attention log-prior on its causal support (what POSITION is worth). available=False "
+            "means no live beta softmax was intercepted -- the active e_step_update does not use "
+            "the kernel route, and the arms carry no meaning."
+        ),
+    }
+
+
+@torch.no_grad()
+def collect_context_sensitivity(
+    model:  torch.nn.Module,
+    tokens: torch.Tensor,
+
+    *,
+    n_replicates: int = 4,
+    seed:         int = 0,
+) -> Dict[str, object]:
+    r"""Does the belief at the final position depend on its prefix, and where does that enter?
+
+    Randomizes every token before the last, holds the last token fixed, and measures the relative
+    :math:`L^2` displacement of the final position's belief mean. A pure per-token lookup reads
+    EXACTLY 0; anything above that is context the forward pass injected. The belief trace this
+    reads is SEQUENCE 0 only, so ``tokens`` supplies one measured sequence however large the batch.
+
+    Three stages separate the two channels. ``raw_prior`` (both loops off) is the control and must
+    read 0. ``model_channel`` adds the s refinement alone, ``belief_estep`` adds the belief loop on
+    top. Measured 2026-07-25 at K=300: 0.000 -> 0.812 -> 0.872, i.e. the model channel injected
+    almost all of it. Under ``s_e_step=False`` the middle stage is omitted, since the refine never
+    runs and the prior is a lookup by construction.
+
+    EXPENSIVE: ``n_replicates`` extra forward passes per stage. Gated by
+    ``cfg.emit_expensive_diagnostics``.
+    """
+    from vfe3.viz.extract import e_step_belief_trace
+
+    if type(n_replicates) is not int or n_replicates < 1:
+        raise ValueError(f"n_replicates must be an int >= 1, got {n_replicates!r}")
+    trained_depth = int(model.cfg.n_e_steps)
+    trained_s_depth = model.cfg.s_e_step_n_iter
+    model_channel_live = bool(model.cfg.s_e_step)
+    was_training = bool(model.training)
+    cpu_rng = torch.get_rng_state().clone()
+    cuda_rng = ([state.clone() for state in torch.cuda.get_rng_state_all()]
+                if torch.cuda.is_available() else None)
+
+    vocab = int(model.cfg.vocab_size)
+    generator = torch.Generator(device="cpu").manual_seed(int(seed))
+
+    def _final_mean(batch: torch.Tensor) -> torch.Tensor:
+        trace = e_step_belief_trace(model, batch, n_iter=int(model.cfg.n_e_steps))
+        return torch.as_tensor(trace["mu"][-1])[-1].flatten().float()   # last iterate, last position
+
+    stages: Dict[str, Optional[float]] = {}
+    try:
+        model.eval()
+        variants = [("raw_prior", 0, 0)]
+        if model_channel_live:
+            variants.append(("model_channel", 0, 1))
+        variants.append(("belief_estep", trained_depth,
+                         (trained_s_depth if trained_s_depth is not None else trained_depth)
+                         if model_channel_live else 0))
+        for name, belief_depth, s_depth in variants:
+            model.cfg.n_e_steps = belief_depth
+            model.cfg.s_e_step_n_iter = s_depth
+            reference = _final_mean(tokens)
+            shifts = []
+            for _ in range(n_replicates):
+                perturbed = tokens.clone()
+                if perturbed.shape[1] > 1:
+                    perturbed[:, :-1] = torch.randint(
+                        0, vocab, perturbed[:, :-1].shape, generator=generator, dtype=perturbed.dtype
+                    ).to(perturbed.device)
+                moved = _final_mean(perturbed)
+                denominator = float(reference.norm())
+                shifts.append(float((moved - reference).norm()) / denominator
+                              if denominator > 0.0 else 0.0)
+            stages[name] = sum(shifts) / len(shifts)
+    finally:
+        model.cfg.n_e_steps = trained_depth
+        model.cfg.s_e_step_n_iter = trained_s_depth
+        model.train(was_training)
+        torch.set_rng_state(cpu_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state_all(cuda_rng)
+
+    return {
+        "n_replicates":       n_replicates,
+        "seed":               int(seed),
+        "model_channel_live": model_channel_live,
+        "stages":             stages,
+        "interpretation": (
+            "mean relative L2 displacement of the FINAL position's belief mean when the prefix is "
+            "randomized and the final token held fixed. raw_prior is the control and reads 0 for a "
+            "pure per-token lookup; model_channel adds the s refinement (absent when s_e_step=False) "
+            "and belief_estep adds the belief loop, so the increments attribute context injection to "
+            "each channel."
+        ),
     }
 
 
