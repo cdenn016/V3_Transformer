@@ -3212,8 +3212,18 @@ def collect_estep_character(
     nothing at all about it. The block-level window below closes that: ``vfe_block`` receives the
     belief prior and returns the converged belief whatever the inner route is, so displacement and
     cosine are now genuinely route-independent. The ``mm_exact`` window stays PRIMARY where it exists,
-    because it reads ``mu_star`` before the block's optional norm and is what the published mm numbers
-    were measured against; the block window is a fallback used only when no belief fusion was recorded.
+    because it is what the published mm numbers were measured against; the block window is a fallback
+    used only when no belief fusion was recorded.
+
+    That fallback then read the block's RETURN value, which is post-``head_mixer``/``cg_coupling``/
+    norm, while the ``mm_exact`` window reads ``mu_star`` before them -- so the two windows measured
+    different quantities and the published ``rel_displacement`` was not comparable across routes
+    (audit 2026-07-26 B-11). On the K=20 ``mm_exact`` checkpoint at ``use_head_mixer=True`` the same
+    forward pass reads 0.213 on the mm window and 4.579 on the block's return, because the mixer
+    alone moves the belief 4.43x its own norm -- and 98.5% of that motion is a scalar gain of 5.33
+    (cosine 0.985), i.e. magnitude carrying no inferential content. The block window now ends at
+    ``capture['converged']``, the pre-transform belief ``vfe_block`` already stashes, so both windows
+    measure the E-step and ``displacement_window`` records which one produced each point.
     """
     from vfe3.alpha_i import alpha_gradient_coefficient, alpha_is_per_coord
     from vfe3.free_energy import self_divergence_for_alpha
@@ -3258,15 +3268,29 @@ def collect_estep_character(
             frame["channel"] = "belief"
 
     def _block_spy(*args, **kwargs):
+        # Route-independent displacement window. vfe_block(belief, mu_p, sigma_p, ...) takes the
+        # prior positionally at the stack call site, so the ANCHOR exists on every e_step_update --
+        # unlike the mm_exact fusion, which the gradient route never calls.
+        #
+        # The CONVERGED end must be the E-step's own output, NOT the block's return value (audit
+        # 2026-07-26 B-11). vfe_block applies head_mixer / cg_coupling / block_norm AFTER the E-step,
+        # so `out.mu` is post-transform while the mm spy reads mu_star pre-transform: the two windows
+        # then measure different quantities and rel_displacement is silently incomparable across
+        # routes. Measured on the K=20 mm_exact checkpoint at use_head_mixer=True, one batch of 64:
+        # the mm window reads 0.213 and the block's return reads 4.579 for the SAME forward pass,
+        # because the mixer alone moves the belief 4.43x its own norm -- and that motion is 98.5%
+        # a scalar gain (cos 0.985, gain 5.33), so it is magnitude carrying no inferential content.
+        # `capture['converged']` is the pre-transform belief vfe_block already stashes for the M-step
+        # self-coupling, which is exactly the mm window's endpoint; inject a capture when the caller
+        # passed none (an empty mapping selects the same branches None does).
+        record = (frame["channel"] == "belief" and frame["layer"] == 0 and len(args) >= 2)
+        if record and kwargs.get("capture") is None:
+            kwargs["capture"] = {}
         out = original_block(*args, **kwargs)
-        # Route-independent displacement window. vfe_block(belief, mu_p, sigma_p, ...) -> BeliefState
-        # takes the prior positionally at the stack call site and returns the converged belief, so
-        # this pair exists on EVERY e_step_update -- unlike the mm_exact fusion, which the gradient
-        # route never calls. Recorded for the belief channel of layer 0 only, on the same window the
-        # mm spy uses, and consumed below only when that spy recorded nothing.
-        if frame["channel"] == "belief" and frame["layer"] == 0 and len(args) >= 2:
+        if record:
             mu_prior = args[1]
-            mu_converged = getattr(out, "mu", None)
+            converged = (kwargs.get("capture") or {}).get("converged")
+            mu_converged = getattr(converged, "mu", None)
             if isinstance(mu_prior, torch.Tensor) and isinstance(mu_converged, torch.Tensor):
                 block_window["mu_p"] = mu_prior.detach()
                 block_window["mu_star"] = mu_converged.detach()
@@ -3361,14 +3385,18 @@ def collect_estep_character(
             belief0 = [call for call in recorded
                        if call["channel"] == "belief" and call["layer"] == 0]
             realized_belief_calls[depth] = len(belief0)
-            # The mm_exact fusion window is primary; the block window covers every other route.
+            # The mm_exact fusion window is primary; the block capture covers every other route.
+            # Both now end at the E-step output, so rel_displacement means the same thing on either
+            # (audit 2026-07-26 B-11). The window is published per point rather than assumed.
             if belief0 and window["first_mu_p"] is not None:
                 anchor, converged = window["first_mu_p"], window["last_mu_star"]
+                measured_window = "mm_exact_fusion"
             else:
                 anchor, converged = block_window["mu_p"], block_window["mu_star"]
+                measured_window = "block_capture"
             if anchor is None or converged is None or float(anchor.norm()) == 0.0:
                 points.append({"belief_depth": depth, "n_belief_calls": len(belief0),
-                               "rel_displacement": None,
+                               "rel_displacement": None, "displacement_window": None,
                                "pair_precision_share": None, "prior_precision_share": None})
                 continue
             displacement = converged - anchor
@@ -3377,6 +3405,7 @@ def collect_estep_character(
                 "belief_depth":          depth,
                 "n_belief_calls":        len(belief0),
                 "rel_displacement":      float(displacement.norm() / anchor.norm()),
+                "displacement_window":   measured_window,
                 "pair_precision_share":  None,
                 "prior_precision_share": None,
             }
@@ -3434,7 +3463,12 @@ def collect_estep_character(
             "the anchor was the model channel's token-uniform centroid r rather than the belief's "
             "prior). n_belief_calls is the REALIZED iteration count, which can fall below "
             "belief_depth when e_step_halt_tol stops the loop early. rel_displacement is "
-            "||mu*_d - mu_p|| / ||mu_p||; cos_dir_vs_step1 near +1 means depth adds magnitude, not "
+            "||mu*_d - mu_p|| / ||mu_p|| where mu*_d is the E-step output BEFORE the block's "
+            "head_mixer / cg_coupling / norm, on either window -- displacement_window names which "
+            "one produced the point (audit 2026-07-26 B-11; before that fix the non-mm_exact window "
+            "ended at the block's RETURN value, so a post-transform number was published alongside "
+            "pre-transform mm_exact numbers and the routes were not comparable). cos_dir_vs_step1 "
+            "near +1 means depth adds magnitude, not "
             "direction. pair_precision_share is the transported-neighbor (attention) mass of the "
             "mm_exact fused precision and prior_precision_share its residual complement; both are "
             "None off the mm_exact route. recompute_max_abs_err is the probe's replica error against "

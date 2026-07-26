@@ -512,6 +512,15 @@ def test_pure_path_report_transport_covariance_class():
 
 
 def test_pure_path_report_reads_transport_registry_metadata():
+    r"""The restore must be COMPLETE: `register_transport` resets every unnamed field.
+
+    This hand-enumerated restore silently dropped `pair_transport_kind` when the E-03 capability
+    ladder added it (audit 2026-07-26), leaving `flat` at the fail-closed default 'opaque' for the
+    rest of the worker's session. Serially that lands after its victims and nothing is seen; under
+    xdist loadscope it can land before them, and every family that requires a 'coboundary' or
+    'pair_inverse' transport then refuses to build. The closing equality assertion is the guard --
+    it fails on the next field added rather than leaking into an unrelated test.
+    """
     from vfe3.geometry import transport
 
     original = transport.get_transport_registration("flat")
@@ -522,6 +531,7 @@ def test_pure_path_report_reads_transport_registry_metadata():
             needs_mu=original.needs_mu,
             needs_sigma=original.needs_sigma,
             batch_independent=original.batch_independent,
+            pair_transport_kind=original.pair_transport_kind,
             override=True,
         )(original.callable)
 
@@ -535,8 +545,10 @@ def test_pure_path_report_reads_transport_registry_metadata():
             needs_mu=original.needs_mu,
             needs_sigma=original.needs_sigma,
             batch_independent=original.batch_independent,
+            pair_transport_kind=original.pair_transport_kind,
             override=True,
         )(original.callable)
+    assert transport.get_transport_registration("flat") == original
 
 
 def test_diagonal_gl_route_reports_not_exactly_gauge_invariant():
