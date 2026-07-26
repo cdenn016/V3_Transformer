@@ -146,33 +146,57 @@ Open question 1 above, answered. Both framings in the question were wrong.
 the beta-frozen objective. Convergence in one step is therefore by construction, not evidence of a
 degenerate E-step, and the earlier reading of "F flat after step 1" as suspicious was misplaced.
 
+> **CORRECTED 2026-07-26.** The table below was produced by a probe that read the MODEL channel's
+> fusion as the belief's and anchored on the token-uniform centroid `r` rather than the belief's own
+> prior (audit finding B-01, fixed in `942f685`). The original numbers are struck through; the
+> re-measurement under the corrected probe is in the right-hand columns. Raw record:
+> `docs/2026-07-26-b01-remeasurement.json`.
+
 Measured on both checkpoints, belief loop only (model channel pinned at its trained depth via the new
 `s_e_step_n_iter`), eight sequences:
 
-| | K=20 | K=300 |
-|---|---|---|
-| `\|\|dmu\|\| / \|\|mu_p\|\|` after 1 step | 0.147 | 0.227 |
-| ...after 8 steps (converged) | 0.200 | 0.323 |
-| share of total displacement taken by step 1 | 73% | 70% |
-| `cos(direction_8, direction_1)` | +0.982 | +0.962 |
-| `KL(q* \|\| p)` | 0.014 nats | 0.215 nats |
-| PAIR (attention) share of the fused precision | 0.190 | **0.298** |
-| PRIOR (residual) share | 0.810 | **0.702** |
+| | K=20 (2026-07-25) | K=20 (corrected) | K=300 (2026-07-25) | K=300 (corrected) |
+|---|---|---|---|---|
+| `\|\|dmu\|\| / \|\|mu_p\|\|` after 1 step | ~~0.147~~ | 0.501 | ~~0.227~~ | **0.297** |
+| ...after 8 steps (converged) | ~~0.200~~ | 0.571 | ~~0.323~~ | **0.317** |
+| share of total displacement taken by step 1 | ~~73%~~ | 88% | ~~70%~~ | **94%** |
+| `cos(direction_8, direction_1)` | ~~+0.982~~ | +0.920 | ~~+0.962~~ | **+0.965** |
+| PAIR (attention) share of the fused precision | ~~0.190~~ | *undefined* | ~~0.298~~ | **0.213** |
+| PRIOR (residual) share | ~~0.810~~ | *undefined* | ~~0.702~~ | **0.787** |
+
+**The K=20 shares are undefined, not merely wrong.** The surviving 2026-07-25 K=20 `s_e_step=True`
+checkpoint (`307.49_wikitext-103_K20_block_glk_linear_mix_s6`, trained 16:32) runs
+`e_step_update='gradient'`, and the pair/prior precision split is a decomposition of the `mm_exact`
+FUSION, which that route never computes. No `estep_character.json` was ever persisted anywhere, so
+the provenance of the published `0.190` cannot be recovered from any artifact on disk: it is not
+reproducible from the checkpoints that exist, and it is withdrawn rather than corrected. Its
+displacement and cosine rows ARE recoverable and are given above.
+
+The `KL(q* || p)` row is dropped: the corrected probe does not compute it, so no re-measured value
+exists and the published one carries the same defect as the rest of the column.
 
 **It is inference, in a precise and unglamorous sense.** The E-step computes the exact stationary
 point of a well-defined objective, and the iteration is a well-conditioned, nearly straight-line
-contraction: one step covers ~70% of the total displacement and every later step moves in essentially
-the same direction (`cos` 0.96-0.98 at depth 8). The belief does move — 20% of its norm at K=20, 32%
-at K=300 — so this is not a no-op.
+contraction: one step covers 88-94% of the total displacement and every later step moves in
+essentially the same direction (`cos` 0.92-0.97 at depth 8). The belief does move — 57% of its
+prior's norm at K=20, 32% at K=300 — so this is not a no-op.
+
+The correction STRENGTHENS this reading rather than weakening it. Step 1 takes 94% of the total
+displacement at K=300, not the 70% published, so the E-step is more nearly one-shot than the original
+table suggested.
 
 **But the fixed point is a convex blend, not a deep computation.** The `mm_exact` fusion
-`mu* = (a mu_p/sp + Sum_j w_ij mu_t/st) / P` puts 70-81% of the fused precision on the PRIOR and
-19-30% on the gauge-transported neighbors. Functionally
-`mu* ~ 0.7 mu_p + 0.3 (attention-weighted transported neighbors)` — an attention layer with a strong
+`mu* = (a mu_p/sp + Sum_j w_ij mu_t/st) / P` puts 79% of the fused precision on the PRIOR and 21% on
+the gauge-transported neighbors at K=300. Functionally
+`mu* ~ 0.79 mu_p + 0.21 (attention-weighted transported neighbors)` — an attention layer with a strong
 residual path, computed as a VFE stationary point instead of a dot-product softmax. The premise that
-capacity comes from ITERATIVE minimization is not what carries the model; one aggregation is. Note
-the attention share RISES with scale (0.190 -> 0.298 from K=20 to K=300), so the aggregation matters
-more in the larger model.
+capacity comes from ITERATIVE minimization is not what carries the model; one aggregation is.
+
+**The width claim is WITHDRAWN.** "The attention share RISES with scale (0.190 -> 0.298 from K=20 to
+K=300)" cannot be repaired: the K=300 endpoint is 0.213, and the K=20 endpoint is undefined for the
+only surviving checkpoint (see above). Nothing is known about how this share moves with width. Re-
+establishing the comparison requires a fresh K=20 run under `e_step_update='mm_exact'` with
+`s_e_step=True`, measured by the corrected probe under the same protocol.
 
 ### Where the context actually enters
 

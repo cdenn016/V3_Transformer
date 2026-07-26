@@ -1,0 +1,120 @@
+{
+  "K20": {
+    "trained_depth": 1,
+    "e_step_update": "gradient",
+    "model_channel_live": true,
+    "measured_channel": "belief",
+    "measured_layer": 0,
+    "e_step_halt_tol": null,
+    "n_sequences": 8,
+    "precision_split_available": false,
+    "recompute_max_abs_err": 0.0,
+    "interpretation": "current-weight E-step character on one fixed batch, measured on the BELIEF channel of LAYER 0 only -- the model channel's own E-step and later layers are tagged and excluded (audit 2026-07-26 B-01; before that fix these were read as belief calls, and the anchor was the model channel's token-uniform centroid r rather than the belief's prior). n_belief_calls is the REALIZED iteration count, which can fall below belief_depth when e_step_halt_tol stops the loop early. rel_displacement is ||mu*_d - mu_p|| / ||mu_p||; cos_dir_vs_step1 near +1 means depth adds magnitude, not direction. pair_precision_share is the transported-neighbor (attention) mass of the mm_exact fused precision and prior_precision_share its residual complement; both are None off the mm_exact route. recompute_max_abs_err is the probe's replica error against the kernel's own mu_star and must stay at 0.",
+    "points": [
+      {
+        "belief_depth": 1,
+        "n_belief_calls": 0,
+        "rel_displacement": 0.5008919835090637,
+        "pair_precision_share": null,
+        "prior_precision_share": null,
+        "cos_dir_vs_step1": 1.0,
+        "step1_share_of_displacement": 1.0
+      },
+      {
+        "belief_depth": 2,
+        "n_belief_calls": 0,
+        "rel_displacement": 0.5109685659408569,
+        "pair_precision_share": null,
+        "prior_precision_share": null,
+        "cos_dir_vs_step1": 0.9705314636230469,
+        "step1_share_of_displacement": 0.9802793962350352
+      },
+      {
+        "belief_depth": 3,
+        "n_belief_calls": 0,
+        "rel_displacement": 0.5258220434188843,
+        "pair_precision_share": null,
+        "prior_precision_share": null,
+        "cos_dir_vs_step1": 0.9658595323562622,
+        "step1_share_of_displacement": 0.9525883811054177
+      },
+      {
+        "belief_depth": 5,
+        "n_belief_calls": 0,
+        "rel_displacement": 0.5449208617210388,
+        "pair_precision_share": null,
+        "prior_precision_share": null,
+        "cos_dir_vs_step1": 0.9464837908744812,
+        "step1_share_of_displacement": 0.9192013349667095
+      },
+      {
+        "belief_depth": 8,
+        "n_belief_calls": 0,
+        "rel_displacement": 0.5708363652229309,
+        "pair_precision_share": null,
+        "prior_precision_share": null,
+        "cos_dir_vs_step1": 0.9201900362968445,
+        "step1_share_of_displacement": 0.8774702762296617
+      }
+    ]
+  },
+  "K300": {
+    "trained_depth": 1,
+    "e_step_update": "mm_exact",
+    "model_channel_live": true,
+    "measured_channel": "belief",
+    "measured_layer": 0,
+    "e_step_halt_tol": null,
+    "n_sequences": 8,
+    "precision_split_available": true,
+    "recompute_max_abs_err": 0.0,
+    "interpretation": "current-weight E-step character on one fixed batch, measured on the BELIEF channel of LAYER 0 only -- the model channel's own E-step and later layers are tagged and excluded (audit 2026-07-26 B-01; before that fix these were read as belief calls, and the anchor was the model channel's token-uniform centroid r rather than the belief's prior). n_belief_calls is the REALIZED iteration count, which can fall below belief_depth when e_step_halt_tol stops the loop early. rel_displacement is ||mu*_d - mu_p|| / ||mu_p||; cos_dir_vs_step1 near +1 means depth adds magnitude, not direction. pair_precision_share is the transported-neighbor (attention) mass of the mm_exact fused precision and prior_precision_share its residual complement; both are None off the mm_exact route. recompute_max_abs_err is the probe's replica error against the kernel's own mu_star and must stay at 0.",
+    "points": [
+      {
+        "belief_depth": 1,
+        "n_belief_calls": 1,
+        "rel_displacement": 0.29677483439445496,
+        "pair_precision_share": 0.21301645244732323,
+        "prior_precision_share": 0.7869835475526767,
+        "cos_dir_vs_step1": 1.0,
+        "step1_share_of_displacement": 1.0
+      },
+      {
+        "belief_depth": 2,
+        "n_belief_calls": 2,
+        "rel_displacement": 0.31020548939704895,
+        "pair_precision_share": 0.21301645244732323,
+        "prior_precision_share": 0.7869835475526767,
+        "cos_dir_vs_step1": 0.9850767254829407,
+        "step1_share_of_displacement": 0.9567040627420254
+      },
+      {
+        "belief_depth": 3,
+        "n_belief_calls": 3,
+        "rel_displacement": 0.31499335169792175,
+        "pair_precision_share": 0.21301645244732323,
+        "prior_precision_share": 0.7869835475526767,
+        "cos_dir_vs_step1": 0.9732719659805298,
+        "step1_share_of_displacement": 0.9421622536032107
+      },
+      {
+        "belief_depth": 5,
+        "n_belief_calls": 5,
+        "rel_displacement": 0.31686145067214966,
+        "pair_precision_share": 0.21301645244732323,
+        "prior_precision_share": 0.7869835475526767,
+        "cos_dir_vs_step1": 0.9659746289253235,
+        "step1_share_of_displacement": 0.9366076059269457
+      },
+      {
+        "belief_depth": 8,
+        "n_belief_calls": 8,
+        "rel_displacement": 0.31701284646987915,
+        "pair_precision_share": 0.21301645244732323,
+        "prior_precision_share": 0.7869835475526767,
+        "cos_dir_vs_step1": 0.9647775888442993,
+        "step1_share_of_displacement": 0.9361603120237667
+      }
+    ]
+  }
+}

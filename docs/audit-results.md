@@ -1106,6 +1106,30 @@ research-wiki notes `2026-07-25-estep-character-and-channel-decomposition`,
 `2026-07-25-token-prior-estep-character-and-diagnostics`, plus the `Precision weighting` and
 `VFE Transformer Program` pages.
 
+**RESOLVED 2026-07-26 (partly).** The corrected probe was replayed on the same checkpoints under the
+production protocol (first validation batch, eight sequences, depths 1/2/3/5/8); raw record in
+`docs/2026-07-26-b01-remeasurement.json`, `recompute_max_abs_err = 0.0` on both.
+
+- **K=300** (`55.41_wikitext-103_K300_...`) re-measured: pair share **0.213** (published 0.298),
+  prior share **0.787**, displacement **0.297** at depth 1 and **0.317** at depth 8, step-1 share
+  **94%** (published 70%), `cos` **+0.965**. The "UNCERTAIN" displacement row resolves here: the
+  corrected trajectory is FLATTER across depth (+6.8% from depth 1 to 8) than the published +42%,
+  so the E-step is more nearly one-shot, not less.
+- **K=20 shares are UNDEFINED, not merely invalid.** The only surviving 2026-07-25 K=20
+  `s_e_step=True` checkpoint runs `e_step_update='gradient'`, and the pair/prior split decomposes
+  the `mm_exact` fusion that route never computes. No `estep_character.json` was ever persisted, so
+  `0.190` cannot be traced to any artifact on disk. It is withdrawn, not corrected. Displacement
+  **0.501 -> 0.571** and `cos` **+0.920** ARE recoverable and were measured.
+- **"Attention share rises with width" cannot be repaired** — one endpoint is 0.213 and the other is
+  gone. Re-establishing it needs a fresh K=20 `mm_exact` + `s_e_step=True` run.
+
+The re-measurement also exposed a defect in the fixed probe itself: `collect_estep_character`
+documented that off the `mm_exact` route "the displacement and cosine are still reported", but its
+displacement window was populated only inside the `mm_exact` spy, so a gradient-route checkpoint
+returned `None` for every field. `vfe_block` receives the belief prior and returns the converged
+belief on every route, so the window is now route-independent, with the `mm_exact` window kept
+primary where it exists (it reads `mu_star` before the block's optional norm). Two regressions pin it.
+
 Separately, the variational expert established that
 `docs/2026-07-25-shadow-prior-investigation.md`'s characterization of the layer-stack prior handoff
 as "a degenerate one-token-per-agent shadow" is **wrong**: `mu_p_i` and `mu_q_i` live in the same
