@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 import ablation
+from vfe3 import run_artifacts
 from vfe3.viz import figure_worker
 
 
@@ -55,8 +56,38 @@ def test_runner_identity_ignores_declaration_only_tack_on_but_binds_logic(
         encoding="utf-8",
     )
     assert ablation._ablation_runner_source_sha256() != before
+
+    # Gating off (the default): a runner-logic edit is reported, not raised on, so an in-flight
+    # sweep is not aborted by an unrelated edit landing in the same process.
+    assert ablation._verified_ablation_runner_source_sha256() != before
+
+    monkeypatch.setattr(run_artifacts, "STRICT_CODE_IDENTITY", True)
     with pytest.raises(RuntimeError, match="restart the Spyder kernel"):
         ablation._verified_ablation_runner_source_sha256()
+
+
+def test_code_identity_is_constant_across_source_drift_when_gating_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finished cohort must survive an unrelated source edit, commit, or checkout.
+
+    ``code_identity`` is the only contract field that tracks source rather than the requested
+    experiment, so holding it constant is what stops ``_cell_is_current`` from missing, the cell
+    directory from being emptied, and ``_invalidate_code_drifted_cells`` from downgrading a
+    successful marker after an edit that cannot change a trained number.
+    """
+    assert run_artifacts.STRICT_CODE_IDENTITY is False       # default keeps ablations reusable
+
+    before = ablation._git_code_identity()
+    monkeypatch.setattr(run_artifacts, "_PROCESS_PACKAGE_CODE_IDENTITY", "0" * 64)
+    monkeypatch.setattr(ablation, "_PROCESS_ABLATION_RUNNER_SHA256", "0" * 64)
+
+    assert ablation._git_code_identity() == before
+    assert ablation._validated_ablation_code_identity(before) == before
+
+    monkeypatch.setattr(run_artifacts, "STRICT_CODE_IDENTITY", True)
+    with pytest.raises(RuntimeError, match="restart the Spyder kernel"):
+        ablation._git_code_identity()
 
 
 def test_validate_sweeps_rejects_duplicate_expanded_labels(

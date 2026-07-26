@@ -2213,20 +2213,40 @@ def _sha256_tensor_content(
 _PROCESS_PACKAGE_CODE_IDENTITY = _package_code_identity()
 
 
+# STRICT_CODE_IDENTITY: when True, a source edit made after this process imported the package is a
+# hard error, and every ablation cell trained under a different source generation is refused for
+# reuse. That is the reproducibility-pure path: a run is labeled only with a generation it provably
+# ran under. It is default OFF because the digest covers whole-file content across the package and
+# the root drivers, so an edit that cannot affect a trained number (a figure driver, an unrelated
+# module, a checkout that rewrites bytes) still invalidates a finished ablation cohort and forces it
+# to retrain. With gating off the digest is still recorded descriptively in provenance; it simply no
+# longer aborts a run or authorizes destroying a completed cell.
+STRICT_CODE_IDENTITY: bool = False
+
+
+def strict_code_identity_enabled() -> bool:
+    """Read the gating toggle live so a test can monkeypatch the module attribute."""
+    return bool(STRICT_CODE_IDENTITY)
+
+
 def _verified_process_code_identity() -> str:
-    r"""Return the import-time identity or fail when disk source drifts in a live process.
+    r"""Return the import-time identity, or under strict gating fail when disk source drifts.
 
     Python keeps imported module objects and bytecode alive after an editor changes their files.
-    Relabeling such a mixed process with the new disk digest would be false provenance. A new run in
-    a long-lived Spyder kernel therefore stops until that kernel restarts and imports one coherent
-    source generation.
+    Relabeling such a mixed process with the new disk digest would be false provenance, so under
+    ``STRICT_CODE_IDENTITY`` a new run in a long-lived Spyder kernel stops until that kernel restarts
+    and imports one coherent source generation. With gating off the current disk digest is returned
+    instead: provenance still records what the source looked like at run start, and the caller is
+    responsible for knowing the process may hold a mixed generation.
     """
     current = _package_code_identity()
     if current != _PROCESS_PACKAGE_CODE_IDENTITY:
-        raise RuntimeError(
-            "vfe3 source changed after this Python process imported the package; restart the "
-            "Spyder kernel before starting another run"
-        )
+        if strict_code_identity_enabled():
+            raise RuntimeError(
+                "vfe3 source changed after this Python process imported the package; restart the "
+                "Spyder kernel before starting another run"
+            )
+        return current
     return _PROCESS_PACKAGE_CODE_IDENTITY
 
 
