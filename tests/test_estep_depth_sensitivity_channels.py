@@ -86,6 +86,60 @@ def test_diagnostic_pins_the_model_channel_while_sweeping_the_belief_loop() -> N
     assert [p["s_depth"] for p in record["model_channel_points"]] == [1, 2, 3]
 
 
+def test_belief_sweep_pins_the_model_channel_to_s_e_step_n_iter_not_n_e_steps() -> None:
+    r"""B-03: the belief sweep must pin the model channel to its OWN trained depth.
+
+    `test_diagnostic_pins_the_model_channel_while_sweeping_the_belief_loop` above cannot see this
+    defect: it builds its model without `s_e_step_n_iter`, so the `None` fallback makes
+    `s_e_step_n_iter` and `n_e_steps` equal and the assertion passes under the pre-fix code too.
+    The two fields are independently validated (`config.py`) and the model channel's trained depth
+    is `n_e_steps if s_e_step_n_iter is None else s_e_step_n_iter` (`model/model.py`), so the only
+    configuration that separates the fix from the bug is one where they differ.
+    """
+    model = _model(prior_source="model_channel", s_e_step=True, lambda_gamma=0.5,
+                   s_e_step_n_iter=4)                    # against n_e_steps=2
+    tokens = torch.randint(0, 11, (2, 6))
+    targets = torch.randint(0, 11, (2, 6))
+
+    record = collect_estep_depth_sensitivity(model, tokens, targets, [1, 2, 3])
+    assert record["trained_depth"] == 2                  # the BELIEF loop's trained depth
+    assert record["trained_s_depth"] == 4                # the MODEL channel's, reported separately
+
+    # The whole point: 4, not the 2 the pre-fix code pinned here.
+    assert [p["s_depth"] for p in record["points"]] == [4, 4, 4]
+    assert [p["belief_depth"] for p in record["points"]] == [1, 2, 3]
+
+    # The model-channel series still pins the belief loop to ITS trained depth, which is n_e_steps.
+    assert [p["belief_depth"] for p in record["model_channel_points"]] == [2, 2, 2]
+    assert [p["s_depth"] for p in record["model_channel_points"]] == [1, 2, 3]
+
+
+def test_record_reports_the_model_channel_trained_depth_when_it_follows_n_e_steps() -> None:
+    r"""`trained_s_depth` resolves the `None` fallback, so a reader never has to re-derive it."""
+    model = _model(prior_source="model_channel", s_e_step=True, lambda_gamma=0.5)
+    tokens = torch.randint(0, 11, (2, 6))
+    targets = torch.randint(0, 11, (2, 6))
+
+    record = collect_estep_depth_sensitivity(model, tokens, targets, [1, 2])
+    assert model.cfg.s_e_step_n_iter is None
+    assert record["trained_s_depth"] == record["trained_depth"] == 2
+
+
+def test_interpretation_names_the_model_channel_pin_without_conflating_the_two_depths() -> None:
+    r"""B-03's other half: the published string said the pin was `trained_depth` for every run."""
+    model = _model(prior_source="model_channel", s_e_step=True, lambda_gamma=0.5,
+                   s_e_step_n_iter=4)
+    tokens = torch.randint(0, 11, (2, 6))
+    targets = torch.randint(0, 11, (2, 6))
+
+    record = collect_estep_depth_sensitivity(model, tokens, targets, [1, 2])
+    text = record["interpretation"]
+    # The belief sweep pins the MODEL channel, so that clause must name trained_s_depth...
+    assert "model channel pinned at trained_s_depth" in text
+    # ...while the model-channel sweep pins the BELIEF loop, where trained_depth is correct.
+    assert "belief loop pinned at trained_depth" in text
+
+
 def test_frozen_model_channel_emits_no_second_series() -> None:
     r"""With `s_e_step=False` the refine never runs, so `n_e_steps` drives the belief loop alone."""
     model = _model(prior_source="token", s_e_step=False)

@@ -3160,14 +3160,20 @@ def collect_estep_depth_sensitivity(
             torch.cuda.set_rng_state_all(cuda_rng)
     return {
         "trained_depth": trained_depth,
+        # The model channel's OWN trained depth, with the `s_e_step_n_iter=None` fallback already
+        # resolved. Reported separately because it is legally != trained_depth, in which case every
+        # `s_depth` in `points` is this value and a reader holding only `trained_depth` would
+        # misread the pin (audit 2026-07-26 B-03, the half the numeric fix left open).
+        "trained_s_depth": pinned_s_depth,
         "model_channel_live": model_channel_live,
         "n_sequences": int(tokens.shape[0]),
         "interpretation": (
-            "current-weight depth sensitivity at fixed weights; no depth other than trained_depth "
-            "was retrained. 'points' varies the BELIEF E-step with the model channel pinned at "
-            "trained_depth; 'model_channel_points' varies the model-channel refine with the belief "
-            "loop pinned (empty when s_e_step=False, where n_e_steps drives the belief loop alone). "
-            "free_energy_per_token is sequence 0 only; ce is over all n_sequences."
+            "current-weight depth sensitivity at fixed weights; no depth other than the trained "
+            "depths was retrained. 'points' varies the BELIEF E-step with the model channel pinned "
+            "at trained_s_depth; 'model_channel_points' varies the model-channel refine with the "
+            "belief loop pinned at trained_depth (empty when s_e_step=False, where n_e_steps drives "
+            "the belief loop alone). trained_depth and trained_s_depth are equal unless the run set "
+            "s_e_step_n_iter. free_energy_per_token is sequence 0 only; ce is over all n_sequences."
         ),
         "points": points,
         "model_channel_points": model_channel_points,
