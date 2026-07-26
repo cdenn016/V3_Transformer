@@ -248,3 +248,68 @@ re-parameterization; or the depth-0 point stays out of the plots.
 
 The base rate is relevant: of the top-ranked mechanism hypotheses in the Stage 0 report, five of five
 were refuted by cheap measurement. This one deserves the same treatment before any code is written.
+
+## 8. STAGE A RESULTS — the motivating premise is refuted
+
+Run 2026-07-25 on both checkpoints. Every mechanism hypothesis in Section 2 is refuted, and the
+depth pathology is shown to live almost entirely in a loop that is not belief inference.
+
+### The four mechanism diagnostics (K=20, varying BELIEF depth only)
+
+| | depth 0 | depth 1 | depth 3 | depth 8 |
+|---|---|---|---|---|
+| body-frame dispersion of `U_i^{-1} mu_i` | 0.9062 | 0.8798 | 0.8672 | 0.8655 |
+| `selfdiv_klmax_frac` | 0.000 | 0.000 | 0.000 | **0.000** |
+| `alpha* = c0/(b0+D)` (median) | 1.00000 | 0.99988 | 0.99977 | **0.99976** |
+| effective rank of `mu` (of K=20) | 14.71 | 14.47 | 14.38 | 14.37 |
+| median self-divergence `D` | 0.000 | 0.006 | 0.011 | 0.012 |
+| F / token | 32.361 | 32.327 | 32.321 | 32.321 |
+
+No consensus collapse (dispersion moves 4.5% across eight iterations). The `1[D < kl_max]` anchor
+gate NEVER fires. The anchor coefficient does not decay — median `D` reaches 0.012 nats against
+`kl_max=160`. No rank collapse. Repeating the entire sweep with `kl_max = 1e6` reproduces every
+number byte for byte, so the clamp is not involved. F converges by depth 2 and moves 0.04 nats in
+total.
+
+### The decoupling: `cfg.n_e_steps` drives TWO loops
+
+`cfg.n_e_steps` is read by the belief E-step (`model/block.py:132`) AND by the model-channel
+refinement `_refine_s` (`model/model.py:864`). Under `prior_source='model_channel'` with
+`s_e_step=True` the refined `s` IS the belief's prior `p_i`, so the shipped sweep moves the prior and
+the belief together. The two `e_step` bindings are independent — `block.py` binds it at import while
+`_refine_s` imports it inside the function — so each loop can be pinned to depth 1 while the other
+varies. Delta CE against each arm's own depth-1 baseline, four fixed test batches:
+
+| depth | K=20 both | K=20 belief only | K=20 s-channel only | K=300 both | K=300 belief only | K=300 s-channel only |
+|---|---|---|---|---|---|---|
+| 2 | +0.327 | **+0.005** | +0.302 | +0.285 | **+0.004** | +0.236 |
+| 3 | +1.147 | **+0.009** | +1.115 | +0.987 | **+0.009** | +0.902 |
+| 5 | +2.826 | **+0.012** | +2.808 | +2.657 | **+0.012** | +2.605 |
+| 8 | +3.479 | **+0.012** | +3.477 | +3.594 | **+0.013** | +3.584 |
+
+**The belief E-step costs 0.012-0.013 nats across eight iterations; the model channel accounts for
+99.7% of the effect.** Replicated across two checkpoints and two model scales.
+
+### Mechanism, and what it means
+
+`r_mu` is a SINGLE `(K,)` vector broadcast to every position (`model.py:850-852`,
+`r_mu_t.expand_as(s_mu)`). The s-channel E-step pulls every `s_i` toward that one global centroid and
+toward its neighbors, so iterating it to convergence makes `p_i` position-independent and the belief
+prior loses token identity. That is genuine consensus collapse, in the channel designed to be a slow
+consensus channel; it is doing what it was built to do. The defect is that a diagnostic named
+`estep_depth_sensitivity` and documented as "current-weight inference-depth sensitivity" cranks a
+second loop it is not named after, and that loop supplies 99.7% of the measured effect.
+
+Consequences. **Belief inference is not anti-aligned with prediction** — it is very nearly neutral,
+so Sections 1-5's proposal has lost its motivation as well as its supporting evidence. Stage B (the
+`n_e_steps=4` retraining arm) is no longer the discriminating experiment for that question, though it
+remains a fair question about the s-channel. Stage C is moot.
+
+Two follow-ups worth carrying forward, neither of which requires new architecture. The shipped
+diagnostic should either drive the two depths independently or be renamed and documented, and its F
+should stop being computed on sequence 0 while its CE covers the whole batch (Stage A used four full
+batches and reports a per-batch SD; the shipped artifact uses one batch with no variance estimate).
+And the more interesting thread: F moves 0.04 nats and the belief is static from depth 2 onward, so
+past the first step the iterative minimization that is meant to supply the model's capacity is nearly
+inert. That sits directly alongside M6 (the coupling energy worth 0.210 nats against the positional
+prior's 0.612) and is the better question to pursue.
