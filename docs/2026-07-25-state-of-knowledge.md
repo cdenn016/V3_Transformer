@@ -152,51 +152,104 @@ degenerate E-step, and the earlier reading of "F flat after step 1" as suspiciou
 > re-measurement under the corrected probe is in the right-hand columns. Raw record:
 > `docs/2026-07-26-b01-remeasurement.json`.
 
-Measured on both checkpoints, belief loop only (model channel pinned at its trained depth via the new
-`s_e_step_n_iter`), eight sequences:
+Measured belief-loop only, with the model channel pinned at its trained depth via the new
+`s_e_step_n_iter`:
 
-| | K=20 (2026-07-25) | K=20 (corrected) | K=300 (2026-07-25) | K=300 (corrected) |
+| | K=20 (2026-07-25) | K=20 (re-trained) | K=300 (2026-07-25) | K=300 (re-measured) |
 |---|---|---|---|---|
-| `\|\|dmu\|\| / \|\|mu_p\|\|` after 1 step | ~~0.147~~ | 0.501 | ~~0.227~~ | **0.297** |
-| ...after 8 steps (converged) | ~~0.200~~ | 0.571 | ~~0.323~~ | **0.317** |
-| share of total displacement taken by step 1 | ~~73%~~ | 88% | ~~70%~~ | **94%** |
-| `cos(direction_8, direction_1)` | ~~+0.982~~ | +0.920 | ~~+0.962~~ | **+0.965** |
-| PAIR (attention) share of the fused precision | ~~0.190~~ | *undefined* | ~~0.298~~ | **0.213** |
-| PRIOR (residual) share | ~~0.810~~ | *undefined* | ~~0.702~~ | **0.787** |
+| `\|\|dmu\|\| / \|\|mu_p\|\|` after 1 step | ~~0.147~~ | **0.213** | ~~0.227~~ | **0.299** |
+| ...after 8 steps (converged) | ~~0.200~~ | **0.222** | ~~0.323~~ | **0.319** |
+| share of total displacement taken by step 1 | ~~73%~~ | **96%** | ~~70%~~ | **94%** |
+| `cos(direction_8, direction_1)` | ~~+0.982~~ | **+0.984** | ~~+0.962~~ | **+0.965** |
+| PAIR (attention) share of the fused precision | ~~0.190~~ | **0.153** | ~~0.298~~ | **0.196** |
+| PRIOR (residual) share | ~~0.810~~ | **0.847** | ~~0.702~~ | **0.804** |
 
-**The K=20 shares are undefined, not merely wrong.** The surviving 2026-07-25 K=20 `s_e_step=True`
-checkpoint (`307.49_wikitext-103_K20_block_glk_linear_mix_s6`, trained 16:32) runs
-`e_step_update='gradient'`, and the pair/prior precision split is a decomposition of the `mm_exact`
-FUSION, which that route never computes. No `estep_character.json` was ever persisted anywhere, so
-the provenance of the published `0.190` cannot be recovered from any artifact on disk: it is not
-reproducible from the checkpoints that exist, and it is withdrawn rather than corrected. Its
-displacement and cosine rows ARE recoverable and are given above.
+Both re-measured columns are at 64 sequences (see the sampling table below). The K=20 column is a
+re-training, not a re-measurement of the original checkpoint, which no longer exists; the K=300
+column is the original checkpoint re-measured.
+
+**Attribution correction (2026-07-26, second pass).** An earlier version of this note identified the
+K=20 checkpoint behind the published column as `307.49_wikitext-103_K20_block_glk_linear_mix_s6` and
+concluded the share was undefined because that run uses `e_step_update='gradient'`. That was wrong.
+The research-wiki source note records the actual checkpoint as
+`vfe3_runs/ablations_single_seed/138.40_mstep-phi-norm=5` (K=20, 2 heads, validation PPL 139.3,
+`mm_exact`). `307.49` is a different, gradient-route run; its numbers (displacement 0.501 -> 0.571,
+`cos` +0.920) belong to that run alone and must not be read against the 2026-07-25 K=20 column.
+
+**The published `0.190` is untraceable because its checkpoint is gone.** `ablations_single_seed/`
+has since been cleared, and no run before 2026-07-26 persisted an `estep_character.json`. So `0.190`
+cannot be re-measured or tied to an artifact: it is withdrawn, not corrected.
+
+**But the replacement is a like-for-like re-training.** The 2026-07-26 run reaches validation PPL
+**139.30** against the deleted checkpoint's **139.3** and carries the same
+`phi_mstep_max_matrix_norm=5` that named that ablation cell, so it reproduces the original K=20
+configuration rather than merely resembling it. Its `0.153` is therefore comparable to the published
+`0.190` as a like-for-like pair, with the difference attributable to the B-01 probe fix rather than to
+config drift — the one caveat being that the deleted cell's `config.json` cannot be diffed directly,
+so equivalence rests on the PPL match and the shared `mstep-phi-norm` setting.
+
+**Sampling sensitivity.** `138.40_wikitext-103_K20_block_glk_linear_mix_s6` persists its
+`estep_character.json`, so unlike `0.190` this number has an artifact behind it. Both checkpoints
+were then re-measured under one matched protocol at two sample sizes, because the first-batch draw
+turns out to matter:
+
+| probe sample | K=20 pair share | K=300 pair share | gap |
+|---|---|---|---|
+| 8 sequences | 0.1476 | 0.2130 | +0.065 |
+| 64 sequences | 0.1533 | 0.1964 | +0.043 |
+
+The K=20 value is stable across the two draws (0.148 / 0.153); the K=300 value is not (0.213 / 0.196),
+so the single-batch share carries real sampling noise at the larger width and no one number should be
+quoted without its sample size. Take the 64-sequence row as primary: it is the larger sample and it
+matches the protocol the in-run probe uses.
+
+At 64 sequences the two runs give displacement 0.213 -> 0.222 (K=20) against 0.299 -> 0.319 (K=300),
+`cos(dir_8, dir_1)` +0.984 against +0.965, and a step-1 share of 96% against 94%.
 
 The `KL(q* || p)` row is dropped: the corrected probe does not compute it, so no re-measured value
 exists and the published one carries the same defect as the rest of the column.
 
 **It is inference, in a precise and unglamorous sense.** The E-step computes the exact stationary
 point of a well-defined objective, and the iteration is a well-conditioned, nearly straight-line
-contraction: one step covers 88-94% of the total displacement and every later step moves in
-essentially the same direction (`cos` 0.92-0.97 at depth 8). The belief does move — 57% of its
-prior's norm at K=20, 32% at K=300 — so this is not a no-op.
+contraction: one step covers 94-96% of the total displacement on the two `mm_exact` runs and every
+later step moves in essentially the same direction (`cos` +0.965 to +0.984 at depth 8). The belief
+does move — 22% of its prior's norm at K=20, 32% at K=300 — so this is not a no-op.
 
 The correction STRENGTHENS this reading rather than weakening it. Step 1 takes 94% of the total
 displacement at K=300, not the 70% published, so the E-step is more nearly one-shot than the original
 table suggested.
 
 **But the fixed point is a convex blend, not a deep computation.** The `mm_exact` fusion
-`mu* = (a mu_p/sp + Sum_j w_ij mu_t/st) / P` puts 79% of the fused precision on the PRIOR and 21% on
-the gauge-transported neighbors at K=300. Functionally
-`mu* ~ 0.79 mu_p + 0.21 (attention-weighted transported neighbors)` — an attention layer with a strong
+`mu* = (a mu_p/sp + Sum_j w_ij mu_t/st) / P` puts 80% of the fused precision on the PRIOR and 20% on
+the gauge-transported neighbors at K=300, and 85%/15% at K=20. Functionally
+`mu* ~ 0.8 mu_p + 0.2 (attention-weighted transported neighbors)` — an attention layer with a strong
 residual path, computed as a VFE stationary point instead of a dot-product softmax. The premise that
 capacity comes from ITERATIVE minimization is not what carries the model; one aggregation is.
 
-**The width claim is WITHDRAWN.** "The attention share RISES with scale (0.190 -> 0.298 from K=20 to
-K=300)" cannot be repaired: the K=300 endpoint is 0.213, and the K=20 endpoint is undefined for the
-only surviving checkpoint (see above). Nothing is known about how this share moves with width. Re-
-establishing the comparison requires a fresh K=20 run under `e_step_update='mm_exact'` with
-`s_e_step=True`, measured by the corrected probe under the same protocol.
+**The width claim: SUPPORTED by two points, but not isolated to width.** The original wording, "the
+attention share RISES with scale (0.190 -> 0.298 from K=20 to K=300)", had both endpoints wrong and
+one of them unreproducible. The corrected pair is 0.153 -> 0.196 at 64 sequences (0.148 -> 0.213 at
+8), so the DIRECTION the claim asserted survives re-measurement at both sample sizes, at roughly half
+the published magnitude.
+
+It is not, however, a controlled width experiment, and this is exactly the error the original claim
+made. Besides `embed_dim`, the two runs differ in twelve config fields. `kl_max` (160 vs 2400) is
+dismissed: `guard_energy_klmax_frac` is 0.0 in both, so the clamp never fires and the pair mask is
+untouched by it. What remains uncontrolled is training length (15k vs 180k steps, 12x), head count
+(2 vs 10, hence `d_head` 10 vs 30, which sets `tau = kappa*sqrt(d_head)` and therefore the softmax
+sharpness the share depends on directly), batch size (64 vs 16), `pos_phi_compose`
+(`group_product` vs `bch`), `phi_mstep_max_matrix_norm`, and the code revision. Any of these could
+move the share on its own.
+
+Head count is the awkward one: `n_heads` must divide `embed_dim`, so 10 heads is unavailable at
+K=20 and `d_head` cannot be held fixed while width varies in this family. A width sweep at fixed
+`d_head` (varying `n_heads` with K) or at fixed `n_heads` (varying `d_head`) would separate the two,
+and until one is run the honest ceiling on this claim is "supported by two points, confounded with
+depth-of-training and head geometry" rather than "the share rises with width".
+
+What IS robust across both widths, and does not depend on the share question at all: the E-step is
+~95% one-shot with `cos` above +0.96, and the residual dominates the fusion at both scales (0.85 at
+K=20, 0.80 at K=300).
 
 ### Where the context actually enters
 
