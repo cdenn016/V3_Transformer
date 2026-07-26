@@ -51,7 +51,8 @@ def _cfg(**kw):
     return VFE3Config(**base)
 
 
-def test_process_code_identity_fails_closed_after_same_process_source_edit(tmp_path, monkeypatch):
+def test_process_code_identity_fails_closed_under_strict_gating_after_source_edit(
+        tmp_path, monkeypatch):
     package = tmp_path / "vfe3"
     package.mkdir()
     entry = package / "run_artifacts.py"
@@ -65,6 +66,12 @@ def test_process_code_identity_fails_closed_after_same_process_source_edit(tmp_p
     source.write_text("VALUE = 2\n", encoding="utf-8")
 
     assert run_artifacts._package_code_identity() != before
+
+    # Gating off (the default): the drifted disk digest is returned for descriptive provenance
+    # instead of aborting the run.
+    assert run_artifacts._verified_process_code_identity() != before
+
+    monkeypatch.setattr(run_artifacts, "STRICT_CODE_IDENTITY", True)
     with pytest.raises(RuntimeError, match="restart the Spyder kernel"):
         run_artifacts._verified_process_code_identity()
 

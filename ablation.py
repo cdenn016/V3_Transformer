@@ -96,6 +96,7 @@ from vfe3.run_artifacts import (
     _write_json_atomic,
     finalize_validation_run,
     semantic_config_fingerprint,
+    strict_code_identity_enabled,
 )
 from vfe3.runtime import seed_everything
 from vfe3.train import coverage_lines, evaluate, train
@@ -156,14 +157,29 @@ _PROCESS_ABLATION_RUNNER_SHA256 = _ablation_runner_source_sha256()
 
 
 def _verified_ablation_runner_source_sha256() -> str:
-    """Return the import-time runner identity or fail after executable runner logic changes."""
+    """Return the import-time runner identity or, under strict gating, fail after runner edits."""
     current = _ablation_runner_source_sha256()
     if current != _PROCESS_ABLATION_RUNNER_SHA256:
-        raise RuntimeError(
-            "ablation runner logic changed after this Python process imported it; restart the "
-            "Spyder kernel before starting another sweep"
-        )
+        if strict_code_identity_enabled():
+            raise RuntimeError(
+                "ablation runner logic changed after this Python process imported it; restart the "
+                "Spyder kernel before starting another sweep"
+            )
+        return current
     return _PROCESS_ABLATION_RUNNER_SHA256
+
+
+# Sentinel digests published in place of the real source hashes when code-identity gating is off.
+# They are constant, so every contract built by any invocation compares equal in its code_identity
+# field no matter what the source did between runs: a finished cell is never re-run (and therefore
+# never deleted) because an unrelated file changed, the pre-sweep snapshot cannot abort a sweep, and
+# the terminal snapshot can never differ from the invocation snapshot, so successful markers are
+# never downgraded. The field keeps its validated two-digest shape, so contract schemas, persisted
+# fixtures, and the required-key lists are untouched.
+_GATING_DISABLED_PACKAGE_SHA256 = hashlib.sha256(
+    b"vfe3 package code identity gating disabled").hexdigest()
+_GATING_DISABLED_RUNNER_SHA256 = hashlib.sha256(
+    b"ablation runner code identity gating disabled").hexdigest()
 
 
 def _git_code_identity() -> Dict[str, object]:
@@ -173,7 +189,16 @@ def _git_code_identity() -> Dict[str, object]:
     data seed are excluded here because their effective values are already bound explicitly by the
     aggregation or per-cell contract. This lets an edit that only adds a sweep value tack onto the
     prior compatible cohort without treating the declaration edit itself as model-code drift.
+
+    Under ``STRICT_CODE_IDENTITY`` these are the real source digests, so any source generation change
+    breaks cohort compatibility. With gating off (the default) constant sentinels are returned and
+    source drift no longer invalidates a cohort; see the sentinel definitions above.
     """
+    if not strict_code_identity_enabled():
+        return {
+            "package_code_sha256":    _GATING_DISABLED_PACKAGE_SHA256,
+            "ablation_runner_sha256": _GATING_DISABLED_RUNNER_SHA256,
+        }
     return {
         "package_code_sha256":  _verified_process_code_identity(),
         "ablation_runner_sha256": _verified_ablation_runner_source_sha256(),
@@ -1783,6 +1808,9 @@ CONFIG: Dict[str, Any] = {
     "max_param_relative_deviation": 0.02,
 
     # Skip cells that already wrote ablation_result.json (idempotent reruns / crash recovery).
+    # Reuse no longer depends on the source generation: vfe3.run_artifacts.STRICT_CODE_IDENTITY is
+    # default False, so editing the package or a driver (or a checkout that rewrites it) cannot
+    # invalidate a finished cell. Set that flag True for a reproducibility-strict cohort instead.
     "resume":      True,
 
     "output_dir":  "vfe3_ablation_results",
