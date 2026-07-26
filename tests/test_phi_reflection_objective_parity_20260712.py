@@ -340,7 +340,7 @@ def _phi_loss_pre_twohop(mu, sigma, phi, group, *, tau, lambda_beta, log_prior,
     branches), rebuilt from the same public primitives. The independent 'old form' the extended loss
     must reproduce EXACTLY at lambda_twohop=0.0 (defaults mirror phi_alignment_loss's)."""
     omega = build_belief_transport(phi, group, transport_mode="flat", mu=mu, sigma=sigma,
-                                   rope=rope, rope_on_value=rope_on_value)
+                                   rope=rope, rope_on_value=rope_on_value, rope_insertion="left")
     mu_t = transport_mean(omega, mu)
     sigma_t = transport_covariance(omega, sigma)
     fam = get_family("gaussian_diagonal")
@@ -577,8 +577,10 @@ def test_metropolis_delta_matches_active_objective(mode, fold):
 # --------------------------------------------------------------------------------------------------
 _TCFG = {
     "flat":           dict(),
-    "rope_decoupled": dict(pos_rotation="rope", rope_on_value=False),
+    "rope_decoupled": dict(pos_rotation="rope", rope_on_value=False,
+                           rope_insertion="left"),   # legacy composition under test
     "rope_on_cov":    dict(pos_rotation="rope", rope_full_gauge=True,
+                           rope_insertion="left",    # legacy composition under test
                            family="gaussian_full", decode_mode="full"),
 }
 
@@ -839,8 +841,10 @@ def test_metropolis_folds_off_delta_equals_raw_prior(mode):
 # The tied-gamma fold and each nonflat transport are pinned separately above; here they are CROSSED.
 # omega-direct Metropolis is flat-only, so the non-flat connection regimes are phi-reflection only.
 _NONFLAT_TCFG = {
-    "rope_decoupled":         dict(pos_rotation="rope", rope_on_value=False),
+    "rope_decoupled":         dict(pos_rotation="rope", rope_on_value=False,
+                                   rope_insertion="left"),   # legacy composition under test
     "rope_on_cov":            dict(pos_rotation="rope", rope_full_gauge=True,
+                                   rope_insertion="left",    # legacy composition under test
                                    family="gaussian_full", decode_mode="full"),
     "regime_ii":              dict(transport_mode="regime_ii"),
     "regime_ii_covariant":    dict(transport_mode="regime_ii_covariant"),

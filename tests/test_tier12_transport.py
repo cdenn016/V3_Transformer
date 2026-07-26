@@ -79,9 +79,9 @@ def test_per_head_transport_mean_rope_wrapped_matches_dense(device):
     rope, _ = torch.linalg.qr(torch.randn(N, 8, 8, generator=g))   # (N, K, K) orthogonal rotations
     rope = rope.to(device)
 
-    off = build_belief_transport(phi, grp, transport_mode="flat", rope=rope)
+    off = build_belief_transport(phi, grp, transport_mode="flat", rope=rope, rope_insertion="left")
     on = build_belief_transport(phi, grp, transport_mode="flat", rope=rope,
-                                transport_mean_per_head=True)
+                                transport_mean_per_head=True, rope_insertion="left")
     assert isinstance(on.base, FactoredTransport) and on.base.mean_per_head
     assert torch.allclose(transport_mean(on, mu), transport_mean(off, mu), atol=1e-6)
 

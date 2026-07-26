@@ -47,6 +47,7 @@ def test_numerical_health_under_rope_does_not_raise():
     # m5: numerical_health used RopeTransport without importing it -> NameError under pos_rotation='rope',
     # which report.py's _safe silently swallowed (blank health panel). Assert it returns the dict instead.
     model = _model(n_layers=1, pos_rotation="rope")
+    rope_insertion="left",   # legacy composition under test
     tok = torch.randint(0, 20, (1, 5))
     health = numerical_health(model, tok)
     for k in ("nan_mu", "nan_sigma", "nan_phi", "nan_energy", "nan_beta", "max_condition"):

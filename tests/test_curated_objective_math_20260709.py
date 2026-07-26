@@ -243,6 +243,7 @@ def test_diagnostics_threads_all_active_objective_terms(monkeypatch: pytest.Monk
             n_e_steps=1,
             lambda_twohop=0.5,
             pos_rotation="rope",
+            rope_insertion="left",   # legacy composition under test
             rope_on_value=False,
         )
         torch.manual_seed(11)

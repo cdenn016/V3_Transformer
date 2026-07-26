@@ -360,8 +360,7 @@ def test_same_frame_certificate_survives_supported_compositions() -> None:
         transport_mode="flat",
         rope=rope_matrix,
         rope_on_cov=True,
-        compact_phi_block_transport=True,
-    )
+        compact_phi_block_transport=True, rope_insertion="left")
 
     assert isinstance(dense_vertex, FactoredTransport)
     assert isinstance(compact, CompactFactoredTransport)

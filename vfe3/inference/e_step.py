@@ -303,10 +303,10 @@ def build_belief_transport(
     clamp_monitor:               bool                                        = False,     # opt-in: warn when the exp Frobenius clamp fires (host sync)
     rope_on_cov:                 bool                                        = False,     # rotate the covariance too (full-gauge)
     rope_on_value:               bool                                        = True,      # False -> value aggregation uses the un-rotated base
-    rope_insertion:               str                                        = "right",   # "right" (pure, folded frame) | "left" (legacy shipped order)
     # Tier-1 transport perf toggles (2026-07-05; default OFF = byte-identical: the dense einsum and
     # the 'dim' island rule stay the default code paths).
     exp_fp64_mode:               str                                         = "dim",    # stable_matrix_exp_pair island keying (flat builders; 'dim' | 'norm')
+    rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     exp_fp64_norm_threshold:     float                                       = 5.0,      # 'norm': upcast only when max clamped block ||M||_F >= this
     transport_mean_per_head:     bool                                        = False,    # factored transport_mean contracts per gauge block (fused path only)
     compact_phi_block_transport: bool                                        = False,    # packed phi factors for canonical flat block_glk
@@ -406,6 +406,7 @@ def build_belief_transport(
         rope=rope,
         on_cov=rope_on_cov,
         on_value=rope_on_value,
+        insertion=rope_insertion,
         same_frame_flat_cocycle=(
             isinstance(built, (CompactFactoredTransport, FactoredTransport))
             and built.same_frame_flat_cocycle
@@ -477,12 +478,12 @@ def free_energy_value(
     compact_phi_block_transport: bool = False,         # HONORED by the compact diagnostic transport
     rope_on_cov:               bool = False,           # full-gauge: rotate the covariance sandwich too
     rope_on_value:             bool = True,            # False -> value aggregation uses the un-rotated base
-    rope_insertion:             str = "right",   # "right" (pure, folded frame) | "left" (legacy shipped order)
     family:                    str  = "gaussian_diagonal",
     divergence_family:         str  = "renyi",
     lambda_alpha_mode:         str  = "constant",
     gradient_mode:             str  = "filtering",     # accepted-and-ignored iteration-only knob
     exp_fp64_mode:             str  = "dim",           # HONORED: forwarded to the global-F _transport float64-island keying
+    rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     phi_precond_mode:          str  = "none",          # accepted-and-ignored iteration-only knob
     phi_retract_mode:          str  = "euclidean",     # accepted-and-ignored iteration-only knob
     spd_retract_mode:          str  = "spd_affine",    # accepted-and-ignored iteration-only knob
@@ -616,6 +617,7 @@ def free_energy_value(
             rope=rope,
             on_cov=rope_on_cov,
             on_value=rope_on_value,
+            insertion=rope_insertion,
             same_frame_flat_cocycle=(
                 keys is None
                 and isinstance(omega, (CompactFactoredTransport, FactoredTransport))
@@ -691,12 +693,12 @@ def phi_alignment_loss(
     link_soft_cap:             float = 6.0,           # direct-link embedded-Frobenius soft cap
     clamp_monitor:             bool  = False,         # opt-in: warn when the exp Frobenius clamp fires
     exp_fp64_mode:                 str   = "dim",  # flat phi-factor float64-island keying
+    rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     exp_fp64_norm_threshold:       float = 5.0,
     transport_mean_per_head:       bool  = False,
     compact_phi_block_transport:   bool  = False,
     rope_on_cov:                   bool  = False,  # gauge-RoPE: rotate the covariance sandwich too
     rope_on_value:                 bool  = True,   # False -> value aggregation uses the un-rotated base
-    rope_insertion:                 str  = "right",   # "right" (pure, folded frame) | "left" (legacy shipped order)
 
     rope:                     Optional[torch.Tensor]   = None,  # (N,K,K) gauge-RoPE rotation (None -> off)
     reflection:               Optional[torch.Tensor]   = None,  # (N,) per-token sign s_i; None -> connected component
@@ -847,6 +849,7 @@ def e_step_iteration(
     transport_mode:            str  = "flat",
     gauge_parameterization:    str  = "phi",                  # 'phi' (exp path) | 'omega_direct' (stored element)
     e_step_gradient:           str  = "unroll",               # backward estimator: unroll | straight_through | detach
+    rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     oracle_unroll_grad:        bool = False,                  # opt-in: oracle returns a differentiable grad (unroll)
     cocycle_relaxation:        float = 1.0,                    # regime_ii homotopy alpha; 0 -> flat (ignored by flat)
     link_alpha:                float = 1.0,                    # direct-link scale (regime_ii_link / _charted)
@@ -865,7 +868,6 @@ def e_step_iteration(
     rope:                      Optional[torch.Tensor]        = None,   # (N, K, K) gauge-RoPE rotation
     rope_on_cov:               bool                          = False,  # full-gauge: rotate covariance too
     rope_on_value:             bool                          = True,   # False -> value aggregation uses the un-rotated base
-    rope_insertion:             str                          = "right",   # "right" (pure, folded frame) | "left" (legacy shipped order)
     grad_record:               Optional[EStepGradientRecord] = None,   # diag out-param: stashes ||grad_mu/sigma/phi|| (None -> no capture)
     transport_chart_max_norm: Optional[float]               = None,   # fail-closed pre-clamp chart bound
     transport_status:         Optional[dict]                = None,   # run-sticky covariant-feature status
@@ -1251,6 +1253,7 @@ def e_step(
     e_steps_backprop_last:     int = 0,           # truncated backprop: no_grad prefix, detach at the boundary (0 = OFF)
 
     e_step_gradient:           str = "unroll",
+    rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     # Tier-1 transport perf toggles (2026-07-05; explicit, off the F_diag bag -- that diagnostic
     # deliberately keeps the default transport numerics). All default OFF/byte-identical.
     exp_fp64_mode:             str = "dim",       # flat-builder float64-island keying ('dim' | 'norm')
@@ -1262,7 +1265,6 @@ def e_step(
     compact_phi_block_transport: bool = False,    # packed canonical flat block_glk phi factors
     rope_on_cov:                 bool = False,
     rope_on_value:               bool = True,
-    rope_insertion:               str = "right",   # "right" (pure, folded frame) | "left" (legacy shipped order)
     training:                    bool = False,    # explicit module mode; independent of autograd context
 
     e_step_halt_tol:             Optional[float]               = None,   # eval halting: break when mean KL(q^t||q^{t-1}) < tol

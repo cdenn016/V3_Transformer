@@ -71,7 +71,7 @@ def test_build_belief_transport_wraps_in_ropetransport_when_rope_set():
     phi = torch.randn(1, 6, g.generators.shape[0])
     R = build_rope_rotation(torch.arange(6), g.irrep_dims, base=100.0,
                             device=phi.device, dtype=phi.dtype)
-    out = build_belief_transport(phi, g, transport_mode="flat", rope=R, rope_on_cov=False)
+    out = build_belief_transport(phi, g, transport_mode="flat", rope=R, rope_on_cov=False, rope_insertion="left")
     assert isinstance(out, RopeTransport)
     # rope=None reproduces the plain build (no wrapper).
     plain = build_belief_transport(phi, g, transport_mode="flat")
@@ -180,12 +180,14 @@ def _rope_cfg(**kw):
 
 def test_rope_cache_key_tracks_mutated_rope_base():
     model = VFEModel(_rope_cfg(pos_rotation="rope", rope_base=100.0, n_heads=1))
+    rope_insertion="left",   # legacy composition under test
     device = model.prior_bank.mu_embed.device
     first = model._rope_rotation(8, device)
 
     model.cfg.rope_base = 2.0
     second = model._rope_rotation(8, device)
     fresh = VFEModel(_rope_cfg(pos_rotation="rope", rope_base=2.0, n_heads=1))._rope_rotation(8, device)
+    rope_insertion="left",   # legacy composition under test
 
     assert not torch.equal(first, second)
     assert torch.equal(second, fresh)
@@ -209,6 +211,7 @@ def test_rope_cache_key_tracks_mutated_pos_rotation():
 
     try:
         model = VFEModel(_rope_cfg(pos_rotation="rope"))
+        rope_insertion="left",   # legacy composition under test
         device = model.prior_bank.mu_embed.device
         first = model._rope_rotation(8, device)
 
@@ -223,6 +226,7 @@ def test_rope_cache_key_tracks_mutated_pos_rotation():
 
 def test_runtime_length_caches_retain_only_the_latest_shape():
     model = VFEModel(_rope_cfg(pos_rotation="rope", n_heads=1))
+    rope_insertion="left",   # legacy composition under test
     device = model.prior_bank.mu_embed.device
 
     for length in range(1, model.cfg.max_seq_len + 1):
@@ -238,6 +242,7 @@ def test_rope_changes_logits_vs_no_rope():
     x = torch.randint(0, 6, (2, 8))
     base = VFEModel(_rope_cfg(pos_rotation="none"))
     roped = VFEModel(_rope_cfg(pos_rotation="rope"))
+    rope_insertion="left",   # legacy composition under test
     roped.load_state_dict(base.state_dict())
     assert not torch.allclose(base(x), roped(x), atol=1e-5)   # RoPE perturbs attention -> logits
 
@@ -247,6 +252,7 @@ def test_attention_maps_reflect_rope():
     x = torch.randint(0, 6, (1, 8))
     base = VFEModel(_rope_cfg(pos_rotation="none"))
     roped = VFEModel(_rope_cfg(pos_rotation="rope"))
+    rope_insertion="left",   # legacy composition under test
     roped.load_state_dict(base.state_dict())
     a = base.attention_maps(x)
     b = roped.attention_maps(x)
@@ -262,6 +268,7 @@ def test_diagnostics_runs_under_rope():
     torch.manual_seed(0)
     x = torch.randint(0, 6, (1, 8))
     roped = VFEModel(_rope_cfg(pos_rotation="rope"))
+    rope_insertion="left",   # legacy composition under test
     diag = roped.diagnostics(x)
     assert diag and all(abs(v) < float("inf") for v in diag.values())
 
@@ -289,7 +296,7 @@ def test_rope_means_only_kernel_matches_oracle():
     phi = torch.randn(1, N, n_gen) * 0.1
     R = build_rope_rotation(torch.arange(N), g.irrep_dims, base=100.0,
                             device=phi.device, dtype=phi.dtype)
-    omega = build_belief_transport(phi, g, transport_mode="flat", rope=R, rope_on_cov=False)
+    omega = build_belief_transport(phi, g, transport_mode="flat", rope=R, rope_on_cov=False, rope_insertion="left")
     mu   = torch.randn(1, N, K); sigma   = torch.rand(1, N, K) + 0.5
     mu_p = torch.randn(1, N, K); sigma_p = torch.rand(1, N, K) + 0.5
     kw = dict(tau=1.0, renyi_order=1.0, kl_max=100.0, eps=1e-6, b0=1.0, c0=1.0, value=1.0,
@@ -320,6 +327,7 @@ def test_rope_full_gauge_covariance_equals_manual_sandwich():
 def test_full_gauge_model_runs_forward_backward():
     # Reachability: a full-covariance rope_full_gauge model trains (finite gradients) end to end.
     cfg = _full_cov_cfg(pos_rotation="rope", rope_full_gauge=True)
+    rope_insertion="left",   # legacy composition under test
     torch.manual_seed(0)
     m = VFEModel(cfg)
     x = torch.randint(0, 6, (1, 6)); y = torch.randint(0, 6, (1, 6))
@@ -350,7 +358,9 @@ def test_rope_on_value_false_decouples_and_changes_logits():
     torch.manual_seed(0)
     x = torch.randint(0, 6, (2, 8))
     coupled = VFEModel(_rope_cfg(pos_rotation="rope", rope_on_value=True))
+    rope_insertion="left",   # legacy composition under test
     decoupled = VFEModel(_rope_cfg(pos_rotation="rope", rope_on_value=False))
+    rope_insertion="left",   # legacy composition under test
     decoupled.load_state_dict(coupled.state_dict())
     assert not torch.allclose(coupled(x), decoupled(x), atol=1e-5)
 
@@ -371,6 +381,7 @@ def test_rope_on_value_false_model_trains_end_to_end():
     # train (finite loss and prior-table gradients) end to end.
     torch.manual_seed(0)
     m = VFEModel(_rope_cfg(pos_rotation="rope", rope_on_value=False))
+    rope_insertion="left",   # legacy composition under test
     x = torch.randint(0, 6, (1, 8)); y = torch.randint(0, 6, (1, 8))
     _, loss, _ = m(x, y); loss.backward()
     assert torch.isfinite(loss)

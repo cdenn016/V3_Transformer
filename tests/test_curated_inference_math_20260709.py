@@ -272,6 +272,7 @@ def test_refine_s_rope_matches_direct_rotated_estep(
 ) -> None:
     with pytest.warns(UserWarning, match="gauge"):
         model, token_ids = _model_channel_case(pos_rotation="rope")
+        rope_insertion="left",   # legacy composition under test
     original_e_step = e_step_module.e_step
     captured_args: tuple[object, ...] = ()
     captured_kwargs: dict[str, object] = {}

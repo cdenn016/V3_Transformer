@@ -215,6 +215,7 @@ def test_gauge_transport_off_rejects_rope():
     Omega=I contract of gauge_transport='off'."""
     with pytest.raises(ValueError, match="pos_rotation"):
         VFE3Config(gauge_transport="off", pos_rotation="rope")
+        rope_insertion="left",   # legacy composition under test
 
 
 def test_gauge_transport_off_rejects_regime_ii():
@@ -725,6 +726,7 @@ def test_rope_with_sp_gauge_warns_structure_group():
     # this is a WARNING (not an error): the operator is still a valid GL(K) element, just not in Sp.
     with pytest.warns(UserWarning, match="symplectic"):
         VFE3Config(gauge_group="sp", pos_rotation="rope")
+        rope_insertion="left",   # legacy composition under test
 
 
 def test_tied_block_glk_rejects_killing_per_block():
@@ -885,8 +887,10 @@ def test_rope_defaults_off_and_full_gauge_requires_full_cov():
     assert cfg.pos_rotation == "none" and cfg.rope_full_gauge is False
     with pytest.raises(ValueError):
         VFE3Config(pos_rotation="rope", rope_full_gauge=True)            # family defaults to diagonal
+        rope_insertion="left",   # legacy composition under test
     # full-gauge with full covariance is allowed
     VFE3Config(pos_rotation="rope", rope_full_gauge=True,
+    rope_insertion="left",   # legacy composition under test
                family="gaussian_full", decode_mode="full")
 
 
@@ -1155,6 +1159,7 @@ def test_rope_warning_names_only_registered_positional_modes():
 
     with pytest.warns(UserWarning) as caught:
         VFE3Config(pos_rotation="rope")
+        rope_insertion="left",   # legacy composition under test
     messages = " ".join(str(item.message) for item in caught)
 
     assert "sinusoidal" not in messages

@@ -147,6 +147,7 @@ def test_metropolis_uses_complete_joint_objective_when_gamma_reverses_belief_dec
 
 def test_gamma_energy_changes_when_rope_transport_is_active() -> None:
     rope = _model(lambda_gamma=1.0, pos_rotation="rope")
+    rope_insertion="left",   # legacy composition under test
     plain = _model(lambda_gamma=1.0, pos_rotation="none")
     tokens = _tokens()
     belief_phi = rope._apply_pos_phi(rope.prior_bank.encode(tokens).phi)

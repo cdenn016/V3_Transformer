@@ -398,6 +398,7 @@ def test_rope_is_not_inert_at_the_default_value_gauge():
     tokens = torch.randint(0, 6, (2, 8))
     plain = VFEModel(_cfg(pos_rotation="none"))
     roped = VFEModel(_cfg(pos_rotation="rope"))          # rope_on_value now defaults True
+    rope_insertion="left",   # legacy composition under test
     roped.load_state_dict(plain.state_dict())
     with torch.no_grad():
         assert float((plain(tokens) - roped(tokens)).abs().max()) > 1e-4

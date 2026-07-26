@@ -87,6 +87,7 @@ def _refined_rope_gamma_model() -> VFEModel:
             gamma_as_beta_prior=True,
             gamma_prior_weight=1.0,
             pos_rotation="rope",
+            rope_insertion="left",   # legacy composition under test
         )
     torch.manual_seed(23)
     model = VFEModel(cfg).to(DEVICE)

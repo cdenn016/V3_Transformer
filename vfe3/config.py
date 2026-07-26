@@ -2081,15 +2081,32 @@ class VFE3Config:
         # contamination, broken gauge covariance) on a config that asked for the pure path -- exactly
         # the class of silent substitution that cost a 15000-step run on 2026-07-26.
         if self.pos_rotation == "rope" and self.rope_insertion == "right":
+            from vfe3.geometry.groups import get_group
             from vfe3.geometry.transport import get_transport_registration
+            _escapes = ("Use a transport and group that carry one, or set rope_insertion='left' to "
+                        "accept the legacy composition R_i Omega_ij R_j^T (which is NOT "
+                        "relative-position dependent once the gauge frame is nonzero).")
             if not get_transport_registration(self.transport_mode).rope_right_foldable:
                 raise ValueError(
                     f"rope_insertion='right' needs a transport carrying a per-vertex gauge chart to "
                     f"fold the rotation into, but transport_mode={self.transport_mode!r} builds an "
-                    "operator without one (a dense Omega, or the BARE direct link). Use "
-                    "transport_mode='flat' or 'regime_ii_link_charted', or set "
-                    "rope_insertion='left' to accept the legacy composition R_i Omega_ij R_j^T "
-                    "(which is NOT relative-position dependent once the gauge frame is nonzero).")
+                    f"operator without one (a dense Omega, or the BARE direct link). {_escapes}")
+            # The flat FACTORED builder -- the thing that exposes the vertex frame -- is only
+            # selected for a block-diagonal group with MORE THAN ONE equal block. A single-block
+            # group (glk, so_k) falls to the dense pairwise Omega even on transport_mode='flat',
+            # so the registration flag alone does not settle it.
+            if self.transport_mode == "flat":
+                _builder = get_group(self.gauge_group)
+                try:                                 # builders differ: only the block groups take n_heads
+                    _dims = _builder(K=self.embed_dim, n_heads=self.n_heads).irrep_dims
+                except TypeError:
+                    _dims = _builder(K=self.embed_dim).irrep_dims
+                if len(_dims) < 2:
+                    raise ValueError(
+                        f"rope_insertion='right' with transport_mode='flat' needs a group whose "
+                        f"transport factors per block, but gauge_group={self.gauge_group!r} has a "
+                        f"single irrep block ({_dims}), so the flat transport is built as a dense "
+                        f"pairwise Omega with no per-vertex frame to fold into. {_escapes}")
         if self.pos_rotation == "rope" and self.rope_insertion == "left":
             import warnings
             warnings.warn(
