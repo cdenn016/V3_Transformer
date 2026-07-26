@@ -36,6 +36,17 @@ def _broadcast_tau(tau: 'float | torch.Tensor', energy: torch.Tensor) -> 'float 
     axis already right-aligns against the (..., [H,] N, N) energy.
     """
     if isinstance(tau, torch.Tensor) and tau.dim() == 1:
+        # A LENGTH-1 vector is a scalar wearing a head axis, and a single-irrep-block group
+        # (glk / so_k / sp, and any cross-coupled block_glk) emits a HEADLESS (..., N, N) energy --
+        # there is no head axis for it to align against. Reshaping it to (1, 1, 1) prepended a
+        # phantom head that propagated into beta and grad_sigma and broke the attention-map einsum
+        # outright (audit 2026-07-26 E-06); it is reachable because learnable_kappa_beta builds
+        # log_kappa_beta with shape (len(irrep_dims),) = (1,) there, and unlike the equivalent
+        # explicit per-head kappa list -- which config validation REJECTS on a single-block group --
+        # the learnable toggle only warned. Collapse to 0-d: same number, no invented axis. A
+        # genuine multi-head tau (H >= 2) keeps the per-head broadcast unchanged.
+        if tau.shape[0] == 1:
+            return tau.to(device=energy.device).reshape(())
         return tau.to(device=energy.device).reshape(tau.shape[0], 1, 1)
     return tau
 

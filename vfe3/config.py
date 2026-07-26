@@ -248,7 +248,15 @@ class VFE3Config:
     # "position-dependent attention, position-independent values" asymmetry. Decoupled breaks beta's
     # coupling-sum stationarity, so the belief gradient routes to the autograd oracle (no closed-form
     # kernel). Inert unless pos_rotation='rope'.
-    rope_on_value:             bool  = False        # False -> value aggregation uses the un-rotated base (RoPE on Q/K only)
+    # Restored to True (audit 2026-07-26 E-07). This field was introduced as True by the feature
+    # commit and flipped to False by `6dbfb58 "config: commit the live working-tree configuration
+    # as-is"` -- a live experimental toggle swept into the library default, not a design decision.
+    # Everything else in the codebase still said True: the prose immediately above, RopeTransport
+    # .on_value, vfe_block(rope_on_value=), stack.py and the five e_step defaults, and
+    # tests/test_rope.py::test_rope_on_value_defaults_true. So a direct caller forwarding `rope=`
+    # without `rope_on_value=` got the COUPLED gauge while the config said decoupled, and four tests
+    # were left permanently red. Behaviorally inert for any run that does not set pos_rotation='rope'.
+    rope_on_value:             bool  = True         # False -> value aggregation uses the un-rotated base (RoPE on Q/K only)
 
     # belief family. ``family`` is the SINGLE covariance-structure toggle (a registry key;
     # gaussian_diagonal | gaussian_full | ...). The diagonal-vs-full flag is its derived,
@@ -988,8 +996,26 @@ class VFE3Config:
                 raise ValueError(f"{name} must be >= 1, got {getattr(self, name)}")
         if self.n_layers < 1:
             raise ValueError(f"n_layers must be >= 1, got {self.n_layers}")
-        if self.n_e_steps < 1:
-            raise ValueError(f"n_e_steps must be >= 1, got {self.n_e_steps}")
+        # Domain is >= 0, not >= 1 (audit 2026-07-26 E-17). Two probes deliberately drive the field
+        # to 0 by direct assignment -- the depth-sensitivity sweep (`collect_estep_depth_sensitivity`)
+        # and the `evaluate_zero_e_steps_counterfactual` readout -- so a `>= 1` rule was simply false
+        # of live instances, and the declared domain has to describe what the code actually does.
+        # Zero is a coherent state (`range(0)` runs no iteration and the belief stays at its prior),
+        # but as a USER setting it silently disables belief inference, so it warns rather than
+        # passing quietly.
+        if self.n_e_steps < 0:
+            raise ValueError(f"n_e_steps must be >= 0, got {self.n_e_steps}")
+        if self.n_e_steps == 0:
+            # Local import: later blocks in this method do `import warnings`, which makes the name
+            # function-local throughout and leaves the module-level binding unreachable here.
+            import warnings
+            warnings.warn(
+                "n_e_steps=0 runs NO belief E-step iteration: the belief stays at its prior and the "
+                "decode reads that prior out directly. This is the zero-depth counterfactual the "
+                "probes measure, not a trained inference path -- set n_e_steps >= 1 to run inference.",
+                UserWarning,
+                stacklevel=2,
+            )
         if self.s_e_step_n_iter is not None and (
                 type(self.s_e_step_n_iter) is not int or self.s_e_step_n_iter < 0):
             raise ValueError(

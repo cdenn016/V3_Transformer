@@ -360,3 +360,136 @@ def test_dead_gaussian_declaration_is_gone():
     for name in ("glk", "block_glk", "tied_block_glk", "so_k", "so_n", "sp", "sp_n"):
         assert declared_invariant_families(name) == ("gaussian_full",)
         assert get_group(name).invariant_families == ("gaussian_full",)
+
+
+# --- E-07: rope_on_value's three contradicting defaults -----------------------------------
+
+def test_rope_on_value_default_agrees_across_every_seam():
+    r"""One value, four places. The config field was flipped to False by a live-config sweep
+    (`6dbfb58 "config: commit the live working-tree configuration as-is"`) while RopeTransport,
+    vfe_block and the e_step defaults all kept True, so a direct caller forwarding `rope=` without
+    `rope_on_value=` silently got the COUPLED gauge -- the opposite of what the config declared.
+    """
+    import inspect
+
+    from vfe3.geometry.transport import RopeTransport
+    from vfe3.model.block import vfe_block
+
+    config_default = VFE3Config().rope_on_value
+    assert config_default is True
+    assert RopeTransport.__dataclass_fields__["on_value"].default is config_default
+    assert inspect.signature(vfe_block).parameters["rope_on_value"].default is config_default
+
+
+def test_rope_is_not_inert_at_the_default_value_gauge():
+    r"""At rope_on_value=False the rotation barely reaches the logits (measured 7.9e-06 against
+    2.1e-02 coupled), which is why test_rope_changes_logits_vs_no_rope was red: RoPE was very nearly
+    a no-op on the shipped default. The coupled single-gauge path is the one that actually rotates.
+    """
+    from vfe3.model.model import VFEModel
+
+    def _cfg(**kw):
+        base = dict(vocab_size=6, embed_dim=4, n_heads=2, max_seq_len=8, n_layers=1,
+                    n_e_steps=2, gauge_group="block_glk", e_step_update="gradient")
+        base.update(kw)
+        return VFE3Config(**base)
+
+    torch.manual_seed(0)
+    tokens = torch.randint(0, 6, (2, 8))
+    plain = VFEModel(_cfg(pos_rotation="none"))
+    roped = VFEModel(_cfg(pos_rotation="rope"))          # rope_on_value now defaults True
+    roped.load_state_dict(plain.state_dict())
+    with torch.no_grad():
+        assert float((plain(tokens) - roped(tokens)).abs().max()) > 1e-4
+
+
+# --- D-03: the purity ledger records the E-step update axis --------------------------------
+
+def _pure_cfg(**kw) -> VFE3Config:
+    base = dict(vocab_size=7, embed_dim=4, n_heads=1, max_seq_len=5, n_layers=1, n_e_steps=1,
+                gauge_group="glk", use_prior_bank=True, lambda_alpha_mode="constant")
+    base.update(kw)
+    return VFE3Config(**base)
+
+
+def test_mm_exact_run_can_no_longer_publish_on_pure_path():
+    # mm_exact minimizes the STRICT-PAIR-MASKED surrogate, which drops the structural E_ii = 0
+    # self-pairs, so it is not the canonical objective. The ledger used to certify such a run as
+    # pure because no flag covered the update rule at all.
+    from vfe3.run_artifacts import _pure_path_report
+
+    report = _pure_path_report(_pure_cfg(e_step_update="mm_exact"), [])
+    assert report["pure_flags"]["gradient_e_step_update"] is False
+    assert report["on_pure_path"] is False
+    assert [k for k, v in report["pure_flags"].items() if not v] == ["gradient_e_step_update"]
+
+
+def test_gradient_run_is_still_certified_pure():
+    from vfe3.run_artifacts import _pure_path_report
+
+    report = _pure_path_report(_pure_cfg(e_step_update="gradient"), [])
+    assert report["pure_flags"]["gradient_e_step_update"] is True
+    assert report["on_pure_path"] is True
+
+
+@pytest.mark.parametrize("update,damping", [("gradient", 1.0), ("mm_exact", 0.5)])
+def test_config_toggles_record_the_update_rule_and_its_damping(update, damping):
+    from vfe3.run_artifacts import _pure_path_report
+
+    toggles = _pure_path_report(
+        _pure_cfg(e_step_update=update, mm_damping=damping), [])["config_toggles"]
+    assert toggles["e_step_update"] == update
+    assert toggles["mm_damping"] == pytest.approx(damping)
+
+
+# --- E-06: a length-1 tau is a scalar, not a one-head vector -------------------------------
+
+@pytest.mark.parametrize("gauge_group", ["glk", "so_k"])
+def test_learnable_kappa_beta_runs_on_a_single_irrep_block_group(gauge_group):
+    r"""``log_kappa_beta`` is built with shape ``(len(irrep_dims),) = (1,)`` on a single-block group,
+    and ``_broadcast_tau`` used to reshape any 1-d tau to ``(H, 1, 1)`` -- prepending a phantom head
+    to a HEADLESS ``(..., N, N)`` energy. It propagated into beta and grad_sigma and broke the
+    attention-map einsum outright, while the equivalent explicit per-head kappa list is rejected at
+    config time.
+    """
+    from vfe3.model.model import VFEModel
+
+    cfg = VFE3Config(vocab_size=7, embed_dim=4, n_heads=1, max_seq_len=5, n_layers=1,
+                     n_e_steps=1, gauge_group=gauge_group, learnable_kappa_beta=True)
+    torch.manual_seed(0)
+    model = VFEModel(cfg)
+    tokens = torch.randint(0, 7, (1, 5))
+
+    with torch.no_grad():
+        logits = model(tokens)
+        maps = model.attention_maps(tokens)
+
+    assert logits.shape == (1, 5, 7)
+    assert maps.shape[-2:] == (5, 5)
+
+
+def test_broadcast_tau_collapses_length_one_but_keeps_real_heads():
+    from vfe3.free_energy import _broadcast_tau
+
+    headless_energy = torch.zeros(5, 5)
+    assert _broadcast_tau(torch.tensor([2.0]), headless_energy).dim() == 0
+    multihead_energy = torch.zeros(3, 5, 5)
+    assert _broadcast_tau(torch.tensor([1.0, 2.0, 3.0]), multihead_energy).shape == (3, 1, 1)
+
+
+# --- E-17: the declared n_e_steps domain matches what the code does ------------------------
+
+def test_n_e_steps_domain_admits_the_zero_depth_probes_use():
+    # Two probes drive the field to 0 by direct assignment (the depth-sensitivity sweep and the
+    # zero-e-steps counterfactual), so a `>= 1` rule was false of live instances.
+    assert _pure_cfg(n_e_steps=0).n_e_steps == 0
+
+
+def test_zero_n_e_steps_warns_that_inference_is_disabled():
+    with pytest.warns(UserWarning, match="runs NO belief E-step"):
+        _pure_cfg(n_e_steps=0)
+
+
+def test_negative_n_e_steps_is_still_rejected():
+    with pytest.raises(ValueError, match="n_e_steps must be >= 0"):
+        _pure_cfg(n_e_steps=-1)

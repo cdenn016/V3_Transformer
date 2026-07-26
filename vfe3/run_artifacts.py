@@ -4034,6 +4034,14 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
         "full_sigma_update":           not cfg.skip_belief_sigma_update,
         "no_twohop_coupling":          cfg.lambda_twohop == 0.0,
         "no_fixed_prior_surrogate":    not fixed_prior_surrogate,
+        # The E-STEP UPDATE RULE axis (audit 2026-07-26 D-03). 'mm_exact' is the closed-form
+        # minimizer of the STRICT-PAIR-MASKED surrogate, which excludes the structural E_ii = 0
+        # self-pairs and is therefore not a majorizer of the canonical frozen-attention objective
+        # (see the e_step_update note and D-01). Without this key a run whose E-step descends that
+        # surrogate published on_pure_path: True with no record of the substitution anywhere: the
+        # only trace, state_dependent_alpha_majorizer, is False at the pure lambda_alpha_mode=
+        # 'constant', so the ledger asserted purity it had not checked.
+        "gradient_e_step_update":      getattr(cfg, "e_step_update", "gradient") == "gradient",
     }
     # Second, INDEPENDENT purity axis (audit 2026-07-01 F8): the gauge / model-channel path. Keyed
     # on pos_rotation itself rather than the RoPE sub-toggles (rope_full_gauge / rope_on_value),
@@ -4076,6 +4084,10 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             "gauge_group":                   cfg.gauge_group,
             "family":                        cfg.family,
             "group_invariant_families":      list(invariant_families),
+            # The update rule and its damping, so a reader can tell WHICH objective the E-step
+            # descended and how far it stepped toward the surrogate's minimizer (audit D-03).
+            "e_step_update":                 getattr(cfg, "e_step_update", "gradient"),
+            "mm_damping":                    float(getattr(cfg, "mm_damping", 1.0)),
             # Truthful fixed-surrogate ledger (C6): these derived booleans expose when the run
             # intentionally freezes a state-dependent quantity rather than following its full
             # joint objective. Defaults are False, preserving the pure path.
