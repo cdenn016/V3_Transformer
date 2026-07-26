@@ -303,6 +303,13 @@ def test_controlled_plot_uses_fixed_display_and_pca_clustering(tmp_path):
             array = np.asarray(values, dtype=float)
             return array[:, :n_components] + seed * 1e-5
 
+        def embed_many(self, values, *, seeds, n_neighbors, min_dist, n_components):
+            # The controlled path fits the seeds concurrently (2026-07-26); one `embed` per seed
+            # keeps this double's recorded per-seed parameters exactly as they were.
+            return {int(seed): self.embed(values, n_neighbors=n_neighbors, min_dist=min_dist,
+                                          n_components=n_components, seed=int(seed))
+                    for seed in seeds}
+
     worker = RecordingWorker()
     image_path = tmp_path / "belief_umap_mu.png"
     sidecar_path = tmp_path / "belief_umap_mu.json"
@@ -372,6 +379,11 @@ def test_controlled_plot_evaluates_semantics_from_native_features(tmp_path, monk
     class RecordingWorker:
         def embed(self, values, *, n_neighbors, min_dist, n_components, seed):
             return np.asarray(values, dtype=float)[:, :n_components] + seed * 1e-5
+
+        def embed_many(self, values, *, seeds, n_neighbors, min_dist, n_components):
+            return {int(seed): self.embed(values, n_neighbors=n_neighbors, min_dist=min_dist,
+                                          n_components=n_components, seed=int(seed))
+                    for seed in seeds}
 
     monkeypatch.setattr(
         figures,

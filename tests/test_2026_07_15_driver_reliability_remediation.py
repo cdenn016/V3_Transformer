@@ -1070,6 +1070,12 @@ class _ProjectionWorker:
         del n_neighbors, min_dist
         return np.asarray(values, dtype=float)[:, :n_components] + seed * 1e-5
 
+    def embed_many(self, values, *, seeds, n_neighbors, min_dist, n_components):
+        # The controlled path fits its seeds concurrently (2026-07-26).
+        return {int(seed): self.embed(values, n_neighbors=n_neighbors, min_dist=min_dist,
+                                      n_components=n_components, seed=int(seed))
+                for seed in seeds}
+
 
 def test_controlled_figure_survives_sidecar_failure_and_reports_both_artifacts(tmp_path, monkeypatch):
     image_path = tmp_path / "belief.png"
