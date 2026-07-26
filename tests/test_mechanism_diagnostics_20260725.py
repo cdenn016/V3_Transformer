@@ -332,3 +332,47 @@ def test_character_probe_restores_the_patched_helpers_it_installs() -> None:
 
     assert VFEModel._refine_s is before_refine
     assert stack_module.vfe_block is before_block
+
+
+def test_gradient_route_still_reports_displacement_and_cosine() -> None:
+    r"""Off the ``mm_exact`` route the shares are None but the trajectory is still measured.
+
+    The docstring promised this from the start; the code did not honor it until 2026-07-26, because
+    the displacement window was populated only inside the ``mm_exact`` spy. A gradient-route
+    checkpoint therefore reported None for EVERY field, which is how the B-01 re-measurement found
+    it: the surviving K=20 checkpoint runs ``e_step_update='gradient'`` and the probe said nothing
+    at all about it. ``vfe_block`` receives the belief prior and returns the converged belief on
+    every route, so the window is now route-independent.
+    """
+    model = _model(e_step_update="gradient")
+    tokens, _ = _batch()
+
+    record = collect_estep_character(model, tokens, depths=[1, 2, 3])
+
+    assert record["precision_split_available"] is False
+    assert record["measured_channel"] == "belief" and record["measured_layer"] == 0
+    for point in record["points"]:
+        assert point["rel_displacement"] is not None and point["rel_displacement"] >= 0.0
+        assert point["cos_dir_vs_step1"] is not None
+        assert point["step1_share_of_displacement"] is not None
+        # Nothing is fabricated for a fusion this route never computes.
+        assert point["pair_precision_share"] is None
+        assert point["prior_precision_share"] is None
+    assert record["points"][0]["cos_dir_vs_step1"] == pytest.approx(1.0, abs=1e-5)
+
+
+def test_mm_route_window_is_unchanged_by_the_block_fallback() -> None:
+    r"""The mm_exact window stays PRIMARY: it reads mu_star before the block's optional norm.
+
+    Pinned because the fallback added for the gradient route must not silently redefine the
+    quantity the published mm numbers were measured against.
+    """
+    model = _model(e_step_update="mm_exact", norm_type_block="layernorm")
+    tokens, _ = _batch()
+
+    record = collect_estep_character(model, tokens, depths=[1, 2])
+
+    assert record["precision_split_available"] is True
+    for point in record["points"]:
+        assert point["rel_displacement"] is not None
+        assert point["pair_precision_share"] is not None

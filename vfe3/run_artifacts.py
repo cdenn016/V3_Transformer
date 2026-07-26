@@ -3204,6 +3204,16 @@ def collect_estep_character(
     Only the ``mm_exact`` kernel route is decomposed. On any other ``e_step_update`` the displacement
     and cosine are still reported and the shares are ``None`` (``precision_split_available=False``);
     nothing is fabricated for a route whose fusion does not exist.
+
+    That last sentence was a docstring CLAIM the code did not honor until 2026-07-26: the displacement
+    window was populated only inside the ``mm_exact`` spy, so a ``e_step_update='gradient'`` checkpoint
+    returned ``None`` for every field, not just the shares. It surfaced while re-measuring the numbers
+    B-01 invalidated -- the surviving K=20 checkpoint runs the gradient route, so the probe reported
+    nothing at all about it. The block-level window below closes that: ``vfe_block`` receives the
+    belief prior and returns the converged belief whatever the inner route is, so displacement and
+    cosine are now genuinely route-independent. The ``mm_exact`` window stays PRIMARY where it exists,
+    because it reads ``mu_star`` before the block's optional norm and is what the published mm numbers
+    were measured against; the block window is a fallback used only when no belief fusion was recorded.
     """
     from vfe3.alpha_i import alpha_gradient_coefficient, alpha_is_per_coord
     from vfe3.free_energy import self_divergence_for_alpha
@@ -3249,6 +3259,17 @@ def collect_estep_character(
 
     def _block_spy(*args, **kwargs):
         out = original_block(*args, **kwargs)
+        # Route-independent displacement window. vfe_block(belief, mu_p, sigma_p, ...) -> BeliefState
+        # takes the prior positionally at the stack call site and returns the converged belief, so
+        # this pair exists on EVERY e_step_update -- unlike the mm_exact fusion, which the gradient
+        # route never calls. Recorded for the belief channel of layer 0 only, on the same window the
+        # mm spy uses, and consumed below only when that spy recorded nothing.
+        if frame["channel"] == "belief" and frame["layer"] == 0 and len(args) >= 2:
+            mu_prior = args[1]
+            mu_converged = getattr(out, "mu", None)
+            if isinstance(mu_prior, torch.Tensor) and isinstance(mu_converged, torch.Tensor):
+                block_window["mu_p"] = mu_prior.detach()
+                block_window["mu_star"] = mu_converged.detach()
         frame["layer"] += 1                              # count layers as they COMPLETE
         return out
 
@@ -3314,6 +3335,7 @@ def collect_estep_character(
     points: List[Dict[str, object]] = []
     directions: Dict[int, torch.Tensor] = {}
     window: Dict[str, Optional[torch.Tensor]] = {"first_mu_p": None, "last_mu_star": None}
+    block_window: Dict[str, Optional[torch.Tensor]] = {"mu_p": None, "mu_star": None}
     split_available = False
     max_err = 0.0
     realized_belief_calls: Dict[int, int] = {}
@@ -3334,29 +3356,41 @@ def collect_estep_character(
             recorded.clear()
             frame["channel"], frame["layer"] = "belief", 0
             window["first_mu_p"] = window["last_mu_star"] = None
+            block_window["mu_p"] = block_window["mu_star"] = None
             model(tokens)
             belief0 = [call for call in recorded
                        if call["channel"] == "belief" and call["layer"] == 0]
             realized_belief_calls[depth] = len(belief0)
-            if not belief0 or window["first_mu_p"] is None:
-                points.append({"belief_depth": depth, "rel_displacement": None,
-                               "pair_precision_share": None, "prior_precision_share": None,
-                               "n_belief_calls": len(belief0)})
+            # The mm_exact fusion window is primary; the block window covers every other route.
+            if belief0 and window["first_mu_p"] is not None:
+                anchor, converged = window["first_mu_p"], window["last_mu_star"]
+            else:
+                anchor, converged = block_window["mu_p"], block_window["mu_star"]
+            if anchor is None or converged is None or float(anchor.norm()) == 0.0:
+                points.append({"belief_depth": depth, "n_belief_calls": len(belief0),
+                               "rel_displacement": None,
+                               "pair_precision_share": None, "prior_precision_share": None})
                 continue
-            split_available = True
-            first = belief0[0]
-            max_err = max(max_err, max(float(call["err"]) for call in recorded))
-            displacement = window["last_mu_star"] - window["first_mu_p"]
+            displacement = converged - anchor
             directions[depth] = displacement.flatten()
-            prior_mass, pair_mass = float(first["prior_mass"]), float(first["pair_mass"])
-            total = prior_mass + pair_mass
-            points.append({
+            point: Dict[str, object] = {
                 "belief_depth":          depth,
                 "n_belief_calls":        len(belief0),
-                "rel_displacement":      float(displacement.norm() / window["first_mu_p"].norm()),
-                "pair_precision_share":  (pair_mass / total) if total > 0.0 else None,
-                "prior_precision_share": (prior_mass / total) if total > 0.0 else None,
-            })
+                "rel_displacement":      float(displacement.norm() / anchor.norm()),
+                "pair_precision_share":  None,
+                "prior_precision_share": None,
+            }
+            # Shares exist only where the mm_exact fusion does; nothing is fabricated otherwise.
+            if belief0 and window["first_mu_p"] is not None:
+                split_available = True
+                first = belief0[0]
+                max_err = max(max_err, max(float(call["err"]) for call in recorded))
+                prior_mass, pair_mass = float(first["prior_mass"]), float(first["pair_mass"])
+                total = prior_mass + pair_mass
+                if total > 0.0:
+                    point["pair_precision_share"] = pair_mass / total
+                    point["prior_precision_share"] = prior_mass / total
+            points.append(point)
     finally:
         for module in holders:
             module.mm_exact_update = original_mm
