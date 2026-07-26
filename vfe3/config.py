@@ -707,6 +707,24 @@ class VFE3Config:
     # the context-sensitivity probe, which re-runs the forward once per randomized-prefix replicate.
     emit_expensive_diagnostics:            bool          = False
 
+    # End-of-run parameter-motion check (2026-07-26). Snapshots every parameter at the first training
+    # step and, after the last one, reports how far each actually moved: relative
+    # ||p - p_0|| / ||p_0||, or the bare ||p - p_0|| for a zero-init table where the relative form is
+    # undefined. A requires_grad parameter that did not move is warned about by name.
+    # This is an OUTCOME check and is complementary to parameter_report, which is a CAPABILITY check:
+    # parameter_report runs one synthetic backward at init and flags p.grad is None, so it catches a
+    # table severed from the loss (R-1: rope + oracle_unroll_grad=False detaches phi_embed) but NOT a
+    # table that receives a gradient and still never moves -- a zero LR in its group (measured:
+    # m_phi_lr=0.0 leaves phi_embed reported live by the init probe and exactly 0.0 moved after real
+    # optimizer steps), a vanishing-but-nonzero gradient, or a parameter live at step 0 that dies later.
+    # Cost is one CPU clone of the parameters (host RAM only, off the GPU) plus one comparison per run.
+    check_parameter_motion:                bool          = True
+
+    # Relative-motion threshold below which check_parameter_motion calls a parameter frozen. A real
+    # freeze is exact (AdamW skips a parameter whose grad is None, and a zero LR scales the update to
+    # zero), so this only has to clear fp32 round-off, not separate "slow" from "stopped".
+    parameter_motion_rel_tol:              float         = 1e-6
+
     # Memory-guard override for full-vocabulary reporting inputs (audit 2026-07-01 F9): the two
     # extractors that materialize full (B, N, V) logits/probabilities are skipped above the guard,
     # while lighter figures still run. True opts those large inputs back in.
@@ -2666,6 +2684,10 @@ class VFE3Config:
             _bval = getattr(self, _bname)
             if type(_bval) is not bool:
                 raise ValueError(f"{_bname} must be a bool, got {type(_bval).__name__}: {_bval!r}")
+        if float(self.parameter_motion_rel_tol) < 0.0:
+            raise ValueError(
+                f"parameter_motion_rel_tol must be >= 0, got {self.parameter_motion_rel_tol!r}"
+            )
         if self.resume_from is not None and not isinstance(self.resume_from, str):
             raise ValueError(
                 f"resume_from must be None or a path string to a checkpoints/step_<N>.pt, got "

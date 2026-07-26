@@ -18,7 +18,8 @@ import math
 import time
 from numbers import Real
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import (Callable, Collection, Dict, Iterable, List, Mapping, NamedTuple, Optional,
+                    Sequence, Tuple)
 
 import torch
 
@@ -1430,6 +1431,21 @@ def train(
     # on stderr; it closes the bar on normal exit or exception.
     show_bar = bool(log_interval) and _tqdm is not None
 
+    # Outcome half of the freeze guard (see parameter_motion_report): clone the parameters BEFORE the
+    # first step so the end-of-run comparison measures motion over the steps this call actually took.
+    # Skipped when the loop is empty, where "nothing moved" is the correct outcome, not a finding.
+    motion_snapshot = (snapshot_parameters(model)
+                       if getattr(cfg, "check_parameter_motion", False) and n_steps > start_step
+                       else None)
+    # Which parameters never even receive a gradient is read off the FIRST REAL STEP below rather
+    # than from a synthetic parameter_report probe here: train_step zeroes grads on entry and not on
+    # exit, so the real .grad is still live when it returns. That costs no extra forward/backward,
+    # and it reports the graph the run actually trains through instead of a probe's approximation of
+    # it. The end-of-run warning subtracts this set, so it fires only on a parameter that DID get a
+    # gradient and still never moved -- the case no existing check covers.
+    motion_known_dead: Tuple[str, ...] = ()
+    motion_dead_captured = False
+
     def _step_indices() -> Iterable[int]:
         if not show_bar:
             yield from range(start_step, n_steps)               # range start_step..n_steps (== 0..n_steps from scratch)
@@ -1542,6 +1558,13 @@ def train(
                                   scaler=scaler, metrics_out=step_metrics, status_out=step_status))
         if timer is not None:
             timer.finish_step(n_tokens=tokens.numel())
+        # Gradient reachability, read off the first step that actually updated: grads are still live
+        # here (train_step zeroes on entry). Gated on did_step because the nonfinite-grad path drops
+        # them, which would read as "every parameter is dead" and mute the whole end-of-run check.
+        if motion_snapshot is not None and not motion_dead_captured and step_status["did_step"]:
+            motion_known_dead = tuple(name for name, p in model.named_parameters()
+                                      if p.requires_grad and p.grad is None)
+            motion_dead_captured = True
         # Metropolis det-sign sweep (opt-in, default OFF): runs on the POST-optimizer-step model,
         # gated + cadence-checked by the helper; inert (no call, no generator draw) unless
         # cfg.omega_reflection == 'metropolis'. tokens is the SAME input batch just fed to train_step.
@@ -1902,6 +1925,32 @@ def train(
             ),
             losses,
         )
+    # Did every trainable parameter actually move? Read on the RAW last iterate, before ema.copy_to,
+    # so the answer is about the optimizer's updates rather than about the average of them.
+    if motion_snapshot is not None:
+        motion = parameter_motion_report(
+            model, motion_snapshot,
+            rel_tol=float(getattr(cfg, "parameter_motion_rel_tol", 1e-6)),
+            known_dead=motion_known_dead,
+        )
+        motion["steps"] = int(n_steps - start_step)
+        if artifacts is not None:
+            artifacts.save_json("parameter_motion.json", motion)
+        frozen = motion["frozen"]
+        if frozen:
+            import warnings
+            warnings.warn(
+                f"parameter motion: {len(frozen)} trainable parameter(s) did not move over "
+                f"{motion['steps']} step(s) and are frozen for this run: "
+                f"{', '.join(str(n) for n in frozen)}. A parameter can be reported live by the "
+                f"init-time grad probe and still never move -- check its group learning rate and "
+                f"whether it reaches the loss only through a detached E-step tangent.",
+                UserWarning,
+                stacklevel=2,
+            )
+        elif logger is not None:
+            logger.info(" parameter motion: all %d trainable parameters moved",
+                        sum(1 for m in motion["motion"].values() if m["requires_grad"]))
     if ema is not None:
         ema.copy_to(model)                               # the trained model IS the averaged weights
     return losses
@@ -2010,6 +2059,74 @@ def parameter_report(
         rep.update(live=live, dead=trainable - live, dead_names=dead_names, probed=True)
     except Exception as exc:
         rep["probe_error"] = repr(exc)                             # surfaced, not swallowed; live/dead stay unknown
+    return rep
+
+
+def snapshot_parameters(
+    model: torch.nn.Module,
+) -> Dict[str, torch.Tensor]:
+    r"""Detached CPU clones of every named parameter, for a later ``parameter_motion_report``.
+
+    Cloned to the HOST so a large model costs no extra device memory; the comparison at the end of
+    the run is the only transfer. Taken at the first step of THIS run, so under a resume the motion
+    reported is motion since the resume point, not since the original init.
+    """
+    return {name: p.detach().to("cpu", copy=True) for name, p in model.named_parameters()}
+
+
+def parameter_motion_report(
+    model:      torch.nn.Module,
+    snapshot:   Mapping[str, torch.Tensor],         # from snapshot_parameters, taken before training
+
+    *,
+    rel_tol:    float                = 1e-6,        # below this relative motion a parameter is frozen
+    known_dead: Collection[str]      = (),          # names that never receive a gradient at all
+) -> Dict[str, object]:
+    r"""How far each parameter ACTUALLY moved over the run, and which ones did not move at all.
+
+    Motion is ``||p - p_0||_2``, reported relative to ``||p_0||_2`` where that is nonzero. For a
+    zero-init table (``connection_W``, ``mixer_deltas``, ``path_weights``) the relative form is
+    undefined, so the absolute norm is the criterion instead and ANY nonzero motion counts as
+    trained -- which makes those the sharpest members of the set, not the murkiest.
+
+    Only ``requires_grad`` parameters can be reported frozen: the hyper-prior centroid ``r_mu`` /
+    ``r_sigma_log`` is deliberately held fixed under ``learnable_r=False`` and must not be flagged.
+
+    This is the OUTCOME half of the pair whose CAPABILITY half is ``parameter_report``. That one runs
+    a synthetic backward at init and flags ``p.grad is None``, so it sees a table severed from the
+    loss; it cannot see a table that is handed a gradient and still never moves. Measured on a tiny
+    model: with ``m_phi_lr=0.0``, ``parameter_report`` reports ``phi_embed`` live while it moves
+    exactly ``0.0`` across real optimizer steps.
+
+    ``known_dead`` -- the names that never receive a gradient at all, which ``train`` reads off the
+    first real step and ``parameter_report`` supplies as ``dead_names`` -- splits the immobile set in
+    two, because only one half is news. A table already known dead is config-dead by construction
+    -- ``decode_log_scale`` under the default ``use_prior_bank=False`` is the standing example -- and
+    lands in ``frozen_known_dead``; it is reported but never warned about, so the warning does not
+    fire on every run of an intentional ablation and get tuned out. ``frozen`` keeps only the
+    parameters that were live at init and still did not move, which no existing check can see.
+    """
+    rep: Dict[str, object] = {"rel_tol": float(rel_tol), "frozen": [], "frozen_known_dead": [],
+                              "missing": [], "motion": {}}
+    motion: Dict[str, Dict[str, object]] = rep["motion"]                          # type: ignore[assignment]
+    dead = set(known_dead)
+    for name, parameter in model.named_parameters():
+        initial = snapshot.get(name)
+        if initial is None or initial.shape != parameter.shape:
+            rep["missing"].append(name)                                           # type: ignore[union-attr]
+            continue                                                              # added/reshaped since the snapshot
+        current   = parameter.detach().to("cpu")
+        delta     = float((current - initial).norm())
+        init_norm = float(initial.norm())
+        relative  = (delta / init_norm) if init_norm > 0.0 else None
+        frozen    = (delta <= rel_tol * init_norm) if init_norm > 0.0 else (delta == 0.0)
+        motion[name] = {"abs": delta, "rel": relative, "init_norm": init_norm,
+                        "requires_grad": bool(parameter.requires_grad), "frozen": bool(frozen),
+                        "known_dead": name in dead}
+        if frozen and parameter.requires_grad:
+            key = "frozen_known_dead" if name in dead else "frozen"
+            rep[key].append(name)                                                 # type: ignore[union-attr]
+    rep["n_parameters"] = len(motion)
     return rep
 
 

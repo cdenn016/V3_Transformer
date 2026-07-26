@@ -293,6 +293,9 @@ def test_periodic_eval_reuses_one_held_out_snapshot_for_metrics_and_maps(
             del logger
             self.saved.append(("gamma", step, maps))
 
+        def save_json(self, _name: str, _obj: object) -> None:
+            return None                                  # train writes parameter_motion.json here
+
         def log_metrics(self, _row: dict[str, float]) -> None:
             return None
 
@@ -393,6 +396,9 @@ def test_periodic_eval_releases_snapshot_before_next_training_step(
             nonlocal best_calls
             best_calls += 1
             assert snapshot_refs[-1]() is not None
+
+        def save_json(self, _name: str, _obj: object) -> None:
+            return None                                  # train writes parameter_motion.json here
 
         def log_metrics(self, _row: dict[str, float]) -> None:
             return None
