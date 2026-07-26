@@ -39,22 +39,32 @@ Single-field diffs, confirmed from each run's `config.json`:
 | `178.78_RIGHT-ROPE-BASE=1000` | `rope_base=1000` | 178.78 |
 | `181.19_...s6` | no rope, `causal_noself` (control) | 181.19 |
 
-Three consequences, none of them recorded:
+Read against the project's working noise floor of **±0.75 PPL** for multi-seed spread (a band ~1.5
+wide), three consequences, none of them recorded:
 
-The R-4 fix buys 2.35 PPL over left and 2.48 over no rope. `docs/2026-07-26-rope-investigation.md:344`
-pre-registered the decision rule "if the corrected rope still lands near 164, the direction closes."
-It lands at 161.64. **The placement bug was not the blocker, and the rope direction closes on its own
-stated criterion** — against a `pos_phi='learned'` gap of ~22.7 PPL.
+**The R-4 fix is real and it was masking the whole rope effect.** Right buys 2.35 PPL over left and
+2.48 over no rope — both ~3.2x the half-spread, comfortably outside noise. The legacy left arm bought
+0.13 PPL over no-rope, which is deep inside the band, i.e. exactly zero. So the earlier reading "rope
+contributes approximately nothing" was correct *about the left composition* and does not survive the
+fix: with the rotation folded into the frame, rope contributes ~2.5 PPL.
 
-`rope_on_value=True` is **11.2 PPL worse** than `False` at otherwise identical config. This directly
-contradicts `docs/2026-07-26-edits.md:560`, which states "`rope_on_value=True` is the better pairing."
-That recommendation was argued from the gradient path (it keeps `mm_exact` legal so the R-1 freeze
-cannot occur) and is correct on those grounds, but it is now measured as costly, and the doc's
-unqualified wording should not stand.
+This splits the pre-registered decision rule at `docs/2026-07-26-rope-investigation.md:344` ("if the
+corrected rope still lands near 164, the direction closes") into two questions it conflated. Does rope
+explain the ~22.7 PPL `pos_phi='learned'` gap? **No** — 161.64 is far nearer 164 than 141, and that
+half of the rule fires. Does rope contribute at all? **Yes, ~2.5 PPL, outside noise.** R-4 was the
+blocker for rope's contribution; rope's ceiling is simply ~2.5 PPL rather than ~22.7. The direction
+closes as a *primary* performance lever, not as a real effect.
 
-`rope_base=1000` is worse than `100` at otherwise identical config (178.78 vs 178.17), which is direct
-empirical support for R-5's rejection of "raise the base" — the negative half of R-5 is now measured
-twice.
+`rope_on_value=True` is **11.2 PPL worse** than `False` at otherwise identical config — an order of
+magnitude past the noise band. This directly contradicts `docs/2026-07-26-edits.md:560`, which states
+"`rope_on_value=True` is the better pairing." That recommendation was argued from the gradient path
+(it keeps `mm_exact` legal so the R-1 freeze cannot occur) and is correct on those grounds, but it is
+now measured as costly, and the doc's unqualified wording should not stand.
+
+`rope_base=1000` versus `100` is **178.78 vs 178.17 — a 0.61 PPL difference, inside the noise band.**
+This is a null result and carries no information about R-5 in either direction. It should not be cited
+as support for rejecting "raise the base"; that rejection continues to rest on the `d_head=10`
+band-count argument alone.
 
 **Action:** record the seven runs and these three conclusions in `docs/`. Cost is prose only. Also
 verify `140.48_alibi-slope=2` and `141.95_1estep-2s-steps` before citing them — one agent reported a
@@ -228,16 +238,37 @@ Repo hygiene: 21 fully-merged local branches, three stale worktrees (one locked,
 `.claude/`, pinning an otherwise-merged branch; one on a detached HEAD unreachable from any branch),
 and loose `.verification/*.xml` at that directory's root. All gitignored, none tracked.
 
-## The cross-cutting problem: no noise floor
+## Reading the corpus against the ±0.75 PPL noise floor
 
-Every quantitative comparison in this two-day corpus is single-seed. The 2.35 PPL right-vs-left rope
-gap, the 0.13 PPL rope delta, 138.40 vs 141.38 on the route comparison, the 0.235 PPL total spread in
-the K=20 bound decomposition — none has a replicate, so none has an established noise floor. A seed-0
-replicate (`vfe3_runs/20260726-181852_..._s0`) is in flight and appears to be the first.
+Every comparison in this two-day corpus is single-seed, but the project's working multi-seed spread is
+**±0.75 PPL** (a band ~1.5 wide), which is enough to sort them. Applied to the K=20 arms:
 
-Two or three more K=20 arms (~30 min each) would make the entire 2026-07-26 table interpretable. This
-is the highest ratio of decision value to cost anywhere in this list, and it gates how much weight
-items 1 and 2 can carry.
+| comparison | delta | verdict |
+|---|---|---|
+| `pos_phi='learned'` gap | ~22.7 | real, dominant |
+| no-head-mixer 148.25 vs 138.40 | 9.85 | real |
+| `rope_on_value` True vs False | 11.19 | real |
+| `s_e_step_n_iter=2` 141.95 vs 138.40 | 3.55 | real |
+| rope without ALiBi 181.19 vs 178.17 | 3.02 | real |
+| route `gradient` 141.38 vs `mm_exact` 138.40 | 2.98 | real |
+| rope right vs no-rope | 2.48 | real (~3.3x half-spread) |
+| rope right vs left | 2.35 | real (~3.1x half-spread) |
+| `alibi_slope=2` 140.48 vs 138.40 | 2.08 | probably real, but possibly two-field |
+| 2-layer 139.97 vs 138.40 | 1.57 | marginal, ~2x half-spread |
+| `rope_base` 1000 vs 100 | 0.61 | **inside noise — null** |
+| rope left vs no-rope | 0.13 | **inside noise — zero** |
+| K=20 bound decomposition, total spread | 0.235 | **inside noise — not established** |
+
+Two results that were being carried as findings dissolve at this floor: the `rope_base` comparison is
+a null, and the entire K=20 phi-bound decomposition in
+`docs/2026-07-25-phi-bound-calibration-and-stage0-report.md` — the basis for the
+`phi_mstep_max_matrix_norm = 13` recommendation — has a total spread of 0.235 PPL across all its arms,
+so it does not separate them. That materially weakens the case for porting bound-13 to K=300 as the
+primary arm, since the K=20 evidence it rests on is indistinguishable from seed noise.
+
+Everything else on the list clears the band, so the single-seed caveat does not undercut items 1 or 2.
+The seed-0 replicate in flight (`vfe3_runs/20260726-181852_..._s0`) is still worth having to confirm
+the floor holds at this specific config, but it is no longer a precondition for acting.
 
 ## Highest-value untested experiments
 
@@ -246,10 +277,13 @@ Ranked by how much the outcome would change what happens next:
 1. **The three-way split of row-centered logit variance** (content / token-frame / position-frame).
    Cheap — checkpoint-only, no retraining. Everything structural in the performance brainstorm is
    priced against a number nobody has measured.
-2. **Multi-seed K=20 replicates.** Cheap-medium; see above.
+2. **Re-establish the phi-bound decomposition above the noise floor at K=20.** Its 0.235 PPL total
+   spread is inside the ±0.75 band, so the bound-13 recommendation currently rests on nothing that
+   separates. Either replicate to shrink the error on the differences, or widen the swept range until
+   the arms separate. Cheap (~30 min/arm) and it gates item 3.
 3. **`phi_mstep_max_matrix_norm = 13` with `group_product` at K=300.** Medium (one run; the last K=300
-   run was 18.7 h). The only cross-scale-supported proposal on record, unrun three weeks after being
-   named the primary arm.
+   run was 18.7 h). Named the primary arm and unrun for three weeks — but see item 2: its supporting
+   K=20 evidence does not currently clear the noise floor, so this should not go first.
 4. **The Stage 1 config bundle at K=300** (`exp_fp64_mode='norm'` + threshold 21, weight-decay
    exemptions, `min_lr_frac=0`, warmup ≈1500). Cheap to configure; the fp64 change alone is claimed at
    up to 279 ms of a 366 ms step, which buys every later experiment.
