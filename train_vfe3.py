@@ -516,6 +516,12 @@ def _select_loader(
     Split-aware loader semantics: only TRAIN shuffles and drops the partial last batch; VALIDATION
     and TEST read the whole split in deterministic order (shuffle=False, drop_last=False) so the
     held-out metric is a stable corpus measurement, not a randomly-varying ~97% subset.
+
+    ``cfg.eval_stride`` applies to VALIDATION and TEST only. None (the default) leaves the disjoint
+    ``stride == max_seq_len`` windows untouched; a smaller value selects the sliding-window
+    evaluation, whose overlapping prefixes are masked so every transition is still scored exactly
+    once (see :class:`~vfe3.data.datasets.TokenWindows`). Train is never strided -- it shuffles and
+    drops its tail, so the exactly-once contract does not apply to it.
     """
     is_train = (split == "train")
     cap = MAX_TOKENS if is_train else None
@@ -525,6 +531,7 @@ def _select_loader(
     gen = torch.Generator().manual_seed(data_seed) if (is_train and data_seed is not None) else None
     return make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size,
                            shuffle=is_train, drop_last=is_train, max_tokens=cap,
+                           stride=(None if is_train else cfg.eval_stride),
                            vocab_size=cfg.vocab_size, generator=gen)
 
 

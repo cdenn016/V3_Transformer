@@ -126,7 +126,12 @@ def _build_loader(dataset: str, cfg: VFE3Config, split: str):
     r"""A stable (unshuffled) loader for ``dataset``/``split``. Raises ``FileNotFoundError`` if the
     cache is absent: the figure driver never substitutes synthetic data for a real corpus (that
     would silently drive the publication figures off a toy stream). Pass ``loader=`` to
-    :func:`generate_figures` to drive a custom stream instead."""
+    :func:`generate_figures` to drive a custom stream instead.
+
+    Deliberately NOT strided by ``cfg.eval_stride``: this stream feeds diagnostic figures, not a
+    reported metric, and overlapping windows would make consecutive figure batches near-duplicates
+    of each other for no gain. The stride belongs to the eval CONTRACT (which transitions the
+    cross-entropy averages over), not to which tokens a heatmap is drawn from."""
     from vfe3.data.datasets import make_dataloader
     return make_dataloader(dataset, split, cfg.max_seq_len, cfg.batch_size,
                            shuffle=False, drop_last=False, vocab_size=cfg.vocab_size)

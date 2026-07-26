@@ -777,27 +777,34 @@ def get_loader(
     split:      str,
 
     *,
-    data_seed:  Optional[int] = None,
-    max_tokens: Optional[int] = None,
-    vocab_size: Optional[int] = None,
+    data_seed:   Optional[int] = None,
+    max_tokens:  Optional[int] = None,
+    vocab_size:  Optional[int] = None,
+    eval_stride: Optional[int] = None,
 ) -> Any:
     r"""Split-aware DataLoader for ``dataset``/``split`` (a missing cache raises ``FileNotFoundError``).
 
-    Memoized on ``(dataset, seq_len, batch_size, split, cap, vocab_size, data_seed)`` so the corpus
-    loads once across cells with the same data and sampling contract.
+    Memoized on ``(dataset, seq_len, batch_size, split, cap, vocab_size, data_seed, stride)`` so the
+    corpus loads once across cells with the same data and sampling contract.
     Only the train stream shuffles / drops the partial last batch; validation/test read the whole split
     in a stable order so the held-out metric is a full-corpus measurement. ``max_tokens`` caps the train
-    split only. No synthetic substitution for a missing real corpus."""
+    split only. No synthetic substitution for a missing real corpus.
+
+    ``eval_stride`` mirrors ``train_vfe3._select_loader`` and ``ablation.get_loader``: it selects the
+    sliding-window held-out evaluation for validation/test and is ignored for train. It belongs in the
+    memo key for the same reason the other fields do -- a scaling route that varied it would otherwise
+    be served the first cell's loader."""
     cap = max_tokens if split == "train" else None
     seeded = split == "train" and data_seed is not None
     validated_data_seed = _require_scaling_seed(data_seed, "data_seed") if seeded else None
+    stride = None if split == "train" else eval_stride
     key = (dataset, seq_len, batch_size, split, cap, vocab_size,
-           validated_data_seed)
+           validated_data_seed, stride)
     if key not in _LOADER_CACHE:
         generator = torch.Generator().manual_seed(validated_data_seed) if seeded else None
         _LOADER_CACHE[key] = make_dataloader(dataset, split, seq_len, batch_size,
                                              shuffle=(split == "train"), drop_last=(split == "train"),
-                                             max_tokens=cap, vocab_size=vocab_size,
+                                             max_tokens=cap, stride=stride, vocab_size=vocab_size,
                                              generator=generator)
     return _LOADER_CACHE[key]
 
@@ -1360,9 +1367,9 @@ def run_cell(
     train_loader = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "train",
                               data_seed=cfg.seed, max_tokens=max_tokens, vocab_size=cfg.vocab_size)
     val_loader   = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "validation",
-                              vocab_size=cfg.vocab_size)
+                              vocab_size=cfg.vocab_size, eval_stride=cfg.eval_stride)
     test_loader  = get_loader(dataset, cfg.max_seq_len, cfg.batch_size, "test",
-                              vocab_size=cfg.vocab_size)
+                              vocab_size=cfg.vocab_size, eval_stride=cfg.eval_stride)
 
     if invocation_sources is not None:
         loaded_sources = _loader_data_source_identities(
