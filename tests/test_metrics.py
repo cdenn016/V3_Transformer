@@ -251,7 +251,47 @@ def test_per_head_gauge_invariants_blocks_and_identity():
     out = per_head_gauge_invariants(exp0, grp.irrep_dims)
     assert out["logdet"].shape == (3, 2) and out["anisotropy"].shape == (3, 2)
     assert float(out["logdet"].abs().max()) < 1e-6                # identity blocks
-    assert torch.allclose(out["anisotropy"], torch.ones_like(out["anisotropy"]), atol=1e-5)
+    # The eigenvalue-modulus squeeze is 0 on an isometric block (all |lambda| == 1), where the old
+    # singular-value RATIO was 1. Audit 2026-07-27 replaced the formula; see the invariance test.
+    assert torch.allclose(out["anisotropy"], torch.zeros_like(out["anisotropy"]), atol=1e-5)
+
+
+def test_per_head_gauge_invariants_are_conjugation_invariant():
+    r"""Both returned entries must be conjugacy-class functions under the group's OWN gauge action.
+
+    The regression this pins (audit 2026-07-27): ``anisotropy`` was ``s_max / s_min``, invariant
+    only under ORTHOGONAL conjugation, while the action here is GL(K) conjugation. It moved by up
+    to 301% under an in-group frame change and was published to metrics.csv under a ``gauge_head_*``
+    key. This is the per-head twin of the ``sp`` fix already pinned in
+    tests/test_run_diagnostics_2026_06_13.py, and its absence is how the defect survived.
+    """
+    torch.manual_seed(0)
+    grp = get_group("block_glk")(4, 2)
+    dims = grp.irrep_dims
+
+    def _blockdiag(mats):
+        out = torch.zeros(4, 4, dtype=mats[0].dtype)
+        start = 0
+        for m in mats:
+            d = m.shape[-1]
+            out[start:start + d, start:start + d] = m
+            start += d
+        return out
+
+    # A real vertex factor is block-diagonal, and block_glk's gauge is untied per block.
+    exp_phi = torch.stack([_blockdiag([torch.matrix_exp(0.3 * torch.randn(d, d)) for d in dims])
+                           for _ in range(5)])
+    g = _blockdiag([torch.matrix_exp(0.5 * torch.randn(d, d)) for d in dims])
+    moved = g @ exp_phi @ torch.linalg.inv(g)
+
+    base, conj = per_head_gauge_invariants(exp_phi, dims), per_head_gauge_invariants(moved, dims)
+    for key in ("logdet", "anisotropy"):
+        rel = ((conj[key] - base[key]).abs() / base[key].abs().clamp(min=1e-12)).max()
+        assert float(rel) < 1e-5, f"{key} moved {float(rel):.3e} under an in-group conjugation"
+
+    # and the old formula would have failed this test, so it is not vacuous
+    old = lambda m: (lambda s: s[..., 0] / s[..., -1])(torch.linalg.svdvals(m[..., :dims[0], :dims[0]]))
+    assert float(((old(moved) - old(exp_phi)).abs() / old(exp_phi).abs()).max()) > 1e-2
 
 
 # --- transport / energy directedness --------------------------------------

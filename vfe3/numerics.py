@@ -137,6 +137,25 @@ def apply_mu_trust_region(
         family or ("gaussian_diagonal" if is_diagonal else "gaussian_full")
     )
 
+    # Sanitize BEFORE whitening (audit 2026-07-27). This guard exists to bound an exploding update,
+    # so a non-finite delta_mu is precisely its design case -- yet every route below propagated it
+    # instead of catching it. Two distinct failures, both reproduced:
+    #   full     : torch.linalg.solve_triangular(eye(3), [1, inf, 2]) returns [1, inf, nan]. LAPACK
+    #              spreads one inf across UNRELATED coordinates, so the clamp on the next line -- the
+    #              guard's entire purpose -- ran after the corruption and returned all-NaN.
+    #   diagonal : in 'ball' mode norm2 is a per-ROW reduction, so one inf makes the whole ratio 0;
+    #              inf*0 = nan at the exploded entry and 0 elsewhere, silently discarding the step
+    #              and ZEROING coordinates that were perfectly finite.
+    # NaN -> 0; +-inf -> +-sentinel, where the sentinel is sized so that summing K of its squares
+    # cannot itself overflow (finfo.max would: ``max**2`` is already out of range, which made the
+    # 'ball' norm inf, the ratio 0, and the whole step vanish). A saturated coordinate then simply
+    # pins at the trust bound in 'box' and dominates the projected direction in 'ball', which is the
+    # intended response to an overshoot, while its finite neighbors keep their values.
+    if not bool(torch.isfinite(delta_mu).all()):
+        finfo = torch.finfo(delta_mu.dtype)
+        sentinel = (finfo.max / max(delta_mu.shape[-1], 1)) ** 0.5 / 2.0
+        delta_mu = torch.nan_to_num(delta_mu, nan=0.0, posinf=sentinel, neginf=-sentinel)
+
     if is_diagonal:
         scale = family_cls.trust_region_scale(sigma_q, eps=eps)
         whitened = delta_mu / scale
@@ -153,6 +172,10 @@ def apply_mu_trust_region(
         delta_mu.unsqueeze(-1),
         upper=False,
     ).squeeze(-1)
+    # A near-singular safe_factor can still emit a non-finite whitened coordinate from finite input.
+    if not bool(torch.isfinite(whitened).all()):
+        finfo = torch.finfo(whitened.dtype)
+        whitened = torch.nan_to_num(whitened, nan=0.0, posinf=finfo.max, neginf=-finfo.max)
     if mode == "ball":
         norm2 = whitened.norm(dim=-1, keepdim=True)
         bounded = whitened * (trust / norm2.clamp(min=eps)).clamp(max=1.0)

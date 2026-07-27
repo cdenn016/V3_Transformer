@@ -196,7 +196,11 @@ def test_gamma_fold_uses_refined_s_belief() -> None:
             s_belief=s_belief,
         )
         expected_gamma = attention_weights(energy, tau=tau, log_prior=gamma_log_prior)
-        expected = torch.log(expected_gamma.clamp(min=1e-12))
+        # At w == 1.0 the mixture IS gamma. The reference clamps at the dtype's smallest normal, not
+        # at 1e-12: audit 2026-07-27 moved the fold into log space, so the returned log-prior is no
+        # longer floored at log(1e-12) = -27.63 nats. This assertion is about which s-belief feeds
+        # the fold; pinning the old floor here would re-pin the defect.
+        expected = torch.log(expected_gamma.clamp(min=torch.finfo(expected_gamma.dtype).tiny))
         actual = model._fold_gamma_prior(
             None,
             token_ids,

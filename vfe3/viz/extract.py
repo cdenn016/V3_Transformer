@@ -1231,7 +1231,6 @@ def s_channel_refinement(
     """
     if not model.cfg.s_e_step:
         return None
-    from vfe3.families.gaussian import DiagonalGaussian
     from vfe3.divergence import get_functional
     cfg, pb = model.cfg, model.prior_bank
     if snapshot is None:

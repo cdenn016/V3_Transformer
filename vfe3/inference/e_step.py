@@ -459,7 +459,7 @@ def free_energy_value(
     lambda_beta:               'float | torch.Tensor' = 1.0,   # weight on the belief-coupling block (1.0 = pure)
     kl_max:                    float = 100.0,
     eps:                       float = 1e-6,
-    lambda_twohop:             float = 0.0,            # HONORED: adds the detached two-hop coupling block to F
+    lambda_twohop:             float = 0.0,            # HONORED: adds the detached two-hop coupling block to F (gated != 0, matching the 4 descent paths)
     sigma_max:                 float = 10.0,           # matches VFE3Config.sigma_max; accepted-and-ignored iteration-only knob
     e_sigma_q_trust:           float = 5.0,            # accepted-and-ignored iteration-only knob
     e_mu_q_trust:              Optional[float] = None, # accepted-and-ignored iteration-only knob
@@ -468,8 +468,8 @@ def free_energy_value(
     e_step_update:             str  = "gradient",      # accepted-and-ignored iteration-only knob
     mass_phi:                  float = 0.0,            # HONORED: adds (mass_phi/2) ||phi||^2 to the reported F
     mm_damping:                float = 1.0,            # accepted-and-ignored iteration-only knob
-    emission_weight:           float = 0.0,            # accepted-and-ignored iteration-only knob (emission block)
-    emission:                  Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # accepted-and-ignored iteration-only runtime object
+    emission_weight:           float = 0.0,            # HONORED: weights the Bohning emission block in the reported F
+    emission:                  Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,  # HONORED: (d, g, z_0) Bohning terms
 
     exp_fp64_norm_threshold:   float = 5.0,            # HONORED: forwarded to the global-F _transport float64-island keying
 
@@ -662,7 +662,7 @@ def free_energy_value(
         log_prior=log_prior, alpha_reg=(reg if lambda_alpha_mode != "constant" else None),
         coupling_energy=coupling_energy,
     )
-    if lambda_twohop > 0.0:
+    if lambda_twohop != 0.0:
         # Two-hop coupling block (fixed cross-workstream convention): DETACHED hop weights
         # W2 = beta @ beta (per head), the SAME pairwise energy grid, no entropy term. Under the
         # decoupled value gauge the summed grid is the value energy, mirroring the coupling sum.
@@ -674,6 +674,25 @@ def free_energy_value(
     # per-sequence sum as that substep, so the reported F and the descended objective agree.
     if mass_phi > 0.0 and getattr(belief, "phi", None) is not None:
         F = F + 0.5 * mass_phi * (belief.phi ** 2).sum()
+    # Emission block (audit 2026-07-27). This was accepted-and-ignored, which put the evaluator in
+    # exactly the D-08 position one file over: e_step_iteration forwards (d, g, z_0) into
+    # mm_exact_update, which fuses them, so with the block omitted here every reported F measured a
+    # functional the belief does not descend. Measured before the fix: one E-step lowered the true
+    # objective 4.825 -> 3.803 while the reported F ROSE 96x. That corrupts estep_f_drop,
+    # estep_f_nondecreasing_frac and estep_final_f_per_token, and the Metropolis acceptance test.
+    #
+    # The Bohning surrogate for -log softmax(W z)_{x_t}, expanded at z_0 and averaged over q:
+    #     w * [ 0.5 (mu - z_0)^T diag(d) (mu - z_0) - (mu - z_0)^T g + 0.5 tr(diag(d) Sigma) ]
+    # The belief-INDEPENDENT constant f(z_0) is dropped, as everywhere else in this evaluator, so F
+    # is reported up to a constant; differences (the descent diagnostics) are exact.
+    if emission is not None and emission_weight != 0.0:
+        emission_prec, emission_pull, emission_z0 = emission
+        delta = belief.mu - emission_z0                                  # (..., N, K)
+        F = F + emission_weight * (
+            0.5 * (emission_prec * delta * delta).sum()
+            - (delta * emission_pull).sum()
+            + 0.5 * (emission_prec * belief.sigma).sum()
+        )
     return F
 
 
@@ -880,7 +899,7 @@ def e_step_iteration(
     grad_record:               Optional[EStepGradientRecord] = None,   # diag out-param: stashes ||grad_mu/sigma/phi|| (None -> no capture)
     transport_chart_max_norm: Optional[float]               = None,   # fail-closed pre-clamp chart bound
     transport_status:         Optional[dict]                = None,   # run-sticky covariant-feature status
-    emission:                 Optional[Tuple[torch.Tensor, torch.Tensor]] = None,   # (d, g) Bohning emission terms (None -> no data term, the pure path)
+    emission:                 Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,   # (d, g, z_0) Bohning emission terms (None -> no data term, the pure path)
 
     _prebuilt_omega:           'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport | None' = None,   # PRIVATE: forward-transport cache from e_step
 ) -> BeliefState:

@@ -942,17 +942,32 @@ def per_head_gauge_invariants(
     r"""Per-head, per-token GL(d_head) invariants from the converged vertex factor.
 
     For a block-diagonal group the head-h frame is the (d_head, d_head) diagonal block of
-    ``exp_phi``; returns its log-volume ``logdet`` (..., H) and its shear/anisotropy
-    ``anisotropy`` = s_max / s_min (..., H). A single-block group (``irrep_dims = [K]``) yields
-    H = 1. Feeds the per-head gauge-specialization ridgelines.
+    ``exp_phi``; returns its log-volume ``logdet`` (..., H) and the eigenvalue-modulus squeeze
+    ``anisotropy`` = max_k log|lambda_k| - min_k log|lambda_k| (..., H). A single-block group
+    (``irrep_dims = [K]``) yields H = 1. Feeds the per-head gauge-specialization ridgelines.
+
+    ``anisotropy`` WAS the singular-value ratio ``s_max / s_min`` (audit 2026-07-27). That is
+    invariant only under ORTHOGONAL conjugation, while the gauge action here is GL(K) conjugation
+    ``g exp(phi) g^{-1}`` -- the same defect this module already corrected for ``sp`` in
+    ``group_gauge_invariant`` above, and for the same reason, but the per-head twin was left
+    behind on ``block_glk``, the group the live config actually runs. Measured at block_glk K=4 in
+    float64 under an in-group conjugation drawn from the group's own generators: ``logdet`` moved by
+    3.7e-15 and the eigenvalue-modulus squeeze by 8.3e-15, while the SVD ratio moved by up to 301%.
+    Both returned entries are now genuine conjugacy-class functions, so the ``gauge_head_*`` keys and
+    the ``per_head_gauge_invariants`` name are honest.
+
+    The value is a LOG ratio where the old one was a bare ratio, so the published
+    ``gauge_head_aniso_mean`` column changes scale: it is now 0 at an isometric block and grows
+    logarithmically, rather than 1 and growing linearly. ``vertex_cond_*`` remains the
+    frame-dependent conditioning probe, honestly named, for anyone who wants the old quantity.
     """
     logdets, anisos = [], []
     start = 0
     for d in irrep_dims:
         blk = exp_phi[..., start:start + d, start:start + d]      # (..., d, d) head block
         logdets.append(torch.linalg.slogdet(blk).logabsdet)
-        s = torch.linalg.svdvals(blk)
-        anisos.append(s[..., 0] / s[..., -1].clamp(min=eps))
+        logmod = torch.log(torch.linalg.eigvals(blk).abs().clamp(min=eps))   # (..., d) log|eig|
+        anisos.append(logmod.amax(dim=-1) - logmod.amin(dim=-1))
         start += d
     return {
         "logdet":     torch.stack(logdets, dim=-1),              # (..., H)

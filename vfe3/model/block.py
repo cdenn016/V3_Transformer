@@ -99,7 +99,7 @@ def vfe_block(
     grad_record:     Optional[EStepGradientRecord] = None,   # diag out-param: E-step belief-grad norms (None -> no capture)
     state_record:    Optional[dict]                = None,   # diag out-param: E-step belief/F trace (None -> no capture)
     transport_status: Optional[dict]               = None,   # run-sticky covariant-feature status
-    emission:        Optional[Tuple[torch.Tensor, torch.Tensor]] = None,   # (d, g) Bohning emission terms (None -> no data term)
+    emission:        Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,   # (d, g, z_0) Bohning emission terms (None -> no data term)
 
     prebuilt_transport: Optional[object]       = None,   # share_refine_s_transport: caller-built flat transport (None -> e_step builds its own)
     gauge_parameterization: str                = "phi",  # 'phi' (exp(phi.G) path) | 'omega_direct' (stored GL(K) element, read from belief.omega)

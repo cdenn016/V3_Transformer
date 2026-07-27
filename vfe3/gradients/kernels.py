@@ -534,7 +534,7 @@ def mm_exact_update(
 
     irrep_dims:    Optional[List[int]]    = None,
     log_prior:     Optional[torch.Tensor] = None,
-    emission:      Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # (d, g) Bohning terms, see vfe3/emission.py
+    emission:      Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,  # (d, g, z_0) Bohning terms, see vfe3/emission.py
 ) -> Tuple[torch.Tensor, torch.Tensor]:          # (mu_star, sigma_star), each (..., N, K)
     r"""Closed-form coordinate minimizer of the beta-frozen, strict-pair-masked diagonal-KL
     surrogate (NOT a majorizer of the canonical frozen-attention objective -- the strict pair
@@ -591,6 +591,8 @@ def mm_exact_update(
                 reuse_pairwise_kl_stats=reuse_pairwise_kl_stats,
                 irrep_dims=irrep_dims,
                 log_prior=(log_prior.float() if log_prior is not None else None),
+                emission_weight=emission_weight,
+                emission=(tuple(t.float() for t in emission) if emission is not None else None),
             )
 
     # Route predicate (audit 2026-07-26 D-02). The fusion below is the stationary point of the
@@ -690,15 +692,20 @@ def mm_exact_update(
     prec = prior_prec + pair_prec                                   # pre-clamp fused precision
     numerator = a * mu_p / sp + pair_mean                           # (..., N, K)
     if emission is not None and emission_weight != 0.0:
-        # Categorical emission factor, Bohning majorizer expanded at the prior mean (vfe3/emission.py).
-        # d is (K,) and constant in the expansion point, g is (..., N, K). The quadratic
-        # (w/2)(z - mu_p)^T diag(d) (z - mu_p) - w (z - mu_p)^T g contributes w*d to the precision and
-        # w*(d*mu_p + g) to the numerator. It carries NO -log sigma term (a likelihood, not a KL), so
+        # Categorical emission factor, Bohning majorizer (vfe3/emission.py). d is (K,) and constant
+        # in the expansion point, g and z_0 are (..., N, K). The quadratic
+        # (w/2)(z - z_0)^T diag(d) (z - z_0) - w (z - z_0)^T g contributes w*d to the precision and
+        # w*(d*z_0 + g) to the numerator. It carries NO -log sigma term (a likelihood, not a KL), so
         # the sigma stationarity below keeps its (a + pair_mass) numerator and picks the emission up
         # through P alone -- that is why sigma_star is untouched here.
-        emission_prec, emission_pull = emission
+        #
+        # z_0 comes from the tuple, NOT from this seam's mu_p (audit 2026-07-27). vfe_stack advances
+        # the block prior every layer while the Bohning pair is built once before the stack, so at
+        # n_layers > 1 the two differ and centering on mu_p minimized a quadratic that majorizes
+        # nothing -- measured gradient residual 5.5e-01 versus 1.2e-07 when the anchors coincide.
+        emission_prec, emission_pull, emission_z0 = emission
         prec = prec + emission_weight * emission_prec
-        numerator = numerator + emission_weight * (emission_prec * mu_p + emission_pull)
+        numerator = numerator + emission_weight * (emission_prec * emission_z0 + emission_pull)
     P = prec.clamp(min=eps)                                         # eps guards the all-saturated row
     mu_star = numerator / P
     # m12: on a fully saturated row (a==0 and all w==0) prec floors to 0; dividing the zero numerator by

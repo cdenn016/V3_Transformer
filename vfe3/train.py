@@ -478,7 +478,10 @@ def _floor_lr_lambdas(
 
 
 def _default_sample_decoder(
-    cfg: VFE3Config,
+    cfg:     VFE3Config,
+
+    *,
+    dataset: Optional[str] = None,        # when known, keys the tokenizer instead of guessing
 ) -> 'Optional[Callable[[Sequence[int]], str]]':
     r"""A best-guess tiktoken ``decode(ids) -> str`` from ``cfg.vocab_size``, or None.
 
@@ -491,6 +494,14 @@ def _default_sample_decoder(
         import tiktoken
     except ImportError:
         return None
+    if dataset is not None:
+        # Dataset-keyed lookup wins (audit 2026-07-27). The vocab-range heuristic below is a guess:
+        # cfg.vocab_size is an independent user-set field, so padding a GPT-2 corpus to a
+        # GPU-friendly multiple above 90,000 silently selected cl100k and printed wrong sample text
+        # with no warning. datasets.get_tiktoken_decoder resolves the encoding from the SAME mapping
+        # that built the cache filename and validated its provenance, so it cannot disagree.
+        from vfe3.data.datasets import get_tiktoken_decoder
+        return get_tiktoken_decoder(dataset)
     if 40_000 <= cfg.vocab_size <= 60_000:
         enc = tiktoken.get_encoding("gpt2")
     elif 90_000 <= cfg.vocab_size <= 110_000:
@@ -1282,7 +1293,8 @@ def train(
     terminal_callback: Optional[Callable[[TrainingTerminalState, List[float]], None]] = None,   # invoked ONCE after the final step (PB-02)
 
     generate_samples:  bool                                     = True,   # False -> pure silent path (no sample text)
-    sample_decode:     Optional[Callable[[Sequence[int]], str]] = None,   # token-ids -> text; None -> auto by vocab
+    sample_decode:     Optional[Callable[[Sequence[int]], str]] = None,   # token-ids -> text; None -> auto
+    sample_dataset:    Optional[str]                            = None,   # keys the sample tokenizer; None -> vocab-size guess
     sample_new_tokens: int                                      = 40,     # greedy continuation length
     sample_prompt_len: int                                      = 6,     # seq-0 prompt length to continue
 ) -> List[float]:
@@ -1639,7 +1651,8 @@ def train(
             # the live batch by sample_new_tokens and decode prompt + continuation. Best-effort: a
             # generation/decode error is logged, never fatal (model.generate is @torch.no_grad).
             decode = None if not generate_samples else (
-                sample_decode if sample_decode is not None else _default_sample_decoder(cfg))
+                sample_decode if sample_decode is not None
+                else _default_sample_decoder(cfg, dataset=sample_dataset))
             if decode is not None:
                 try:
                     prompt = tokens[:1, :sample_prompt_len]                       # (1, P) seq-0 prompt

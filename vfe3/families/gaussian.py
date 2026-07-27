@@ -82,6 +82,17 @@ class DiagonalGaussian(BeliefParams):
 
     cov_kind = "diagonal"
     dispersion_is_covariance = True
+    # Scale-normalize the participation ratio (audit 2026-07-27). ``effective_rank`` floors its
+    # denominator ``sum lam^2`` at the family value, and the Gaussian families returned the bare
+    # ``eps`` -- a covariance^1 quantity guarding a covariance^2 denominator. The ratio
+    # ``(sum lam)^2 / sum lam^2`` is homogeneous of degree 0, so it must equal K for ANY isotropic
+    # spectrum at ANY scale; with the mismatched floor it collapsed instead. Measured at K=20 on a
+    # flat spectrum (true value 20 everywhere): 20.000000 / 19.999998 / 4.000000 / 0.040000 /
+    # 0.000400 as sigma fell 1e0 -> 1e-6. At the live K=210, eps=1e-6 the floor binds below
+    # sigma ~ 7e-5, INSIDE the admissible [eps, sigma_max] band, so eff_rank_* reported a
+    # maximally FLAT covariance as sub-rank-1 collapse -- the opposite of what it exists to
+    # detect. ``laplace_diagonal`` already opted in; these did not.
+    effective_rank_rescale = True
     gaussian_pointwise_algebra = True
 
     def __init__(self, mu: torch.Tensor, sigma: torch.Tensor) -> None:
@@ -349,6 +360,17 @@ class FullGaussian(BeliefParams):
 
     cov_kind = "full"
     dispersion_is_covariance = True
+    # Scale-normalize the participation ratio (audit 2026-07-27). ``effective_rank`` floors its
+    # denominator ``sum lam^2`` at the family value, and the Gaussian families returned the bare
+    # ``eps`` -- a covariance^1 quantity guarding a covariance^2 denominator. The ratio
+    # ``(sum lam)^2 / sum lam^2`` is homogeneous of degree 0, so it must equal K for ANY isotropic
+    # spectrum at ANY scale; with the mismatched floor it collapsed instead. Measured at K=20 on a
+    # flat spectrum (true value 20 everywhere): 20.000000 / 19.999998 / 4.000000 / 0.040000 /
+    # 0.000400 as sigma fell 1e0 -> 1e-6. At the live K=210, eps=1e-6 the floor binds below
+    # sigma ~ 7e-5, INSIDE the admissible [eps, sigma_max] band, so eff_rank_* reported a
+    # maximally FLAT covariance as sub-rank-1 collapse -- the opposite of what it exists to
+    # detect. ``laplace_diagonal`` already opted in; these did not.
+    effective_rank_rescale = True
     gaussian_pointwise_algebra = True
 
     @classmethod
