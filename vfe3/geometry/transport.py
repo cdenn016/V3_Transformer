@@ -50,6 +50,7 @@ class FactoredTransport:
     irrep_dims:              List[int]     # equal block sizes; sum == K, len > 1
     mean_per_head:           bool = False  # transport_mean contracts per gauge block
     same_frame_flat_cocycle: bool = False  # one vertex table supplies U_i and true inverse U_j^-1
+    cond_escalation:         bool = False  # opt-in conditioning trigger for the fp64 congruence escalation
 
     def __post_init__(self) -> None:
         if type(self.same_frame_flat_cocycle) is not bool:
@@ -83,9 +84,10 @@ class DirectLinkTransport:
     boundary for diagnostics and legacy registry callers that genuinely require ``Omega``.
     """
 
-    exp_link:     torch.Tensor
-    exp_phi:      Optional[torch.Tensor] = None
-    exp_neg_phi:  Optional[torch.Tensor] = None
+    exp_link:        torch.Tensor
+    exp_phi:         Optional[torch.Tensor] = None
+    exp_neg_phi:     Optional[torch.Tensor] = None
+    cond_escalation: bool                   = False  # opt-in conditioning trigger for the fp64 congruence escalation
 
     def __post_init__(self) -> None:
         if self.exp_link.dim() != 4 or self.exp_link.shape[-1] != self.exp_link.shape[-2]:
@@ -139,6 +141,7 @@ class CompactFactoredTransport:
     K:                       int
     mean_per_head:           bool = False
     same_frame_flat_cocycle: bool = False
+    cond_escalation:         bool = False  # opt-in conditioning trigger for the fp64 congruence escalation
 
     def __post_init__(self) -> None:
         compatible = (
@@ -203,6 +206,7 @@ class CompactFactoredTransport:
             self.K,
             mean_per_head=self.mean_per_head,
             same_frame_flat_cocycle=self.same_frame_flat_cocycle,
+            cond_escalation=self.cond_escalation,
         )
 
     def to_dense_omega(self) -> torch.Tensor:
@@ -377,6 +381,7 @@ def fold_rope_into_frame(
             exp_link=base.exp_link,
             exp_phi=base.exp_phi @ rope_t,
             exp_neg_phi=rope @ base.exp_neg_phi,
+            cond_escalation=base.cond_escalation,
         )
     if isinstance(base, CompactFactoredTransport):
         H, d = base.exp_blocks.shape[-3], base.exp_blocks.shape[-1]
@@ -391,6 +396,7 @@ def fold_rope_into_frame(
             K=base.K,
             mean_per_head=base.mean_per_head,
             same_frame_flat_cocycle=base.same_frame_flat_cocycle,
+            cond_escalation=base.cond_escalation,
         )
     return FactoredTransport(
         exp_phi=base.exp_phi @ rope_t,
@@ -398,6 +404,7 @@ def fold_rope_into_frame(
         irrep_dims=list(base.irrep_dims),
         mean_per_head=base.mean_per_head,
         same_frame_flat_cocycle=base.same_frame_flat_cocycle,
+        cond_escalation=base.cond_escalation,
     )
 
 
@@ -2015,6 +2022,7 @@ def build_factored_transport(
     exp_fp64_norm_threshold: float                  = 5.0,         # 'norm' mode: max clamped block ||M||_F upcast threshold
     clamp_monitor:           bool                   = False,       # opt-in: warn when the exp Frobenius clamp fires
     mean_per_head:           bool                   = False,       # container flag: transport_mean contracts per gauge block
+    cond_escalation:         bool                   = False,       # container flag: opt-in conditioning trigger for the fp64 congruence escalation
     compact_blocks:          bool                   = False,       # canonical block_glk: retain (..., N, H, d, d) factors
     validity_max_norm:       Optional[float]        = None,        # opt-in fail-closed pre-clamp chart bound
     right_phi:               Optional[torch.Tensor] = None,        # (..., N, n_gen) exact right factor exp(Y)
@@ -2050,11 +2058,12 @@ def build_factored_transport(
             eye = eye_d.expand(*phi.shape[:-1], H, d, d).contiguous()
             return CompactFactoredTransport(
                 exp_blocks=eye, inv_blocks=eye, K=K, mean_per_head=mean_per_head,
-                same_frame_flat_cocycle=True)
+                same_frame_flat_cocycle=True, cond_escalation=cond_escalation)
         eye_K = torch.eye(K, device=phi.device, dtype=phi.dtype)
         eye = eye_K.expand(*phi.shape[:-1], K, K).contiguous()
         return FactoredTransport(exp_phi=eye, exp_neg_phi=eye, irrep_dims=list(group.irrep_dims),
-                                 mean_per_head=mean_per_head, same_frame_flat_cocycle=True)
+                                 mean_per_head=mean_per_head, same_frame_flat_cocycle=True,
+                                 cond_escalation=cond_escalation)
     if gauge_mode != "learned":
         raise ValueError(f"gauge_mode must be 'learned' or 'trivial', got {gauge_mode!r}")
 
@@ -2089,7 +2098,8 @@ def build_factored_transport(
             inv_blocks = right_inv @ inv_blocks
         return CompactFactoredTransport(
             exp_blocks=exp_blocks, inv_blocks=inv_blocks, K=group.generators.shape[-1],
-            mean_per_head=mean_per_head, same_frame_flat_cocycle=True)
+            mean_per_head=mean_per_head, same_frame_flat_cocycle=True,
+            cond_escalation=cond_escalation)
 
     phi_matrix = _embed_algebra_fp32_floor(phi, group.generators)
     # exp_dim: same block-scale float64-island keying as compute_transport_operators (see the
@@ -2122,7 +2132,8 @@ def build_factored_transport(
         exp_phi = exp_phi @ right_exp
         exp_neg_phi = right_inv @ exp_neg_phi
     return FactoredTransport(exp_phi=exp_phi, exp_neg_phi=exp_neg_phi, irrep_dims=list(group.irrep_dims),
-                             mean_per_head=mean_per_head, same_frame_flat_cocycle=True)
+                             mean_per_head=mean_per_head, same_frame_flat_cocycle=True,
+                             cond_escalation=cond_escalation)
 
 
 def _certifies_same_frame_flat_cocycle(
@@ -2302,6 +2313,7 @@ def transport_covariance(
                 exp_link=omega.base.exp_link,
                 exp_phi=exp_phi,
                 exp_neg_phi=exp_neg_phi,
+                cond_escalation=omega.base.cond_escalation,
             )
             return transport_covariance(
                 rotated,
@@ -2319,7 +2331,8 @@ def transport_covariance(
             rotated = CompactFactoredTransport(
                 exp_blocks, inv_blocks, omega.base.K,
                 mean_per_head=omega.base.mean_per_head,
-                same_frame_flat_cocycle=_certifies_same_frame_flat_cocycle(omega))
+                same_frame_flat_cocycle=_certifies_same_frame_flat_cocycle(omega),
+                cond_escalation=omega.base.cond_escalation)
             return transport_covariance(
                 rotated,
                 sigma,
@@ -2553,7 +2566,9 @@ def _direct_link_diagonal_covariance(
 
         out = _reduce(work)
         if work is not torch.float64:
-            out = _escalate_if_negative(out, _reduce, exp_blocks=direct.exp_phi)
+            out = _escalate_if_negative(
+                out, _reduce,
+                exp_blocks=(direct.exp_phi if direct.cond_escalation else None))
         return out.clamp(min=0.0).to(sigma.dtype)
 
 
@@ -2645,7 +2660,9 @@ def _compact_factored_diagonal_covariance(
         work = sigma.dtype if sigma.dtype in (torch.float32, torch.float64) else torch.float32
         out = _reduce(work)
         if work is not torch.float64:
-            out = _escalate_if_negative(out, _reduce, exp_blocks=factored.exp_blocks)
+            out = _escalate_if_negative(
+                out, _reduce,
+                exp_blocks=(factored.exp_blocks if factored.cond_escalation else None))
         out = out.clamp(min=0.0).to(sigma.dtype)
     return out.reshape(*out.shape[:-2], factored.K)
 
@@ -2740,7 +2757,9 @@ def _factored_diagonal_covariance(
                   return torch.einsum("...ikmn,...jmn->...ijk", e2, g)   # (..., N, N, d)
               blk = _reduce(work)
               if work is not torch.float64:
-                  blk = _escalate_if_negative(blk, _reduce, exp_blocks=ep)
+                  blk = _escalate_if_negative(
+                      blk, _reduce,
+                      exp_blocks=(ep if factored.cond_escalation else None))
               # Back to the common working dtype so torch.cat below sees one dtype across blocks. An
               # escalated block keeps its CORRECTED value here; only its extra precision is dropped,
               # which is the whole point -- float64 was used to avoid the cancellation, not to be stored.

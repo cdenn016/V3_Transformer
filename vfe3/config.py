@@ -806,7 +806,19 @@ class VFE3Config:
     # argument, not a dimension argument; small-norm blocks are fp32-accurate at any dim.
     exp_fp64_mode:             str   = "dim"          # "dim" | "norm"
     exp_fp64_norm_threshold:   float = 5.0            # 'norm' mode: upcast when max ||M||_F >= this
-    
+
+    # Second trigger for the diagonal-congruence float64 escalation (_escalate_if_negative). The
+    # DEFAULT guard is sign-only: recompute in float64 iff the working-dtype congruence went
+    # negative -- one amin reduction the floor needs regardless. Positivity is necessary but not
+    # sufficient (cancellation destroys accuracy before it destroys sign), so this toggle adds the
+    # conditioning proxy cond(exp_phi)^4 * eps > 1e-3, which bounds the quadratic form's backward
+    # error (Higham 2002, 3.1). It is OPT-IN because it is not free: it runs svdvals on the vertex
+    # blocks and then a bool() on the result, i.e. an SVD launch plus a GPU->CPU sync, on the
+    # HEALTHY path of every covariance transport. Measured on the K=20 wikitext run, always-on cost
+    # 85 -> 126 ms/step with no value change in the well-conditioned case. Turn it on where the
+    # accuracy actually bites -- large K, large ||phi||, ill-conditioned frames.
+    congruence_cond_escalation: bool  = False         # True -> also escalate on the conditioning proxy
+
     # Build the flat FactoredTransport ONCE per forward and share it between _refine_s and the
     # belief E-step (both consume the identical phi); skips a redundant matrix-exp pair + backward.
     share_refine_s_transport:  bool  = False

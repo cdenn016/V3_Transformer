@@ -83,6 +83,7 @@ def _transport(
 
     clamp_monitor:          bool = False,        # opt-in: warn when the exp Frobenius clamp fires
     transport_mean_per_head: bool = False,       # omega-direct factored mean contracts per block
+    congruence_cond_escalation: bool = False,    # opt-in conditioning trigger for the fp64 congruence escalation
     materialize:            bool = True,         # compatibility/diagnostic boundary
 
     validity_max_norm:      Optional[float]          = None,  # fail-closed pre-clamp chart bound
@@ -137,6 +138,7 @@ def _transport(
             clamp_monitor=clamp_monitor,
             validity_max_norm=validity_max_norm,
             mean_per_head=transport_mean_per_head,
+            cond_escalation=congruence_cond_escalation,
             right_phi=right_phi,
         )
         if reflection is not None:
@@ -309,6 +311,7 @@ def build_belief_transport(
     rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     exp_fp64_norm_threshold:     float                                       = 5.0,      # 'norm': upcast only when max clamped block ||M||_F >= this
     transport_mean_per_head:     bool                                        = False,    # factored transport_mean contracts per gauge block (fused path only)
+    congruence_cond_escalation:  bool                                        = False,    # opt-in conditioning trigger for the fp64 congruence escalation
     compact_phi_block_transport: bool                                        = False,    # packed phi factors for canonical flat block_glk
     validity_max_norm:           Optional[float]                             = None,     # opt-in fail-closed pre-clamp chart bound
     mu:                          Optional[torch.Tensor]                      = None,     # regime_ii edge connection reads these
@@ -375,6 +378,7 @@ def build_belief_transport(
                                          exp_fp64_mode=exp_fp64_mode,
                                          exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                                          mean_per_head=transport_mean_per_head,
+                                         cond_escalation=congruence_cond_escalation,
                                          validity_max_norm=validity_max_norm,
                                          right_phi=right_phi,
                                          compact_blocks=(compact_phi_block_transport
@@ -478,6 +482,7 @@ def free_energy_value(
     compile_pair_kernel:       bool = False,           # accepted-and-ignored iteration-only knob
     reuse_pairwise_kl_stats:   bool = False,           # accepted-and-ignored iteration-only knob
     transport_mean_per_head:   bool = False,           # HONORED by omega-direct factored transport
+    congruence_cond_escalation:    bool = False,   # opt-in conditioning trigger for the fp64 congruence escalation
     compact_phi_block_transport: bool = False,         # HONORED by the compact diagnostic transport
     rope_on_cov:               bool = False,           # full-gauge: rotate the covariance sandwich too
     rope_on_value:             bool = True,            # False -> value aggregation uses the un-rotated base
@@ -563,6 +568,7 @@ def free_energy_value(
             "clamp_monitor": clamp_monitor,
             "cocycle_relaxation": cocycle_relaxation,
             "transport_mean_per_head": transport_mean_per_head,
+            "congruence_cond_escalation": congruence_cond_escalation,
             "exp_fp64_mode": exp_fp64_mode,
             "exp_fp64_norm_threshold": exp_fp64_norm_threshold,
             "validity_max_norm": transport_chart_max_norm,
@@ -723,6 +729,7 @@ def phi_alignment_loss(
     rope_insertion:              str = "right",   # "right" (pure, folded frame) | "left" (legacy)
     exp_fp64_norm_threshold:       float = 5.0,
     transport_mean_per_head:       bool  = False,
+    congruence_cond_escalation:    bool = False,   # opt-in conditioning trigger for the fp64 congruence escalation
     compact_phi_block_transport:   bool  = False,
     rope_on_cov:                   bool  = False,  # gauge-RoPE: rotate the covariance sandwich too
     rope_on_value:                 bool  = True,   # False -> value aggregation uses the un-rotated base
@@ -789,6 +796,7 @@ def phi_alignment_loss(
                                    exp_fp64_mode=exp_fp64_mode,
                                    exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                                    transport_mean_per_head=transport_mean_per_head,
+                                   congruence_cond_escalation=congruence_cond_escalation,
                                    compact_phi_block_transport=compact_phi_block_transport,
                                    validity_max_norm=transport_chart_max_norm,
                                    exactness_out=transport_status,
@@ -886,6 +894,7 @@ def e_step_iteration(
     exp_fp64_mode:                 str   = "dim",  # Tier-1: flat-builder float64-island keying ('dim' | 'norm')
     exp_fp64_norm_threshold:       float = 5.0,    # Tier-1 'norm': max clamped block ||M||_F upcast threshold
     transport_mean_per_head:       bool  = False,  # Tier-1: factored transport_mean contracts per gauge block
+    congruence_cond_escalation:    bool = False,   # opt-in conditioning trigger for the fp64 congruence escalation
     compact_phi_block_transport:   bool  = False,  # P1: packed canonical flat block_glk phi factors
 
     log_prior:                 Optional[torch.Tensor]        = None,
@@ -990,6 +999,7 @@ def e_step_iteration(
                 cocycle_relaxation=cocycle_relaxation,
                 exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                 transport_mean_per_head=transport_mean_per_head,
+                congruence_cond_escalation=congruence_cond_escalation,
                 compact_phi_block_transport=compact_phi_block_transport,
                 validity_max_norm=transport_chart_max_norm,
                 exactness_out=transport_status,
@@ -1204,6 +1214,7 @@ def e_step_iteration(
                 exp_fp64_mode=exp_fp64_mode,
                 exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                 transport_mean_per_head=transport_mean_per_head,
+                congruence_cond_escalation=congruence_cond_escalation,
                 compact_phi_block_transport=compact_phi_block_transport,
                 transport_chart_max_norm=transport_chart_max_norm,
                 transport_status=transport_status,
@@ -1243,6 +1254,7 @@ def e_step_iteration(
                     exp_fp64_mode=exp_fp64_mode,
                     exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                     transport_mean_per_head=transport_mean_per_head,
+                    congruence_cond_escalation=congruence_cond_escalation,
                     compact_phi_block_transport=compact_phi_block_transport,
                     validity_max_norm=transport_chart_max_norm,
                     reflection=belief.reflection,
@@ -1292,6 +1304,7 @@ def e_step(
     oracle_unroll_grad:          bool = False,    # explicit (not in kwargs): keep it off the F_diag bag
     randomize_e_steps:           bool = False,    # training forwards sample T; eval keeps n_iter
     transport_mean_per_head:     bool = False,    # factored transport_mean contracts per gauge block
+    congruence_cond_escalation:    bool = False,   # opt-in conditioning trigger for the fp64 congruence escalation
     compact_phi_block_transport: bool = False,    # packed canonical flat block_glk phi factors
     rope_on_cov:                 bool = False,
     rope_on_value:               bool = True,
@@ -1378,6 +1391,7 @@ def e_step(
                 clamp_monitor=kwargs.get("clamp_monitor", False),
                 exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                 transport_mean_per_head=transport_mean_per_head,
+                congruence_cond_escalation=congruence_cond_escalation,
                 compact_phi_block_transport=compact_phi_block_transport,
                 validity_max_norm=transport_chart_max_norm,
                 exactness_out=transport_status,
@@ -1426,6 +1440,7 @@ def e_step(
                                      gauge_parameterization=gauge_param_kw,
                                      compact_phi_block_transport=compact_phi_block_transport,
                                      transport_mean_per_head=transport_mean_per_head,
+                                     congruence_cond_escalation=congruence_cond_escalation,
                                      transport_chart_max_norm=transport_chart_max_norm,
                                      transport_status=transport_status,
                                      **kwargs).detach()
@@ -1475,6 +1490,7 @@ def e_step(
                     e_step_gradient=e_step_gradient, oracle_unroll_grad=oracle_unroll_grad,
                     exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                     transport_mean_per_head=transport_mean_per_head,
+                    congruence_cond_escalation=congruence_cond_escalation,
                     compact_phi_block_transport=compact_phi_block_transport,
                     transport_chart_max_norm=transport_chart_max_norm,
                     transport_status=transport_status,
@@ -1513,6 +1529,7 @@ def e_step(
                         clamp_monitor=kwargs.get("clamp_monitor", False),
                         exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                         transport_mean_per_head=transport_mean_per_head,
+                        congruence_cond_escalation=congruence_cond_escalation,
                         compact_phi_block_transport=compact_phi_block_transport,
                         validity_max_norm=transport_chart_max_norm,
                         exactness_out=transport_status,
@@ -1525,6 +1542,7 @@ def e_step(
                 e_step_gradient=e_step_gradient, oracle_unroll_grad=oracle_unroll_grad,
                 exp_fp64_mode=exp_fp64_mode, exp_fp64_norm_threshold=exp_fp64_norm_threshold,
                 transport_mean_per_head=transport_mean_per_head,
+                congruence_cond_escalation=congruence_cond_escalation,
                 compact_phi_block_transport=compact_phi_block_transport,
                 transport_chart_max_norm=transport_chart_max_norm,
                 transport_status=transport_status,
