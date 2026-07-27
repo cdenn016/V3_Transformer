@@ -20,6 +20,14 @@ import torch.nn.functional as F
 from torch import nn
 
 from vfe3.attention_prior import attention_log_prior
+# The MODEL channel's softmax, bound here at import time so it survives the beta-channel ablation
+# (audit 2026-07-27). `collect_beta_channel_decomposition` monkeypatches `attention_weights` on
+# free_energy / kernels / e_step to ablate the BELIEF channel's energy or prior; `_fold_gamma_prior`
+# resolved its own binding at call time from free_energy, so the gamma softmax was intercepted too
+# and `delta_ce.content_channel` / `positional_channel` mixed the two channels. This module is not
+# in that patch list, so a module-level alias keeps gamma on the true function. free_energy imports
+# only alpha_i / divergence / families.base, so this is not circular.
+from vfe3.free_energy import attention_weights as _gamma_attention_weights
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.emission import bohning_emission_terms
@@ -2374,27 +2382,52 @@ class VFEModel(nn.Module):
         composed OUTSIDE the no_grad so ``log_prior``'s own graph (the learnable T5 bias) stays live.
         An UNDETACHED variant -- training s through the belief attention -- is deliberately deferred.
         """
-        from vfe3.free_energy import attention_weights
         w = self.cfg.gamma_prior_weight
         with torch.no_grad():
             e_s, gamma_tau, gamma_log_prior = self._gamma_energy(
                 token_ids, phi, omega=omega, reflection=reflection, s_belief=s_belief,
             )
-            gamma = attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)  # (B, [H,] N, N)
+            # _gamma_attention_weights, NOT the call-time free_energy binding: the beta-channel
+            # ablation patches that one and would silently ablate the model channel too.
+            gamma = _gamma_attention_weights(e_s, tau=gamma_tau, log_prior=gamma_log_prior)  # (B, [H,] N, N)
+        # LOG-SPACE mixture (audit 2026-07-27). The old form composed in probability space and then
+        # took ``log(pi.clamp(min=log_eps))``, which floored the deep tail flat at log(1e-12) =
+        # -27.63 nats. Measured at the live shape (N=128, H=7, causal_alibi_noself, alibi_slope=1):
+        # 2,954 of 56,903 causal entries floored, up to 36.30 nats of distortion, all of it on the
+        # two steepest-slope heads -- and on head 4, 72 of 126 outward steps became TIES at exactly
+        # log(1e-12), so ALiBi's monotone distance decay, its only content, was destroyed on a third
+        # of that head's row. The perturbation to beta at the live energy scale is ~1e-12 (below fp32
+        # eps) because the region carries almost no mass, but at alibi_slope=2 -- a configuration
+        # already in the run history -- the floor onset moves adjacent to the trained attention
+        # reach, where the cliff puts most of a row's mass on keys the exact prior forbids.
+        # logaddexp is exact here and costs nothing.
         if log_prior is None:
-            pi_b    = torch.full_like(gamma, 1.0 / gamma.shape[-1])   # uniform prior over keys
-            support = None
+            n_keys   = gamma.shape[-1]
+            log_pi_b = torch.full_like(gamma, -math.log(n_keys))      # uniform prior over keys
+            support  = None
         else:
-            pi_b    = torch.softmax(log_prior, dim=-1)                # rows normalized on the causal support
-            support = torch.isfinite(log_prior)                       # shared causal mask (both channels)
-        pi  = (1.0 - w) * pi_b + w * gamma                            # probability-space mixture
+            log_pi_b = torch.log_softmax(log_prior, dim=-1)           # rows normalized on the causal support
+            support  = torch.isfinite(log_prior)                      # shared causal mask (both channels)
+        # gamma is a probability; take its log on the support only, so a structural zero stays -inf
+        # rather than being floored into the mixture. The guard is the dtype's smallest positive
+        # normal, NOT log_eps -- it exists solely to keep log(0) finite for an entry the softmax has
+        # already underflowed, and at fp32 it sits at about -87 nats, far below anything the mixture
+        # can resolve. Using log_eps here would reintroduce the -27.6 nat floor this fix removes.
+        log_gamma = torch.log(gamma.clamp(min=torch.finfo(gamma.dtype).tiny))
+        if support is not None:
+            log_gamma = log_gamma.masked_fill(~support, float("-inf"))
+        if w <= 0.0:
+            out = log_pi_b
+        elif w >= 1.0:
+            out = log_gamma
+        else:
+            out = torch.logaddexp(math.log1p(-w) + log_pi_b, math.log(w) + log_gamma)
         if support is not None:
             # The beta support is authoritative. Gamma may have been normalized on a wider support;
-            # remove that forbidden mass BEFORE normalizing the mixture so every retained row sums
+            # -inf there removes the forbidden mass BEFORE renormalizing, so every retained row sums
             # to one on the keys the belief channel can actually attend to.
-            pi = pi.masked_fill(~support, 0.0)
-        pi  = pi / pi.sum(dim=-1, keepdim=True).clamp(min=log_eps)    # normalize on active support
-        out = torch.log(pi.clamp(min=log_eps))                        # (B, [H,] N, N)
+            out = out.masked_fill(~support, float("-inf"))
+        out = out - torch.logsumexp(out, dim=-1, keepdim=True)        # renormalize on active support
         if support is not None:
             out = out.masked_fill(~support, float("-inf"))            # keep the EXACT -inf causal structure
         return out
@@ -2403,8 +2436,8 @@ class VFEModel(nn.Module):
         self,
         token_ids: torch.Tensor,                 # (B, N) CURRENT-token ids x_t
         mu_p:      torch.Tensor,                 # (B, N, K) prior means; the MM expansion point
-    ) -> 'Optional[Tuple[torch.Tensor, torch.Tensor]]':
-        r"""Build the Bohning ``(d, g)`` pair for the categorical emission, or ``None`` when off.
+    ) -> 'Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]':
+        r"""Build the Bohning ``(d, g, z_0)`` triple for the categorical emission, or ``None`` when off.
 
         ``None`` on the pure path AND at ``emission_weight == 0``, so the zero-weight case costs
         nothing rather than building a factor it would then scale away. See ``vfe3/emission.py`` for
@@ -2982,9 +3015,14 @@ class VFEModel(nn.Module):
                 vertex_cond = (
                     block_svd[..., 0].amax(dim=-1)
                     / block_svd[..., -1].amin(dim=-1).clamp(min=cfg.eps))
+                # Eigenvalue-modulus squeeze, matching metrics.per_head_gauge_invariants. The
+                # singular-value ratio this replaced is frame-DEPENDENT under GL conjugation
+                # (audit 2026-07-27); block_svd above still feeds the honestly-named vertex_cond.
+                block_logmod = torch.log(
+                    torch.linalg.eigvals(active_blocks).abs().clamp(min=cfg.eps))   # (N,H,d)
                 _ghi = {
                     "logdet": block_logdet,
-                    "anisotropy": block_svd[..., 0] / block_svd[..., -1].clamp(min=cfg.eps),
+                    "anisotropy": block_logmod.amax(dim=-1) - block_logmod.amin(dim=-1),
                 }
             else:
                 active_vertex = out.omega                                       # (N,K,K) stored element
@@ -3143,9 +3181,25 @@ class VFEModel(nn.Module):
         # Attention-entropy COLLAPSE: per-head min row entropy + count of near-deterministic heads at
         # the converged (last-block) belief; the single logged attn_entropy averages collapse away.
         ent_rows = metrics.attention_entropy_rows(beta)             # (N,) single head or (H, N) multi-head
-        head_min = ent_rows.min(dim=-1).values if ent_rows.dim() >= 2 else ent_rows.min().reshape(1)
-        d["attn_entropy_min"]             = float(head_min.min())
-        d["attn_entropy_collapsed_heads"] = float((head_min < _LOG2).float().sum())
+        # Skip query rows whose causal support cannot carry entropy (audit 2026-07-27). Under
+        # causal / causal_noself / causal_alibi* / causal_windowed, row 0 has exactly ONE admissible
+        # key, so beta[..., 0, :] is one-hot and H_0 = 0 for every head, layer, seed and parameter
+        # value -- the min over rows could never exceed the eps artifact. Measured: attn_entropy_min
+        # was 8.28931e-11 and collapsed_heads 2.0, byte-identical across two seeds AND three distinct
+        # causal priors, while the `uniform` control gave 1.386293 / 0.0. Both columns were therefore
+        # structurally constant, not a head-collapse signal, and were logged and plotted as one.
+        # Row i admits i+1 keys under a causal mask (i under no-self), so the first row that can
+        # carry entropy is the first with at least two admissible keys.
+        row_support = (beta > 0.0).sum(dim=-1)                       # (..., N) admissible keys per row
+        scorable = row_support >= 2                                  # rows a min-entropy probe can see
+        if bool(scorable.any()):
+            masked = ent_rows.masked_fill(~scorable, float("inf"))
+            head_min = masked.min(dim=-1).values if masked.dim() >= 2 else masked.min().reshape(1)
+            d["attn_entropy_min"]             = float(head_min.min())
+            d["attn_entropy_collapsed_heads"] = float((head_min < _LOG2).float().sum())
+        else:                                                        # N == 1, or a fully one-hot map
+            d["attn_entropy_min"]             = float("nan")
+            d["attn_entropy_collapsed_heads"] = float("nan")
 
         # Registry-owned transport order parameters (conditional columns, mirroring lambda_beta).
         # Lowercasing the stable serialization key preserves the established W/M/L metric names and

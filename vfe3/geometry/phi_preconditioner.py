@@ -524,7 +524,6 @@ def _full_pullback_group_direction(
     differential = torch.einsum("...aij,...jk->...aik", pushed, exp_phi)
     metric = torch.einsum("...aij,...bij->...ab", differential, differential)
     metric = 0.5 * (metric + metric.transpose(-1, -2))
-    gram_factor = preparation.gram_factor
     gram_inverse_half = preparation.gram_inverse_half
     whitened = torch.matmul(torch.matmul(gram_inverse_half, metric), gram_inverse_half.transpose(-1, -2))
     undamped_eigenvalues = torch.linalg.eigvalsh(0.5 * (whitened + whitened.transpose(-1, -2)))

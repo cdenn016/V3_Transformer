@@ -496,8 +496,14 @@ def route_grow_k(embed_dims: List[int], n_heads: int = 4) -> List[Dict[str, Any]
     r"""Grow N by widening embed_dim at a FIXED block_glk head count (route A). Mixed linear+quadratic
     token-prior route: 2VK grows linearly, phi_embed = V*K^2/n_heads quadratically. n_heads stays equal to the
     block count so the baseline causal_alibi prior and the head mixer remain valid."""
+    # kl_max scales WITH k (audit 2026-07-27). BASELINE freezes it at 8*train_K once, so route A
+    # inherited 8*20 = 160 at every width while its three siblings (route_grow_k_mup,
+    # route_grow_k_fixed_block, route_vary_block_fixed_k) each set 8*k per cell. Route A's divergence
+    # ceiling therefore fell from 8.0 to 1.33 nats/coordinate across the very axis it measures, so
+    # its width exponent was not measured under the same functional as route A'.
     return [{"label": f"K{k}", "route": "grow_K", "scale_knob": "embed_dim",
-             "overrides": {"embed_dim": k, "n_heads": n_heads, "gauge_group": "block_glk"}}
+             "overrides": {"embed_dim": k, "n_heads": n_heads, "gauge_group": "block_glk",
+                           "kl_max": 8 * k}}
             for k in embed_dims]
 
 

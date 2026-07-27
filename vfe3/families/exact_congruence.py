@@ -141,7 +141,6 @@ def _vertex_log_abs_det(
         raise TypeError(f"no vertex factors on transport {type(omega).__name__!r}")
 
     ell = _slogdet(blocks)                                          # (..., N, H_t)
-    n_transport_blocks = ell.shape[-1]
     if len(irrep_dims) == 1:
         return ell.sum(dim=-1, keepdim=True)                        # (..., N, 1) full-K block
     # Compare the block SIZES, not just how many there are (audit 2026-07-26 D-05). Counting alone

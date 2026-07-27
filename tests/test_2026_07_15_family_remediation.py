@@ -234,9 +234,19 @@ def test_laplace_default_floor_effective_rank_is_float32_safe() -> None:
     assert per_token_rank.item() == pytest.approx(100.0 / 68.0)
 
 
-def test_gaussian_near_floor_effective_rank_keeps_legacy_stabilizer() -> None:
+def test_gaussian_near_floor_effective_rank_is_scale_invariant() -> None:
+    r"""The Gaussian participation ratio must survive a near-floor spectrum (audit 2026-07-27).
+
+    This test previously pinned the legacy stabilizer -- ``effective_rank`` floors its denominator
+    ``sum lam^2`` at the family value, and the Gaussian families returned the bare ``eps``, a
+    covariance^1 quantity guarding a covariance^2 denominator. ``(sum lam)^2 / sum lam^2`` is
+    homogeneous of degree 0, so it must be scale-INVARIANT; the mismatched floor made it collapse
+    toward 0 instead. For [1e-6, 2e-6] the true ratio is 9e-12 / 5e-12 = 1.8, while the floored
+    baseline returns 9e-12 / 1e-6 = 9e-6 -- six orders out. The Gaussian families now opt into
+    ``effective_rank_rescale`` exactly as ``laplace_diagonal`` already did.
+    """
     variance = torch.tensor([[1e-6, 2e-6]])
-    baseline = metrics.effective_rank(variance, eps=1e-6)
+    baseline = metrics.effective_rank(variance, eps=1e-6)          # raw helper: still floors
     per_token = metrics.effective_rank_per_token(
         variance,
         eps=1e-6,
@@ -248,9 +258,14 @@ def test_gaussian_near_floor_effective_rank_keeps_legacy_stabilizer() -> None:
         family="gaussian_diagonal",
     )
 
-    assert baseline.item() == pytest.approx(9e-6)
-    assert torch.equal(per_token, baseline)
-    assert torch.equal(spectrum["effective_rank"], baseline)
+    assert baseline.item() == pytest.approx(9e-6)                  # the un-rescaled contrast
+    assert per_token.item() == pytest.approx(1.8, rel=1e-5)        # the true participation ratio
+    assert torch.equal(spectrum["effective_rank"], per_token)
+
+    # and it is genuinely scale-free: the same shape at a healthy scale gives the same answer
+    scaled = metrics.effective_rank_per_token(
+        variance * 1e6, eps=1e-6, family="gaussian_diagonal")
+    assert scaled.item() == pytest.approx(per_token.item(), rel=1e-5)
 
 
 def test_laplace_fisher_figure_labels_name_scale_precision() -> None:

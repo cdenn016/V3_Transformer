@@ -1403,8 +1403,11 @@ _DIAG_CONGRUENCE_NEGATIVE_WARNED: bool = False
 
 
 def _escalate_if_negative(
-    out:    torch.Tensor,                          # (..., N, N, H, d) working-dtype congruence
-    reduce: 'Callable[[torch.dtype], torch.Tensor]',  # recompute the same reduction at a given dtype
+    out:        torch.Tensor,                          # (..., N, N, H, d) working-dtype congruence
+    reduce:     'Callable[[torch.dtype], torch.Tensor]',  # recompute the same reduction at a given dtype
+
+    *,
+    exp_blocks: Optional[torch.Tensor] = None,         # (..., H, d, d) vertex blocks, for the accuracy trigger
 
 ) -> torch.Tensor:
     r"""Recompute a diagonal congruence in float64 iff the working-dtype result went negative.
@@ -1423,12 +1426,38 @@ def _escalate_if_negative(
     from a static toggle the caller would have to guess: pay float32 speed in the common case, and pay
     float64 exactly on the calls that actually lose nonnegativity. This mirrors the escalating-ridge
     ladder :func:`safe_cholesky` already uses rather than upcasting unconditionally.
+
+    **Positivity is necessary but NOT sufficient** (audit 2026-07-27). Cancellation destroys accuracy
+    well before it destroys sign, so a sign-only test passes results that are order-unity wrong with
+    every entry strictly positive. Measured on trained production weights (K=210, H=7, d=30) with the
+    sigma dynamic range set to the run's own recorded ``belief_cond``: the guard read ``amin``
+    between +0.69 and +1.00 -- comfortably positive, not marginal -- while the worst transported
+    variance was 64% wrong. It was also perverse in both directions: it escalated on a case already
+    accurate to 8e-6 and passed a 9.2%-wrong entry at ``amin = +1.04e-4``.
+
+    So the trigger is now ``amin < 0`` OR a conditioning proxy. For a quadratic form
+    ``sum_l Omega_kl^2 sigma_l`` the relevant backward-error scale is ``cond(Omega)^2 * eps_work``
+    (Higham 2002, section 3.1), and ``cond(Omega_ij) <= cond(exp_phi_i)^2``, so the per-block vertex
+    condition number bounds it. This matters most where the codebase is heading rather than where it
+    is: the same tail-selection procedure gives a worst relative error of 9.9e-04 at K=20 (d=10) and
+    6.4e-01 at K=210 (d=30) -- three orders of magnitude over one decade of K, on a path swept toward
+    K=300. ``exp_blocks`` is optional so direct callers that do not hold the vertex factors keep the
+    old sign-only behavior rather than failing.
     """
     global _DIAG_CONGRUENCE_NEGATIVE_WARNED
     with torch.no_grad():
         worst = float(out.amin())
-    if worst >= 0.0:
+        ill_conditioned = False
+        if worst >= 0.0 and exp_blocks is not None and out.dtype != torch.float64:
+            # svdvals on the (H, d, d) vertex blocks only -- O(H d^3) once, not per pair.
+            sv = torch.linalg.svdvals(exp_blocks.detach().float())
+            cond = (sv[..., 0] / sv[..., -1].clamp(min=torch.finfo(torch.float32).tiny)).amax()
+            # cond(Omega)^2 ~ cond(exp_phi)^4; escalate once the predicted relative error clears 1e-3.
+            ill_conditioned = bool(cond ** 4 * torch.finfo(out.dtype).eps > 1e-3)
+    if worst >= 0.0 and not ill_conditioned:
         return out
+    if ill_conditioned and worst >= 0.0:
+        return reduce(torch.float64)                  # accurate-but-positive path: escalate silently
     if not _DIAG_CONGRUENCE_NEGATIVE_WARNED:
         import warnings
         _DIAG_CONGRUENCE_NEGATIVE_WARNED = True
@@ -2524,7 +2553,7 @@ def _direct_link_diagonal_covariance(
 
         out = _reduce(work)
         if work is not torch.float64:
-            out = _escalate_if_negative(out, _reduce)
+            out = _escalate_if_negative(out, _reduce, exp_blocks=direct.exp_phi)
         return out.clamp(min=0.0).to(sigma.dtype)
 
 
@@ -2616,7 +2645,7 @@ def _compact_factored_diagonal_covariance(
         work = sigma.dtype if sigma.dtype in (torch.float32, torch.float64) else torch.float32
         out = _reduce(work)
         if work is not torch.float64:
-            out = _escalate_if_negative(out, _reduce)
+            out = _escalate_if_negative(out, _reduce, exp_blocks=factored.exp_blocks)
         out = out.clamp(min=0.0).to(sigma.dtype)
     return out.reshape(*out.shape[:-2], factored.K)
 
@@ -2711,7 +2740,7 @@ def _factored_diagonal_covariance(
                   return torch.einsum("...ikmn,...jmn->...ijk", e2, g)   # (..., N, N, d)
               blk = _reduce(work)
               if work is not torch.float64:
-                  blk = _escalate_if_negative(blk, _reduce)
+                  blk = _escalate_if_negative(blk, _reduce, exp_blocks=ep)
               # Back to the common working dtype so torch.cat below sees one dtype across blocks. An
               # escalated block keeps its CORRECTED value here; only its extra precision is dropped,
               # which is the whole point -- float64 was used to avoid the cancellation, not to be stored.

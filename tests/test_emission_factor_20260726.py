@@ -100,7 +100,7 @@ def test_linear_term_is_the_pullback_of_the_residual():
     mu_p = torch.randn(2, 4, dim)
     tokens = _tokens(3, vocab=vocab)
 
-    _, g = bohning_emission_terms(mu_p, weight, tokens, bias=bias)
+    _, g, _ = bohning_emission_terms(mu_p, weight, tokens, bias=bias)
     probs = torch.softmax(mu_p @ weight.T + bias, dim=-1)             # dense reference
     onehot = torch.nn.functional.one_hot(tokens, vocab).to(probs.dtype)
     assert torch.allclose(g, (onehot - probs) @ weight, atol=1e-5)
@@ -111,8 +111,8 @@ def test_streaming_is_independent_of_the_vocab_tile():
     weight = torch.randn(16, 4)
     mu_p = torch.randn(2, 4, 4)
     tokens = _tokens(3)
-    _, g_big = bohning_emission_terms(mu_p, weight, tokens, vocab_chunk=1024)
-    _, g_small = bohning_emission_terms(mu_p, weight, tokens, vocab_chunk=3)
+    _, g_big, _ = bohning_emission_terms(mu_p, weight, tokens, vocab_chunk=1024)
+    _, g_small, _ = bohning_emission_terms(mu_p, weight, tokens, vocab_chunk=3)
     assert torch.allclose(g_big, g_small, atol=1e-6)
 
 

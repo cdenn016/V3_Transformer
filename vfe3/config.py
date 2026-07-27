@@ -2956,6 +2956,27 @@ class VFE3Config:
         _inert: List[str] = []
         if canonical_e_step_update != "mm_exact" and _changed("mm_damping"):
             _inert.append(f"mm_damping={self.mm_damping} (only read by e_step_update='mm_exact')")
+        # The REVERSE direction of the rule above (audit 2026-07-27). The mm_exact branch of
+        # e_step_iteration reads only mm_damping/eps/sigma_max/skip_belief_sigma_update; every
+        # step-size, preconditioner, trust-region and SPD-retraction knob is read exclusively in the
+        # `else` (gradient) branch, on BOTH the belief channel and -- via _refine_s, which forwards
+        # cfg.e_step_update unchanged -- the model channel. Measured: two configs differing across
+        # all of these produce a bit-identical loss under mm_exact and diverge under gradient. Only
+        # the forward rule existed, so a run that set them got no warning at all, and seven ablation
+        # sweeps varied them against an mm_exact baseline and recorded byte-identical arms.
+        if canonical_e_step_update == "mm_exact":
+            _mm_dead = [
+                name for name in (
+                    "e_q_mu_lr", "e_q_sigma_lr", "e_s_mu_lr", "e_s_sigma_lr",
+                    "e_step_mu_precond", "e_mu_q_trust", "mu_trust_mode",
+                    "e_sigma_q_trust", "spd_retract_mode",
+                )
+                if _changed(name)
+            ]
+            if _mm_dead:
+                _inert.append(
+                    f"{'/'.join(_mm_dead)} (unread under e_step_update='mm_exact', whose only step "
+                    f"control is mm_damping={self.mm_damping}; set e_step_update='gradient' to use them)")
         if not self.randomize_e_steps and _changed("e_steps_min", "e_steps_max"):
             _inert.append("e_steps_min/e_steps_max (only read by randomize_e_steps=True)")
         if not self.decode_unigram_prior and _changed("unigram_kappa"):

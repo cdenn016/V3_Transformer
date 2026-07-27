@@ -1215,7 +1215,8 @@ def test_compact_free_energy_and_diagnostics_never_dense_materialize(monkeypatch
     full_logdet = block_logdet.sum(dim=-1)
     represented_cond = (
         block_svd[..., 0].amax(dim=-1) / block_svd[..., -1].amin(dim=-1))
-    anisotropy = block_svd[..., 0] / block_svd[..., -1]
+    block_logmod = torch.log(torch.linalg.eigvals(active_blocks).abs().clamp(min=1e-12))
+    anisotropy = block_logmod.amax(dim=-1) - block_logmod.amin(dim=-1)   # audit 2026-07-27
     assert diagnostics["gauge_trace_spread"] == pytest.approx(
         float(full_logdet.std(unbiased=False)), rel=1e-6)
     assert diagnostics["gauge_invariant_mean"] == pytest.approx(float(full_logdet.mean()), rel=1e-6)
