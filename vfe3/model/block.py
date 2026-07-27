@@ -7,7 +7,7 @@ runs the iterative E-step (Phase 6) and an optional gauge-equivariant norm on th
 mean. The belief handoff across blocks lives in stack.py.
 """
 
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -63,7 +63,7 @@ def e_step_shared_kwargs(
         link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
         clamp_monitor=cfg.transport_clamp_monitor,
         e_step_update=cfg.e_step_update, mm_damping=cfg.mm_damping,
-        lambda_twohop=cfg.lambda_twohop,
+        lambda_twohop=cfg.lambda_twohop, emission_weight=cfg.emission_weight,
         skip_belief_sigma_update=cfg.skip_belief_sigma_update,
         compile_pair_kernel=cfg.compile_pair_kernel,
         reuse_pairwise_kl_stats=True,
@@ -99,6 +99,7 @@ def vfe_block(
     grad_record:     Optional[EStepGradientRecord] = None,   # diag out-param: E-step belief-grad norms (None -> no capture)
     state_record:    Optional[dict]                = None,   # diag out-param: E-step belief/F trace (None -> no capture)
     transport_status: Optional[dict]               = None,   # run-sticky covariant-feature status
+    emission:        Optional[Tuple[torch.Tensor, torch.Tensor]] = None,   # (d, g) Bohning emission terms (None -> no data term)
 
     prebuilt_transport: Optional[object]       = None,   # share_refine_s_transport: caller-built flat transport (None -> e_step builds its own)
     gauge_parameterization: str                = "phi",  # 'phi' (exp(phi.G) path) | 'omega_direct' (stored GL(K) element, read from belief.omega)
@@ -145,6 +146,7 @@ def vfe_block(
         exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
         transport_chart_max_norm=cfg.transport_chart_max_norm,
         transport_status=transport_status,
+        emission=emission,
         randomize_e_steps=cfg.randomize_e_steps,
         training=training,
         e_steps_min=cfg.e_steps_min, e_steps_max=cfg.e_steps_max,

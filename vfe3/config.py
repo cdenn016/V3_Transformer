@@ -775,6 +775,31 @@ class VFE3Config:
     decode_unigram_prior:      bool  = False
     unigram_kappa:             float = 1.0            # tempering on log pi_v (1.0 = exact Bayes rule)
 
+    # Categorical emission factor in the belief's Markov blanket (VFE 4.0
+    # eq:state-model-markov-blanket-potentials, vfe4_whitepaper/06_elbo_coordinate_updates.tex:406):
+    # the potential for z_s carries log L(x_s | z_s, m_s), so an observation-conditioned belief update
+    # includes the emission. V3's E-step descends alpha KL(q||p) + Sum_j beta KL(q||Omega q) + entropy
+    # with NO data term, which is why the pair energy measures belief AGREEMENT rather than predictive
+    # relevance. The factor reads x_s, the CURRENT token, so it is prefix-measurable and non-leaky --
+    # unlike conditioning q_t on the held-out target x_{t+1}, which evaluation would also have to run.
+    #
+    # No finite Gaussian (dJ, dh) identity exists for a categorical softmax
+    # (06_elbo_coordinate_updates.tex:777 names the admissible routes), so this uses the declared
+    # Bohning quadratic bound: constant curvature dJ = diag(W^T H W), H = (1/2)(I_V - 11^T/V),
+    # expanded at the prior mean. That is a genuine majorize-minimize step on the same objective
+    # mm_exact already minimizes exactly, not a bolted-on gradient.
+    #
+    #   "off"      -- the PURE path and the default: no data term, byte-identical to before.
+    #   "shared"   -- reuse the decode table (output_proj_weight). Whitepaper-faithful, no new
+    #                 parameters, but V3 decodes position t against x_{t+1} while the emission pulls
+    #                 toward x_t, so one linear map carries both roles with no nonlinear head between.
+    #   "separate" -- own (V, K) table. Removes that competition at the cost of decoupling the factor
+    #                 from the decoder that actually scores the prediction.
+    # Both live modes are fixed-basis linear maps and therefore NOT gauge-equivariant, the same
+    # footprint the linear decode already carries; "off" keeps the gauge-pure path.
+    emission_mode:             str   = "off"          # "off" | "shared" | "separate"
+    emission_weight:           float = 0.0            # 0.0 reproduces the "off" path byte-identically
+
     # fp64 island keying for stable_matrix_exp_pair. 'dim' (default): upcast when the block dim
     # >= its dim_threshold (the long-standing rule). 'norm': upcast only when the clamped block
     # Frobenius norm exceeds exp_fp64_norm_threshold -- the conditioning argument is a norm
@@ -840,7 +865,19 @@ class VFE3Config:
     # against the configured sigma_init). Set 0.0 to exempt the sigma sector. Mirrors
     # connection_weight_decay.
     sigma_weight_decay:        Optional[float] = None
-    
+
+    # SEPARATE AdamW weight decay for the MEAN-role capacity tables (mu_embed, s_mu_embed,
+    # decode_mu_embed, output_proj_weight) -- the exact mirror of sigma_weight_decay above.
+    # None = inherit the global weight_decay (the long-standing behavior). A dead TENSOR escapes
+    # AdamW decay because zero_grad(set_to_none=True) leaves p.grad = None, but a rarely-visited
+    # ROW inside a live tensor does not: the embedding gather produces a dense gradient, so decay
+    # is applied to all V rows on every step whether or not the token appeared. Measured on the
+    # K=300 wikitext-103 run, that drives the zero-count rows of the mean tables to norm 0.000 and
+    # the count-1..15 rows BELOW random initialization (half-life ln2/(lr*wd) = 2310 steps against
+    # an inter-arrival of 57050/count steps). Set 0.0 to exempt the mean sector; the frequent rows
+    # keep their dense likelihood gradient either way.
+    mu_weight_decay:           Optional[float] = None
+
     # Untied decode bank (use_prior_bank=True only): decode reads its OWN (V,K) mu/sigma tables,
     # cloned from the encode tables at init (step-0 byte-identical) and trained separately. Isolates
     # the tied-vs-untied confound in the linear-vs-bank comparison; still a KL-to-priors decode.
@@ -1600,6 +1637,39 @@ class VFE3Config:
                 )
         if not math.isfinite(self.mass_phi) or self.mass_phi < 0.0:
             raise ValueError(f"mass_phi must be >= 0 and finite, got {self.mass_phi}")
+        if self.emission_mode not in ("off", "shared", "separate"):
+            raise ValueError(
+                f"emission_mode must be 'off', 'shared', or 'separate', got {self.emission_mode!r}"
+            )
+        if not math.isfinite(self.emission_weight) or self.emission_weight < 0.0:
+            raise ValueError(
+                f"emission_weight must be >= 0 and finite, got {self.emission_weight}"
+            )
+        if self.emission_mode != "off":
+            # Fail closed rather than run silently inert. The Bohning (dJ, dh) pair is consumed only
+            # by the closed-form fusion; on the gradient/oracle route it would be accepted and dropped,
+            # which is exactly the class of dead-config defect this project keeps finding after the fact.
+            if self.e_step_update != "mm_exact":
+                raise ValueError(
+                    f"emission_mode={self.emission_mode!r} requires e_step_update='mm_exact' "
+                    f"(the emission enters the closed-form precision fusion); got "
+                    f"{self.e_step_update!r}."
+                )
+            if self.emission_mode == "shared" and self.use_prior_bank:
+                raise ValueError(
+                    "emission_mode='shared' reads the linear-decode table output_proj_weight, which "
+                    "exists only under use_prior_bank=False. Use emission_mode='separate' with the "
+                    "prior-bank decode, or set use_prior_bank=False."
+                )
+            if self.emission_weight == 0.0:
+                import warnings
+                warnings.warn(
+                    f"emission_mode={self.emission_mode!r} with emission_weight=0.0 is INERT: the "
+                    "factor is built and then scaled to zero, so the run is byte-identical to "
+                    "emission_mode='off' at the cost of building it. Set emission_weight>0.",
+                    UserWarning,
+                    stacklevel=2,
+                )
         if (not math.isfinite(self.mstep_self_coupling_weight)
                 or self.mstep_self_coupling_weight < 0.0):
             raise ValueError(

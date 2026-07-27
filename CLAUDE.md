@@ -59,7 +59,18 @@ This V3 is a production quality gauge-theoretic VFE transformer that allows clea
   its per-query scale uses the bare block trace `tr(Sigma_h)`, and
   `tr(g_h Sigma_h g_h^T) != tr(Sigma_h)` for a general non-orthogonal frame. It is invariant for
   orthogonal gauges; `query_tau_c=0` or `query_adaptive_tau=False` retains the pure base-temperature
-  path.
+  path. (8) `emission_mode='separate'` allocates a raw `(V, K)` nn.Parameter `emission_proj_weight`
+  for the categorical emission factor in the belief's Markov blanket (VFE 4.0
+  `eq:state-model-markov-blanket-potentials`), read by the Böhning majorizer in `vfe3/emission.py`
+  and consumed by the closed-form fusion. `emission_mode='shared'` adds NO parameter — it reuses the
+  exception-(1) decode table. Both live modes are fixed-basis linear maps and are therefore NOT
+  gauge-equivariant, the same footprint the linear decode already carries. Both are default OFF
+  (`emission_mode='off'`, `emission_weight=0.0`), and `off` is the gauge-pure path with no data term
+  in the E-step at all. Note the emission reads `x_t`, the CURRENT token, so it is prefix-measurable
+  and non-leaky; conditioning the belief on the held-out `x_{t+1}` would invalidate every reported
+  perplexity and is not offered. The consumed curvature is `diag(W^T H W)`, which under the diagonal
+  family is an approximation rather than a strict majorizer — stated in the module docstring and
+  pinned by `tests/test_emission_factor_20260726.py`.
 - NO CLI arg parsing; entry points are click-to-run (edit config dicts, then run).
 - float32 throughout; CUDA where applicable (user has an RTX 5090).
 - High modularity: a config-selected registry behind every seam (divergence,

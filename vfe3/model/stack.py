@@ -15,7 +15,7 @@ block stay available via the ``capture`` out-param (the M-step self-coupling rea
 them from there).
 """
 
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -55,6 +55,7 @@ def vfe_stack(
     capture:         Optional[MStepCapture]        = None,   # out-param: LAST block's converged belief + live prior
     grad_record:     Optional[EStepGradientRecord] = None,   # diag out-param: LAST block's E-step belief-grad norms (None -> no capture)
     transport_status: Optional[dict]               = None,   # run-sticky covariant-feature status
+    emission:        Optional[Tuple[torch.Tensor, torch.Tensor]] = None,   # (d, g) Bohning emission terms (None -> no data term)
 
     prebuilt_transport: Optional[object]       = None,   # share_refine_s_transport: one flat transport shared across blocks (valid: e_phi_lr==0 + flat, phi loop-invariant)
     gauge_parameterization: str                = "phi",  # 'phi' (exp(phi.G) path) | 'omega_direct' (stored GL(K) element, read from belief.omega)
@@ -138,6 +139,7 @@ def vfe_stack(
                            training=training, tau=tau_b,
                            capture=capture, grad_record=grad_record,   # each block overwrites; last wins
                            transport_status=transport_status,
+                           emission=emission,
                            state_record=(diagnostic_capture.setdefault(
                                "e_step_trace", {"sequence_index": 0})
                                          if diagnostic_capture is not None and layer_index == 0 else None),

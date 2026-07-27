@@ -26,7 +26,13 @@ _B_LOSS = 2.7726001740               # (b) dense training loss == ce (no mass_ph
 _C_LOSS = 2.7726004124               # (c) fused-chunked CE (matches dense to ~1e-6, distinct kernel)
 _D_LOSS = 2.7726044655               # (d) loss WITH mstep self-coupling (> ce)
 _D_CE = 2.7726001740                 # (d) ce unchanged by the mstep term
-_E_LOSS = 2.7726650238               # (e) loss WITH mass_phi penalty (> ce)
+_E_LOSS = 2.7731170654               # (e) loss WITH mass_phi penalty (> ce); RE-PINNED 2026-07-26 (D-08)
+                                     #     The M-step penalty was (phi**2).mean(), which differed from
+                                     #     the E-step's (phi**2).sum() by phi.numel() -- one mass_phi
+                                     #     naming two strengths. Both now use the per-position squared
+                                     #     norm; at this config n_gen=8, so the penalty is exactly 8.000x
+                                     #     the old one and the old pin was ce + 0.5*0.3*(phi**2).mean()
+                                     #     = 2.7726649857. Deliberate change, not a regression.
 _E_CE = 2.7726004124                 # (e) ce from the mass-penalty path
 _F_LOGITS_SUM = -0.1151125083        # (f) linear-decode inference logits
 _F_LOSS = 2.7732081413               # (f) linear-decode training loss == ce

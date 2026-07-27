@@ -224,9 +224,16 @@ def build_optimizer(
     # every sigma-role CAPACITY table (belief, s-channel, untied decode); the centroid r_sigma_log
     # keeps its existing hard 0.0 exemption.
     sigma_wd = {} if cfg.sigma_weight_decay is None else {"weight_decay": cfg.sigma_weight_decay}
+    # mu_weight_decay (default None = inherit the global weight_decay, the long-standing behavior):
+    # the exact mirror of sigma_wd for the MEAN-role capacity tables. Decoupled AdamW decay reaches
+    # every row of a live embedding table on every step, so the rarely-visited rows are decayed far
+    # faster than their gather-driven gradient can restore them; mu_weight_decay=0.0 exempts the
+    # mean sector. Applied to the same class sigma_wd covers (belief, s-channel, untied decode) plus
+    # the linear-decode projection, which is the mean-role twin of decode_log_scale.
+    mu_wd = {} if cfg.mu_weight_decay is None else {"weight_decay": cfg.mu_weight_decay}
     groups = []
     if pb.mu_embed is not None:
-        groups.append({"params": [pb.mu_embed], "lr": cfg.m_p_mu_lr, "role": "mu"})
+        groups.append({"params": [pb.mu_embed], "lr": cfg.m_p_mu_lr, "role": "mu", **mu_wd})
     sigma_parameters = [parameter for parameter in (pb.sigma_log_embed, pb.decode_log_scale)
                         if parameter is not None]
     if sigma_parameters:
@@ -242,10 +249,14 @@ def build_optimizer(
         # Cloned from the encode tables at init (step-0 byte-identical decode), trained separately so
         # the decode direction can decouple from the E-step prior/self-coupling target; grouped like
         # the tables they were cloned from (mean@m_p_mu_lr, log-scale@m_p_sigma_lr).
-        groups.append({"params": [pb.decode_mu_embed],        "lr": cfg.m_p_mu_lr,    "role": "mu"})
+        groups.append({"params": [pb.decode_mu_embed],        "lr": cfg.m_p_mu_lr,    "role": "mu", **mu_wd})
         groups.append({"params": [pb.decode_sigma_log_embed], "lr": cfg.m_p_sigma_lr, "role": "sigma", **sigma_wd})
     if pb.output_proj_weight is not None:                       # use_prior_bank=False linear decode
-        groups.append({"params": [pb.output_proj_weight], "lr": cfg.m_p_mu_lr, "role": "mu"})
+        groups.append({"params": [pb.output_proj_weight], "lr": cfg.m_p_mu_lr, "role": "mu", **mu_wd})
+    if getattr(pb, "emission_proj_weight", None) is not None:   # emission_mode='separate' readout
+        # A (V, K) mean-role readout like output_proj_weight, grouped identically so the 'shared'
+        # and 'separate' arms differ only in WHICH table the emission reads, not in how it is stepped.
+        groups.append({"params": [pb.emission_proj_weight], "lr": cfg.m_p_mu_lr, "role": "mu", **mu_wd})
     if pb.output_proj_bias is not None:                         # decode_bias: learned log-unigram prior
         # weight_decay=0 -- decaying a unigram prior toward zero biases it to a flat distribution
         # (the same protection phi/Omega carry).
@@ -272,7 +283,7 @@ def build_optimizer(
         model_frame_group.update(phi_group_metadata)
         groups.append(model_frame_group)
     if getattr(pb, "s_mu_embed", None) is not None:             # model-channel s tables (lambda_gamma>0 or
-        groups.append({"params": [pb.s_mu_embed],        "lr": cfg.m_p_mu_lr,    "role": "mu"})    # prior_source=model_channel):
+        groups.append({"params": [pb.s_mu_embed],        "lr": cfg.m_p_mu_lr,    "role": "mu", **mu_wd})  # prior_source=model_channel):
         groups.append({"params": [pb.s_sigma_log_embed], "lr": cfg.m_p_sigma_lr, "role": "sigma", **sigma_wd})  # mean@m_p_mu_lr, log-scale@
         if getattr(pb, "s_sigma_lower_embed", None) is not None:  # gaussian_full: packed strict-lower Cholesky
             # The off-diagonal capacity of the full model-channel covariance -- grouped in the sigma

@@ -22,6 +22,7 @@ from torch import nn
 from vfe3.attention_prior import attention_log_prior
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
+from vfe3.emission import bohning_emission_terms
 from vfe3.contracts import (
     EffectiveBetaPriorContext,
     EStepGradientOutput,
@@ -265,6 +266,7 @@ class VFEModel(nn.Module):
             # Tier-1/Tier-2 decode toggles (2026-07-05; all default OFF, byte-identical):
             unigram_kappa=cfg.unigram_kappa,
             decode_unigram_prior=cfg.decode_unigram_prior,
+            emission_mode=cfg.emission_mode,
             untie_decode_bank=cfg.untie_decode_bank and cfg.use_prior_bank,
             gauge_parameterization=cfg.gauge_parameterization,
             irrep_dims=list(self.group.irrep_dims),
@@ -1116,8 +1118,15 @@ class VFEModel(nn.Module):
             grad_rec: Optional[EStepGradientRecord] = (
                 {} if estep_grad_out is not None else None
             )                                                       # E-step belief-grad capture (gated, off by default)
+            # Categorical emission factor (cfg.emission_mode, default 'off' = the pure path). Built
+            # HERE because this is the only seam holding both token_ids and the readout table, and
+            # expanded at the belief entering the stack -- which is the prior exactly (forward_beliefs
+            # anchors q0 == p), so the Bohning majorizer is expanded at the point the E-step starts
+            # from. Reads x_t, the CURRENT token, never the held-out target.
+            emission = self._emission_terms(token_ids, beliefs.mu)
             out = vfe_stack(
                 beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
+                emission=emission,
                 log_prior=log_prior, block_norm=self.block_norm,
                 head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
                 lambda_beta=lambda_beta,
@@ -1600,7 +1609,14 @@ class VFEModel(nn.Module):
             # outer-loss role; mass_phi ALSO enters the inner phi E-step objective (e_step:
             # phi_alignment_loss), shaping the inference trajectory. Both roles are in the
             # manuscript algorithm (E-step phi gradient and M-step loss both carry alpha_phi/2||phi||^2).
-            loss = loss + 0.5 * self.cfg.mass_phi * (belief.phi ** 2).mean()
+            # D-08: this used (phi ** 2).mean(), which differs from the E-step's (phi ** 2).sum()
+            # at e_step.phi_alignment_loss by phi.numel() (10^3-10^5 here), so ONE mass_phi named
+            # two different penalty strengths in the two places the manuscript gives one alpha_phi.
+            # Both now carry the per-position squared norm ||phi_i||^2 = (phi ** 2).sum(dim=-1);
+            # the E-step sums it over the sequence to match its per-sequence F, and the M-step
+            # averages it over positions to match the per-token mean that `ce` already is. Latent
+            # at the 0.0 default (no shipped config changes), material on a mass_phi sweep.
+            loss = loss + 0.5 * self.cfg.mass_phi * (belief.phi ** 2).sum(dim=-1).mean()
         if self.cfg.mstep_self_coupling_weight > 0.0:
             # M-step self-coupling regularizer (manuscript Algorithm 1, GL(K)_attention.tex:2111):
             # L += alpha_hat * sum_i alpha_i D(q_i*||p_i), the alpha-weighted self-coupling of the
@@ -2382,6 +2398,27 @@ class VFEModel(nn.Module):
         if support is not None:
             out = out.masked_fill(~support, float("-inf"))            # keep the EXACT -inf causal structure
         return out
+
+    def _emission_terms(
+        self,
+        token_ids: torch.Tensor,                 # (B, N) CURRENT-token ids x_t
+        mu_p:      torch.Tensor,                 # (B, N, K) prior means; the MM expansion point
+    ) -> 'Optional[Tuple[torch.Tensor, torch.Tensor]]':
+        r"""Build the Bohning ``(d, g)`` pair for the categorical emission, or ``None`` when off.
+
+        ``None`` on the pure path AND at ``emission_weight == 0``, so the zero-weight case costs
+        nothing rather than building a factor it would then scale away. See ``vfe3/emission.py`` for
+        the majorizer; the consumer is the closed-form fusion in ``gradients/kernels.py``.
+        """
+        cfg = self.cfg
+        if cfg.emission_mode == "off" or cfg.emission_weight == 0.0:
+            return None
+        bank = self.prior_bank
+        if cfg.emission_mode == "separate":
+            weight, bias = bank.emission_proj_weight, None
+        else:                                    # 'shared': the decode table, bias included so the
+            weight, bias = bank.output_proj_weight, bank.output_proj_bias   # expansion matches decode
+        return bohning_emission_terms(mu_p, weight, token_ids, bias=bias)
 
     def _effective_beta_log_prior(
         self,
