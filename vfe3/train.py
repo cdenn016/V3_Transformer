@@ -1703,9 +1703,19 @@ def train(
                 "epoch":                       epoch,
                 "data_identity":               loader_data_identity,
             } if loader_data_identity is not None else None)
-            artifacts.save_checkpoint(step + 1, model, optimizer, cfg, scaler=scaler, ema=ema,
-                                      metropolis_generator=metro_gen,
-                                      data_state=checkpoint_data_state)
+            # Best-effort, like every other periodic side effect above (audit 2026-07-27). A
+            # checkpoint is a convenience for RESUMING, not a correctness requirement of the step
+            # loop, so a failed write must cost one checkpoint and not the run: a transient
+            # torch.save stream failure ("ios_base::badbit set") at step 120000 of 180000
+            # previously aborted 10 hours of training with a perfectly healthy model in memory.
+            # Loud warning, then continue -- the next interval attempts a fresh save.
+            try:
+                artifacts.save_checkpoint(step + 1, model, optimizer, cfg, scaler=scaler, ema=ema,
+                                          metropolis_generator=metro_gen,
+                                          data_state=checkpoint_data_state)
+            except Exception as exc:
+                logger.warning("       (checkpoint save at step %d failed: %s); training "
+                               "continues, next checkpoint retries", step + 1, exc)
 
         # Persistence is opt-in: with no artifacts object do_csv is False, so the silent/in-memory
         # path is unchanged. A metrics.csv row is written every LOG_INTERVAL (and every eval) -- the

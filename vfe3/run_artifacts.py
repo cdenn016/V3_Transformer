@@ -417,6 +417,10 @@ def _atomic_replace(
             os.close(directory_fd)
 
 
+_TEMP_CLEANUP_RETRIES = 5                        # mirrors _atomic_replace's Windows-lock backoff
+_TEMP_CLEANUP_DELAY   = 0.2
+
+
 @contextmanager
 def _unique_sibling_temp(final: Path) -> Iterator[Path]:
     r"""Yield a uniquely reserved same-directory temporary path for one artifact writer.
@@ -424,6 +428,13 @@ def _unique_sibling_temp(final: Path) -> Iterator[Path]:
     ``mkstemp`` performs the reservation atomically, so concurrent writers to the same final
     artifact never share a temporary filename.  The caller must publish with
     :func:`_atomic_replace`; this context also removes an unconsumed temporary after any failure.
+
+    Cleanup RETRIES rather than taking a single shot (audit 2026-07-27): a writer that failed
+    mid-save can still hold the handle while this unwinds, and Windows refuses to unlink an open
+    file, so one attempt loses a race it wins moments later. The incident that motivated this
+    abandoned a 2.48 GB checkpoint temp that was freely deletable minutes afterward; with a failed
+    save now non-fatal to training, an unretried cleanup would leak that much per checkpoint
+    interval and fill the disk the run is still writing to.
     """
     final = Path(final)
     final.parent.mkdir(parents=True, exist_ok=True)
@@ -437,10 +448,14 @@ def _unique_sibling_temp(final: Path) -> Iterator[Path]:
     try:
         yield tmp
     finally:
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
+        for i in range(_TEMP_CLEANUP_RETRIES):
+            try:
+                tmp.unlink(missing_ok=True)
+                break
+            except OSError:                              # cleanup failure must not mask the original error
+                if i == _TEMP_CLEANUP_RETRIES - 1:
+                    break
+                time.sleep(_TEMP_CLEANUP_DELAY)
 
 
 @contextmanager
