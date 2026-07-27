@@ -1135,3 +1135,43 @@ Separately, the variational expert established that
 as "a degenerate one-token-per-agent shadow" is **wrong**: `mu_p_i` and `mu_q_i` live in the same
 fiber over token `i`, so no transport belongs there.
 
+
+---
+
+# Addendum, 2026-07-26 evening: the K=20 obligation is discharged; the K=300 endpoint is not
+
+The two claims above that "`0.190` cannot be traced to any artifact on disk" and that **"Attention
+share rises with width" cannot be repaired** are both superseded. They should not be read as open
+obligations.
+
+**The required run exists.** `vfe3_runs/138.40_wikitext-103_K20_block_glk_linear_mix_s6/config.json`
+gives `embed_dim=20`, `s_e_step=True`, `e_step_update='mm_exact'`, `n_layers=1` -- exactly the pairing
+this report said had to be re-run -- and its `estep_character.json` gives `measured_channel='belief'`,
+`measured_layer=0`, `n_sequences=64`, `precision_split_available=true`, `recompute_max_abs_err=0.0`,
+and `pair_precision_share = 0.15327950264845877` at every swept depth. The K=20 endpoint is therefore
+**0.153**, measured on the belief channel under the production protocol.
+
+**Why it read as missing.** The share is written per-point, inside `points[]`. The top-level
+`pair_precision_share` key exists and is `None`. A top-level read of the file returns `None` and the
+artifact looks empty, which is how a discharged obligation stayed on the punch list. Read
+`points[*].pair_precision_share`.
+
+**What still does not have provenance is the other endpoint.** The corrected K=300 value **0.196** is
+quoted in `docs/2026-07-25-state-of-knowledge.md:164` and `:201` and on four research-wiki pages, and
+no artifact for it was found either in this repo or at the external checkpoint directory
+`Desktop/data/55.41_wikitext-103_K300_block_glk_linear_mix_s6/`, which contains no
+`estep_character.json`. The only K=300 artifact on disk is the 8-sequence
+`docs/2026-07-26-b01-remeasurement.json`, which reports **0.213**, not 0.196.
+
+So the corrected width pair is half-evidenced, in the same shape as the defect this section documents:
+a published figure whose source cannot be produced. The K=20 end has an artifact; the K=300 end has a
+number. **Open obligation, restated:** re-emit and persist the K=300 64-sequence
+`estep_character.json`, or restate the claim at the 8-sequence 0.213 that does have a file. Until then
+`state-of-knowledge.md:157` should stop citing `b01-remeasurement.json` as the "Raw record" for a
+table containing neither of its values.
+
+**On the claim itself.** With 0.153 against 0.196 the direction survives at both sample sizes, so
+"share rises with width" is no longer unrepairable. It is also not established: the two checkpoints
+differ in roughly a dozen config fields besides `embed_dim`, `d_head` among them, so the honest
+statement is that it is supported by two points and not isolated to width. De-confounding needs a
+width sweep at fixed `d_head` or fixed `n_heads`, which is a new experiment rather than a re-run.
