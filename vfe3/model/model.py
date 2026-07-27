@@ -923,6 +923,7 @@ class VFEModel(nn.Module):
             # The s-channel E-step shares the active per-head transport numerics with the belief
             # channel; packed transport remains gated to the eligible canonical phi route.
             transport_mean_per_head=True,
+            congruence_cond_escalation=cfg.congruence_cond_escalation,
             compact_phi_block_transport=self._compact_phi_blocks_enabled(),
             reuse_pairwise_kl_stats=True,
             exp_fp64_mode=cfg.exp_fp64_mode,
@@ -1076,6 +1077,7 @@ class VFEModel(nn.Module):
                     # The shared build carries the same active per-head mean contraction as the
                     # per-E-step transport hoists.
                     transport_mean_per_head=True,
+                    congruence_cond_escalation=self.cfg.congruence_cond_escalation,
                     compact_phi_block_transport=self._compact_phi_blocks_enabled(),
                     exp_fp64_mode=self.cfg.exp_fp64_mode,
                     exp_fp64_norm_threshold=self.cfg.exp_fp64_norm_threshold,
@@ -1301,6 +1303,7 @@ class VFEModel(nn.Module):
                 link_alpha=cfg.link_alpha, link_soft_cap=cfg.link_soft_cap,
                 clamp_monitor=cfg.transport_clamp_monitor,
                 transport_mean_per_head=True,
+                congruence_cond_escalation=cfg.congruence_cond_escalation,
                 rope=context.rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
                 rope_insertion=cfg.rope_insertion,
                 exp_fp64_mode=cfg.exp_fp64_mode, exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
@@ -1899,6 +1902,7 @@ class VFEModel(nn.Module):
                                        mu=(s_mu if tm in _TRANSPORT_NEEDS_MU else None),
                                        sigma=(s_sigma if tm in _TRANSPORT_NEEDS_SIGMA else None),
                                        transport_mean_per_head=True,
+                                       congruence_cond_escalation=cfg.congruence_cond_escalation,
                                        compact_phi_block_transport=self._compact_phi_blocks_enabled(),
                                        rope=self._rope_rotation(n_pos, token_ids.device),
                                        rope_on_cov=cfg.rope_full_gauge,
@@ -2559,6 +2563,7 @@ class VFEModel(nn.Module):
                 self.group,
                 compact_phi_block_transport=True,
                 transport_mean_per_head=True,
+                congruence_cond_escalation=cfg.congruence_cond_escalation,
                 exp_fp64_mode=cfg.exp_fp64_mode,
                 exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
                 **kwargs,

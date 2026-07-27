@@ -141,6 +141,7 @@ def vfe_block(
         rope=rope, rope_on_cov=rope_on_cov, rope_on_value=rope_on_value,
         rope_insertion=rope_insertion,
         transport_mean_per_head=True,
+        congruence_cond_escalation=cfg.congruence_cond_escalation,
         compact_phi_block_transport=compact_phi_blocks,
         exp_fp64_mode=cfg.exp_fp64_mode,
         exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
