@@ -130,22 +130,46 @@ two differ.
 B-03 was rated high and triple-confirmed with a repro. It is now protected by nothing.
 **Action:** one test case with `s_e_step_n_iter != n_e_steps`.
 
-### 5. C-07 — no config-reachable fail-closed path for a non-group-inverse transport
+### 5. C-07 — REFUTED as a promotion; stays medium, at the audit's original scope
 
-Promoted from low on new evidence rather than re-judgment. `TRANSPORT_CLAMP_MAX_NORM = 20.0`
-(`transport.py:1393`) sits past where the fp32 exponential pair stops being a group inverse, and all
-three guards that would catch it are unreachable from a config:
+**This item was wrong and is withdrawn.** It was promoted to high on the claim that "no toggle makes
+transport fail closed", which rested on `validity_max_norm` having no `VFE3Config` field. That grep
+was for the wrong name. The config field is **`transport_chart_max_norm`** (`config.py:606`), it is
+validated (`config.py:922-928`), it is threaded end-to-end to `validity_max_norm` through
+`e_step.py:565`, `:598`, `:766`, `:941`, `:965`, `:1217`, `block.py:146`, and `model.py:920`, `:1072`,
+`:1290`, `:1883`, `:2478`, `:2968`, `:3463`, it is referenced by roughly ten test files, and
+`pullback_group` mode **requires** it to be set (`config.py:1997-2005`).
 
-- `_checked_group_inverse` is called at `transport.py:1612`, `:1674`, `:1683` with no `residual_tol`,
-  and the parameter defaults to `None`, which by its own docstring skips the identity residual check.
-- `validity_max_norm` — the fail-closed chart bound threaded end-to-end through `transport.py`
-  (`:798`, `:832`, `:1023`) — has **no `VFE3Config` field at all**.
-- `transport_clamp_monitor` defaults `False` (`config.py:601`).
+Verified by behavior rather than by reading. At `||M||_F = 15`, which is inside the band C-07 measured
+as dangerous (residual 1.06e-3 at 16, 2.08e-2 at 20):
 
-The project's standing rule is that a theoretically pure path must exist under appropriate toggles.
-Here there is no toggle that makes transport fail closed, the failure produces wrong numbers rather
-than a crash, and it is on the training hot path. Whether production `||phi||` actually reaches the
-clamp is unmeasured — and the monitor that would answer it is the one that is off by default.
+```
+default (no bound)          -> returns, shape (2, 4, 4)
+validity_max_norm=10.0      -> ValueError: transport chart validity bound exceeded
+                               before matrix-exponential clamp
+```
+
+So the pure path exists under an appropriate toggle, which is exactly what the project's standing rule
+requires, and the rule is not violated. `transport_clamp_monitor` (`config.py:601`) is likewise a real
+config field, not an unreachable internal.
+
+**What actually survives is the audit's original medium, unchanged.** `TRANSPORT_CLAMP_MAX_NORM = 20.0`
+is calibrated on `matrix_exp` accuracy (~1e-6 at every norm to 20) rather than on the property that
+matters, the stored fp32 pair's group-inverse identity, which fails 25/25 draws at norm 20. The audit
+offered two fixes as alternatives: pass `residual_tol` from the pair builders, **or** lower the clamp
+toward ~10. The second is available today by setting `transport_chart_max_norm = 10`.
+
+The one genuine gap is that `residual_tol` is not config-reachable — `_checked_group_inverse`
+(`transport.py:1612`, `:1674`, `:1683`) is called without it and there is no `VFE3Config` field for it.
+**I recommend not adding one.** It would need the same ten-hop threading `validity_max_norm` already
+has, which is the change class that broke 30 tests when `rope_insertion` was threaded, to add a second
+guard over a regime the first one already closes. The norm bound is a proxy for the residual rather
+than the residual itself, so the two are not identical, but nothing on record shows a config that
+needs the finer instrument.
+
+**The real residue is a measurement, not code:** whether production `||phi||` approaches 20 at all is
+still unknown, and it is the same unmeasured operating point that item 8 (C-01) turns on. One
+instrumented run answers both.
 
 ### 6. `so_n` / `sp_n` cannot use RoPE on the default insertion
 
