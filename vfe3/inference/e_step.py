@@ -466,8 +466,11 @@ def free_energy_value(
     mu_trust_mode:             str  = "box",           # accepted-and-ignored iteration-only knob
     e_step_mu_precond:         str  = "fisher",        # accepted-and-ignored iteration-only knob
     e_step_update:             str  = "gradient",      # accepted-and-ignored iteration-only knob
-    mass_phi:                  float = 0.0,            # accepted-and-ignored iteration-only knob (phi penalty)
+    mass_phi:                  float = 0.0,            # HONORED: adds (mass_phi/2) ||phi||^2 to the reported F
     mm_damping:                float = 1.0,            # accepted-and-ignored iteration-only knob
+    emission_weight:           float = 0.0,            # accepted-and-ignored iteration-only knob (emission block)
+    emission:                  Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # accepted-and-ignored iteration-only runtime object
+
     exp_fp64_norm_threshold:   float = 5.0,            # HONORED: forwarded to the global-F _transport float64-island keying
 
     include_attention_entropy: bool = True,
@@ -666,6 +669,11 @@ def free_energy_value(
         beta2 = attention_weights(energy, tau=tau, log_prior=log_prior).detach()
         F = F + lambda_twohop * (torch.matmul(beta2, beta2)
                                  * (energy if coupling_energy is None else coupling_energy)).sum()
+    # D-08: mass_phi was accepted-and-ignored here, so a mass_phi>0 sweep logged an F that omitted
+    # the very term the phi substep descends (phi_alignment_loss:mass). Same expression and same
+    # per-sequence sum as that substep, so the reported F and the descended objective agree.
+    if mass_phi > 0.0 and getattr(belief, "phi", None) is not None:
+        F = F + 0.5 * mass_phi * (belief.phi ** 2).sum()
     return F
 
 
@@ -833,6 +841,7 @@ def e_step_iteration(
     e_step_update:             str  = "gradient",        # "gradient" (pure) | "mm_exact" (closed-form MM fusion)
     mass_phi:                  float = 0.0,
     mm_damping:                float = 1.0,              # mm_exact: natural-coordinate damping eta (1 = exact minimizer)
+    emission_weight:           float = 0.0,              # weight on the categorical emission block (0.0 = OFF, the pure path)
     lambda_twohop:             float = 0.0,              # weight on the detached two-hop pair term (kernel route)
 
     include_attention_entropy: bool = True,
@@ -871,6 +880,7 @@ def e_step_iteration(
     grad_record:               Optional[EStepGradientRecord] = None,   # diag out-param: stashes ||grad_mu/sigma/phi|| (None -> no capture)
     transport_chart_max_norm: Optional[float]               = None,   # fail-closed pre-clamp chart bound
     transport_status:         Optional[dict]                = None,   # run-sticky covariant-feature status
+    emission:                 Optional[Tuple[torch.Tensor, torch.Tensor]] = None,   # (d, g) Bohning emission terms (None -> no data term, the pure path)
 
     _prebuilt_omega:           'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport | None' = None,   # PRIVATE: forward-transport cache from e_step
 ) -> BeliefState:
@@ -1016,6 +1026,7 @@ def e_step_iteration(
             need_sigma_update=(not skip_belief_sigma_update),
             reuse_pairwise_kl_stats=reuse_pairwise_kl_stats,
             irrep_dims=group.irrep_dims, log_prior=log_prior,
+            emission=emission, emission_weight=emission_weight,
         )
         # Backward estimator, mirroring the gradient path: 'unroll' keeps the analytic graph
         # through (mu*, sigma*); 'straight_through' detaches the TARGETS so only the additive

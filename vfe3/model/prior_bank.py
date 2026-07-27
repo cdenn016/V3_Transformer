@@ -332,6 +332,7 @@ class PriorBank(nn.Module):
     """
 
     output_proj_weight: Optional[nn.Parameter]   # (V, K) linear-decode weight; None unless use_prior_bank=False
+    emission_proj_weight: Optional[nn.Parameter] # (V, K) emission readout; None unless emission_mode='separate'
     output_proj_bias:   Optional[nn.Parameter]   # (V,) linear-decode log-unigram bias; None unless use_prior_bank=False and decode_bias
     mu_embed:           Optional[nn.Parameter]   # (V, K) token-prior mean; None when no executable route consumes it
     sigma_log_embed:    Optional[nn.Parameter]   # (V, K) token-prior log variance; same routing contract
@@ -366,6 +367,7 @@ class PriorBank(nn.Module):
 
         unigram_kappa:        float = 1.0,
         decode_unigram_prior: bool  = False,
+        emission_mode:        str   = "off",     # "off" | "shared" | "separate"; 'separate' allocates its own (V,K) readout
         untie_decode_bank:    bool  = False,
 
         gauge_parameterization: str                 = "phi",
@@ -520,6 +522,20 @@ class PriorBank(nn.Module):
             self.output_proj_bias = (
                 nn.Parameter(torch.zeros(vocab_size)) if decode_bias else None
             )
+
+        # Categorical emission readout (emission_mode='separate'): the emission factor in the
+        # belief's Markov blanket gets its OWN (V, K) table instead of reusing the decode table.
+        # V3 decodes position t against x_{t+1} while the emission pulls toward x_t, so under
+        # 'shared' one linear map carries both roles; 'separate' removes that competition at the
+        # cost of decoupling the factor from the decoder that scores the prediction. Same
+        # Xavier-uniform init as the decode weight, drawn LAST so neither existing table's RNG
+        # stream moves (an emission_mode='off' build is byte-identical to before). None on the
+        # pure path and under 'shared', which reads output_proj_weight.
+        self.emission_proj_weight = (
+            nn.Parameter(torch.empty(vocab_size, K)) if emission_mode == "separate" else None
+        )
+        if self.emission_proj_weight is not None:
+            nn.init.xavier_uniform_(self.emission_proj_weight)
 
         # MODEL CHANNEL (manuscript eq:pointwise_free_energy), default-OFF. The model-channel belief
         # tables s_mu_embed/s_sigma_log_embed (V, K) -- a per-token DIAGONAL Gaussian s_i looked up

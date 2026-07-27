@@ -523,6 +523,7 @@ def mm_exact_update(
     eps:           float = 1e-6,
     lambda_twohop: float = 0.0,                   # weight on the detached two-hop pair block
     value:         float = 1.0,
+    emission_weight: float = 0.0,                 # cfg.emission_weight; 0.0 -> the emission block is skipped
 
     lambda_alpha_mode: str = "constant",
     family:            str = "gaussian_diagonal",
@@ -533,6 +534,7 @@ def mm_exact_update(
 
     irrep_dims:    Optional[List[int]]    = None,
     log_prior:     Optional[torch.Tensor] = None,
+    emission:      Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # (d, g) Bohning terms, see vfe3/emission.py
 ) -> Tuple[torch.Tensor, torch.Tensor]:          # (mu_star, sigma_star), each (..., N, K)
     r"""Closed-form coordinate minimizer of the beta-frozen, strict-pair-masked diagonal-KL
     surrogate (NOT a majorizer of the canonical frozen-attention objective -- the strict pair
@@ -686,8 +688,19 @@ def mm_exact_update(
         pair_prec = _pair_contract(w, pair_stats.inv_sigma_t, irrep_dims)
         pair_mean = _pair_contract(w, mu_t * pair_stats.inv_sigma_t, irrep_dims)
     prec = prior_prec + pair_prec                                   # pre-clamp fused precision
+    numerator = a * mu_p / sp + pair_mean                           # (..., N, K)
+    if emission is not None and emission_weight != 0.0:
+        # Categorical emission factor, Bohning majorizer expanded at the prior mean (vfe3/emission.py).
+        # d is (K,) and constant in the expansion point, g is (..., N, K). The quadratic
+        # (w/2)(z - mu_p)^T diag(d) (z - mu_p) - w (z - mu_p)^T g contributes w*d to the precision and
+        # w*(d*mu_p + g) to the numerator. It carries NO -log sigma term (a likelihood, not a KL), so
+        # the sigma stationarity below keeps its (a + pair_mass) numerator and picks the emission up
+        # through P alone -- that is why sigma_star is untouched here.
+        emission_prec, emission_pull = emission
+        prec = prec + emission_weight * emission_prec
+        numerator = numerator + emission_weight * (emission_prec * mu_p + emission_pull)
     P = prec.clamp(min=eps)                                         # eps guards the all-saturated row
-    mu_star = (a * mu_p / sp + pair_mean) / P
+    mu_star = numerator / P
     # m12: on a fully saturated row (a==0 and all w==0) prec floors to 0; dividing the zero numerator by
     # eps snapped the belief to (0, eps), the OPPOSITE of the gradient route (which stays put). Keep the
     # live belief where prec floors, matching the gradient route and preserving graph liveness.
