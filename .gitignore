@@ -17,4 +17,5 @@ vfe3_scaling_results/
 vfe3_policy_results/
 .claude/
 .codex/
+.verification/
 docs/
