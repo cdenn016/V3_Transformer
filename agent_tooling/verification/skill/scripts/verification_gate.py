@@ -68,8 +68,40 @@ _PLACEHOLDER_REVISIONS = frozenset(
     {"UNSPECIFIED", "UNKNOWN", "PLACEHOLDER", "<PLACEHOLDER>", "TBD", "TODO", "NONE", "NULL", "N/A"}
 )
 
+# Evidence kinds whose meaning depends on the pinned worktree: a mechanical run, a reproduced
+# output, or a numerical result asserts something regenerable from the revision the ledger pins.
+# `artifact_revision` is only a freshness guarantee for these when the location actually lies
+# inside that worktree, because `capture_artifact_revision` digests tracked and untracked-not-
+# ignored repo files and nothing else. A URL, DOI, or absolute path outside the tree can carry the
+# revision string while the digest covers none of it. Source kinds (`primary_source`,
+# `reproduced_source`) are legitimately external and are exempt.
+_WORKTREE_BOUND_EVIDENCE_KINDS = frozenset({"mechanical", "reproduced_output", "numerical"})
+
+_EXTERNAL_LOCATION_SCHEMES = ("http://", "https://", "ftp://", "doi:", "arxiv:", "urn:", "mailto:")
+
 GATE_COMMAND_TOKEN = "{{VERIFICATION_GATE_COMMAND}}"
 GATE_SHELL_TOKEN = "{{VERIFICATION_GATE_SHELL}}"
+
+
+def _external_location(location: object) -> bool:
+    """Return True when `location` cannot lie inside the pinned worktree.
+
+    Syntactic only — `validate_ledger` has no cwd, so this cannot stat the path. It rejects the
+    three forms that provably escape a repo-relative digest: a URL/DOI scheme, an absolute path
+    (POSIX ``/`` or Windows drive/UNC), and a ``..`` component that walks out of the tree.
+    """
+    if not _nonempty_string(location):
+        return False
+    text = str(location).strip()
+    lowered = text.lower()
+    if lowered.startswith(_EXTERNAL_LOCATION_SCHEMES):
+        return True
+    normalized = text.replace("\\", "/")
+    if normalized.startswith("/") or normalized.startswith("//"):
+        return True
+    if len(text) >= 2 and text[1] == ":" and text[0].isalpha():
+        return True
+    return any(part == ".." for part in normalized.split("/"))
 
 
 def _as_dict(value: object) -> dict[str, object] | None:
@@ -564,6 +596,11 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                     errors.append(f"{item_prefix}: kind must be one of {', '.join(sorted(EVIDENCE_KINDS))}")
                 if not _nonempty_string(entry.get("location")):
                     errors.append(f"{item_prefix}: location must be a nonempty string")
+                elif kind in _WORKTREE_BOUND_EVIDENCE_KINDS and _external_location(entry.get("location")):
+                    errors.append(
+                        f"{item_prefix}: kind {kind} requires a location inside the pinned worktree; "
+                        f"artifact_revision does not cover an external location"
+                    )
                 evidence_revision = entry.get("artifact_revision")
                 if not _nonempty_string(evidence_revision):
                     errors.append(f"{item_prefix}: artifact_revision must be a nonempty string")
@@ -610,6 +647,11 @@ def validate_ledger(data: dict[str, object]) -> list[str]:
                     errors.append(f"{item_prefix}: kind must be one of {', '.join(sorted(EVIDENCE_KINDS))}")
                 if not _nonempty_string(entry.get("location")):
                     errors.append(f"{item_prefix}: location must be a nonempty string")
+                elif kind in _WORKTREE_BOUND_EVIDENCE_KINDS and _external_location(entry.get("location")):
+                    errors.append(
+                        f"{item_prefix}: kind {kind} requires a location inside the pinned worktree; "
+                        f"artifact_revision does not cover an external location"
+                    )
                 counterevidence_revision = entry.get("artifact_revision")
                 if not _nonempty_string(counterevidence_revision):
                     errors.append(f"{item_prefix}: artifact_revision must be a nonempty string")
