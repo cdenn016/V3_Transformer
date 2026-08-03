@@ -1319,3 +1319,81 @@ def test_refuted_source_claim_accepts_reproduced_source_counterevidence() -> Non
     claim["domain"] = "source"
 
     assert validate_ledger(ledger) == []
+
+
+def test_worktree_bound_evidence_rejects_url_location() -> None:
+    """A mechanical result pinned to the revision cannot live outside the digested worktree."""
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    evidence = claim["evidence"]
+    assert isinstance(evidence, list)
+    first = evidence[0]
+    assert isinstance(first, dict)
+    first["kind"] = "mechanical"
+    first["location"] = "https://ci.example.com/run/1234"
+
+    errors = validate_ledger(ledger)
+
+    assert any("requires a location inside the pinned worktree" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "https://ci.example.com/run/1234",
+        "doi:10.1090/S0002-9939-2010-10541-5",
+        "/etc/results/run.json",
+        r"C:\runs\output.json",
+        "../outside-the-repo/run.json",
+        "//share/results/run.json",
+    ],
+)
+def test_worktree_bound_evidence_rejects_every_escaping_form(location: str) -> None:
+    ledger = valid_ledger()
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    evidence = claim["evidence"]
+    assert isinstance(evidence, list)
+    first = evidence[0]
+    assert isinstance(first, dict)
+    first["kind"] = "reproduced_output"
+    first["location"] = location
+
+    errors = validate_ledger(ledger)
+
+    assert any("requires a location inside the pinned worktree" in error for error in errors)
+
+
+def test_source_evidence_may_be_external() -> None:
+    """primary_source/reproduced_source are legitimately outside the tree and stay exempt."""
+    ledger = refuted_code_ledger(
+        [
+            {
+                "kind": "reproduced_source",
+                "location": "https://doi.org/10.1090/S0002-9939-2010-10541-5",
+                "artifact_revision": "abc123",
+                "supports": False,
+            }
+        ]
+    )
+    claim = ledger["claims"][0]
+    assert isinstance(claim, dict)
+    claim["domain"] = "source"
+
+    assert validate_ledger(ledger) == []
+
+
+def test_worktree_bound_evidence_accepts_repo_relative_location() -> None:
+    ledger = refuted_code_ledger(
+        [
+            {
+                "kind": "mechanical",
+                "location": ".verification/results/run.json",
+                "artifact_revision": "abc123",
+                "supports": False,
+            }
+        ]
+    )
+
+    assert validate_ledger(ledger) == []
