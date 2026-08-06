@@ -83,6 +83,7 @@ class _DiagnosticSnapshotSpy(torch.nn.Module):
             "belief_cond_p95":        1.0,
             "belief_lam_min":         1.0,      # audit 2026-08-06 F16 raw spectrum extremes
             "belief_lam_max":         1.0,
+            "belief_cond_valid_frac": 1.0,      # ... and the validity flag for belief_cond_*
             "phi_norm_mean":          0.0,
             "phi_norm_std":           0.0,
             "guard_sigma_floor_frac": 0.0,

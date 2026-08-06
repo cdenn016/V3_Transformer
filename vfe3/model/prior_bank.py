@@ -61,6 +61,87 @@ from vfe3.numerics import (
 )
 
 
+# --- decode a_v working precision (audit 2026-08-06 F32) -------------------------------------
+# Every decode kernel needs
+#     a_v = sum_k [ (sq_k + (mc_q_k - mc_v_k)^2) / sigma_v_k ] + sum_k log sigma_v_k,
+# evaluated as mc_q^2 - 2 mc_q mc_v + mc_v^2 so the v-dependent part is a single (2K)-inner-product
+# GEMM over the vocabulary -- the reason the chunked kernels are cheap. F32 filed this as a
+# CANCELLATION defect in that expanded square and proposed differencing before squaring.
+#
+# MEASURED, and the attribution is wrong (K=20, V=64, uniform sigma_v, vs a float64 reference):
+#
+#   sigma_v   expanded fp32   exact fp32   expanded fp64   exact fp64
+#   4e+00        5.20e-06      4.49e-06        1.42e-14      0.00e+00
+#   1e-02        2.50e-03      1.52e-03        5.46e-12      0.00e+00
+#   1e-04        2.22e-01      1.26e-01        4.66e-10      0.00e+00
+#
+# Differencing before squaring buys a factor of ~1.8. Doing the SAME expanded algebra in float64
+# buys nine decades. So the defect is not the factorization, it is accumulating terms of size
+# 1/sigma_v (2e5 at sigma_v=1e-4, against fp32's ~7 significant digits) and then dividing the
+# result by 2*tau = 0.016. The exact form was implemented, measured, and dropped: a 1.8x accuracy
+# gain does not pay for giving up the GEMM and materializing a (B, N, Vc, K) transient per chunk.
+#
+# "fp64" therefore keeps the expanded algebra and raises the working precision, and the island must
+# extend THROUGH the logit -- a_v itself is large, so rounding it back to float32 before subtracting
+# per_pos and dividing by tau would throw the accuracy straight back away. Callers cast the finished
+# O(1) logit, not a_v. The severity is latent either way: sigma_log_embed trains freely against only
+# the eps=1e-6 floor, so this is harmless at init (2.4e-4 induced logit error) and about one order
+# of magnitude of shrinkage from material. Default "fp32" is bit-identical to every run on disk.
+_DECODE_AV_PRECISIONS = ("fp32", "fp64")
+_DECODE_AV_PRECISION: str = "fp32"
+
+
+def set_decode_av_precision(precision: str) -> str:
+    r"""Set the process-wide decode ``a_v`` working precision; returns the previous value."""
+    global _DECODE_AV_PRECISION
+    if precision not in _DECODE_AV_PRECISIONS:
+        raise ValueError(
+            f"decode_av_precision must be one of {_DECODE_AV_PRECISIONS}, got {precision!r}")
+    previous = _DECODE_AV_PRECISION
+    _DECODE_AV_PRECISION = precision
+    return previous
+
+
+def decode_av_precision() -> str:
+    r"""Return the active decode ``a_v`` working precision."""
+    return _DECODE_AV_PRECISION
+
+
+def _decode_av_lhs(
+    sq:   torch.Tensor,                   # (..., N, K) query variances
+    mc_q: torch.Tensor,                   # (..., N, K) centered query means
+) -> torch.Tensor:                        # (..., N, 2K)
+    r"""The v-independent left factor, hoisted out of the chunk loop."""
+    return torch.cat([sq + mc_q ** 2, -2.0 * mc_q], dim=-1)
+
+
+def _decode_av(
+    sq:    torch.Tensor,                  # (..., N, K) query variances (diag(Sigma_q) for the full family)
+    mc_q:  torch.Tensor,                  # (..., N, K) centered query means
+    mc_v:  torch.Tensor,                  # (Vc, K) centered prior means
+    inv_v: torch.Tensor,                  # (Vc, K) 1/sigma_v
+    lsum:  torch.Tensor,                  # (Vc,) sum_k log sigma_v
+
+    *,
+    lhs:   Optional[torch.Tensor] = None,  # (..., N, 2K) precomputed _decode_av_lhs (fp32 policy only)
+) -> torch.Tensor:                        # (..., N, Vc), float64 under the fp64 policy
+    r"""``a_v`` under the active working precision -- the ONE place this algebra is written.
+
+    Shared by all four decode kernels (diagonal/full x chunked-CE/logits) so the policy cannot apply
+    to some and not others, which would let the fused CE and the logits it is pinned against
+    disagree. Returns float64 under ``"fp64"`` ON PURPOSE: the caller must keep the island open
+    through ``-0.5 * (a_v - per_pos) / tau_eff`` and cast the finished logit, because a_v is the
+    large quantity and rounding it here would discard the entire gain. See the module note.
+    """
+    if _DECODE_AV_PRECISION == "fp64" and sq.dtype is not torch.float64:
+        return _decode_av(
+            sq.double(), mc_q.double(), mc_v.double(), inv_v.double(), lsum.double())
+    if lhs is None or lhs.dtype is not sq.dtype:
+        lhs = _decode_av_lhs(sq, mc_q)
+    rhs = torch.cat([inv_v, mc_v * inv_v], dim=-1)             # (Vc, 2K)
+    return lhs @ rhs.transpose(-1, -2) + (mc_v ** 2 * inv_v).sum(-1) + lsum
+
+
 # ---------------------------------------------------------------------------
 # Registries: mode name -> callable. Variants swap by config; add a variant by
 # writing-and-registering it, never by editing call sites.
@@ -852,6 +933,21 @@ class PriorBank(nn.Module):
         """
         return self.decode_mu_embed if self.untie_decode_bank else self._prior_mu_table()
 
+    @torch.no_grad()
+    def decode_sigma_v_min(self) -> float:
+        r"""The smallest decode prior variance in the table -- the margin behind ``a_v``'s accuracy.
+
+        ``a_v`` accumulates terms of size ``1/sigma_v`` and is then divided by ``2*tau``, so the
+        working precision has to carry roughly ``log10(1/(sigma_v * tau))`` digits before the logits
+        start moving (audit 2026-08-06 F32). This is the one number that says how much headroom is
+        left: at the ``sigma_init``-scale table the induced logit error is ~2e-4, at 1e-3 it is ~1.5
+        logits, and at 1e-4 ~12. ``sigma_log_embed`` trains freely against only the ``eps`` floor, so
+        the margin is not structurally bounded -- it has to be watched. Switch
+        ``decode_av_precision="fp64"`` if this falls far enough to matter.
+        """
+        return float(bounded_variance_from_log(
+            self._decode_sigma_log_table(), eps=self.eps).min())
+
     def _decode_sigma_log_table(self) -> torch.Tensor:
         r"""The (V, K) log-variance decode table; the sigma sibling of _decode_mu_table (see there).
 
@@ -1051,7 +1147,7 @@ class PriorBank(nn.Module):
         u_all = self._unigram_bias() if self.decode_unigram_prior else None  # (V,) kappa*log pi_v or None
 
         mc_q = mu_q - c                                                     # (B, N, K) centered query means
-        lhs = torch.cat([sigma_q + mc_q ** 2, -2.0 * mc_q], dim=-1)         # (B, N, 2K)
+        lhs = _decode_av_lhs(sigma_q, mc_q)                                 # (B, N, 2K) expanded-form left factor
         # Per-position, v-INDEPENDENT term of -KL/tau_eff: it cancels in the CE difference
         # (logsumexp - target_logit) but is carried so each chunk's logits equal _decode_diagonal's.
         per_pos = self.K + torch.log(sigma_q.clamp(min=self.eps)).sum(-1, keepdim=True)  # (B, N, 1)
@@ -1060,17 +1156,25 @@ class PriorBank(nn.Module):
                              mu_v_c:  torch.Tensor, inv_v_c:         torch.Tensor,
                              lsum_c:  torch.Tensor, in_chunk_f:      torch.Tensor,
                              local_idx: torch.Tensor,
-                             u_c:     Optional[torch.Tensor]) -> 'tuple[torch.Tensor, torch.Tensor]':
+                             u_c:     Optional[torch.Tensor],
+                             sq_:     torch.Tensor,
+                             mc_q_:   torch.Tensor) -> 'tuple[torch.Tensor, torch.Tensor]':
             r"""Reduce one vocab chunk to (lse_chunk, target_contrib), both (B, N), on the inside.
 
             logit_{i,v} = -0.5(a_v - per_pos)/tau_eff over the chunk (see _decode_diagonal). The
             full (B, N, Vc) chunk logit lives only here so checkpointing frees it after forward.
             ``in_chunk_f`` is a 0/1 (B, N) mask selecting positions whose target falls in this chunk.
+
+            ``sq_``/``mc_q_`` carry the UNEXPANDED query pieces alongside ``lhs_`` so the "exact"
+            a_v form can difference before squaring (audit 2026-08-06 F32); the default expanded
+            form uses ``lhs_`` and ignores them.
             """
-            rhs = torch.cat([inv_v_c, mu_v_c * inv_v_c], dim=-1)            # (Vc, 2K), mu_v_c already centered
-            a_v = lhs_ @ rhs.transpose(-1, -2)                             # (B, N, Vc)
-            a_v = a_v + (mu_v_c ** 2 * inv_v_c).sum(-1) + lsum_c            # + sum_k(mc_v^2/sigma_v + log sigma_v)
-            logit_chunk = -0.5 * (a_v - per_pos_) / tau_eff                # (B, N, Vc)
+            a_v = _decode_av(sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_)   # (B, N, Vc)
+            # Cast the FINISHED logit, not a_v (audit 2026-08-06 F32): under the fp64 policy a_v
+            # comes back float64 and the subtraction/division stay in the island, so only the O(1)
+            # result is rounded. Under the default fp32 policy every operand is already float32 and
+            # .to() is an identity no-op, so this line is byte-identical.
+            logit_chunk = (-0.5 * (a_v - per_pos_) / tau_eff).to(lhs_.dtype)   # (B, N, Vc)
             if u_c is not None:
                 logit_chunk = logit_chunk + u_c                            # unigram log-prior chunk slice
             lse_chunk = torch.logsumexp(logit_chunk, dim=-1)               # (B, N)
@@ -1100,11 +1204,12 @@ class PriorBank(nn.Module):
             if torch.is_grad_enabled() and lhs.requires_grad:
                 lse_chunk, contrib = _checkpoint.checkpoint(
                     _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, lsum_c, in_chunk_f, local_idx,
-                    u_c, use_reentrant=False,
+                    u_c, sigma_q, mc_q, use_reentrant=False,
                 )
             else:
                 lse_chunk, contrib = _chunk_summaries(
-                    lhs, per_pos, mc_v_c, inv_v_c, lsum_c, in_chunk_f, local_idx, u_c
+                    lhs, per_pos, mc_v_c, inv_v_c, lsum_c, in_chunk_f, local_idx, u_c,
+                    sigma_q, mc_q,
                 )
             lse_chunks.append(lse_chunk)
             target_logit = target_logit + contrib                          # exactly one chunk contributes per valid pos
@@ -1238,7 +1343,7 @@ class PriorBank(nn.Module):
 
         diag_sq, logdet_q, spd_ok = self._full_cov_query_invariants(sigma_q)  # (B,N,K), (B,N), (B,N)
         mc_q = mu_q - c                                                     # (B, N, K) centered query means
-        lhs = torch.cat([diag_sq + mc_q ** 2, -2.0 * mc_q], dim=-1)         # (B, N, 2K)
+        lhs = _decode_av_lhs(diag_sq, mc_q)                                 # (B, N, 2K) expanded-form left factor
         # v-INDEPENDENT term of -KL/tau_eff (cancels in the CE difference, carried so each chunk's
         # logits equal _decode_full's): K + log|Sigma_q| (the full-cov analogue of K + sum_k log sigma_q).
         per_pos = self.K + logdet_q.unsqueeze(-1)                          # (B, N, 1)
@@ -1247,18 +1352,25 @@ class PriorBank(nn.Module):
                              mu_v_c:  torch.Tensor, inv_v_c:         torch.Tensor,
                              lsum_c:  torch.Tensor, in_chunk_f:      torch.Tensor,
                              local_idx: torch.Tensor,
-                             u_c:     Optional[torch.Tensor]) -> 'tuple[torch.Tensor, torch.Tensor]':
+                             u_c:     Optional[torch.Tensor],
+                             sq_:     torch.Tensor,
+                             mc_q_:   torch.Tensor) -> 'tuple[torch.Tensor, torch.Tensor]':
             r"""Reduce one vocab chunk to (lse_chunk, target_contrib), both (B, N), on the inside.
 
             a_v = sum_k[(diag(Sigma_q) + (mc_q-mc_v)^2)/sigma_v] + sum_k log sigma_v
                 = trace_term + mahalanobis + log|diag(sigma_v)|, the gaussian_full KL with a
             diagonal prior; logit = -0.5(a_v - per_pos)/tau_eff. The (B, N, Vc) chunk logit lives
             only here so checkpointing frees it after forward.
+
+            ``sq_``/``mc_q_`` carry the UNEXPANDED query pieces alongside ``lhs_`` so the "exact"
+            a_v form can difference before squaring (audit 2026-08-06 F32).
             """
-            rhs = torch.cat([inv_v_c, mu_v_c * inv_v_c], dim=-1)            # (Vc, 2K), mu_v_c centered
-            a_v = lhs_ @ rhs.transpose(-1, -2)                             # (B, N, Vc)
-            a_v = a_v + (mu_v_c ** 2 * inv_v_c).sum(-1) + lsum_c            # + sum_k(mc_v^2/sigma_v + log sigma_v)
-            logit_chunk = -0.5 * (a_v - per_pos_) / tau_eff                # (B, N, Vc)
+            a_v = _decode_av(sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_)   # (B, N, Vc)
+            # Cast the FINISHED logit, not a_v (audit 2026-08-06 F32): under the fp64 policy a_v
+            # comes back float64 and the subtraction/division stay in the island, so only the O(1)
+            # result is rounded. Under the default fp32 policy every operand is already float32 and
+            # .to() is an identity no-op, so this line is byte-identical.
+            logit_chunk = (-0.5 * (a_v - per_pos_) / tau_eff).to(lhs_.dtype)   # (B, N, Vc)
             if u_c is not None:
                 logit_chunk = logit_chunk + u_c                            # unigram log-prior chunk slice
             lse_chunk = torch.logsumexp(logit_chunk, dim=-1)               # (B, N)
@@ -1289,11 +1401,12 @@ class PriorBank(nn.Module):
             if torch.is_grad_enabled() and lhs.requires_grad:
                 lse_chunk, contrib = _checkpoint.checkpoint(
                     _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, lsum_c, in_chunk_f, local_idx,
-                    u_c, use_reentrant=False,
+                    u_c, diag_sq, mc_q, use_reentrant=False,
                 )
             else:
                 lse_chunk, contrib = _chunk_summaries(
-                    lhs, per_pos, mc_v_c, inv_v_c, lsum_c, in_chunk_f, local_idx, u_c
+                    lhs, per_pos, mc_v_c, inv_v_c, lsum_c, in_chunk_f, local_idx, u_c,
+                    diag_sq, mc_q,
                 )
             lse_chunks.append(lse_chunk)
             target_logit = target_logit + contrib                          # exactly one chunk contributes per valid pos
@@ -1734,14 +1847,16 @@ def _decode_diagonal(
     mc_v = mu_v - c                                                     # (V, K) centered prior means
     mc_q = mu_q - c                                                     # (B, N, K) centered query means
 
-    lhs = torch.cat([sigma_q + mc_q ** 2, -2.0 * mc_q], dim=-1)          # (B, N, 2K)
-    rhs = torch.cat([inv_v, mc_v * inv_v], dim=-1)                       # (V, 2K)
-    a_v = lhs @ rhs.transpose(-1, -2)                                    # (B, N, V): sum_k[(sigma_q+mc_q^2-2 mc_q mc_v)/sigma_v]
-    a_v = a_v + (mc_v ** 2 * inv_v).sum(-1) + torch.log(sigma_v).sum(-1)  # + sum_k(mc_v^2/sigma_v + log sigma_v)
+    a_v = _decode_av(                                                    # (B, N, V)
+        sigma_q, mc_q, mc_v, inv_v, torch.log(sigma_v).sum(-1))
+    # == sum_k[(sigma_q + mc_q^2 - 2 mc_q mc_v)/sigma_v] + sum_k(mc_v^2/sigma_v + log sigma_v)
+    # under the default expanded form; see _decode_av for the "exact" alternative (F32).
     # a_v == sum_k(sigma_q/sigma_v + (mc_q-mc_v)^2/sigma_v) + sum_k log sigma_v
     #     == sum_k(sigma_q/sigma_v + (mu_q-mu_v)^2/sigma_v) + sum_k log sigma_v = 2 KL + K + sum_k log sigma_q
     per_pos = pb.K + torch.log(sigma_q.clamp(min=pb.eps)).sum(-1, keepdim=True)   # (B, N, 1) = K + sum_k log sigma_q
-    kl_v = (0.5 * (a_v - per_pos)).clamp(min=0.0)                        # (B, N, V); KL>=0 floor matches
+    # .to() after the clamp keeps the fp64 a_v island open through the subtraction (F32); it is an
+    # identity no-op under the default fp32 policy.
+    kl_v = (0.5 * (a_v - per_pos)).clamp(min=0.0).to(mu_q.dtype)         # (B, N, V); KL>=0 floor matches
     return -kl_v / tau_eff                                               # reference_decode's safe_kl_clamp (r2 id17)
 
 
@@ -1844,12 +1959,12 @@ def _decode_full_chunked(
     mc_v = mu_v - c                                                      # (V, K) centered prior means
     mc_q = mu_q - c                                                      # (B, N, K) centered query means
 
-    lhs = torch.cat([diag_sq + mc_q ** 2, -2.0 * mc_q], dim=-1)          # (B, N, 2K)
-    rhs = torch.cat([inv_v, mc_v * inv_v], dim=-1)                       # (V, 2K)
-    a_v = lhs @ rhs.transpose(-1, -2)                                    # (B, N, V): trace + mahalanobis core
-    a_v = a_v + (mc_v ** 2 * inv_v).sum(-1) + torch.log(sigma_v).sum(-1)  # + sum_k(mc_v^2/sigma_v + log sigma_v)
+    a_v = _decode_av(                                                    # (B, N, V) trace + mahalanobis
+        diag_sq, mc_q, mc_v, inv_v, torch.log(sigma_v).sum(-1))
     per_pos = pb.K + logdet_q.unsqueeze(-1)                              # (B, N, 1) = K + log|Sigma_q|
-    kl_v = (0.5 * (a_v - per_pos)).clamp(min=0.0)                        # (B, N, V); KL>=0 floor matches
+    # .to() after the clamp keeps the fp64 a_v island open through the subtraction (F32); it is an
+    # identity no-op under the default fp32 policy.
+    kl_v = (0.5 * (a_v - per_pos)).clamp(min=0.0).to(mu_q.dtype)         # (B, N, V); KL>=0 floor matches
     # A non-PD Sigma_q has no valid likelihood: emit an INFORMATIONLESS uniform row rather than a
     # score built on a placeholder log-det (audit 2026-08-06 F31). log_softmax of a uniform row is
     # -log V, finite; the all--inf row this used to produce maps to NaN. The CE seams exclude the

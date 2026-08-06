@@ -960,6 +960,7 @@ _VAL_DIAG_KEYS = (
     # held-out gauge / SPD / Fisher geometry (surfaced from the already-computed val diagnostics dict)
     "val_holonomy_wilson", "val_cocycle_residual", "val_gauge_invariant_spread",
     "val_fisher_trace_mean", "val_belief_cond_p95", "val_belief_lam_min", "val_belief_lam_max",
+    "val_belief_cond_valid_frac",
     "val_phi_norm_mean", "val_phi_norm_std",
     "val_phi_matrix_norm_p95", "val_phi_matrix_norm_p99", "val_phi_matrix_norm_max",
     "val_phi_exp_clamp_frac", "val_phi_exp_scale_min", "val_vertex_cond_p99",
@@ -1035,6 +1036,10 @@ def _val_diagnostics(
     # val_guard_sigma_floor_frac > 0 the condition number is lam_max/eps, a guard readout.
     out["val_belief_lam_min"]          = vd["belief_lam_min"]
     out["val_belief_lam_max"]          = vd["belief_lam_max"]
+    # ... and the validity flag on the same row, so val_belief_cond_p95 can be read without
+    # knowing that val_guard_sigma_floor_frac exists and is what invalidates it. 1.0 = the ratio
+    # is a belief property everywhere; anything less and that fraction of tokens reports lam_max/eps.
+    out["val_belief_cond_valid_frac"]  = vd["belief_cond_valid_frac"]
     out["val_phi_norm_mean"]           = vd["phi_norm_mean"]
     out["val_phi_norm_std"]            = vd["phi_norm_std"]
     for _source, _target in (
@@ -1742,6 +1747,20 @@ def train(
             )
 
         if do_eval:
+            # RNG ISOLATION (audit 2026-08-06 F30). Everything in this block that builds a DataLoader
+            # iterator -- ``evaluate`` below and ``_val_diagnostics`` further down -- draws a
+            # base_seed from the GLOBAL CPU RNG, and the TRAIN loader's RandomSampler draws every
+            # epoch permutation from that same stream (datasets.py:686-687). So without this, two
+            # runs with the same seed but different eval cadences see different data orders from the
+            # first epoch boundary onward, and eval_interval silently becomes a training
+            # hyperparameter. Sampling and figure generation are inside the guard for the same
+            # reason. The resume path already applies exactly this snapshot/restore (:1612).
+            #
+            # CPU only, matching that precedent: the permutation is a CPU draw, and reading the CUDA
+            # state costs a host sync per eval. INERT on every run currently on disk -- at
+            # max_steps=10000 on wikitext-103 the run covers 0.26 epochs, so no boundary is reached
+            # and no permutation is ever redrawn.
+            eval_cpu_rng = torch.get_rng_state().clone()
             if ema is not None:                          # eval / best-save / samples on the averaged weights
                 ema.store(model)
                 ema.copy_to(model)
@@ -1817,6 +1836,7 @@ def train(
                     validation_diagnostics = None
             if ema is not None:
                 ema.restore(model)                       # live SGD weights back before the next train_step
+            torch.set_rng_state(eval_cpu_rng)            # F30: hand the training stream back untouched
 
         # Periodic resumable checkpoint (opt-in; needs the artifacts dir and the optimizer state).
         if (artifacts is not None and cfg.checkpoint_interval
