@@ -2232,7 +2232,8 @@ def transport_covariance(
     *,
     retain_full_precision: bool = False,
 
-    diagonal_out: Optional[bool] = None,
+    diagonal_out:    Optional[bool]      = None,
+    marginal_blocks: Optional[List[int]] = None,
 ) -> torch.Tensor:
     r"""Sandwich action Sigma_t[i,j] = Omega_ij Sigma_j Omega_ij^T.
 
@@ -2280,6 +2281,17 @@ def transport_covariance(
     ``retain_full_precision=True`` keeps only a full-covariance sandwich in float64 after its
     existing float64 contraction. The default remains the source dtype, and every diagonal route
     ignores this opt-in so the default and compact hot paths remain unchanged.
+
+    ``marginal_blocks`` (audit 2026-08-05) is the irrep partition the CONSUMER will read as
+    head-diagonal marginals -- a promise about the downstream read, not a request for a different
+    object. It is honored ONLY on the compact-factored full-covariance route and ONLY when it
+    matches that transport's own equal-block partition exactly, in which case the cross-head output
+    blocks are provably unread and :func:`_compact_factored_full_covariance` skips them (H^2 -> H
+    block products). Every other route -- dense, factored, direct-link, and every diagonal sibling
+    -- ignores it, so an unrecognized partition silently falls back to the full congruence rather
+    than to a wrong answer. The head-diagonal blocks it does compute are the SAME algebra as the
+    full route (``Omega_h Sigma^(h,h) Omega_h^T``), equal up to float64 reassociation, so this is
+    exactness on the read region, not a bitwise identity.
     """
     if isinstance(omega, RopeTransport):
         if not omega.on_cov:
@@ -2288,6 +2300,7 @@ def transport_covariance(
                 sigma,
                 retain_full_precision=retain_full_precision,
                 diagonal_out=diagonal_out,
+                marginal_blocks=marginal_blocks,
             )   # mu-only
         folded = omega.score_operator()
         if folded is not None:                                # RIGHT: an ordinary coboundary
@@ -2296,6 +2309,7 @@ def transport_covariance(
                 sigma,
                 retain_full_precision=retain_full_precision,
                 diagonal_out=diagonal_out,
+                marginal_blocks=marginal_blocks,
             )
         if isinstance(omega.base, DirectLinkTransport):
             is_diag = _direct_link_is_diagonal(omega.base, sigma, diagonal_out)
@@ -2320,6 +2334,7 @@ def transport_covariance(
                 sigma,
                 retain_full_precision=retain_full_precision,
                 diagonal_out=is_diag,
+                marginal_blocks=marginal_blocks,
             )
         if isinstance(omega.base, CompactFactoredTransport):
             blocks = _equal_diag_blocks(
@@ -2338,6 +2353,7 @@ def transport_covariance(
                 sigma,
                 retain_full_precision=retain_full_precision,
                 diagonal_out=diagonal_out,
+                marginal_blocks=marginal_blocks,
             )
         # Other full-gauge bases use the established rotated dense operator.
         out = transport_covariance(
@@ -2345,6 +2361,7 @@ def transport_covariance(
             sigma,
             retain_full_precision=retain_full_precision,
             diagonal_out=diagonal_out,
+            marginal_blocks=marginal_blocks,
         )
         if isinstance(omega.base, FactoredTransport):
             is_diag = (
@@ -2368,7 +2385,9 @@ def transport_covariance(
             out = _compact_factored_diagonal_covariance(omega, sigma)
         else:
             sigma_work = sigma.double() if retain_full_precision else sigma
-            out = _compact_factored_full_covariance(omega, sigma_work)
+            out = _compact_factored_full_covariance(
+                omega, sigma_work,
+                blocks_only=_reads_only_head_marginals(omega, marginal_blocks))
         return _restore_certified_self_links_(
             out,
             sigma if is_diag or not retain_full_precision else sigma.double(),
@@ -2665,6 +2684,32 @@ def _compact_factored_diagonal_covariance(
                 exp_blocks=(factored.exp_blocks if factored.cond_escalation else None))
         out = out.clamp(min=0.0).to(sigma.dtype)
     return out.reshape(*out.shape[:-2], factored.K)
+
+
+def _reads_only_head_marginals(
+    factored:        CompactFactoredTransport,
+    marginal_blocks: Optional[List[int]],
+) -> bool:
+    r"""Is the consumer's declared read partition exactly this transport's own head partition?
+
+    The safety predicate for the ``blocks_only`` congruence (audit 2026-08-05). It must hold that
+    every coordinate the consumer reads lies INSIDE one head block, so that zeroing the cross-head
+    output blocks cannot change a value that is read. That is true iff the consumer's partition is
+    the transport's partition -- ``[block_dim] * n_blocks``.
+
+    A MISALIGNED partition is the failure this guards: ``irrep_dims=[4, 6]`` against a transport
+    with two 5-wide heads slices ``[0:4]`` and ``[4:10]``, and the second slice straddles the head
+    boundary at 5, so it reads the (0,1) and (1,0) cross-blocks the fast path zeroes. Fails closed
+    to the full congruence.
+
+    ``len < 2`` also fails closed, mirroring :func:`~vfe3.free_energy.pairwise_energy`, which for
+    ``irrep_dims`` None or a single block computes the FULL-K divergence and therefore reads every
+    off-block. (At ``n_blocks == 1`` the two routes coincide anyway, so nothing is lost.)
+    """
+    if marginal_blocks is None or len(marginal_blocks) < 2:
+        return False
+    return (len(marginal_blocks) == factored.n_blocks
+            and all(int(b) == factored.block_dim for b in marginal_blocks))
 
 
 def _compact_factored_full_covariance(

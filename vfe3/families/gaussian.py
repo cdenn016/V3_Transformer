@@ -575,13 +575,17 @@ class FullGaussian(BeliefParams):
         omega:      object,               # dense/factored/direct-link/RoPE transport container
 
         *,
-        diagonal_out: Optional[bool] = None,
+        diagonal_out:    Optional[bool]      = None,
+        marginal_blocks: Optional[List[int]] = None,
     ) -> torch.Tensor:
         r"""Retain the float64 full-covariance congruence through SPD factorization.
 
         A dense sandwich can be positive definite in float64 but indefinite after float32 storage.
         The public divergence retains the source-family dtype; only this transported covariance is
         kept in float64 until the FullGaussian KL/Renyi computation has consumed it.
+
+        This is the family the ``marginal_blocks`` promise pays off in -- the only one whose
+        transported dispersion is a full (K, K) congruence with cross-head blocks to skip.
         """
         from vfe3.geometry.transport import transport_covariance
         return transport_covariance(
@@ -589,6 +593,7 @@ class FullGaussian(BeliefParams):
             dispersion,
             retain_full_precision=True,
             diagonal_out=diagonal_out,
+            marginal_blocks=marginal_blocks,
         )
 
     @classmethod

@@ -346,7 +346,8 @@ class BeliefParams(ABC):
         omega:      object,               # dense/factored/direct-link/RoPE transport container
 
         *,
-        diagonal_out: Optional[bool] = None,
+        diagonal_out:    Optional[bool]      = None,
+        marginal_blocks: Optional[List[int]] = None,
     ) -> torch.Tensor:
         r"""Transport the family's dispersion parameter under ``omega``.
 
@@ -354,9 +355,16 @@ class BeliefParams(ABC):
         overrides this seam when its stored parameter has a different homogeneity degree. The lazy
         import avoids a module cycle while keeping family selection in the family registry rather
         than hard-coding family names into geometry or inference call sites.
+
+        ``marginal_blocks`` declares the irrep partition the CALLER will read as head-diagonal
+        marginals, letting a structured transport skip cross-head output blocks it can prove are
+        never read; see :func:`~vfe3.geometry.transport.transport_covariance`. It is a promise
+        about the read, so only a caller that owns the downstream consumption may set it.
         """
         from vfe3.geometry.transport import transport_covariance
-        return transport_covariance(omega, dispersion, diagonal_out=diagonal_out)
+        return transport_covariance(
+            omega, dispersion,
+            diagonal_out=diagonal_out, marginal_blocks=marginal_blocks)
 
     @classmethod
     def coupling_energy(
@@ -393,10 +401,21 @@ class BeliefParams(ABC):
 
         ``diagonal_out`` is forwarded to :meth:`transport_dispersion` verbatim so each call site keeps
         its established diagonal-vs-full resolution.
+
+        ``irrep_dims`` is ALSO forwarded as ``marginal_blocks`` (audit 2026-08-05). This seam is the
+        one place the promise is safe to make: the transported dispersion is a local that never
+        escapes, its single consumer is the ``pairwise_energy`` below, and with more than one irrep
+        block that consumer reads exactly ``block(h*d, (h+1)*d)`` per head and no off-block. A
+        structured transport may therefore skip the cross-head congruence blocks. Callers that
+        instead invoke :meth:`transport_dispersion` DIRECTLY (the gauge-equivariance certificate in
+        ``metrics``, the model's sandwich diagnostic) do not pass it and keep the full congruence,
+        which is why the promise lives here rather than inside the family or the geometry.
         """
         from vfe3.free_energy import pairwise_energy
         mu_t = cls.transport_location(mu_k, omega)
-        dispersion_t = cls.transport_dispersion(dispersion_k, omega, diagonal_out=diagonal_out)
+        dispersion_t = cls.transport_dispersion(
+            dispersion_k, omega,
+            diagonal_out=diagonal_out, marginal_blocks=irrep_dims)
         return pairwise_energy(
             cls(mu_q, dispersion_q),
             cls.from_transported(mu_t, dispersion_t, dispersion_k),
