@@ -584,6 +584,19 @@ class FullGaussian(BeliefParams):
         The public divergence retains the source-family dtype; only this transported covariance is
         kept in float64 until the FullGaussian KL/Renyi computation has consumed it.
 
+        Retention is keyed to whether the KL will ACTUALLY consume float64 (audit 2026-08-06 F2).
+        Under ``full_cov_kl_precision="fp32_escalate"`` :meth:`renyi_closed_form` immediately does
+        ``sigma_t.to(compute_dtype)`` with ``compute_dtype = float32``, so retaining produced a
+        float64 pairwise ``(B, N, N, K, K)`` tensor -- 629 MB at the live shape -- and rounded it
+        straight back. Keying off the policy drops that round trip.
+
+        BIT-IDENTICAL under both policies, and the reason is specific: every full-covariance
+        congruence in ``transport.py`` hard-codes float64 ARITHMETIC independently of this flag, so
+        the flag chooses only the OUTPUT dtype, and float32 -> float64 promotion is exact.
+        Round-early vs round-late measured 0/50 mismatches across the compact, blocks-only and dense
+        routes. (Do NOT instead key ``compute_dtype`` on ``other.sigma.dtype`` -- that silently
+        disables the ``full_cov_kl_precision`` knob entirely.)
+
         This is the family the ``marginal_blocks`` promise pays off in -- the only one whose
         transported dispersion is a full (K, K) congruence with cross-head blocks to skip.
         """
@@ -591,7 +604,7 @@ class FullGaussian(BeliefParams):
         return transport_covariance(
             omega,
             dispersion,
-            retain_full_precision=True,
+            retain_full_precision=(_FULL_COV_KL_PRECISION == "fp64"),
             diagonal_out=diagonal_out,
             marginal_blocks=marginal_blocks,
         )
