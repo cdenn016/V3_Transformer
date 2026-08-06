@@ -1036,9 +1036,16 @@ def _val_diagnostics(
     # to 0.96 per row, vs TV(forward, entry) == 0.000000, so every val_attn_* below was a statistic
     # of a post-hoc re-score rather than of the model). The converged/prior triple is still saved
     # separately under attention_estep/ for anyone who wants the comparison.
+    # NO snapshot here: a snapshot stores only the CONVERGED maps, so model.py:3281 rejects the
+    # pair outright (audit 2026-08-06 -- passing both raised ValueError at every single validation,
+    # and because _val_diagnostics is called under one try/except at :1710 that NaNs the whole
+    # _VAL_DIAG_KEYS set, it silently cost the free-energy decomposition, guard fractions, phi norms
+    # and E-step certificate too, not just the attention block). Entry scoring must be replayed
+    # from the model, exactly as the attention_estep/ figures at :1140 already do. The replay
+    # re-scores token_ids[:1], which IS diagnostic_tokens (val_tok[:1] at :982), so the sample is
+    # unchanged -- only the scoring point moves.
     amaps = model.attention_maps(                               # (L, H, N, N) all layers/heads
         diagnostic_tokens,
-        snapshot=snapshot,
         score_at="entry",
     )
     # Row-support filter (audit 2026-08-05): attention_entropy_rows floors beta at eps, so a

@@ -232,9 +232,12 @@ def test_model_diagnostics_dispatch_dispersion_transport_through_family(monkeypa
     original = family.transport_dispersion
     calls = []
 
-    def tracked(cls, dispersion, omega, *, diagonal_out=None):
+    # marginal_blocks: the coupling seam forwards its irrep_dims here (audit 2026-08-05), so the
+    # double has to accept it; laplace_diagonal ignores it, having no cross-head block to skip.
+    def tracked(cls, dispersion, omega, *, diagonal_out=None, marginal_blocks=None):
         calls.append((dispersion.shape, diagonal_out))
-        return original(dispersion, omega, diagonal_out=diagonal_out)
+        return original(dispersion, omega, diagonal_out=diagonal_out,
+                        marginal_blocks=marginal_blocks)
 
     monkeypatch.setattr(family, "transport_dispersion", classmethod(tracked))
     model = VFEModel(_tiny_config(family="laplace_diagonal", lambda_gamma=0.2))
