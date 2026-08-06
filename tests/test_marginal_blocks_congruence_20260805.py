@@ -74,30 +74,46 @@ def _energy(monkeypatch, *, irrep_dims, sigma, honor):
 
 def test_promise_propagates_from_coupling_energy_to_the_congruence(monkeypatch):
     r"""Without this the parity pins below would pass vacuously: they compare a fast route that
-    never fired against a full route, and agree because both are the full route."""
+    never fired against a full route, and agree because both are the full route.
+
+    Both seams are spied, because there are now two ways to honor the promise (audit 2026-08-06
+    B2): ``_compact_factored_full_covariance(blocks_only=True)`` computes the head blocks and then
+    scatters them into a dense zero tensor, while ``_compact_head_block_congruence`` -- reached
+    through ``transport_covariance_head_blocks`` -- returns them in the block layout and skips the
+    scatter. ``FullGaussian.coupling_energy`` takes the second; asserting on the FIRST alone is
+    exactly how this test went stale.
+    """
     import vfe3.geometry.transport as transport_mod
 
-    seen: list[bool] = []
-    real = transport_mod._compact_factored_full_covariance
+    fired: list[str] = []
+    real_dense = transport_mod._compact_factored_full_covariance
+    real_blocks = transport_mod._compact_head_block_congruence
 
-    def spy(factored, sigma, blocks_only=False):
-        seen.append(blocks_only)
-        return real(factored, sigma, blocks_only=blocks_only)
+    def dense_spy(factored, sigma, blocks_only=False):
+        fired.append("scatter" if blocks_only else "full")
+        return real_dense(factored, sigma, blocks_only=blocks_only)
 
-    monkeypatch.setattr(transport_mod, "_compact_factored_full_covariance", spy)
+    def blocks_spy(factored, sigma):
+        fired.append("head_blocks")
+        return real_blocks(factored, sigma)
+
+    monkeypatch.setattr(transport_mod, "_compact_factored_full_covariance", dense_spy)
+    monkeypatch.setattr(transport_mod, "_compact_head_block_congruence", blocks_spy)
     fam, sigma = get_family("gaussian_full"), _spd(3, block_diagonal=True)
 
     fam.coupling_energy(_mu(1), sigma, _mu(2), sigma, _omega(),
                         irrep_dims=[d] * H, **KW)
-    assert seen == [True], "per-head coupling_energy must reach the blocks-only congruence"
+    assert fired == ["head_blocks"], (
+        "per-head coupling_energy must reach the head-block congruence, and must NOT also build "
+        "the dense congruence")
 
-    seen.clear()
+    fired.clear()
     fam.coupling_energy(_mu(1), sigma, _mu(2), sigma, _omega(), irrep_dims=None, **KW)
-    assert seen == [False], "full-K coupling_energy reads off-blocks and must not fire it"
+    assert fired == ["full"], "full-K coupling_energy reads off-blocks and must not fire it"
 
-    seen.clear()
+    fired.clear()
     fam.transport_dispersion(sigma, _omega(), diagonal_out=False)
-    assert seen == [False], "a direct transport_dispersion caller makes no promise"
+    assert fired == ["full"], "a direct transport_dispersion caller makes no promise"
 
 
 # -- (a) the promise is honored, on both covariance structures --------------------------------

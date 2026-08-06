@@ -324,10 +324,19 @@ def test_full_chunked_ce_grad_reaches_prior_tables():
 
 
 def test_full_cov_chunked_matches_dense_on_non_pd():
-    """F6 (audit 2026-07-01): a non-PD Sigma_q position must yield -inf logits on BOTH the dense
-    full decode (gaussian_full ok-gating -> NaN -> kl_max=inf -> -inf) and the chunked closed form
-    (safe_cholesky ok mask -> logdet_q = -inf -> per_pos = -inf); PD positions agree to atol-1e-3.
-    Pre-fix the chunked path dropped the ok mask and returned finite-but-wrong logits there."""
+    """F6 (audit 2026-07-01), RESTATED for the F31 exclusion contract (audit 2026-08-06).
+
+    The original pin was that a non-PD Sigma_q position yields -inf logits on BOTH the dense full
+    decode (gaussian_full ok-gating -> NaN -> kl_max=inf -> -inf) and the chunked closed form
+    (safe_cholesky ok mask -> logdet_q = -inf -> per_pos = -inf). That contract was itself the NaN
+    generator it was supposed to guard: log_softmax of an all--inf row is NaN on both paths, so one
+    degenerate position NaN'd the whole batch's scalar CE.
+
+    The contract is now EXCLUSION, and it still has to hold on both paths together: a position with
+    no valid likelihood contributes an informationless UNIFORM logit row (finite; log_softmax gives
+    -log V) and is dropped from the cross-entropy outright. What F6 exists to prevent -- the two
+    paths silently disagreeing about a degenerate position -- is unchanged and still pinned here.
+    PD positions agree to atol-1e-3 exactly as before."""
     from vfe3.model.prior_bank import _decode_full, _decode_full_chunked
     torch.manual_seed(6)
     V, B, N, K = 32, 2, 4, 4
@@ -339,11 +348,22 @@ def test_full_cov_chunked_matches_dense_on_non_pd():
     tau_eff = pb._tau_eff(None)
     dense = _decode_full(pb, mu_q, sigma_q, tau_eff)                    # (B, N, V)
     chunked = _decode_full_chunked(pb, mu_q, sigma_q, tau_eff)          # (B, N, V)
-    assert torch.isneginf(dense[0, 1]).all()
-    assert torch.isneginf(chunked[0, 1]).all()
+
+    for name, out in (("dense", dense), ("chunked", chunked)):
+        assert torch.isfinite(out[0, 1]).all(), f"{name}: degenerate row must be finite"
+        assert torch.equal(out[0, 1], torch.zeros_like(out[0, 1])), (
+            f"{name}: degenerate row must be uniform (informationless), not a placeholder score")
+        assert torch.isfinite(torch.log_softmax(out[0, 1], dim=-1)).all(), (
+            f"{name}: the row that used to be all--inf must no longer be NaN under log_softmax")
+    # the two paths agree on the degenerate position, which is what F6 is for
+    assert torch.equal(dense[0, 1], chunked[0, 1])
+    # and the dense branch's CE consumer is told to drop exactly that position
+    assert pb.decode_degenerate_positions(sigma_q)[0, 1]
+
     good = torch.ones(B, N, dtype=torch.bool)
     good[0, 1] = False
     assert torch.allclose(chunked[good], dense[good], atol=1e-3)
+    assert pb.decode_degenerate_positions(sigma_q)[good].sum() == 0
 
 
 def test_full_cov_query_invariants_all_pd_byte_identical():
@@ -356,9 +376,9 @@ def test_full_cov_query_invariants_all_pd_byte_identical():
     pb = _full_model(vocab_size=V, decode_mode="full").prior_bank
     A = torch.randn(B, N, K, K)
     sigma_q = A @ A.transpose(-1, -2) + torch.eye(K)
-    diag_sq, logdet_q = pb._full_cov_query_invariants(sigma_q)
+    diag_sq, logdet_q, spd_ok = pb._full_cov_query_invariants(sigma_q)
     L, ok = safe_cholesky(sigma_q, eps=pb.eps, rounds=5)
-    assert bool(ok.all())
+    assert bool(ok.all()) and bool(spd_ok.all())
     assert torch.equal(logdet_q, _logdet_chol(L))
     assert torch.isfinite(logdet_q).all()
     assert torch.equal(diag_sq, torch.diagonal(sigma_q, dim1=-2, dim2=-1))

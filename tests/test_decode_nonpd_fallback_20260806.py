@@ -7,17 +7,24 @@ target is not in this chunk. With an -inf logit that is ``-inf * 0.0`` = NaN, so
 position poisoned ``target_logit`` through chunks it has no business contributing to. A mask must
 not manufacture NaN under any contract; it is now a select, byte-identical for finite logits.
 
-**NOT fixed, by design.** ``logdet_q = -inf`` on a total Cholesky failure is a PINNED cross-path
-parity contract (``test_full_cov_chunked_matches_dense_on_non_pd``, audit 2026-07-01 F6): the dense
-and chunked paths must agree that a degenerate position scores -inf. But an all--inf logit row is
-NaN downstream on BOTH paths -- ``log_softmax`` of it is NaN, and the chunked
-``logsumexp_v - target_logit`` is ``-inf - (-inf)``. Making that finite changes what a degenerate
-position should SCORE and would have to move both paths together, so it is a decision, not a patch.
-The event is counted instead, so a run can at least tell it happened.
+**Also fixed, as a decision.** ``logdet_q = -inf`` on a total Cholesky failure used to be a PINNED
+cross-path parity contract (``test_full_cov_chunked_matches_dense_on_non_pd``, audit 2026-07-01 F6):
+the dense and chunked paths had to agree that a degenerate position scores -inf. That contract was
+itself the NaN generator -- an all--inf logit row is NaN under ``log_softmax`` on BOTH paths, and the
+chunked ``logsumexp_v - target_logit`` is ``-inf - (-inf)``.
 
-Pins: (a) the mask no longer manufactures NaN; (b) the -inf parity contract still holds; (c) the
-NaN-CE consequence is real on both paths, recorded so a future change is deliberate; (d) the event
-is counted; (e) the healthy path is untouched.
+The resolution is EXCLUSION rather than a different sentinel: a position whose ``Sigma_q`` is not
+positive definite has no valid likelihood, so it contributes nothing and leaves the denominator, and
+the loss of tokens is visible through ``decode_logdet_fallback_elements``. Any finite sentinel would
+have worked numerically -- ``per_pos`` is v-independent and cancels exactly -- but a sentinel
+fabricates a score, and ``log V`` in particular reads as a plausible loss. Both paths moved
+together: the fused kernels fold the mask into ``valid``, and the dense branch asks
+``decode_degenerate_positions`` and marks the position ``ignore_index``. The F6 pin is restated in
+terms of the exclusion, not deleted.
+
+Pins: (a) the mask no longer manufactures NaN; (b) the degenerate row is finite, uniform, and
+NaN-free under log_softmax; (c) the fused CE excludes the position from BOTH numerator and
+denominator; (d) the event is counted; (e) the healthy path is untouched.
 """
 
 import pytest
@@ -77,25 +84,53 @@ def test_finite_logits_are_byte_identical_under_the_select():
         torch.where(in_chunk_f > 0, gathered, torch.zeros_like(gathered)))
 
 
-# -- (b)/(c) the -inf contract stands, and its consequence is recorded -------------------------
+# -- (b) the degenerate row is finite and informationless, on both paths -----------------------
 
 
-def test_non_pd_still_scores_neg_inf_on_both_paths():
-    r"""The F6 parity contract. If this ever changes, it must change on BOTH paths together."""
+def test_degenerate_row_is_uniform_and_finite_on_both_paths():
+    r"""The restated F6 parity contract. If this ever changes, it must change on BOTH paths."""
     model, bank = _bank()
     mu, sigma, _ = _inputs(model, non_pd_at=(0, 2))
     tau = bank._tau_eff(None)
     dense = prior_bank._decode_full(bank, mu, sigma, tau)
-    assert torch.isneginf(dense[0, 2]).all()
+    chunked = prior_bank._decode_full_chunked(bank, mu, sigma, tau)
+    for name, out in (("dense", dense), ("chunked", chunked)):
+        assert torch.isfinite(out[0, 2]).all(), name
+        assert torch.equal(out[0, 2], torch.zeros_like(out[0, 2])), name
+    assert torch.equal(dense[0, 2], chunked[0, 2])
 
 
-def test_all_neg_inf_row_is_nan_downstream_on_the_dense_path():
-    r"""Records WHY F31 is still open: the pinned -inf contract is itself NaN-generating, so
-    'fix the sentinel' is not a local change."""
+def test_the_old_neg_inf_row_no_longer_nans_under_log_softmax():
+    r"""The exact failure the -inf sentinel produced, now closed on the path that used to show it."""
     model, bank = _bank()
     mu, sigma, _ = _inputs(model, non_pd_at=(0, 2))
     dense = prior_bank._decode_full(bank, mu, sigma, bank._tau_eff(None))
-    assert torch.isnan(torch.log_softmax(dense[0, 2], dim=-1)).all()
+    assert torch.isfinite(torch.log_softmax(dense[0, 2], dim=-1)).all()
+
+
+# -- (c) the fused CE excludes the position from numerator AND denominator ---------------------
+
+
+def test_fused_ce_excludes_the_degenerate_position():
+    r"""Exclusion, not scoring: the CE must equal the CE of the same batch with that position
+    already marked ignore_index, and must not be NaN."""
+    model, bank = _bank()
+    mu, sigma, targets = _inputs(model, non_pd_at=(0, 2))
+    got = bank.decode_ce_full_chunked(mu, sigma, targets)
+    masked = targets.clone()
+    masked[0, 2] = -100
+    reference = bank.decode_ce_full_chunked(mu, sigma, masked)
+    assert torch.isfinite(got)
+    assert torch.equal(got, reference)
+
+
+def test_degenerate_position_leaves_the_denominator():
+    r"""The token count really drops -- otherwise 'excluded' would just mean 'scored zero'."""
+    model, bank = _bank()
+    mu, sigma, targets = _inputs(model, non_pd_at=(0, 2))
+    degenerate = bank.decode_degenerate_positions(sigma)
+    assert degenerate is not None and int(degenerate.sum()) == 1 and bool(degenerate[0, 2])
+    assert bank.decode_degenerate_positions(torch.rand(2, 5, model.cfg.embed_dim)) is None
 
 
 # -- (d)/(e) the event is counted, and the healthy path is untouched ---------------------------

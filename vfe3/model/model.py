@@ -1610,8 +1610,20 @@ class VFEModel(nn.Module):
                 logits = self.prior_bank.decode(mu_final.float(), sigma_final.float())   # (B, N, V) fp32
             # targets is guaranteed not None here (the inference path returned via forward_beliefs above).
             with self._amp_off_context(token_ids.device):
+                # A position whose Sigma_q is not PD has no valid likelihood and is EXCLUDED, exactly
+                # as the fused chunked kernels exclude it (audit 2026-08-06 F31). The dense branch
+                # cannot see that from the logits alone -- the decode emits an informationless
+                # uniform row there -- so it asks the bank and marks the position ignore_index, which
+                # drops it from both F.cross_entropy's sum and the n_valid denominator below. None on
+                # every diagonal decode, where there is no factorization to fail.
+                ce_targets = targets
+                if self.cfg.use_prior_bank:
+                    degenerate = self.prior_bank.decode_degenerate_positions(sigma_final.float())
+                    if degenerate is not None:
+                        ce_targets = torch.where(
+                            degenerate, targets.new_full((), -100), targets)
                 flat_logits = logits.reshape(-1, self.cfg.vocab_size).float()
-                flat_targets = targets.reshape(-1)
+                flat_targets = ce_targets.reshape(-1)
                 # Branchless masked mean (no host sync to test .any()): sum-reduced CE over the
                 # non-ignored tokens divided by a device-side clamped count. An all-ignore microbatch
                 # gives 0/1 = a finite grad-connected 0; F.cross_entropy's default mean would be

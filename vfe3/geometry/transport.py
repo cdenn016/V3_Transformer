@@ -2783,6 +2783,125 @@ def _reads_only_head_marginals(
             and all(int(b) == factored.block_dim for b in marginal_blocks))
 
 
+def _head_diagonal_blocks(
+    matrix:    torch.Tensor,              # (..., K, K) with K == n_blocks * block_dim
+    n_blocks:  int,
+    block_dim: int,
+) -> torch.Tensor:                        # (..., n_blocks, block_dim, block_dim)
+    r"""The ``H`` head-DIAGONAL ``(d, d)`` sub-blocks of a ``(K, K)`` matrix.
+
+    ``torch.diagonal`` appends the diagonal axis last, so it is moved back into the head slot.
+    """
+    blocked = matrix.reshape(*matrix.shape[:-2], n_blocks, block_dim, n_blocks, block_dim)
+    return torch.diagonal(blocked, dim1=-4, dim2=-2).movedim(-1, -3)
+
+
+def _compact_head_block_congruence(
+    factored: CompactFactoredTransport,
+    sigma:    torch.Tensor,               # (..., N, K, K) full SPD covariances
+) -> torch.Tensor:                        # (..., N, N, H, d, d) head-diagonal congruence blocks
+    r"""``Omega_h Sigma^(h,h) Omega_h^T`` for each head, in the BLOCK layout, never densified.
+
+    This is the arithmetic that :func:`_compact_factored_full_covariance`'s ``blocks_only`` branch
+    performs; that branch then scatters the result into a dense ``(K, K)`` zero tensor, of which
+    half is structurally zero and never read. Callers that consume only head marginals can take the
+    blocks directly through :func:`transport_covariance_head_blocks` and skip the round trip.
+    """
+    H, d = factored.n_blocks, factored.block_dim
+    work = _congruence_compute_dtype(sigma.dtype)          # fp64 by default; see the policy above
+    omega_blocks = _compact_pair_blocks(factored).to(work)
+    sigma_diag = _head_diagonal_blocks(sigma, H, d)                # (..., N, H, d, d)
+    out = torch.einsum(                                            # (..., Ni, Nj, H, d, d)
+        "...ijhkl,...jhlm,...ijhnm->...ijhkn",
+        omega_blocks, sigma_diag.to(work), omega_blocks)
+    out = _escalate_congruence_if_nonfinite(
+        out, work,
+        lambda hi: torch.einsum("...ijhkl,...jhlm,...ijhnm->...ijhkn",
+                                omega_blocks.to(hi), sigma_diag.to(hi), omega_blocks.to(hi)))
+    return out.to(sigma.dtype)
+
+
+def _resolve_compact_for_head_blocks(
+    omega: object,
+) -> Optional[CompactFactoredTransport]:
+    r"""Unwrap ``omega`` to the ``CompactFactoredTransport`` its congruence actually runs on.
+
+    Mirrors :func:`transport_covariance`'s own container dispatch for exactly the routes that reach
+    the compact full-covariance branch, and returns ``None`` for every other container so the caller
+    falls back to the dense route rather than to a different answer. The RoPE-on-covariance case
+    rebuilds the same rotated container that :func:`transport_covariance` builds, INCLUDING its
+    same-frame-flat-cocycle certification, so the self-link restore downstream sees what it would
+    have seen on the dense route.
+    """
+    if isinstance(omega, RopeTransport):
+        if not omega.on_cov:
+            return _resolve_compact_for_head_blocks(omega.base)    # mu-only; covariance untouched
+        folded = omega.score_operator()
+        if folded is not None:                                     # RIGHT: an ordinary coboundary
+            return _resolve_compact_for_head_blocks(folded)
+        if isinstance(omega.base, CompactFactoredTransport):
+            blocks = _equal_diag_blocks(
+                omega.rope, omega.base.n_blocks, omega.base.block_dim)
+            return CompactFactoredTransport(
+                torch.einsum("...nhkl,...nhlm->...nhkm", blocks, omega.base.exp_blocks),
+                torch.einsum("...nhkl,...nhml->...nhkm", omega.base.inv_blocks, blocks),
+                omega.base.K,
+                mean_per_head=omega.base.mean_per_head,
+                same_frame_flat_cocycle=_certifies_same_frame_flat_cocycle(omega),
+                cond_escalation=omega.base.cond_escalation)
+        return None
+    if isinstance(omega, CompactFactoredTransport):
+        return omega
+    return None
+
+
+def transport_covariance_head_blocks(
+    omega: object,                        # dense/factored/direct-link/RoPE transport container
+    sigma: torch.Tensor,                  # (..., N, K, K) full SPD covariances
+
+    *,
+    retain_full_precision: bool                = False,
+    diagonal_out:          Optional[bool]      = None,
+    marginal_blocks:       Optional[List[int]] = None,
+) -> Optional[torch.Tensor]:              # (..., N, N, H, d, d), or None when not applicable
+    r"""The head-diagonal congruence blocks, or ``None`` when this transport cannot supply them.
+
+    The block-layout twin of :func:`transport_covariance` for a consumer that reads ONLY head
+    marginals (audit 2026-08-06 B2/F14). ``transport_covariance`` must return a dense
+    ``(..., N, N, K, K)`` because that is what every one of its callers is typed against, so its
+    ``blocks_only`` fast path pays a ``new_zeros`` + scatter to get back into that layout -- at
+    B=48, N=64, H=2, d=10 a 629 MB allocation, half of it structurally zero, which the consumer then
+    slices apart again. This entry point hands the ``(..., N, N, H, d, d)`` blocks over directly.
+
+    ``None`` means "not applicable, use :func:`transport_covariance`" and is returned BEFORE any
+    arithmetic, so probing costs nothing. The conditions are the same ones the dense route uses to
+    choose ``blocks_only``: a container that resolves to a ``CompactFactoredTransport``, a
+    full-covariance (not diagonal) ``sigma``, and a ``marginal_blocks`` partition equal to the
+    transport's own -- see :func:`_reads_only_head_marginals` for why that predicate is what makes
+    skipping the cross-head blocks sound.
+
+    EQUAL ON THE READ REGION, not bitwise equal as a tensor: the head-diagonal blocks are the same
+    arithmetic on the same operands as the dense route computes, but the cross-head blocks the dense
+    route materializes as zeros (and, at ``i == j`` under a certified cocycle, as the source's own
+    cross-head entries) are simply absent here. That is the whole point, and it is sound only
+    because the caller has promised not to read them.
+    """
+    factored = _resolve_compact_for_head_blocks(omega)
+    if factored is None or not _reads_only_head_marginals(factored, marginal_blocks):
+        return None
+    is_diag = (sigma.dim() == factored.exp_blocks.dim() - 2
+               if diagonal_out is None else diagonal_out)
+    if is_diag:
+        return None
+    sigma_work = sigma.double() if retain_full_precision else sigma
+    return _restore_certified_self_links_(
+        _compact_head_block_congruence(factored, sigma_work),
+        _head_diagonal_blocks(sigma_work, factored.n_blocks, factored.block_dim),
+        factored,
+        event_ndim=3,                     # (H, d, d) is one element's trailing shape here
+    )
+
+
 def _compact_factored_full_covariance(
     factored:    CompactFactoredTransport,
     sigma:       torch.Tensor,            # (..., N, K, K) full SPD covariances
@@ -2811,25 +2930,19 @@ def _compact_factored_full_covariance(
     ``_reads_only_head_marginals`` and is airtight.
     """
     H, d = factored.n_blocks, factored.block_dim
-    sigma_blocks = sigma.reshape(*sigma.shape[:-3], sigma.shape[-3], H, d, H, d)
-    work = _congruence_compute_dtype(sigma.dtype)          # fp64 by default; see the policy above
-    omega_blocks = _compact_pair_blocks(factored).to(work)
     if blocks_only:
-        # sigma_blocks is (..., N, H_row, d, H_col, d); take the H_row == H_col diagonal. torch
-        # .diagonal appends the diagonal axis last, so move it back into the head slot.
-        sigma_diag = torch.diagonal(                              # (..., N, H, d, d)
-            sigma_blocks, dim1=-4, dim2=-2).movedim(-1, -3)
-        diag_out = torch.einsum(                                  # (..., Ni, Nj, H, d, d)
-            "...ijhkl,...jhlm,...ijhnm->...ijhkn",
-            omega_blocks, sigma_diag.to(work), omega_blocks)
-        diag_out = _escalate_congruence_if_nonfinite(
-            diag_out, work,
-            lambda hi: torch.einsum("...ijhkl,...jhlm,...ijhnm->...ijhkn",
-                                    omega_blocks.to(hi), sigma_diag.to(hi), omega_blocks.to(hi)))
+        # The head-diagonal congruence itself lives in _compact_head_block_congruence so that
+        # transport_covariance_head_blocks can return it WITHOUT this scatter (audit 2026-08-06 B2).
+        # Casting to sigma.dtype before the scatter rather than after is exact: the scatter is pure
+        # data movement and an exact zero is an exact zero in either dtype.
+        diag_out = _compact_head_block_congruence(factored, sigma)  # (..., Ni, Nj, H, d, d)
         out = diag_out.new_zeros((*diag_out.shape[:-3], H, d, H, d))
         for h in range(H):                                        # H is the head count (2 here)
             out[..., h, :, h, :] = diag_out[..., h, :, :]
-        return out.reshape(*out.shape[:-4], factored.K, factored.K).to(sigma.dtype)
+        return out.reshape(*out.shape[:-4], factored.K, factored.K)
+    sigma_blocks = sigma.reshape(*sigma.shape[:-3], sigma.shape[-3], H, d, H, d)
+    work = _congruence_compute_dtype(sigma.dtype)          # fp64 by default; see the policy above
+    omega_blocks = _compact_pair_blocks(factored).to(work)
     out = torch.einsum(
         "...ijhkl,...jhlgm,...ijgnm->...ijhkgn",
         omega_blocks, sigma_blocks.to(work), omega_blocks)
