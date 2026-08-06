@@ -51,6 +51,10 @@ from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artif
 from vfe3.runtime import seed_everything
 from vfe3.timing import TrainingTimer
 from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM   # single source for the phi-clamp threshold (M2)
+from vfe3.geometry.retraction import (                          # SPD-retraction non-finite tangent guard
+    nonfinite_tangent_elements,
+    reset_nonfinite_tangent_elements,
+)
 
 
 _PHI_CLAMP_WARNED:   bool = False
@@ -1528,6 +1532,9 @@ def train(
     # gradient and still never moved -- the case no existing check covers.
     motion_known_dead: Tuple[str, ...] = ()
     motion_dead_captured = False
+    skipped_steps = 0                 # cumulative REJECTED optimizer updates (audit 2026-08-06 F5)
+    consecutive_skips = 0
+    reset_nonfinite_tangent_elements()   # per-run accounting for the SPD-retraction guard
 
     def _step_indices() -> Iterable[int]:
         if not show_bar:
@@ -1644,6 +1651,28 @@ def train(
         # Gradient reachability, read off the first step that actually updated: grads are still live
         # here (train_step zeroes on entry). Gated on did_step because the nonfinite-grad path drops
         # them, which would read as "every parameter is dead" and mute the whole end-of-run check.
+        # Cumulative accepted/rejected accounting (audit 2026-08-06 F5). step_skipped is written
+        # per-row but only on LOGGING steps, and summary.json reports cfg.max_steps -- the CONFIGURED
+        # value, never the realized one. A real run
+        # (832.33_wikitext-103_K30_block_glk_s6) accepted 453 updates of 60000 over 11.4 hours and
+        # published a normal-looking summary; the live arms lose 0.2%-4.5% ARM-DEPENDENTLY, so arms
+        # of one sweep are compared at different effective budgets and different points on the LR
+        # schedule (the scheduler clocks on accepted updates). Free: status_out["did_step"] is
+        # already returned every step.
+        if step_status["did_step"]:
+            consecutive_skips = 0
+        else:
+            skipped_steps += 1
+            consecutive_skips += 1
+            if skipped_steps == 1:
+                logger.warning(
+                    "step %d: optimizer update REJECTED (non-finite gradient or AMP scale "
+                    "reduction). The LR scheduler clocks on accepted updates, so skips shorten the "
+                    "realized schedule; accepted_updates is reported in summary.json.", step + 1)
+            elif consecutive_skips > 10 and consecutive_skips % 10 == 0:
+                logger.warning(
+                    "step %d: %d CONSECUTIVE rejected updates (%d of %d total so far)",
+                    step + 1, consecutive_skips, skipped_steps, step + 1)
         if motion_snapshot is not None and not motion_dead_captured and step_status["did_step"]:
             motion_known_dead = tuple(name for name, p in model.named_parameters()
                                       if p.requires_grad and p.grad is None)
@@ -2045,6 +2074,27 @@ def train(
         elif logger is not None:
             logger.info(" parameter motion: all %d trainable parameters moved",
                         sum(1 for m in motion["motion"].values() if m["requires_grad"]))
+    # Realized-vs-configured update accounting (audit 2026-08-06 F5), handed to finalize_run through
+    # the artifacts object because train() returns only `losses`. summary.json's "n_steps" is
+    # cfg.max_steps -- what was ASKED for. These say what actually happened, so an arm that quietly
+    # trained on 95% of its budget is visible instead of being compared as if it had the full one.
+    attempted = int(n_steps - start_step)
+    if artifacts is not None:
+        neutralized = nonfinite_tangent_elements()
+        artifacts.realized_updates = {
+            "attempted_steps":      attempted,
+            "accepted_updates":     int(attempted - skipped_steps),
+            "skipped_steps":        int(skipped_steps),
+            "accepted_update_frac": (float(attempted - skipped_steps) / attempted
+                                     if attempted else float("nan")),
+            "nonfinite_tangent_elements": int(neutralized),
+        }
+        if skipped_steps or neutralized:
+            logger.warning(
+                " realized budget: %d/%d optimizer updates accepted (%.3f%%); "
+                "%d SPD tangent element(s) neutralized as non-finite",
+                attempted - skipped_steps, attempted,
+                100.0 * (attempted - skipped_steps) / max(attempted, 1), neutralized)
     if ema is not None:
         ema.copy_to(model)                               # the trained model IS the averaged weights
     return losses
