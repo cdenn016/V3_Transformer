@@ -930,7 +930,8 @@ _VAL_DIAG_KEYS = (
     "val_self_coupling", "val_self_divergence", "val_belief_coupling", "val_attention_entropy",
     "val_inner_alignment_energy_total",
     "val_attn_entropy", "val_effective_rank", "val_belief_cond_median", "val_attn_entropy_min",
-    "val_attn_entropy_min_all", "val_attn_collapsed_heads", "val_future_leakage", "val_row_sum_error",
+    "val_attn_entropy_min_all", "val_attn_entropy_min_norm",
+    "val_attn_collapsed_heads", "val_future_leakage", "val_row_sum_error",
     "val_pos_content_r2", "val_prev_token_mass", "val_period_match_mass", "val_head_redundancy_js",
     "estep_f_drop", "estep_f_nondecreasing_frac", "estep_r_mu_last", "estep_r_sigma_last",
     "estep_r_phi_last", "estep_fp_kl", "estep_fp_mu_rms", "estep_fp_sigma_rms",
@@ -1054,14 +1055,21 @@ def _val_diagnostics(
     # (1.740754e-09 = 63*1e-12*ln(1e-12)) and val_attn_collapsed_heads pinned at n_heads, so the
     # collapsed-head alarm could never fire. model.py already applies this filter for the
     # val_attn_entropy_min twin; these two were missed.
+    # The collapse test is scored on entropy NORMALIZED by each row's own ceiling ln(support_i)
+    # (audit 2026-08-06 F22). A fixed ln 2 threshold is exactly the ceiling of the first two-key row,
+    # so the strict `<` was decided by float noise -- measured 2 of 2 heads flagged on an untrained
+    # model whose attention is as uniform as the causal mask permits. See metrics.attention_head_collapse.
     ent_rows = M.attention_entropy_rows(amaps)                  # (L, H, N)
     scorable = (amaps > 0.0).sum(dim=-1) >= 2                   # rows with >=2 admissible keys
     hmin = ent_rows.masked_fill(~scorable, float("inf")).min(dim=-1).values   # (L, H)
     finite_hmin = hmin[torch.isfinite(hmin)]
     out["val_attn_entropy_min_all"] = (float(finite_hmin.min()) if finite_hmin.numel()
                                        else float("nan"))
-    out["val_attn_collapsed_heads"] = float(
-        (finite_hmin < 0.6931471805599453).float().sum())
+    worst_norm, collapsed = M.attention_head_collapse(amaps)    # (L, H) each
+    finite_norm = worst_norm[torch.isfinite(worst_norm)]
+    out["val_attn_entropy_min_norm"] = (float(finite_norm.min()) if finite_norm.numel()
+                                        else float("nan"))
+    out["val_attn_collapsed_heads"] = float(collapsed.float().sum())
     cs = M.causal_sanity(amaps)
     out["val_future_leakage"] = float(cs["future_leakage"].max())   # soft causal prior can leak silently
     out["val_row_sum_error"]  = float(cs["row_sum_error"].max())

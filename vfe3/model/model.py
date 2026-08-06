@@ -3203,15 +3203,24 @@ class VFEModel(nn.Module):
         # structurally constant, not a head-collapse signal, and were logged and plotted as one.
         # Row i admits i+1 keys under a causal mask (i under no-self), so the first row that can
         # carry entropy is the first with at least two admissible keys.
+        # A row admitting s_i keys cannot exceed ln(s_i) nats, so the collapse test is scored on the
+        # NORMALIZED entropy H_i / ln(s_i) (audit 2026-08-06 F22): against a fixed ln 2 the first
+        # two-key row sits ON the threshold and float noise decided the alarm, flagging every head
+        # on essentially every step. ``attn_entropy_min`` keeps its raw-nats meaning so runs already
+        # on disk stay comparable; ``attn_entropy_min_norm`` is the commensurate twin.
         row_support = (beta > 0.0).sum(dim=-1)                       # (..., N) admissible keys per row
         scorable = row_support >= 2                                  # rows a min-entropy probe can see
         if bool(scorable.any()):
             masked = ent_rows.masked_fill(~scorable, float("inf"))
             head_min = masked.min(dim=-1).values if masked.dim() >= 2 else masked.min().reshape(1)
+            worst_norm, collapsed = metrics.attention_head_collapse(beta)
             d["attn_entropy_min"]             = float(head_min.min())
-            d["attn_entropy_collapsed_heads"] = float((head_min < _LOG2).float().sum())
+            d["attn_entropy_min_norm"]        = float(torch.nan_to_num(
+                worst_norm, nan=float("inf")).min())
+            d["attn_entropy_collapsed_heads"] = float(collapsed.float().sum())
         else:                                                        # N == 1, or a fully one-hot map
             d["attn_entropy_min"]             = float("nan")
+            d["attn_entropy_min_norm"]        = float("nan")
             d["attn_entropy_collapsed_heads"] = float("nan")
 
         # Registry-owned transport order parameters (conditional columns, mirroring lambda_beta).

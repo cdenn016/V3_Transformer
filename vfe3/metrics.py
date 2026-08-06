@@ -817,6 +817,47 @@ def attention_entropy_rows(
     return -(b * torch.log(b)).sum(dim=-1)
 
 
+COLLAPSE_ENTROPY_FRACTION: float = 0.5   # a head is "collapsed" below half its achievable entropy
+
+
+def attention_head_collapse(
+    beta: torch.Tensor,                  # (..., N, N) row-stochastic attention weights
+
+    *,
+    eps:      float = 1e-12,
+    fraction: float = COLLAPSE_ENTROPY_FRACTION,
+) -> Tuple[torch.Tensor, torch.Tensor]:  # (..., ) min normalized row entropy, (...) collapsed flag
+    r"""Per-head minimum row entropy as a FRACTION of that row's achievable maximum.
+
+    Row ``i`` of a causal map admits only ``s_i`` keys, so its entropy CANNOT exceed ``ln s_i``.
+    Comparing a raw row entropy against a fixed threshold therefore measures the mask, not the head:
+    under ``causal_alibi_noself`` the first scorable row admits exactly two keys, so its ceiling
+    **is** ``ln 2`` -- the very threshold the previous test used -- and the strict ``<`` fired on
+    float noise. Measured on an untrained model whose attention is as uniform as the mask permits:
+    row entropies ``0.693146884`` and ``0.693145990`` against ``ln 2 = 0.693147181``, i.e. margins
+    of 3e-7 and 1e-6, flagging 2 of 2 heads as collapsed (audit 2026-08-06 F22). The 2026-07-27 and
+    2026-08-05 fixes moved that pin from row 0 to the first two-key row rather than removing it.
+
+    Normalizing by ``ln s_i`` makes every scorable row commensurate: 1.0 is the most uniform the
+    mask allows and 0.0 is one-hot, so a threshold expresses "this head uses less than ``fraction``
+    of the entropy available to it" at any row width. Rows with fewer than two admissible keys carry
+    no entropy at all and are excluded rather than scored as collapsed.
+
+    Returns ``(min_normalized_entropy, collapsed)`` with the row axis reduced. A leading axis with
+    no scorable row at all yields NaN and False, so ``N == 1`` and fully one-hot maps abstain
+    instead of raising a false alarm.
+    """
+    support = (beta > 0.0).sum(dim=-1)                       # (..., N) admissible keys per row
+    scorable = support >= 2
+    rows = attention_entropy_rows(beta, eps=eps)             # (..., N) raw nats
+    ceiling = torch.log(support.clamp(min=2).to(rows.dtype))
+    normalized = (rows / ceiling).masked_fill(~scorable, float("inf"))
+    worst = normalized.min(dim=-1).values                    # (...) per head/layer
+    has_scorable = scorable.any(dim=-1)
+    worst = torch.where(has_scorable, worst, torch.full_like(worst, float("nan")))
+    return worst, (worst < fraction) & has_scorable
+
+
 def _ols_slope(
     y: torch.Tensor,                     # (..., M) response sampled at x = 0..M-1
 ) -> torch.Tensor:                       # (...) least-squares slope over the last axis
