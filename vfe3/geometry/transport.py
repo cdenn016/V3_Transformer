@@ -1399,6 +1399,72 @@ def _direct_link_dense_bytes(batch: int, n_tok: int, k: int, dtype: torch.dtype)
 # diverge (audit 2026-07-06 M2).
 TRANSPORT_CLAMP_MAX_NORM: float = 20.0
 
+# --- full-covariance CONGRUENCE precision policy (audit 2026-08-06 C1/F3) --------------------
+# The full-covariance sandwich Omega Sigma Omega^T hard-coded ``.double()`` at every site with no
+# dtype parameter, no module global and no autocast guard -- unlike the KL (full_cov_kl_precision)
+# and unlike the diagonal sibling's ``_escalate_if_negative``, this stage had no policy at all.
+# It is the largest stage in the step at the live shape: the blocks_only einsum is
+# 2*2*B*N^2*H*d^3 = 1.573 GFLOP of float64 over ~1.57 GB, arithmetic intensity 0.83 FLOP/byte, on
+# a card whose float64 rate is ~1/64 of float32.
+#
+# "fp64": the historical unconditional float64 island -- THE DEFAULT, so every run on disk stays
+#         bit-reproducible and nothing changes until the user opts in.
+# "fp32_escalate": contract in float32 and recompute in float64 only for a batch whose float32
+#         result lost finiteness. The congruence SQUARES cond(Omega), so this is a real accuracy
+#         trade at high ||phi||; the downstream KL's safe_cholesky already owns non-PD robustness,
+#         which is why the escalation trigger here is finiteness rather than an SPD test (an SPD
+#         test would need a Cholesky over the whole (B*N*N, K, K) grid and cost more than it saves).
+_FULL_COV_CONGRUENCE_PRECISIONS = ("fp64", "fp32_escalate")
+_FULL_COV_CONGRUENCE_PRECISION: str = "fp64"
+
+
+def set_full_cov_congruence_precision(policy: str) -> str:
+    r"""Set the process-wide full-covariance congruence precision; returns the previous value."""
+    global _FULL_COV_CONGRUENCE_PRECISION
+    if policy not in _FULL_COV_CONGRUENCE_PRECISIONS:
+        raise ValueError(
+            f"full_cov_congruence_precision must be one of {_FULL_COV_CONGRUENCE_PRECISIONS}, "
+            f"got {policy!r}")
+    previous = _FULL_COV_CONGRUENCE_PRECISION
+    _FULL_COV_CONGRUENCE_PRECISION = policy
+    return previous
+
+
+def full_cov_congruence_precision() -> str:
+    r"""Return the active full-covariance congruence precision policy."""
+    return _FULL_COV_CONGRUENCE_PRECISION
+
+
+def _escalate_congruence_if_nonfinite(
+    out:     torch.Tensor,               # contraction result at the working dtype
+    work:    torch.dtype,                # the dtype it was contracted in
+    recompute: "Callable[[torch.dtype], torch.Tensor]",
+) -> torch.Tensor:
+    r"""Redo a float32 congruence in float64 when it lost finiteness; inert on the float64 policy.
+
+    The congruence SQUARES cond(Omega), so a float32 contraction can overflow where a float64 one
+    would not. Non-PD-ness is deliberately NOT the trigger: the downstream KL's ``safe_cholesky``
+    already owns that, and an SPD test here would need a Cholesky over the whole (B*N*N, K, K) grid
+    -- more expensive than the contraction it guards. On the default "fp64" policy this returns
+    immediately without a sync, so the historical path is untouched.
+    """
+    if work is torch.float64:
+        return out
+    if bool(torch.isfinite(out).all()):
+        return out
+    return recompute(torch.float64).to(work)
+
+
+def _congruence_compute_dtype(source_dtype: torch.dtype) -> torch.dtype:
+    r"""Working dtype for a full-covariance congruence under the active policy.
+
+    A float64 SOURCE always contracts in float64 regardless of policy -- the policy governs only
+    whether a float32 source is promoted, which is what the historical island did unconditionally.
+    """
+    if _FULL_COV_CONGRUENCE_PRECISION == "fp64" or source_dtype == torch.float64:
+        return torch.float64
+    return torch.float32
+
 # Process-wide "the exponential clamp has fired at least once" latch (audit 2026-07-25 F2). The clamp
 # returns a surrogate operator rather than exp(M), so its first occurrence is reported even when the
 # per-build clamp_monitor is off; the latch keeps the default path from paying a host sync forever.
@@ -2451,8 +2517,13 @@ def transport_covariance(
     # or use a compact group / diagonal family there. Reached only on the full-covariance path
     # (family='gaussian_full'); the diagonal default above and the compact (orthogonal Omega, cond=1)
     # groups are untouched, so the hot path is unchanged.
+    work = _congruence_compute_dtype(sigma.dtype)          # fp64 by default; see the policy above
     out = torch.einsum("...ijkl,...jlm,...ijnm->...ijkn",
-                       omega.double(), sigma.double(), omega.double())
+                       omega.to(work), sigma.to(work), omega.to(work))
+    out = _escalate_congruence_if_nonfinite(
+        out, work,
+        lambda hi: torch.einsum("...ijkl,...jlm,...ijnm->...ijkn",
+                                omega.to(hi), sigma.to(hi), omega.to(hi)))
     return out if retain_full_precision else out.to(sigma.dtype)
 
 
@@ -2741,7 +2812,8 @@ def _compact_factored_full_covariance(
     """
     H, d = factored.n_blocks, factored.block_dim
     sigma_blocks = sigma.reshape(*sigma.shape[:-3], sigma.shape[-3], H, d, H, d)
-    omega_blocks = _compact_pair_blocks(factored).double()
+    work = _congruence_compute_dtype(sigma.dtype)          # fp64 by default; see the policy above
+    omega_blocks = _compact_pair_blocks(factored).to(work)
     if blocks_only:
         # sigma_blocks is (..., N, H_row, d, H_col, d); take the H_row == H_col diagonal. torch
         # .diagonal appends the diagonal axis last, so move it back into the head slot.
@@ -2749,14 +2821,22 @@ def _compact_factored_full_covariance(
             sigma_blocks, dim1=-4, dim2=-2).movedim(-1, -3)
         diag_out = torch.einsum(                                  # (..., Ni, Nj, H, d, d)
             "...ijhkl,...jhlm,...ijhnm->...ijhkn",
-            omega_blocks, sigma_diag.double(), omega_blocks)
+            omega_blocks, sigma_diag.to(work), omega_blocks)
+        diag_out = _escalate_congruence_if_nonfinite(
+            diag_out, work,
+            lambda hi: torch.einsum("...ijhkl,...jhlm,...ijhnm->...ijhkn",
+                                    omega_blocks.to(hi), sigma_diag.to(hi), omega_blocks.to(hi)))
         out = diag_out.new_zeros((*diag_out.shape[:-3], H, d, H, d))
         for h in range(H):                                        # H is the head count (2 here)
             out[..., h, :, h, :] = diag_out[..., h, :, :]
         return out.reshape(*out.shape[:-4], factored.K, factored.K).to(sigma.dtype)
     out = torch.einsum(
         "...ijhkl,...jhlgm,...ijgnm->...ijhkgn",
-        omega_blocks, sigma_blocks.double(), omega_blocks)
+        omega_blocks, sigma_blocks.to(work), omega_blocks)
+    out = _escalate_congruence_if_nonfinite(
+        out, work,
+        lambda hi: torch.einsum("...ijhkl,...jhlgm,...ijgnm->...ijhkgn",
+                                omega_blocks.to(hi), sigma_blocks.to(hi), omega_blocks.to(hi)))
     return out.reshape(*out.shape[:-4], factored.K, factored.K).to(sigma.dtype)
 
 

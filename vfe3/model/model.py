@@ -64,6 +64,7 @@ from vfe3.model.prior_bank import (
 from vfe3.model.stack import vfe_stack
 from vfe3.families.base import get_family
 from vfe3.families.gaussian import set_full_cov_kl_precision
+from vfe3.geometry.transport import set_full_cov_congruence_precision
 
 
 # Transport-mode state-routing sets: which regimes' Omega builders read mu/sigma. Sourced from the
@@ -240,6 +241,8 @@ class VFEModel(nn.Module):
         # policy makes that desynchronisation structurally impossible. Default "fp64" keeps every
         # caller byte-identical to the pre-policy build.
         set_full_cov_kl_precision(cfg.full_cov_kl_precision)
+        # Same one-place-set rule for the congruence that feeds it (audit 2026-08-06 C1).
+        set_full_cov_congruence_precision(cfg.full_cov_congruence_precision)
         self._transport_status = {"regime_ii_covariant_feature_exact": True}
         self.group = build_group(cfg)
         # ALiBi-family priors carry a per-head (n_heads, N, N) axis, while the energy's head axis

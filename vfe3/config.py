@@ -861,6 +861,17 @@ class VFE3Config:
     # 4e-6 on real trained matrices. A float64 PUBLIC family still computes in float64 either way.
     full_cov_kl_precision:     str   = "fp64"        # "fp64" | "fp32_escalate"
 
+    # Working precision of the full-covariance CONGRUENCE Omega Sigma Omega^T (audit 2026-08-06
+    # C1/F3). Distinct from full_cov_kl_precision above: that governs the pair DIVERGENCE, this
+    # governs the transport sandwich that feeds it, which had no policy at all and hard-coded
+    # float64 at every site. At the live shape it is the largest stage in the step -- 1.573 GFLOP
+    # of float64 over ~1.57 GB, 0.83 FLOP/byte, on a card whose float64 rate is ~1/64 of float32.
+    # "fp64" is the historical island and THE DEFAULT, so every run on disk stays bit-reproducible.
+    # "fp32_escalate" contracts in float32 and redoes a batch in float64 only if the float32 result
+    # lost finiteness; the congruence SQUARES cond(Omega), so it is a real accuracy trade at high
+    # ||phi||. A float64 SOURCE contracts in float64 under either setting.
+    full_cov_congruence_precision: str = "fp64"      # "fp64" | "fp32_escalate"
+
     # Working precision of the FULL-covariance pair KL (family="gaussian_full" only; the diagonal
     # family already keys its island on operand dtypes). "fp64" is the historical unconditional
     # float64 island and the default, so leaving this alone is byte-identical to the pre-2026-08-05
@@ -2226,6 +2237,10 @@ class VFE3Config:
             raise ValueError(
                 "full_cov_kl_precision must be one of ('fp64', 'fp32_escalate'), "
                 f"got {self.full_cov_kl_precision!r}")
+        if self.full_cov_congruence_precision not in ("fp64", "fp32_escalate"):
+            raise ValueError(
+                "full_cov_congruence_precision must be one of ('fp64', 'fp32_escalate'), "
+                f"got {self.full_cov_congruence_precision!r}")
         # Full-covariance KL working precision (audit 2026-08-05). Validated here rather than left
         # to the family so an unreachable spelling fails at construction, not mid-forward.
         # FAIL CLOSED rather than falling back. The right insertion folds R into the VERTEX frame, so
