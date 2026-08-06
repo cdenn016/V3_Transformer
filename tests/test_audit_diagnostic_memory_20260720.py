@@ -37,6 +37,7 @@ class _DiagnosticSnapshotSpy(torch.nn.Module):
         self.forward_calls = 0
         self.build_shapes: list[tuple[int, ...]] = []
         self.consumer_calls: list[tuple[str, tuple[int, ...], object]] = []
+        self.attention_score_points: list[str] = []
 
     def forward_beliefs(
         self,
@@ -93,8 +94,13 @@ class _DiagnosticSnapshotSpy(torch.nn.Module):
         token_ids: torch.Tensor,
 
         *,
-        snapshot: object,
+        snapshot: object = None,
+        score_at:  str    = "converged",
     ) -> torch.Tensor:
+        # snapshot is OPTIONAL and score_at is accepted (audit 2026-08-06): the metrics arm scores
+        # at "entry", which a snapshot cannot serve -- it stores only the converged maps -- so that
+        # arm replays with snapshot=None. The figure arm still passes the shared snapshot.
+        self.attention_score_points.append(score_at)
         self.consumer_calls.append(("attention_maps", tuple(token_ids.shape), snapshot))
         length = int(token_ids.shape[1])
         return torch.full(
@@ -205,7 +211,22 @@ def test_val_diagnostics_slices_first_sequence_before_snapshot_decode(
         "e_step_fixed_point",
     }
     assert all(shape == (1, _ACTIVE_SEQUENCE_LENGTH) for _, shape, _ in model.consumer_calls)
-    assert all(snapshot is snapshots[0] for _, _, snapshot in model.consumer_calls)
+    # The memory contract this file exists to pin is "ONE snapshot per eval", asserted by
+    # build_shapes/len(snapshots)/forward_calls above -- and it still holds. What changed (audit
+    # 2026-08-06) is that the attention arm scores at "entry", which no snapshot can serve, so it
+    # replays with snapshot=None instead of reading the stored converged maps. Every OTHER consumer
+    # still shares the one snapshot, and no consumer builds a second one.
+    assert model.attention_score_points == ["entry"]
+    assert all(
+        snapshot is snapshots[0]
+        for name, _, snapshot in model.consumer_calls
+        if name != "attention_maps"
+    )
+    assert all(
+        snapshot is None
+        for name, _, snapshot in model.consumer_calls
+        if name == "attention_maps"
+    )
     expected_first_row_ce = torch.log(torch.exp(torch.tensor(4.0)) + 7.0) - 4.0
     assert result.metrics["pos_loss_first_q"] == pytest.approx(float(expected_first_row_ce), abs=1e-6)
     assert result.metrics["pos_loss_last_q"] == pytest.approx(float(expected_first_row_ce), abs=1e-6)
@@ -258,10 +279,18 @@ def test_periodic_eval_reuses_one_held_out_snapshot_for_metrics_and_maps(
             consumers.append(("diagnostics", tokens.detach().clone(), snapshot))
         return real_diagnostics(tokens, snapshot=snapshot)
 
-    def attention_maps(tokens: torch.Tensor, *, snapshot: object | None = None) -> torch.Tensor:
+    def attention_maps(
+        tokens: torch.Tensor,
+
+        *,
+        snapshot: object | None = None,
+        score_at: str = "converged",
+    ) -> torch.Tensor:
+        # Only the snapshot-bearing FIGURE call is a "consumer" of the shared snapshot; the metrics
+        # arm now replays at score_at="entry" with no snapshot (audit 2026-08-06).
         if snapshot is not None:
             consumers.append(("attention_maps", tokens.detach().clone(), snapshot))
-        return real_attention_maps(tokens, snapshot=snapshot)
+        return real_attention_maps(tokens, snapshot=snapshot, score_at=score_at)
 
     def gamma_attention_maps(tokens: torch.Tensor, *, snapshot: object | None = None) -> object:
         if snapshot is not None:
