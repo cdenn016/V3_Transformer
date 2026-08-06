@@ -398,7 +398,11 @@ def test_periodic_eval_releases_snapshot_before_next_training_step(
         _model: object,
         _loader: object,
         _device: torch.device,
-    ) -> ValidationDiagnostics:
+
+        *,
+        batches: int = 1,      # audit 2026-08-06 F6; the caller now passes it, and the train loop's
+    ) -> ValidationDiagnostics:   # best-effort except would otherwise swallow the TypeError as NaNs
+        del batches
         snapshot = _SnapshotProbe()
         snapshot_refs.append(weakref.ref(snapshot))
         return ValidationDiagnostics({}, val_tokens[:1], snapshot)  # type: ignore[arg-type]

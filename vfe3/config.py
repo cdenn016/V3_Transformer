@@ -910,6 +910,18 @@ class VFE3Config:
     # material; watch decode_sigma_v_min. Default "fp32" is bit-identical to every run on disk.
     decode_av_precision: str = "fp32"     # "fp32" | "fp64"
 
+    # How many validation batches the held-out val_* probes average over (audit 2026-08-06 F6).
+    # At 1 -- the historical value, and bit-identical -- EVERY val_* column is a statistic of one
+    # fixed 64-token sequence: _val_diagnostics takes next(iter(val_loader)) then [:1], the loader is
+    # shuffle=False, and the sampler is sequential, so the same sequence is scored at every eval of
+    # every run. It shows up in the artifacts as guard fractions that are exact multiples of 1/1280
+    # (K*N) and 1/8192 (H*N^2), which only holds at B=1. That is a sample size of one standing behind
+    # every held-out number the project reports, including estep_f_nondecreasing_frac, which at
+    # n_e_steps=1 is a single Bernoulli draw (see estep_f_comparisons). Raising this costs one extra
+    # held-out forward per batch per eval and is the cheapest way to make the val_* columns mean what
+    # they appear to mean; the attention FIGURES still come from the first sequence either way.
+    val_diagnostic_batches: int = 1
+
     # Working precision of the FULL-covariance pair KL (family="gaussian_full" only; the diagonal
     # family already keys its island on operand dtypes). "fp64" is the historical unconditional
     # float64 island and the default, so leaving this alone is byte-identical to the pre-2026-08-05
@@ -2289,6 +2301,12 @@ class VFE3Config:
             raise ValueError(
                 "mu_trust_cholesky_rounds must be a nonnegative int, got "
                 f"{self.mu_trust_cholesky_rounds!r}")
+        if (not isinstance(self.val_diagnostic_batches, int)
+                or isinstance(self.val_diagnostic_batches, bool)
+                or self.val_diagnostic_batches < 1):
+            raise ValueError(
+                "val_diagnostic_batches must be an int >= 1, got "
+                f"{self.val_diagnostic_batches!r}")
         if self.decode_av_precision not in ("fp32", "fp64"):
             raise ValueError(
                 "decode_av_precision must be one of ('fp32', 'fp64'), "
