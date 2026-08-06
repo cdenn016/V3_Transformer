@@ -63,6 +63,7 @@ from vfe3.model.prior_bank import (
 )
 from vfe3.model.stack import vfe_stack
 from vfe3.families.base import get_family
+from vfe3.families.gaussian import set_full_cov_kl_precision
 
 
 # Transport-mode state-routing sets: which regimes' Omega builders read mu/sigma. Sourced from the
@@ -232,6 +233,13 @@ class VFEModel(nn.Module):
         # before model + loader are built), NOT here: seeding inside __init__ would clobber a
         # caller-set RNG state (e.g. a test that seeds then constructs several models).
         self.cfg = cfg
+        # Publish the full-covariance KL precision policy (audit 2026-08-05). This is the SINGLE
+        # place the policy is set: `coupling_energy` has 15 call sites, and a per-call-site kwarg
+        # is how `_transport_to_float` silently lost `cond_escalation` -- one path computing the
+        # gradient at a different precision than the path reporting the objective. A process-wide
+        # policy makes that desynchronisation structurally impossible. Default "fp64" keeps every
+        # caller byte-identical to the pre-policy build.
+        set_full_cov_kl_precision(cfg.full_cov_kl_precision)
         self._transport_status = {"regime_ii_covariant_feature_exact": True}
         self.group = build_group(cfg)
         # ALiBi-family priors carry a per-head (n_heads, N, N) axis, while the energy's head axis

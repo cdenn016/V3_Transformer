@@ -29,6 +29,74 @@ def _full_gaussian_public_dtype(*dtypes: torch.dtype) -> torch.dtype:
     return torch.float64 if torch.float64 in dtypes else torch.float32
 
 
+# --- full-covariance KL precision policy (audit 2026-08-05) --------------------------------
+# "fp64": the historical unconditional float64 island -- the default, so every existing caller,
+#         test, and viz path is byte-identical to the pre-policy build.
+# "fp32_escalate": evaluate the pair grid in float32 and recompute in float64 only when a
+#         Cholesky actually fails. Measured 15.7x faster on the live (B,N,N,K,K) grid, with
+#         attention weights moving by at most 4.0e-6 at the trained operating point.
+# Process-global by design: see the note in FullGaussian.renyi_closed_form. It is set in exactly
+# one place (VFEModel.__init__) so no two consumers of coupling_energy can disagree.
+_FULL_COV_KL_PRECISIONS = ("fp64", "fp32_escalate")
+_FULL_COV_KL_PRECISION: str = "fp64"
+
+
+def set_full_cov_kl_precision(policy: str) -> str:
+    r"""Set the process-wide full-covariance KL precision policy; returns the previous value."""
+    global _FULL_COV_KL_PRECISION
+    if policy not in _FULL_COV_KL_PRECISIONS:
+        raise ValueError(
+            f"full_cov_kl_precision must be one of {_FULL_COV_KL_PRECISIONS}, got {policy!r}")
+    previous = _FULL_COV_KL_PRECISION
+    _FULL_COV_KL_PRECISION = policy
+    return previous
+
+
+def full_cov_kl_precision() -> str:
+    r"""Return the active full-covariance KL precision policy."""
+    return _FULL_COV_KL_PRECISION
+
+
+def _full_cov_kl_compute_dtype(result_dtype: torch.dtype) -> torch.dtype:
+    r"""Working dtype for the full-covariance KL under the active policy.
+
+    A float64 PUBLIC family always computes in float64 regardless of policy -- the policy only
+    governs whether a float32 family is promoted, which is what the historical island did."""
+    if _FULL_COV_KL_PRECISION == "fp64" or result_dtype == torch.float64:
+        return torch.float64
+    return torch.float32
+
+
+def _full_gaussian_kl_terms(
+    mu_q:    torch.Tensor,             # (..., K) query means
+    sigma_q: torch.Tensor,             # (..., K, K) query covariances
+    mu_t:    torch.Tensor,             # (..., K) transported key means
+    sigma_t: torch.Tensor,             # (..., K, K) transported key covariances
+    K:       int,
+    eps:     float,
+) -> Tuple[torch.Tensor, torch.Tensor]:   # (unclamped KL (...), ok mask (...))
+    r"""Exact full-covariance KL(q||t) and its per-element factorization mask.
+
+    Lifted verbatim out of ``FullGaussian.renyi_closed_form``'s alpha==1 branch so the float64
+    escalation can re-evaluate the identical arithmetic at a higher precision rather than
+    duplicating it (audit 2026-08-05). Every operand must already share one dtype.
+    """
+    L_p, ok_p = safe_cholesky(sigma_t, eps=eps, rounds=5)
+    L_q, ok_q = safe_cholesky(sigma_q, eps=eps, rounds=5)
+    Y = torch.linalg.solve_triangular(L_p, sigma_q, upper=False)
+    Z = torch.linalg.solve_triangular(L_p.transpose(-1, -2), Y, upper=True)
+    trace_term = torch.diagonal(Z, dim1=-2, dim2=-1).sum(dim=-1)
+    delta_mu = mu_t - mu_q
+    v = torch.linalg.solve_triangular(
+        L_p, delta_mu.unsqueeze(-1), upper=False
+    ).squeeze(-1)
+    mahal_term = (v ** 2).sum(dim=-1)
+    logdet_p = _logdet_chol(L_p)
+    logdet_q = _logdet_chol(L_q)
+    div = 0.5 * (trace_term + mahal_term - K + logdet_p - logdet_q)
+    return div, ok_p & ok_q
+
+
 def diag_kl_unclamped(
     mu_q:    torch.Tensor,             # (..., N, K) query means
     sigma_q: torch.Tensor,             # (..., N, K) query variances
@@ -600,7 +668,17 @@ class FullGaussian(BeliefParams):
         result_dtype = (torch.float64
                         if torch.float64 in (self._public_dtype, other._public_dtype)
                         else torch.float32)
-        compute_dtype = torch.float64
+        # Precision policy (audit 2026-08-05). Historically this was an unconditional
+        # `compute_dtype = torch.float64` -- unlike the `result_dtype` line directly above it and
+        # unlike DiagonalGaussian.renyi_closed_form, which keys on its operand dtypes. On the live
+        # gaussian_full pair grid that meant every cholesky / solve_triangular / logdet ran in
+        # float64, measured at 15.7x the float32 cost on a consumer GPU whose float64 throughput is
+        # heavily reduced. The policy is process-global ON PURPOSE: `coupling_energy` has 15 call
+        # sites (oracle, phi objective, reported F, gamma coupling, viz), and threading a kwarg
+        # through them invites exactly the desynchronisation that lost `cond_escalation` in
+        # `_transport_to_float` -- a gradient computed at one precision against an objective
+        # reported at another. One policy, one read site, no way for two paths to disagree.
+        compute_dtype = _full_cov_kl_compute_dtype(result_dtype)
         mu_q = self.mu.to(compute_dtype)
         sigma_q = self.sigma.to(compute_dtype)
         mu_t = other.mu.to(compute_dtype)
@@ -619,20 +697,17 @@ class FullGaussian(BeliefParams):
             # This matches the robustness the alpha != 1 branch already has. Round 0 adds zero
             # jitter, so valid-SPD inputs stay byte-identical to torch.linalg.cholesky; an element
             # that fails every round -> NaN -> safe_kl_clamp -> kl_max (mirroring that branch).
-            L_p, ok_p = safe_cholesky(sigma_t, eps=eps, rounds=5)
-            L_q, ok_q = safe_cholesky(sigma_q, eps=eps, rounds=5)
-            Y = torch.linalg.solve_triangular(L_p, sigma_q, upper=False)
-            Z = torch.linalg.solve_triangular(L_p.transpose(-1, -2), Y, upper=True)
-            trace_term = torch.diagonal(Z, dim1=-2, dim2=-1).sum(dim=-1)
-            delta_mu = mu_t - mu_q
-            v = torch.linalg.solve_triangular(
-                L_p, delta_mu.unsqueeze(-1), upper=False
-            ).squeeze(-1)
-            mahal_term = (v ** 2).sum(dim=-1)
-            logdet_p = _logdet_chol(L_p)
-            logdet_q = _logdet_chol(L_q)
-            div = 0.5 * (trace_term + mahal_term - K + logdet_p - logdet_q)
-            div = torch.where(ok_p & ok_q, div, div.new_tensor(float("nan")))
+            div, ok = _full_gaussian_kl_terms(mu_q, sigma_q, mu_t, sigma_t, K, eps)
+            # Data-keyed escalation: under a float32 policy a pair whose factorization failed is
+            # recomputed in float64 rather than being written off to kl_max. The whole grid is
+            # escalated (not the failed subset) so the returned tensor keeps one dtype and one
+            # autograd graph; the branch is skipped entirely on the float64 policy, which is why
+            # that path stays bit-identical to the pre-policy build.
+            if compute_dtype is not torch.float64 and bool((~ok).any()):
+                div_escalated, ok = _full_gaussian_kl_terms(
+                    mu_q.double(), sigma_q.double(), mu_t.double(), sigma_t.double(), K, eps)
+                div = div_escalated.to(compute_dtype)
+            div = torch.where(ok, div, div.new_tensor(float("nan")))
         else:
             # alpha > 1 leaves the convex regime: the blend can be indefinite for some
             # (i,j) pairs. safe_cholesky factors per element (cholesky_ex, never raises),

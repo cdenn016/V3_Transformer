@@ -82,13 +82,15 @@ config = dict(
     embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
     n_heads                   = 2,
     
-    max_seq_len               = 128,                 # N, context length
+    max_seq_len               = 64,                 # N, context length
+    eval_stride               = None,
     
-    batch_size                = 64,
+    batch_size                = 48,
     max_steps                 = 15000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
+    s_e_step_n_iter           = None,              #None = same as n_e_steps
     
     seed                      = 6,
     warmup_steps              = 100,
@@ -100,7 +102,7 @@ config = dict(
     divergence_family         = "renyi",   # "renyi", "squared_hellinger","bhattacharyya", "jeffreys",
     renyi_order               = 1.0,       # Renyi order (1.0 -> KL)
 
-    family                    = "gaussian_diagonal", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" | "gaussian_frame_diagonal"
+    family                    = "gaussian_full", # "gaussian_diagonal" | "gaussian_full" | "laplace_diagonal" | "gaussian_frame_diagonal"
                                                      # | "gaussian_diagonal_exact" (single covariance toggle; diagonal_covariance is derived)
                                                      # "gaussian_frame_diagonal" (default OFF): covariance diagonal in the agent's OWN fiber frame,
                                                      # Sigma_i = U_i diag(sigma_i) U_i^T, which IS closed under GL(K) -- so the pair energy is the EXACT
@@ -143,17 +145,17 @@ config = dict(
     #        Encode/Decode          #
     #################################
     decode_bias               = True,     # only if use_prior_bank = False
-    use_head_mixer            = True,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
+    use_head_mixer            = False,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
                                            # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
     
-    use_prior_bank            = False,               # True: KL-to-prior decode (pure path). False: linear projection
+    use_prior_bank            = True,               # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (encode stays on the prior bank)
     decode_tau                = 0.008,
-    decode_mode               = 'diagonal_chunked',  #"full_chunked", "diagonal_chunked", "expected_likelihood_chunked", "full", "family", "family_chunked" (family/family_chunked: divergence-consistent KL-to-prior decode, use_prior_bank=True)
+    decode_mode               = 'full_chunked',  #"full_chunked", "diagonal_chunked", "expected_likelihood_chunked", "full", "family", "family_chunked" (family/family_chunked: divergence-consistent KL-to-prior decode, use_prior_bank=True)
     encode_mode               = "per_token",   #"per_token_additive"
     
     
-    oracle_unroll_grad        = False,
+    oracle_unroll_grad        = True,
     
     #################################
     #          Gauge Group
@@ -184,7 +186,7 @@ config = dict(
     
     m_phi_update_mode         = "adamw",      # "adamw" | "pullback_group"
     transport_chart_max_norm  = None, 
-    phi_mstep_max_matrix_norm = 5,
+    phi_mstep_max_matrix_norm = 12,
     
     m_phi_group_trust_radius  = 0.1,          # embedded Frobenius bound on the group factor
     
@@ -226,14 +228,16 @@ config = dict(
     ####################################
     # Non-Flat Connection - Regime II
     ####################################
-     transport_mode            = "flat",     # "flat" (Regime-I phi-cocycle) | "regime_ii" (learned bilinear edge
-                                            # connection delta=mu^T W mu; gauge-invariant only at W=0; NN exception, default-off)
-                                            # | "regime_ii_covariant" (Route B: gauge-COVARIANT non-flat connection
-                                            # delta=M . invariant-features(q_i, Omega^0 q_j); covariant for any M; NN exception, default-off)
-    cocycle_relaxation        =   1.0,        # regime_ii / regime_ii_covariant homotopy: 0.0 -> flat, 1.0 -> fully relaxed (ignored by flat)
-    cross_couplings           = None,       # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only (None = block-diagonal gauge)
+     transport_mode            = "flat",     # "flat" 
+                                                       # "regime_ii"    
+                                                       #  "regime_ii_covariant" 
+                                                       # "regime_ii_link"   
+                                                       # "regime_ii_link_charted"
+                                           
+    cocycle_relaxation        =  1.0,        # regime_ii / regime_ii_covariant homotopy: 0.0 -> flat, 1.0 -> fully relaxed (ignored by flat)
+    cross_couplings           =  None, #[(0, 1)],       # off-block GL(K) head pairs e.g. [(0, 1)]; block_glk only (None = block-diagonal gauge)
                                                #if enabled and head-mixer = True or causal_alibi it will fail
-    close_basis               = False,
+    close_basis               =  False,
     ####################################
     #       Positional Encoding
     #    BCH gauge-frame PE (pos_phi)
@@ -246,6 +250,13 @@ config = dict(
                
     
     rope_base                 = 100.0,               # rotary frequency base
+    rope_insertion            = "right",             # "right" (PURE: frame V_i = U_i R_i^T, so Omega_ij = U_i R(theta_j - theta_i) U_j^-1 --
+                                                     #   the relative rotation sits BETWEEN query and key content, per GL(K)_attention.tex and
+                                                     #   Su et al. Eq 16. Exactly (i-j)-dependent for any phi, and exactly gauge covariant.)
+                                                     # "left" (LEGACY, what shipped pre-2026-07-26: Omega_ij = R_i U_i U_j^-1 R_j^T, rotations
+                                                     #   OUTSIDE the content operator, so the transport is conjugated by the query's ABSOLUTE
+                                                     #   angle. Measured on the K=20 rope run: 69% of the pair-energy spread is absolute-position
+                                                     #   contamination and gauge covariance fails at 5.6. Kept only to reproduce old runs.)
     rope_full_gauge           = False,               # rotate the covariance sandwich too (REQUIRES family="gaussian_full")
     rope_on_value             = False,
     
@@ -253,14 +264,14 @@ config = dict(
     #                Self Energy:  
     #        Sum_i alpha_i * KL(q_i||p_i)
     ######################################
-    lambda_alpha_mode          = "state_dependent_per_coord",  # "constant" | "state_dependent" | "state_dependent_per_coord"
+    lambda_alpha_mode          = "constant",  # "constant" | "state_dependent" | "state_dependent_per_coord"
     lambda_h_mode              = "constant",  # "constant" | "state_dependent" (lambda_h*=c0_h/(b0_h+KL); +R_h)
     
     b0                         = 1.0,                 # state-dependent alpha shape: alpha* = c0/(b0 + D)
     c0                         = 1.0,                 # state-dependent alpha shape (numerator)
        
     lambda_alpha               = 1,          # constant self-coupling value
-    lambda_h                   = 0.25,       # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
+    lambda_h                   = 0.0,       # hyper-prior weight lambda_h * mean_i KL(s_i||r) (0 = OFF; >0 creates s/r tables)
     
     
     b0_h                       = 1.0,        # state-dependent lambda_h shape: lambda_h* = c0_h/(b0_h + KL(s||r))
@@ -277,7 +288,7 @@ config = dict(
     ##################################################
     
     lambda_beta                = 1.0,        # belief-coupling block weight (1.0 = pure F)    
-    lambda_gamma               = 0.75,       # model-channel coupling (0 = OFF; >0 creates s tables, predictively inert by default)
+    lambda_gamma               = 0,       # model-channel coupling (0 = OFF; >0 creates s tables, predictively inert by default)
          
 
     ########################################
@@ -296,7 +307,7 @@ config = dict(
     beta_attention_prior         = "causal_alibi_noself",        # "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
     gamma_attention_prior        = "causal_alibi_noself",        # model-channel prior pi^s_ij (same 7 keys): "uniform" | "causal" | "alibi" | "causal_alibi" | "windowed" | "causal_windowed" | "t5_relative_bias"
 
-    alibi_slope                  = 1.0,
+    alibi_slope                  = 1,
 
     t5_learnable_bias            = False,           # learn the per-bucket T5 bias table b_{i-j} (sanctioned NN exception, default OFF; needs a t5_relative_bias channel)
 
@@ -310,8 +321,8 @@ config = dict(
     #         Learning Rates
     #################################
     
-    e_q_mu_lr                 = 0.9,
-    e_q_sigma_lr              = 0.001,
+    e_q_mu_lr                 = 0.1,
+    e_q_sigma_lr              = 0.005,
     e_phi_lr                  = 0.00,     
     
     
@@ -336,15 +347,22 @@ config = dict(
         
     m_p_mu_lr                 = 0.015,     
     m_p_sigma_lr              = 0.01,     
-    m_phi_lr                  = 0.01,
+    m_phi_lr                  = 0.0025,    #0.0025 pure path
     
     m_s_phi_lr                = 0.007,         
     
     weight_decay              = 0.02,   
     phi_weight_decay          = 0.03,   
-    sigma_weight_decay        = 0.01,           # AdamW decay for log-variance tables (None = inherit weight_decay;
+    sigma_weight_decay        = 0.00,           # AdamW decay for log-variance tables (None = inherit weight_decay;
                                              # 0.0 exempts sigma from the unintended log-sigma->0 pull)
-    
+    mu_weight_decay           = None,            # AdamW decay for the MEAN-role tables: mu_embed, s_mu_embed,
+                                             # decode_mu_embed, output_proj_weight (None = inherit weight_decay).
+                                             # Decoupled decay reaches EVERY row of a live embedding table on
+                                             # every step, so rare rows are crushed faster than their gather
+                                             # gradient restores them (measured: zero-count rows at norm 0.000,
+                                             # count 1-15 BELOW init). 0.0 exempts the mean sector; set None to
+                                             # restore the pre-2026-07-26 inherit-the-global behavior.
+
     min_lr                    = 0,       # absolute cosine-decay LR floor (0.0 = pure cosine)
     min_lr_frac               = 0.01,    # proportional LR floor, max(min_lr, frac*base); OFF
     
@@ -364,37 +382,25 @@ config = dict(
     #        Numerical Safety
     #################################
     
-    e_mu_q_trust              = None,
+    e_mu_q_trust              = 1,
     e_sigma_q_trust           = 10.0,
-    sigma_max                 = 10.0,
+    sigma_max                 = 100,
     
     #################################
     #         Misc/Logging
     #################################     
-    amp_dtype                 = 'bf16',      # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
+    amp_dtype                 = None,      # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
         
     log_interval              = 100,       # console log every N steps (0 = off)
     eval_interval             = 1500,      # periodic validation every N steps (0 = off)
     checkpoint_interval       = 15000,     # save a resumable checkpoint every N steps (0 = off)
 
-    generate_figures          = True,      # OFF: strict opt-out for all finalization plots, plot-only
-                                           # probes/model replays, and per-eval attention/gamma heatmaps.
-                                           # True re-enables; make_figures.py later rebuilds the replayable
-                                           # model-report, saved-probe, and persisted-history set.
+    
 
-    use_ema                   = False,     # EMA/Polyak averaging of the trained tables (default OFF = pure
-                                           # path: model is the last SGD iterate). ON: eval/best-save/final
-                                           # model use the running average s <- ema_decay*s + (1-ema_decay)*theta
-    ema_decay                 = 0.95,     # EMA decay in (0,1); only read when use_ema=True
 
-    ############################################################
-    #   Tier-1/Tier-2 improvement toggles (2026-07-05)
-    #   docs/2026-07-05-improvement-ideas.md -- ALL default OFF
-    #   (byte-identical to the pre-toggle build when left as-is)
-    ############################################################
 
     # --- E-step update rule ---
-    e_step_update             = "mm_exact",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
+    e_step_update             = "gradient",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
                                              # coordinate minimizer at frozen beta: precision fusion in ONE
                                              # iteration, same cost; kernel route only)
     mm_damping                = 0.75,         # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
@@ -407,31 +413,42 @@ config = dict(
     e_step_halt_tol           = None,        # eval halting: break when mean KL(q^t||q^{t-1}) < tol (None = OFF)
 
     # --- decode / objective ---
-    decode_unigram_prior      = False,       # add kappa*log pi_v (corpus unigram, data statistic) to decode logits
-    unigram_kappa             = 1.0,         # tempering on log pi_v (1.0 = exact Bayes class prior)
+    decode_unigram_prior      = True,       # add kappa*log pi_v (corpus unigram, data statistic) to decode logits
+    unigram_kappa             = 1,         # tempering on log pi_v (1.0 = exact Bayes class prior)
     
     # decode_mode "expected_likelihood_chunked" is also new: sigma-aware Gaussian-convolution readout
     # log N(mu_q; mu_v, Sigma_q + Sigma_v) - select it above under use_prior_bank=True.
-    untie_decode_bank         = False,       # use_prior_bank=True only: decode reads its OWN cloned (V,K) tables
+    untie_decode_bank         = True,       # use_prior_bank=True only: decode reads its OWN cloned (V,K) tables
     z_loss_weight             = 0,           # z-loss on the decode partition: w * mean(logsumexp^2) (0 = OFF)
    
 
     # --- attention / coupling ---
-    gamma_as_beta_prior       = True,        # fold DETACHED gamma posterior into beta's prior (h->s->p->q);
+    gamma_as_beta_prior       = False,        # fold DETACHED gamma posterior into beta's prior (h->s->p->q);
                                              # needs lambda_gamma > 0
     gamma_prior_weight        = 0.5,         # mixture weight w in [0,1]: pi = (1-w) softmax(B) + w gamma
     lambda_twohop             = 0.0,         # two-hop coupling F2 = lam2 sum_ik (beta@beta)_ik KL_ik (0 = OFF;
                                              # exact composed transport, effective depth 2 at L=1)
     query_adaptive_tau        = False,       # per-query tau_i = tau_h (1 + c tr_h Sigma_i / d_h), detached
     query_tau_c               = 1.0,         # strength c >= 0 (read only when query_adaptive_tau=True)
-    # New attention priors (select above): "causal_noself" / "causal_alibi_noself" mask the E_ii ~ 0
-    # self-edge attention sink (diagonal -inf except (0,0)).
+    
+
+    #   "off"      -- the PURE path and the default: no data term, byte-identical to before.
+    #   "shared"   -- reuse the decode table (output_proj_weight). Whitepaper-faithful, no new
+    #                 parameters, but V3 decodes position t against x_{t+1} while the emission pulls
+    #                 toward x_t, so one linear map carries both roles with no nonlinear head between.
+    #   "separate" -- own (V, K) table. Removes that competition at the cost of decoupling the factor
+    #                 from the decoder that actually scores the prediction.
+    # Both live modes are fixed-basis linear maps and therefore NOT gauge-equivariant, the same
+    # footprint the linear decode already carries; "off" keeps the gauge-pure path.
+    emission_mode    = "off",       # "off" | "shared" | "separate"
+    emission_weight  = 0.0,            # 0.0 reproduces the "off" path byte-identically
+
 
     # --- training mechanics ---
     grad_clip                 = 1.0,         # gradient clip: global L2 norm unless grad_clip_per_role; None/0.0 disables
     grad_clip_per_role        = True,        # clip grads per role (mu/sigma/phi) instead of one global norm
                                              # (global is phi-dominated and silently rescales other roles)
-    skip_belief_sigma_update  = True,        # skip the belief-channel sigma E-step update (dead-compute ablation
+    skip_belief_sigma_update  = False,        # skip the belief-channel sigma E-step update (dead-compute ablation
                                              # for linear-decode configs; user asserts sigma has no consumer)
 
     # --- compute reclamation (exactness-preserving perf; default OFF) ---
@@ -442,8 +459,22 @@ config = dict(
     share_refine_s_transport  = True,        # build the flat transport ONCE per forward, share s-refine + belief
                                              # E-step (+ all layers); valid on flat/e_phi_lr=0/no-rope configs
     compile_pair_kernel       = False,       # torch.compile the closed-form pair kernel (eager fallback + warn)
+
+    full_cov_kl_precision     = "fp32_escalate",  # "fp64" | "fp32_escalate"  (family="gaussian_full" only)
+                                             # "fp64" = the historical unconditional float64 island.
+                                             # "fp32_escalate" runs the (B,N,N,K,K) pair KL in float32 and
+                                             # recomputes in float64 ONLY when a Cholesky actually fails --
+                                             # data-keyed, not a blanket downcast. Verified single-pass through
+                                             # cond(Sigma)~1e6, escalates at ~1e9; post-softmax attention moves
+                                             # <=2e-4 on adversarial synthetic spectra, 4e-6 on real trained ones.
+
+    congruence_cond_escalation           = False,         # True -> slow ...escalate on the conditioning proxy
+    emit_expensive_diagnostics           = True,    
+    generate_figures                     = True,      # OFF: strict opt-out for all finalization plots, plot-only
+                                                      # probes/model replays, and per-eval attention/gamma heatmaps.
+                                                      # True re-enables; make_figures.py later rebuilds the replayable
+                                                      # model-report, saved-probe, and persisted-history set.
     
-    evaluate_zero_e_steps_counterfactual = True
 
 )
 
@@ -692,6 +723,7 @@ def _run_once(
         device=torch.device(DEVICE),
         logger=logger,
         artifacts=artifacts,
+        sample_dataset=DATASET,          # audit 2026-07-27: key the sample tokenizer, do not guess
     )
     wall = time.perf_counter() - t0
 

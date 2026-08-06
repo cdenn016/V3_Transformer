@@ -39,17 +39,24 @@ def _transport_to_float(
     r"""Cast only an oracle island's transport tensors to fp32, preserving its representation."""
     if isinstance(omega, torch.Tensor):
         return omega.float()
+    # cond_escalation MUST be carried on every rebuild (audit 2026-08-05): it defaults to False, so
+    # dropping it here silently disabled the opt-in conditioning guard INSIDE the oracle island while
+    # the rest of the forward still had it on -- the gradient and the reported objective would then
+    # be computed under different congruence policies. Every other reconstruction site in
+    # transport.py propagates it; these three did not.
     if isinstance(omega, CompactFactoredTransport):
         return CompactFactoredTransport(
             omega.exp_blocks.float(), omega.inv_blocks.float(), omega.K,
             mean_per_head=omega.mean_per_head,
             same_frame_flat_cocycle=omega.same_frame_flat_cocycle,
+            cond_escalation=omega.cond_escalation,
         )
     if isinstance(omega, DirectLinkTransport):
         return DirectLinkTransport(
             exp_link=omega.exp_link.float(),
             exp_phi=(omega.exp_phi.float() if omega.exp_phi is not None else None),
             exp_neg_phi=(omega.exp_neg_phi.float() if omega.exp_neg_phi is not None else None),
+            cond_escalation=omega.cond_escalation,
         )
     if isinstance(omega, FactoredTransport):
         return FactoredTransport(
@@ -58,6 +65,7 @@ def _transport_to_float(
             irrep_dims=omega.irrep_dims,
             mean_per_head=omega.mean_per_head,
             same_frame_flat_cocycle=omega.same_frame_flat_cocycle,
+            cond_escalation=omega.cond_escalation,
         )
     if isinstance(omega, RopeTransport):
         return RopeTransport(

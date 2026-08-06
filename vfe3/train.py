@@ -1031,13 +1031,30 @@ def _val_diagnostics(
     out["val_guard_energy_klmax_frac"] = vd["guard_energy_klmax_frac"]
     out["val_nonfinite_frac"]          = vd["nonfinite_frac"]
 
+    # score_at="entry" is the beta the FORWARD actually used (audit 2026-08-05: the "converged"
+    # default re-scores the belief AFTER the E-step moved it -- measured TV(forward, converged) up
+    # to 0.96 per row, vs TV(forward, entry) == 0.000000, so every val_attn_* below was a statistic
+    # of a post-hoc re-score rather than of the model). The converged/prior triple is still saved
+    # separately under attention_estep/ for anyone who wants the comparison.
     amaps = model.attention_maps(                               # (L, H, N, N) all layers/heads
         diagnostic_tokens,
         snapshot=snapshot,
+        score_at="entry",
     )
-    hmin = M.attention_entropy_rows(amaps).min(dim=-1).values   # (L, H) per-head min row entropy
-    out["val_attn_entropy_min_all"] = float(hmin.min())
-    out["val_attn_collapsed_heads"] = float((hmin < 0.6931471805599453).float().sum())
+    # Row-support filter (audit 2026-08-05): attention_entropy_rows floors beta at eps, so a
+    # hard-masked row of an N-key grid returns (#masked)*eps*|ln eps| -- a pure function of N and
+    # eps. Unfiltered, val_attn_entropy_min_all was CONSTANT across every logged step of every run
+    # (1.740754e-09 = 63*1e-12*ln(1e-12)) and val_attn_collapsed_heads pinned at n_heads, so the
+    # collapsed-head alarm could never fire. model.py already applies this filter for the
+    # val_attn_entropy_min twin; these two were missed.
+    ent_rows = M.attention_entropy_rows(amaps)                  # (L, H, N)
+    scorable = (amaps > 0.0).sum(dim=-1) >= 2                   # rows with >=2 admissible keys
+    hmin = ent_rows.masked_fill(~scorable, float("inf")).min(dim=-1).values   # (L, H)
+    finite_hmin = hmin[torch.isfinite(hmin)]
+    out["val_attn_entropy_min_all"] = (float(finite_hmin.min()) if finite_hmin.numel()
+                                       else float("nan"))
+    out["val_attn_collapsed_heads"] = float(
+        (finite_hmin < 0.6931471805599453).float().sum())
     cs = M.causal_sanity(amaps)
     out["val_future_leakage"] = float(cs["future_leakage"].max())   # soft causal prior can leak silently
     out["val_row_sum_error"]  = float(cs["row_sum_error"].max())

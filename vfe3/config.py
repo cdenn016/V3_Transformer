@@ -71,13 +71,7 @@ class VFE3Config:
     ``__post_init__`` in field-declaration order.
     """
 
-    # numerics
-    eps:                       float = 1e-6
-    kl_max:                    float = 100.0
-
-    # divergence seam
-    divergence_family:         str   = "renyi"        # divergence FUNCTIONAL (renyi, ...); renyi_order selects member
-    renyi_order:               float = 1.0            # Renyi order (alpha=1 -> KL)
+    
 
     # model structure
     vocab_size:                int   = 50257
@@ -101,6 +95,42 @@ class VFE3Config:
     n_layers:                  int   = 1            # L (number of blocks)
     n_e_steps:                 int   = 1            # T (E-step inner iterations)
     n_heads:                   int   = 8
+
+    seed:                      int   = 6
+    deterministic:             bool  = True         # opt-in full run-to-run determinism (esp. GPU): _seed_everything
+                                                     # adds torch.use_deterministic_algorithms(warn_only) + cudnn.deterministic
+                                                     # + CUBLAS_WORKSPACE_CONFIG (env var takes full effect only if set
+                                                     # before the first CUDA op). Default False = today's byte-identical path.
+    log_interval:              int   = 100           # console log every N steps (0 = off)
+    eval_interval:             int   = 2000            # periodic validation every N steps (0 = off)
+    checkpoint_interval:       int   = 25000            # save a resumable checkpoint every N steps (0 = off)
+    
+    
+    # Opt-in training RESUME (default None = OFF = the pure from-scratch path): a path to a
+    # checkpoints/step_<N>.pt written by checkpoint_interval. When set, train() restores the model
+    # weights, the AdamW optimizer state (momentum), the RNG, and rebuilds the per-group cosine
+    # LambdaLR at the saved step, then continues from step N to max_steps. An explicit train(resume_from=...)
+    # argument takes precedence over this field. None leaves train() byte-identical to the from-scratch loop.
+    resume_from:               Optional[str] = None
+
+    # Resume-checkpoint trust gate (default OFF = safe). load_checkpoint reads a resume bundle with
+    # torch.load(weights_only=True), which refuses to execute arbitrary pickle reductions; our bundles
+    # (tensors + an asdict config + RNG tensors) load fine under it. If a (e.g. legacy-format) bundle
+    # fails the safe load, the resume RAISES unless this is True, which permits the legacy
+    # weights_only=False load -- only set it for a checkpoint you trust, since that path can execute
+    # arbitrary code embedded in the pickle.
+    trust_resume_checkpoint:   bool          = False    
+
+    # numerics
+    eps:                       float = 1e-6
+    kl_max:                    float = 100.0
+
+    # divergence seam
+    divergence_family:         str   = "renyi"        # divergence FUNCTIONAL (renyi, ...); renyi_order selects member
+    renyi_order:               float = 1.0            # Renyi order (alpha=1 -> KL)
+
+
+
 
     # belief-table init scales (PriorBank.__init__): mu_v ~ N(0, mu_init_std^2), every coordinate
     # variance set to the constant sigma_init (stored as log(sigma_init); not random spread), and the
@@ -465,7 +495,7 @@ class VFE3Config:
     e_mu_q_trust:              Optional[float] = None
     e_sigma_q_trust:           float = 5.0       # diag L2 / full Frobenius: one shared whole-tangent ball
     
-    mu_trust_mode:             str   = "box"          # "box" | "ball" (consulted only when e_mu_q_trust is not None)
+    mu_trust_mode:             str   = "ball"          # "box" | "ball" (consulted only when e_mu_q_trust is not None)
     
     # E-step MEAN preconditioner (B3/EXP-14 mu-arm ablation). 'fisher' (default, pure) descends the
     # Fisher natural gradient nat_mu = Sigma*grad_mu (diagonal Gaussian); 'raw' descends the raw
@@ -499,7 +529,7 @@ class VFE3Config:
     decode_bias:               bool  = False  # use_prior_bank=False only: learned per-vocab log-unigram bias on logits=mu_q@W^T+b (zero-init, weight-decay-free). Inert (warns) under use_prior_bank=True.
    
     decode_tau:                float = 1.0
-    decode_mode:               str   = "diagonal"    #"full_chunked", "diagonal_chunked", "expected_liklihood_chunked", "diagonal_untied", "full"
+    decode_mode:               str   = "diagonal_chunked"    #"full_chunked", "diagonal_chunked", "expected_liklihood_chunked", "diagonal_untied", "full"
     
     # decode_chunk_size: vocabulary-chunk width V is iterated over by the fused
     # decode_mode='diagonal_chunked' CE path (the training-path memory win that never
@@ -661,29 +691,8 @@ class VFE3Config:
     #                          with min_lr as max(min_lr, min_lr_frac*base). 0.0 (with min_lr=0) is
     #                          the pure half-cosine-to-zero path.
     
-    seed:                      int   = 6
-    deterministic:             bool  = True         # opt-in full run-to-run determinism (esp. GPU): _seed_everything
-                                                     # adds torch.use_deterministic_algorithms(warn_only) + cudnn.deterministic
-                                                     # + CUBLAS_WORKSPACE_CONFIG (env var takes full effect only if set
-                                                     # before the first CUDA op). Default False = today's byte-identical path.
-    log_interval:              int   = 100           # console log every N steps (0 = off)
-    eval_interval:             int   = 2000            # periodic validation every N steps (0 = off)
-    checkpoint_interval:       int   = 25000            # save a resumable checkpoint every N steps (0 = off)
     
-    # Opt-in training RESUME (default None = OFF = the pure from-scratch path): a path to a
-    # checkpoints/step_<N>.pt written by checkpoint_interval. When set, train() restores the model
-    # weights, the AdamW optimizer state (momentum), the RNG, and rebuilds the per-group cosine
-    # LambdaLR at the saved step, then continues from step N to max_steps. An explicit train(resume_from=...)
-    # argument takes precedence over this field. None leaves train() byte-identical to the from-scratch loop.
-    resume_from:               Optional[str] = None
 
-    # Resume-checkpoint trust gate (default OFF = safe). load_checkpoint reads a resume bundle with
-    # torch.load(weights_only=True), which refuses to execute arbitrary pickle reductions; our bundles
-    # (tensors + an asdict config + RNG tensors) load fine under it. If a (e.g. legacy-format) bundle
-    # fails the safe load, the resume RAISES unless this is True, which permits the legacy
-    # weights_only=False load -- only set it for a checkpoint you trust, since that path can execute
-    # arbitrary code embedded in the pickle.
-    trust_resume_checkpoint:   bool          = False
 
     # Opt-in EMA / Polyak weight averaging (default OFF = the pure path: no shadow, the trained model
     # IS the last SGD iterate). When on, train() keeps an exponential moving average of the trainable
@@ -697,6 +706,7 @@ class VFE3Config:
     # Periodic-evaluation and finalization controls.
     eval_max_batches:                      Optional[int] = None
     evaluate_zero_e_steps_counterfactual:  bool          = True
+    
     generate_figures:                      bool          = True
 
     # End-of-run mechanism diagnostics (2026-07-25). The CHEAP tier -- E-step character (belief
@@ -827,6 +837,24 @@ class VFE3Config:
     # outside). Falls back to eager with a warning when the backend is unavailable (e.g. no triton).
     compile_pair_kernel:       bool  = False
 
+    # Working precision of the FULL-covariance pair KL (family="gaussian_full" only; the diagonal
+    # family already keys its island on operand dtypes). "fp64" is the historical unconditional
+    # float64 island and the default, so leaving this alone is byte-identical to the pre-2026-08-05
+    # build. "fp32_escalate" evaluates the (B,N,N,K,K) grid in float32 and recomputes in float64
+    # only when a Cholesky actually fails. Verified single-pass through cond(Sigma)~1e6 and
+    # escalating at ~1e9; post-softmax attention moves <=2e-4 on adversarial synthetic spectra and
+    # 4e-6 on real trained matrices. A float64 PUBLIC family still computes in float64 either way.
+    full_cov_kl_precision:     str   = "fp64"        # "fp64" | "fp32_escalate"
+
+    # Working precision of the FULL-covariance pair KL (family="gaussian_full" only; the diagonal
+    # family already keys its island on operand dtypes). "fp64" is the historical unconditional
+    # float64 island and the default, so leaving this alone is byte-identical to the pre-2026-08-05
+    # build. "fp32_escalate" evaluates the (B,N,N,K,K) grid in float32 and recomputes in float64
+    # only when a Cholesky actually fails -- measured 15.7x faster on that kernel (23.33 -> 1.49 ms
+    # at B=4) with post-softmax attention weights moving by at most 4.0e-6 and zero SPD failures at
+    # the trained operating point (cond(Omega Sigma Omega^T) median 2.7e3 / p95 2.1e4). float32
+    # Cholesky first fails around cond 4.8e8, i.e. ~2x the trained frame scale, which is what the
+    # escalation is there to catch. A float64 PUBLIC family still computes in float64 either way.
     # --- randomized-depth E-step (train with stochastic T, eval with elastic T; default OFF) ---
     # When True, each TRAINING forward samples T ~ Uniform{e_steps_min..e_steps_max} inner
     # iterations (eval keeps the deterministic n_e_steps). Trains path independence so extra
@@ -2175,6 +2203,16 @@ class VFE3Config:
         if self.rope_insertion not in ROPE_INSERTIONS:
             raise ValueError(
                 f"rope_insertion must be one of {ROPE_INSERTIONS}, got {self.rope_insertion!r}")
+        # Full-covariance KL working precision (audit 2026-08-05). The allowed spellings are
+        # inlined rather than imported from vfe3.families.gaussian: importing a family module from
+        # inside __post_init__ perturbs import order. set_full_cov_kl_precision validates the same
+        # set, so the two cannot drift without a test noticing.
+        if self.full_cov_kl_precision not in ("fp64", "fp32_escalate"):
+            raise ValueError(
+                "full_cov_kl_precision must be one of ('fp64', 'fp32_escalate'), "
+                f"got {self.full_cov_kl_precision!r}")
+        # Full-covariance KL working precision (audit 2026-08-05). Validated here rather than left
+        # to the family so an unreachable spelling fails at construction, not mid-forward.
         # FAIL CLOSED rather than falling back. The right insertion folds R into the VERTEX frame, so
         # it needs a transport that carries one; a dense Omega exposes only the composed operator.
         # Silently reverting to 'left' there would put the defective composition (69% absolute-position

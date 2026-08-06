@@ -204,6 +204,52 @@ def _spectral_values_and_derivatives(
     return values, derivatives
 
 
+def _loewner_adjoint(
+    eigenvalues:  torch.Tensor,
+    eigenvectors: torch.Tensor,
+    kind:         str,
+    lower:        float,
+    upper:        Optional[float],
+    grad_output:  torch.Tensor,
+) -> torch.Tensor:
+    r"""Adjoint of ONE symmetric matrix function, given a shared eigendecomposition.
+
+    Factored out of ``_SymmetricSpectralMap.backward`` so the single- and paired-output
+    Functions run byte-identical adjoint code (audit 2026-08-05).
+    """
+    values, _ = _spectral_values_and_derivatives(
+        eigenvalues,
+        kind,
+        lower,
+        upper,
+    )
+    lambda_i = eigenvalues.unsqueeze(-1)
+    lambda_j = eigenvalues.unsqueeze(-2)
+    gap = lambda_i - lambda_j
+    value_gap = values.unsqueeze(-1) - values.unsqueeze(-2)
+    scale = torch.maximum(lambda_i.abs(), lambda_j.abs())
+    resolution = (
+        8.0 * torch.finfo(eigenvalues.dtype).eps * scale
+    ).clamp(min=torch.finfo(eigenvalues.dtype).tiny)
+    repeated = gap.abs() <= resolution
+    safe_gap = torch.where(repeated, torch.ones_like(gap), gap)
+    divided_difference = value_gap / safe_gap
+    midpoint = 0.5 * (lambda_i + lambda_j)
+    _, repeated_limit = _spectral_values_and_derivatives(
+        midpoint,
+        kind,
+        lower,
+        upper,
+    )
+    divided_difference = torch.where(repeated, repeated_limit, divided_difference)
+
+    eigenvectors_t = eigenvectors.transpose(-1, -2)
+    symmetric_grad = 0.5 * (grad_output + grad_output.transpose(-1, -2))
+    inner = eigenvectors_t @ symmetric_grad @ eigenvectors
+    grad_matrix = eigenvectors @ (divided_difference * inner) @ eigenvectors_t
+    return 0.5 * (grad_matrix + grad_matrix.transpose(-1, -2))
+
+
 class _SymmetricSpectralMap(torch.autograd.Function):
     r"""Symmetric matrix function with Loewner divided differences in the adjoint."""
 
@@ -227,38 +273,71 @@ class _SymmetricSpectralMap(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         eigenvalues, eigenvectors = ctx.saved_tensors
-        values, _ = _spectral_values_and_derivatives(
+        grad_matrix = _loewner_adjoint(
             eigenvalues,
+            eigenvectors,
             ctx.kind,
             ctx.lower,
             ctx.upper,
+            grad_output,
         )
-        lambda_i = eigenvalues.unsqueeze(-1)
-        lambda_j = eigenvalues.unsqueeze(-2)
-        gap = lambda_i - lambda_j
-        value_gap = values.unsqueeze(-1) - values.unsqueeze(-2)
-        scale = torch.maximum(lambda_i.abs(), lambda_j.abs())
-        resolution = (
-            8.0 * torch.finfo(eigenvalues.dtype).eps * scale
-        ).clamp(min=torch.finfo(eigenvalues.dtype).tiny)
-        repeated = gap.abs() <= resolution
-        safe_gap = torch.where(repeated, torch.ones_like(gap), gap)
-        divided_difference = value_gap / safe_gap
-        midpoint = 0.5 * (lambda_i + lambda_j)
-        _, repeated_limit = _spectral_values_and_derivatives(
-            midpoint,
-            ctx.kind,
-            ctx.lower,
-            ctx.upper,
-        )
-        divided_difference = torch.where(repeated, repeated_limit, divided_difference)
-
-        eigenvectors_t = eigenvectors.transpose(-1, -2)
-        symmetric_grad = 0.5 * (grad_output + grad_output.transpose(-1, -2))
-        inner = eigenvectors_t @ symmetric_grad @ eigenvectors
-        grad_matrix = eigenvectors @ (divided_difference * inner) @ eigenvectors_t
-        grad_matrix = 0.5 * (grad_matrix + grad_matrix.transpose(-1, -2))
         return grad_matrix, None, None, None
+
+
+class _SymmetricSpectralMapPair(torch.autograd.Function):
+    r"""TWO symmetric matrix functions of ONE matrix, sharing a single eigendecomposition.
+
+    ``retract_spd_full`` needs both ``Sigma^{1/2}`` and ``Sigma^{-1/2}`` of the SAME ``Sigma``.
+    Two ``_symmetric_spectral_map`` calls ran ``_eigh_damped`` twice on identical input; the two
+    functions share a spectrum, so one decomposition serves both (audit 2026-08-05: measured as a
+    redundant ``eigh`` over the live ``(B*N, K, K)`` covariance stack on every E-step).
+
+    Forward is bit-identical to the two separate calls -- same symmetrization, same damped
+    eigendecomposition, same per-kind value map. Backward returns the SUM of the two adjoints,
+    which is exactly what autograd accumulates when one tensor feeds two consumers (IEEE-754
+    addition of the two contributions is order-independent, so the sum is bit-identical too).
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        matrix: torch.Tensor,
+        kind_a: str,
+        kind_b: str,
+        lower:  float,
+        upper:  Optional[float],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        symmetric = 0.5 * (matrix + matrix.transpose(-1, -2))
+        eigenvalues, eigenvectors = _eigh_damped(symmetric, _rel_gap_eps(symmetric))
+        values_a, _ = _spectral_values_and_derivatives(eigenvalues, kind_a, lower, upper)
+        values_b, _ = _spectral_values_and_derivatives(eigenvalues, kind_b, lower, upper)
+        ctx.save_for_backward(eigenvalues, eigenvectors)
+        ctx.kind_a = kind_a
+        ctx.kind_b = kind_b
+        ctx.lower = lower
+        ctx.upper = upper
+        return (
+            eigenvectors * values_a.unsqueeze(-2) @ eigenvectors.transpose(-1, -2),
+            eigenvectors * values_b.unsqueeze(-2) @ eigenvectors.transpose(-1, -2),
+        )
+
+    @staticmethod
+    def backward(ctx, grad_a: Optional[torch.Tensor], grad_b: Optional[torch.Tensor]):
+        eigenvalues, eigenvectors = ctx.saved_tensors
+        grad_matrix = None
+        for kind, grad_output in ((ctx.kind_a, grad_a), (ctx.kind_b, grad_b)):
+            if grad_output is None:                      # that output never reached the loss
+                continue
+            contribution = _loewner_adjoint(
+                eigenvalues,
+                eigenvectors,
+                kind,
+                ctx.lower,
+                ctx.upper,
+                grad_output,
+            )
+            grad_matrix = contribution if grad_matrix is None else grad_matrix + contribution
+        return grad_matrix, None, None, None, None
 
 
 def _symmetric_spectral_map(
@@ -270,6 +349,22 @@ def _symmetric_spectral_map(
     upper:  Optional[float] = None,
 ) -> torch.Tensor:
     return _SymmetricSpectralMap.apply(matrix, kind, lower, upper)
+
+
+def _symmetric_spectral_map_pair(
+    matrix: torch.Tensor,
+    kind_a: str,
+    kind_b: str,
+
+    *,
+    lower:  float,
+    upper:  Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""Both matrix functions of ONE matrix from a single shared eigendecomposition.
+
+    Bit-identical to calling :func:`_symmetric_spectral_map` twice on the same input; see
+    :class:`_SymmetricSpectralMapPair`."""
+    return _SymmetricSpectralMapPair.apply(matrix, kind_a, kind_b, lower, upper)
 
 
 def _frechet_log_spd(
@@ -502,13 +597,12 @@ def retract_spd_full(
         sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
         delta_sigma = 0.5 * (delta_sigma + delta_sigma.transpose(-1, -2))
 
-        sigma_sqrt = _symmetric_spectral_map(
+        # ONE damped eigendecomposition serves both halves: sqrt and inv-sqrt of the SAME sigma
+        # share a spectrum (audit 2026-08-05 -- the two separate calls ran eigh twice over the
+        # live (B*N, K, K) stack on every E-step). Bit-identical, forward and backward.
+        sigma_sqrt, sigma_inv_sqrt = _symmetric_spectral_map_pair(
             sigma,
             "sqrt_floor",
-            lower=eps,
-        )
-        sigma_inv_sqrt = _symmetric_spectral_map(
-            sigma,
             "inv_sqrt_floor",
             lower=eps,
         )
