@@ -62,6 +62,7 @@ import stat
 import subprocess
 import sys
 import time
+import warnings
 from collections.abc import Mapping
 from dataclasses import asdict, fields as dataclass_fields
 from pathlib import Path
@@ -1307,7 +1308,15 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "lambda_h_mode": {
         "description": "self-coupling lambda_h form",
         "param": "lambda_h_mode",
-        "values": ["constant", "state_dependent", "state_dependent_per_coord"],
+        # 'state_dependent_per_coord' needs a per-coordinate hyper-prior divergence, which exists
+        # only for a diagonal family -- unreachable under the gaussian_full baseline, and a single
+        # non-constructing arm drops the WHOLE sweep to "not scheduled". Two live arms beat three
+        # with one that disqualifies the other two.
+        "values": ["constant", "state_dependent"],
+        # audit 2026-08-06 F20: at lambda_h=0 (the baseline) TWO gates make all three arms identical
+        # -- model.py:877 hard-overrides the mode to "constant" for _refine_s, and model.py:1829-1831
+        # returns zeros from _hyper_prior_weighted. The mode is only observable at lambda_h > 0.
+        "requires": {"lambda_h": 0.25},
     },
     
     "b0_h": {
@@ -1375,7 +1384,9 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "sigma_max": {  # E1 / EXP-20: does the SPD variance ceiling ever bind? (read guard_sigma_ceil_frac)
         "description": "SPD variance ceiling sigma_max (binding vs slack) [E1/EXP-20]",
-        "param": "sigma_max", "values": [15],
+        # audit 2026-08-06 F20: a single-value grid is not a comparison. The point of this sweep is
+        # whether the ceiling ever BINDS, so it needs points either side of the baseline 100.
+        "param": "sigma_max", "values": [5, 15, 50, 200],
     },
     
     
@@ -1520,13 +1531,19 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "e_s_mu_lr": {
        "description": "E-step natural-gradient step size for mu_s",
        "param": "e_s_mu_lr", "values": [0.5, 0.75, 0.8, 0.85, 0.9, 1],
-       "requires": {"e_step_update": "gradient"},   # audit 2026-07-27: unread under mm_exact
+       # audit 2026-08-06 F20: 'requires' satisfied the mm_exact rule and left the one that matters
+       # unsatisfied -- e_s_mu_lr is read ONLY inside _refine_s (model.py:888), gated on s_e_step,
+       # which in turn requires the model_channel s-tables.
+       "requires": {"e_step_update": "gradient", "s_e_step": True,
+                    "prior_source": "model_channel"},
     },
     
     "e_s_sigma_lr": {
        "description": "E-step retraction step size for sigma_s",
        "param": "e_s_sigma_lr", "values": [0, 0.005, 0.01, 0.05, 0.1],
-       "requires": {"e_step_update": "gradient"},   # audit 2026-07-27: unread under mm_exact
+       # audit 2026-08-06 F20: same gate, same previously-incomplete 'requires' as e_s_mu_lr.
+       "requires": {"e_step_update": "gradient", "s_e_step": True,
+                    "prior_source": "model_channel"},
     },
     
     
@@ -1621,11 +1638,20 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     
     
+    # COLLISION, audit 2026-08-06 F4 -- these two sweeps are the SAME experiment under the current
+    # baseline. train.py:410 passes weight_decay=cfg.weight_decay to AdamW, so the global reaches
+    # only groups that omit an explicit key; resolving the live groups gives exactly six, of which
+    # only mu_embed and decode_mu_embed inherit -- both role 'mu'. So cfg.weight_decay IS
+    # mu_weight_decay here, and the shared grid values {0.01, 0.02, 0.03} are three bit-identical
+    # arms (training is bitwise deterministic, so they are duplicate numbers, not replicates).
+    # NOT changed here because both sweeps are in the LIVE SWEEP_ORDER. Preferred resolution once
+    # the queue drains: set mu_weight_decay=0.0 in BASELINE_CONFIG so weight_decay becomes a genuine
+    # "everything else" knob, or drop this sweep and widen mu_weight_decay to the union grid.
     "weight_decay": {
         "description": "AdamW weight decay",
         "param": "weight_decay", "values": [0.01, 0.015, 0.02, 0.025, 0.03, 0.04],
-    }, 
-   
+    },
+
     "mu_weight_decay": {
         "description": "AdamW weight decay",
         "param": "mu_weight_decay", "values": [0.00, 0.005, 0.01, 0.02, 0.03],
@@ -1675,6 +1701,10 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
       "gamma_prior_weight": {
           "description": "gamma_prior_weight",
           "param": "gamma_prior_weight", "values": [0.4, 0.45, 0.55, 0.6],
+          # audit 2026-08-06 F20: had NO 'requires' key at all; the weight is read only when
+          # gamma_as_beta_prior is on (default False), so every arm returned the baseline number.
+          # gamma_as_beta_prior itself needs a live gamma energy, hence lambda_gamma > 0.
+          "requires": {"gamma_as_beta_prior": True, "lambda_gamma": 0.2},
       },
 
     "warmup_steps": {  # LR warmup length before the cosine decay (0 = no warmup, straight into cosine).
@@ -2273,7 +2303,37 @@ def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True
             cfg = dict(BASELINE_CONFIG)
             cfg.update(overrides)
             try:
-                VFE3Config(**cfg)
+                # An INERT arm is a silent measurement failure, not a construction failure: the run
+                # completes, publishes a number, and the number is the baseline's because the swept
+                # value is read by no active path. config.py already detects this and says so -- but
+                # it says it through warnings.warn, which this call site discarded, so six registered
+                # sweeps shipped dead (audit 2026-08-06 F20, Wave 2's precision_attention_b0 /
+                # kappa_gamma / b0_h).
+                #
+                # Only an inert setting the ARM ITSELF varies is an error. The BASELINE carries its
+                # own inert settings -- under e_step_update='gradient' the whole mm_exact family
+                # (mm_damping, ...) is inert by construction -- and failing on those would reject all
+                # ten currently-scheduled sweeps at startup, which is the opposite of useful. So
+                # intersect the reported inert names with this arm's overridden keys: "the parameter
+                # this sweep varies is read by no active path" is precisely the F20 defect.
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    VFE3Config(**cfg)
+                inert_names = {
+                    entry.split("=", 1)[0].strip()
+                    for warning in caught if "inert configuration setting" in str(warning.message)
+                    for entry in str(warning.message).splitlines()
+                    if entry.strip().startswith("- ")
+                    for entry in [entry.strip()[2:]]
+                }
+                dead_knobs = sorted(inert_names & set(overrides))
+                if dead_knobs:
+                    construction_errors.append((
+                        name, label,
+                        f"swept parameter(s) {', '.join(dead_knobs)} are INERT under this arm's "
+                        f"config -- every arm would produce the baseline number. Add the enabling "
+                        f"setting(s) to the sweep's 'requires'.",
+                    ))
             except (TypeError, ValueError) as exc:
                 construction_errors.append((name, label, str(exc)))
     if construction_errors:
