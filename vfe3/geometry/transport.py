@@ -2728,8 +2728,16 @@ def _compact_factored_full_covariance(
     when the caller either (a) supplies a block-diagonal ``sigma`` -- then the cross-head outputs
     are identically zero anyway, since ``Sigma^(h,g) = 0`` for ``h != g`` -- or (b) consumes only
     the head marginals. ``pairwise_energy`` is case (b): it slices ``block(h*d, (h+1)*d)`` per
-    irrep and never reads an off-block. Under the live gaussian_full config BOTH hold, because the
-    token prior enters ``diag_embed``-promoted and nothing ever writes a cross-head entry.
+    irrep and never reads an off-block.
+
+    CORRECTNESS RESTS ENTIRELY ON (b) (audit 2026-08-06 A8). Justification (a) also happens to hold
+    under the live gaussian_full config -- the token prior enters ``diag_embed``-promoted and
+    nothing writes a cross-head entry -- but only to eigh round-off: ``retract_spd_full`` on the
+    degenerate ``4I`` spectrum returns head-MIXING eigenvectors, and the mixing cancels only because
+    ``f(lambda)`` is constant across the degenerate cluster (measured cross-head leak in
+    ``Sigma^(1/2)``: 7.3e-8 on exact ``4I``). Do NOT simplify this function by leaning on (a); it is
+    a property of one config's initialization, not an invariant. (b) is enforced structurally by
+    ``_reads_only_head_marginals`` and is airtight.
     """
     H, d = factored.n_blocks, factored.block_dim
     sigma_blocks = sigma.reshape(*sigma.shape[:-3], sigma.shape[-3], H, d, H, d)

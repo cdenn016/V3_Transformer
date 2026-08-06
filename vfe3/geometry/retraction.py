@@ -307,6 +307,13 @@ class _SymmetricSpectralMapPair(torch.autograd.Function):
         lower:  float,
         upper:  Optional[float],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Without this, autograd MATERIALIZES an undefined output gradient as a zero tensor, so the
+        # backward's `if grad_output is None: continue` never fires and a full Loewner adjoint runs
+        # against an all-zero cotangent -- the saving the skip branch was written for was never
+        # taken (audit 2026-08-06 F33). With it, an output that never reached the loss arrives as
+        # None and is genuinely skipped. Values are unaffected: the skipped contribution was
+        # identically zero either way.
+        ctx.set_materialize_grads(False)
         symmetric = 0.5 * (matrix + matrix.transpose(-1, -2))
         eigenvalues, eigenvectors = _eigh_damped(symmetric, _rel_gap_eps(symmetric))
         values_a, _ = _spectral_values_and_derivatives(eigenvalues, kind_a, lower, upper)

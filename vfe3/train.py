@@ -51,6 +51,14 @@ from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artif
 from vfe3.runtime import seed_everything
 from vfe3.timing import TrainingTimer
 from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM   # single source for the phi-clamp threshold (M2)
+from vfe3.geometry.retraction import (                          # SPD-retraction non-finite tangent guard
+    nonfinite_tangent_elements,
+    reset_nonfinite_tangent_elements,
+)
+from vfe3.numerics import (                                     # mu-trust-region equivariance fallback
+    mu_trust_fallback_elements,
+    reset_mu_trust_fallback_elements,
+)
 
 
 _PHI_CLAMP_WARNED:   bool = False
@@ -727,11 +735,20 @@ def train_step(
         metrics_out["grad_finite"] = float(grad_finite)
     if grad_clip is not None and grad_clip > 0 and not skip_step:
         if getattr(model.cfg, "grad_clip_per_role", False):
-            # Per-role clipping (default OFF): the global L2 norm below is dominated by phi_embed
-            # (V x n_gen, the bulk of all parameters), so when it binds it silently rescales every
-            # OTHER role's effective LR by a phi-noise-coupled factor -- the kl_max silent-bind
-            # pattern. Clip each role's parameter set to grad_clip separately instead (the roles
-            # partition the optimizer groups; see build_optimizer).
+            # Per-role clipping: the global L2 norm below couples the roles, so when it binds it
+            # rescales every OTHER role's effective LR -- the kl_max silent-bind pattern. Clip each
+            # role's parameter set to grad_clip separately instead (the roles partition the
+            # optimizer groups; see build_optimizer).
+            #
+            # Correction (audit 2026-08-06 F33): phi_embed dominates the SPIKES, not the steady
+            # state. At the live K=20 / N=64 settings sigma dominates the global norm and neither
+            # clip binds, so this toggle is inert there and matters on the tail. The measurement it
+            # was flipped on came from run 221.24, which is K=20/N=64 -- not the K=30/N=128 believed
+            # at the time; what separates that run from the live cells is m_phi_lr, e_q_mu_lr,
+            # mu_trust_mode, prior_source and lambda_h, not K or N. Per-role clipping does change
+            # direction (median 0 deg, p95 12.9 deg, max 37.6 deg from the global-clipped vector) and
+            # raises the post-clip bound to sqrt(3)*grad_clip, but AdamW attenuates a CONSTANT
+            # rescale to 4.26e-4 relative, so it acts only through that factor's time-variation.
             role_params: dict = {}
             for _g in optimizer.param_groups:
                 role_params.setdefault(_g.get("role", "other"), []).extend(_g["params"])
@@ -930,7 +947,8 @@ _VAL_DIAG_KEYS = (
     "val_self_coupling", "val_self_divergence", "val_belief_coupling", "val_attention_entropy",
     "val_inner_alignment_energy_total",
     "val_attn_entropy", "val_effective_rank", "val_belief_cond_median", "val_attn_entropy_min",
-    "val_attn_entropy_min_all", "val_attn_collapsed_heads", "val_future_leakage", "val_row_sum_error",
+    "val_attn_entropy_min_all", "val_attn_entropy_min_norm",
+    "val_attn_collapsed_heads", "val_future_leakage", "val_row_sum_error",
     "val_pos_content_r2", "val_prev_token_mass", "val_period_match_mass", "val_head_redundancy_js",
     "estep_f_drop", "estep_f_nondecreasing_frac", "estep_r_mu_last", "estep_r_sigma_last",
     "estep_r_phi_last", "estep_fp_kl", "estep_fp_mu_rms", "estep_fp_sigma_rms",
@@ -939,12 +957,14 @@ _VAL_DIAG_KEYS = (
     "val_builder_resid",
     # held-out gauge / SPD / Fisher geometry (surfaced from the already-computed val diagnostics dict)
     "val_holonomy_wilson", "val_cocycle_residual", "val_gauge_invariant_spread",
-    "val_fisher_trace_mean", "val_belief_cond_p95", "val_phi_norm_mean", "val_phi_norm_std",
+    "val_fisher_trace_mean", "val_belief_cond_p95", "val_belief_lam_min", "val_belief_lam_max",
+    "val_phi_norm_mean", "val_phi_norm_std",
     "val_phi_matrix_norm_p95", "val_phi_matrix_norm_p99", "val_phi_matrix_norm_max",
     "val_phi_exp_clamp_frac", "val_phi_exp_scale_min", "val_vertex_cond_p99",
     "val_pos_phi_matrix_norm_p95", "val_pos_phi_matrix_norm_p99", "val_pos_phi_matrix_norm_max",
     "val_pos_phi_exp_clamp_frac", "val_pos_phi_exp_scale_min",
     "val_guard_sigma_floor_frac", "val_guard_sigma_ceil_frac", "val_guard_energy_klmax_frac",
+    "val_guard_energy_klmax_frac_live", "val_live_pair_frac",
     "val_nonfinite_frac",
 )
 
@@ -1009,6 +1029,10 @@ def _val_diagnostics(
     out["val_gauge_invariant_spread"]  = vd["gauge_invariant_spread"]
     out["val_fisher_trace_mean"]       = vd["fisher_trace_mean"]
     out["val_belief_cond_p95"]         = vd["belief_cond_p95"]
+    # Raw extremes so the ratio above is interpretable (audit 2026-08-06 F16): once
+    # val_guard_sigma_floor_frac > 0 the condition number is lam_max/eps, a guard readout.
+    out["val_belief_lam_min"]          = vd["belief_lam_min"]
+    out["val_belief_lam_max"]          = vd["belief_lam_max"]
     out["val_phi_norm_mean"]           = vd["phi_norm_mean"]
     out["val_phi_norm_std"]            = vd["phi_norm_std"]
     for _source, _target in (
@@ -1029,6 +1053,11 @@ def _val_diagnostics(
     out["val_guard_sigma_floor_frac"]  = vd["guard_sigma_floor_frac"]
     out["val_guard_sigma_ceil_frac"]   = vd["guard_sigma_ceil_frac"]
     out["val_guard_energy_klmax_frac"] = vd["guard_energy_klmax_frac"]
+    # Companion restricted to causally-admissible pairs (audit 2026-08-06 F17). The whole-grid
+    # column above is KEPT as-is: masked pairs are not numerically inert, so their kl_max pin is a
+    # real firewall reading. The pair tells you which triangle is actually saturating.
+    out["val_guard_energy_klmax_frac_live"] = vd.get("guard_energy_klmax_frac_live", float("nan"))
+    out["val_live_pair_frac"]               = vd.get("guard_energy_live_pair_frac", float("nan"))
     out["val_nonfinite_frac"]          = vd["nonfinite_frac"]
 
     # score_at="entry" is the beta the FORWARD actually used (audit 2026-08-05: the "converged"
@@ -1054,14 +1083,21 @@ def _val_diagnostics(
     # (1.740754e-09 = 63*1e-12*ln(1e-12)) and val_attn_collapsed_heads pinned at n_heads, so the
     # collapsed-head alarm could never fire. model.py already applies this filter for the
     # val_attn_entropy_min twin; these two were missed.
+    # The collapse test is scored on entropy NORMALIZED by each row's own ceiling ln(support_i)
+    # (audit 2026-08-06 F22). A fixed ln 2 threshold is exactly the ceiling of the first two-key row,
+    # so the strict `<` was decided by float noise -- measured 2 of 2 heads flagged on an untrained
+    # model whose attention is as uniform as the causal mask permits. See metrics.attention_head_collapse.
     ent_rows = M.attention_entropy_rows(amaps)                  # (L, H, N)
     scorable = (amaps > 0.0).sum(dim=-1) >= 2                   # rows with >=2 admissible keys
     hmin = ent_rows.masked_fill(~scorable, float("inf")).min(dim=-1).values   # (L, H)
     finite_hmin = hmin[torch.isfinite(hmin)]
     out["val_attn_entropy_min_all"] = (float(finite_hmin.min()) if finite_hmin.numel()
                                        else float("nan"))
-    out["val_attn_collapsed_heads"] = float(
-        (finite_hmin < 0.6931471805599453).float().sum())
+    worst_norm, collapsed = M.attention_head_collapse(amaps)    # (L, H) each
+    finite_norm = worst_norm[torch.isfinite(worst_norm)]
+    out["val_attn_entropy_min_norm"] = (float(finite_norm.min()) if finite_norm.numel()
+                                        else float("nan"))
+    out["val_attn_collapsed_heads"] = float(collapsed.float().sum())
     cs = M.causal_sanity(amaps)
     out["val_future_leakage"] = float(cs["future_leakage"].max())   # soft causal prior can leak silently
     out["val_row_sum_error"]  = float(cs["row_sum_error"].max())
@@ -1143,14 +1179,21 @@ def _save_eval_attention_maps(
 ) -> None:
     r"""Save beta/gamma maps from one post-step, post-EMA diagnostic snapshot.
 
-    The shipped ``attention/`` set is emitted from the snapshot unchanged. The ``attention_estep/``
-    set is a REPLAY (audit 2026-07-26 R-3): the snapshot stores only the converged maps, so the
-    entry-belief and prior arms have to be re-scored from the model. A replay failure is swallowed
-    like every other figure -- the shipped maps and the run itself do not depend on it.
+    The shipped ``attention/`` set is scored at ``"entry"`` to match the CSV (audit 2026-08-06 F19).
+    It previously came off the snapshot, which stores only the CONVERGED maps -- so after the metric
+    path moved to ``"entry"`` on 2026-08-05 the same run directory published a figure and a column
+    that measured DIFFERENT objects under the same name. Entry is the beta the forward actually used
+    (measured TV(forward, converged) up to 0.96 per row, TV(forward, entry) == 0.0), so the figure
+    follows the metric rather than the other way round. Scoring at entry cannot come from a snapshot,
+    hence the replay; the converged and prior arms remain available under ``attention_estep/``.
+
+    The ``attention_estep/`` set is a REPLAY (audit 2026-07-26 R-3) for the same reason. A replay
+    failure is swallowed like every other figure -- the shipped maps and the run itself do not
+    depend on it.
     """
     artifacts.save_attention_maps(
         step,
-        model.attention_maps(token_ids, snapshot=snapshot),
+        model.attention_maps(token_ids, score_at="entry"),
         logger=logger,
     )
     artifacts.save_gamma_attention_maps(
@@ -1507,6 +1550,10 @@ def train(
     # gradient and still never moved -- the case no existing check covers.
     motion_known_dead: Tuple[str, ...] = ()
     motion_dead_captured = False
+    skipped_steps = 0                 # cumulative REJECTED optimizer updates (audit 2026-08-06 F5)
+    consecutive_skips = 0
+    reset_nonfinite_tangent_elements()   # per-run accounting for the SPD-retraction guard
+    reset_mu_trust_fallback_elements()   # ... and for the mu-trust-region equivariance fallback
 
     def _step_indices() -> Iterable[int]:
         if not show_bar:
@@ -1623,6 +1670,28 @@ def train(
         # Gradient reachability, read off the first step that actually updated: grads are still live
         # here (train_step zeroes on entry). Gated on did_step because the nonfinite-grad path drops
         # them, which would read as "every parameter is dead" and mute the whole end-of-run check.
+        # Cumulative accepted/rejected accounting (audit 2026-08-06 F5). step_skipped is written
+        # per-row but only on LOGGING steps, and summary.json reports cfg.max_steps -- the CONFIGURED
+        # value, never the realized one. A real run
+        # (832.33_wikitext-103_K30_block_glk_s6) accepted 453 updates of 60000 over 11.4 hours and
+        # published a normal-looking summary; the live arms lose 0.2%-4.5% ARM-DEPENDENTLY, so arms
+        # of one sweep are compared at different effective budgets and different points on the LR
+        # schedule (the scheduler clocks on accepted updates). Free: status_out["did_step"] is
+        # already returned every step.
+        if step_status["did_step"]:
+            consecutive_skips = 0
+        else:
+            skipped_steps += 1
+            consecutive_skips += 1
+            if skipped_steps == 1:
+                logger.warning(
+                    "step %d: optimizer update REJECTED (non-finite gradient or AMP scale "
+                    "reduction). The LR scheduler clocks on accepted updates, so skips shorten the "
+                    "realized schedule; accepted_updates is reported in summary.json.", step + 1)
+            elif consecutive_skips > 10 and consecutive_skips % 10 == 0:
+                logger.warning(
+                    "step %d: %d CONSECUTIVE rejected updates (%d of %d total so far)",
+                    step + 1, consecutive_skips, skipped_steps, step + 1)
         if motion_snapshot is not None and not motion_dead_captured and step_status["did_step"]:
             motion_known_dead = tuple(name for name, p in model.named_parameters()
                                       if p.requires_grad and p.grad is None)
@@ -2024,6 +2093,31 @@ def train(
         elif logger is not None:
             logger.info(" parameter motion: all %d trainable parameters moved",
                         sum(1 for m in motion["motion"].values() if m["requires_grad"]))
+    # Realized-vs-configured update accounting (audit 2026-08-06 F5), handed to finalize_run through
+    # the artifacts object because train() returns only `losses`. summary.json's "n_steps" is
+    # cfg.max_steps -- what was ASKED for. These say what actually happened, so an arm that quietly
+    # trained on 95% of its budget is visible instead of being compared as if it had the full one.
+    attempted = int(n_steps - start_step)
+    if artifacts is not None:
+        neutralized = nonfinite_tangent_elements()
+        mu_fallbacks = mu_trust_fallback_elements()
+        artifacts.realized_updates = {
+            "attempted_steps":      attempted,
+            "accepted_updates":     int(attempted - skipped_steps),
+            "skipped_steps":        int(skipped_steps),
+            "accepted_update_frac": (float(attempted - skipped_steps) / attempted
+                                     if attempted else float("nan")),
+            "nonfinite_tangent_elements": int(neutralized),
+            "mu_trust_fallback_elements": int(mu_fallbacks),
+        }
+        if skipped_steps or neutralized or mu_fallbacks:
+            logger.warning(
+                " realized budget: %d/%d optimizer updates accepted (%.3f%%); "
+                "%d SPD tangent element(s) neutralized as non-finite; "
+                "%d belief(s) whitened by the non-equivariant mu-trust fallback",
+                attempted - skipped_steps, attempted,
+                100.0 * (attempted - skipped_steps) / max(attempted, 1),
+                neutralized, mu_fallbacks)
     if ema is not None:
         ema.copy_to(model)                               # the trained model IS the averaged weights
     return losses

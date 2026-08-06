@@ -436,7 +436,15 @@ class VFE3Config:
     
     beta_attention_prior:      str   = "causal"
 
-    alibi_slope:               float = 1.0          # base slope for alibi/causal_alibi priors (Press et al. schedule)
+    # MULTIPLIER on the Press schedule 2^(-8h/H), not a slope (audit 2026-08-06 F8): attention_prior
+    # .py:39-48 returns alibi_slope * 2^(-8h/H), so at alibi_slope=1.0, H=2 the REALIZED per-head
+    # slopes are 0.0625 and 0.00390625, spanning 3.94 and 0.246 nats over N=64 -- head 1's positional
+    # prior is worth a quarter of a nat and is near-indistinguishable from causal_noself. Consequence
+    # for experiment design: an n_heads sweep at FIXED alibi_slope silently rescales the positional
+    # prior by up to 180x (head-0 span 0.246/3.94/15.75/28.53/31.50/44.55 nats at H=1/2/4/7/8/16),
+    # so pin the realized head-0 slope, not this base. Kept named alibi_slope: renaming is a
+    # config-schema change that would break every config.json on disk.
+    alibi_slope:               float = 1.0          # BASE multiplier for alibi/causal_alibi priors
     attention_window:          int   = 128          # band half-width for the windowed/causal_windowed priors
 
     # Precision-weighted attention (diagnostic, default OFF): fold a detached per-key reliability
@@ -572,8 +580,15 @@ class VFE3Config:
 
     # M-step / training
     # E-step backward estimator (manuscript Algorithm 1, GL(K)_attention.tex:2050). Three modes:
-    #   'unroll'          (default): fully differentiate through the inner trajectory -- the
-    #                     gradient keeps the second-order d delta/d belief_prev terms.
+    #   'unroll'          (default): differentiate through the inner trajectory. NOTE (audit
+    #                     2026-08-06 F26): this keeps the OWN-ROW second-order term d^2F/dq_i^2 but
+    #                     NOT the cross-row d^2F/dq_i dq_j, because under the default
+    #                     gradient_mode='filtering' the key slot is a detached copy
+    #                     (gradients/oracle.py:191) and so is absent from the outer backward too.
+    #                     The detach is intended and documented (oracle.py:7-9,
+    #                     GL(K)_attention.tex:969,1499 -- the mean-field coordinate-ascent default,
+    #                     with 'smoothing' the registered alternative); measured missing component
+    #                     at T=1 is ~6% of the gradient norm, cos 0.998. Only this comment was wrong.
     #   'straight_through': each inner update computes its tangent DETACHED but rebuilds the
     #                     belief grad-connected to the previous belief (mu_next = mu_prev +
     #                     delta.detach(), sigma_next = retract(sigma_prev, delta.detach())), so

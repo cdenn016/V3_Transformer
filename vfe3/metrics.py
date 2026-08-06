@@ -573,6 +573,15 @@ def belief_spectrum(
     result: Dict[str, Any] = {
         "eigenvalues":            lam_desc,
         "condition":              condition,
+        # lam_min alongside the ratio (audit 2026-08-06 F16). `condition` divides by
+        # lam_min.clamp(min=covariance_floor), so once an eigenvalue reaches the floor the ratio
+        # stops measuring the belief and starts reporting lam_max/eps -- a readout of the GUARD.
+        # Worked example from 183.05's final row: guard_sigma_floor_frac 0.003125 x 1280 = exactly 4
+        # floored eigenvalues, and belief_cond_max 1453861.5 x 1e-6 = 1.4538615, i.e. a plausible
+        # lam_max divided by the floor. Read `condition` as invalid whenever floor_frac > 0; lam_min
+        # is what tells you which regime you are in.
+        "lam_min":                lam_min,
+        "lam_max":                lam_max,
         "effective_rank":         _family_effective_rank(
             lam.clamp(min=0.0),
             family=family,
@@ -817,6 +826,47 @@ def attention_entropy_rows(
     return -(b * torch.log(b)).sum(dim=-1)
 
 
+COLLAPSE_ENTROPY_FRACTION: float = 0.5   # a head is "collapsed" below half its achievable entropy
+
+
+def attention_head_collapse(
+    beta: torch.Tensor,                  # (..., N, N) row-stochastic attention weights
+
+    *,
+    eps:      float = 1e-12,
+    fraction: float = COLLAPSE_ENTROPY_FRACTION,
+) -> Tuple[torch.Tensor, torch.Tensor]:  # (..., ) min normalized row entropy, (...) collapsed flag
+    r"""Per-head minimum row entropy as a FRACTION of that row's achievable maximum.
+
+    Row ``i`` of a causal map admits only ``s_i`` keys, so its entropy CANNOT exceed ``ln s_i``.
+    Comparing a raw row entropy against a fixed threshold therefore measures the mask, not the head:
+    under ``causal_alibi_noself`` the first scorable row admits exactly two keys, so its ceiling
+    **is** ``ln 2`` -- the very threshold the previous test used -- and the strict ``<`` fired on
+    float noise. Measured on an untrained model whose attention is as uniform as the mask permits:
+    row entropies ``0.693146884`` and ``0.693145990`` against ``ln 2 = 0.693147181``, i.e. margins
+    of 3e-7 and 1e-6, flagging 2 of 2 heads as collapsed (audit 2026-08-06 F22). The 2026-07-27 and
+    2026-08-05 fixes moved that pin from row 0 to the first two-key row rather than removing it.
+
+    Normalizing by ``ln s_i`` makes every scorable row commensurate: 1.0 is the most uniform the
+    mask allows and 0.0 is one-hot, so a threshold expresses "this head uses less than ``fraction``
+    of the entropy available to it" at any row width. Rows with fewer than two admissible keys carry
+    no entropy at all and are excluded rather than scored as collapsed.
+
+    Returns ``(min_normalized_entropy, collapsed)`` with the row axis reduced. A leading axis with
+    no scorable row at all yields NaN and False, so ``N == 1`` and fully one-hot maps abstain
+    instead of raising a false alarm.
+    """
+    support = (beta > 0.0).sum(dim=-1)                       # (..., N) admissible keys per row
+    scorable = support >= 2
+    rows = attention_entropy_rows(beta, eps=eps)             # (..., N) raw nats
+    ceiling = torch.log(support.clamp(min=2).to(rows.dtype))
+    normalized = (rows / ceiling).masked_fill(~scorable, float("inf"))
+    worst = normalized.min(dim=-1).values                    # (...) per head/layer
+    has_scorable = scorable.any(dim=-1)
+    worst = torch.where(has_scorable, worst, torch.full_like(worst, float("nan")))
+    return worst, (worst < fraction) & has_scorable
+
+
 def _ols_slope(
     y: torch.Tensor,                     # (..., M) response sampled at x = 0..M-1
 ) -> torch.Tensor:                       # (...) least-squares slope over the last axis
@@ -866,6 +916,7 @@ def guard_saturation(
     sigma_max: Optional[float] = 5.0,
     kl_max:    float = 100.0,
     rtol:      float = 1e-3,
+    log_prior: Optional[torch.Tensor] = None,   # (..., N, N) additive prior; -inf marks masked pairs
 ) -> Dict[str, float]:
     r"""Fraction of converged-belief entries pinned at each numerical guard boundary.
 
@@ -873,6 +924,19 @@ def guard_saturation(
     (``kl_max`` on E_ij and on D(q||p)) are INERT on the pure path or load-bearing. sat_frac =
     mean(|x - boundary| < rtol * |boundary|) over the relevant entries; the variance spectrum is
     the eigenvalues for a full covariance. A near-zero map means the clamps never bind.
+
+    ``energy_klmax_frac`` denominates over the WHOLE ``(..., N, N)`` grid, masked pairs included,
+    and that is deliberate: a masked pair is not numerically inert, because ``-inf + NaN`` would
+    poison its whole softmax row, and the ``kl_max`` clamp is exactly the firewall this metric
+    certifies. Passing ``log_prior`` adds ``energy_klmax_frac_live`` restricted to the pairs the
+    causal mask actually admits (``isfinite(log_prior)``), WITHOUT changing the existing column
+    (audit 2026-08-06 F17).
+
+    Both are needed because the obvious "the denominator is 2x too big" correction is probably
+    sign-wrong: across seven runs on disk ``energy_klmax_frac * 8192`` peaks at 4163 against a
+    masked-set cardinality of 4158, the signature of the MASKED triangle saturating while the live
+    triangle does not. Re-denominatoring to the live half alone would have doubled an alarm that
+    is already overstated. Reporting both is what settles it.
     """
     spec = _spectrum(sigma, diagonal=diagonal)
     # eigvalsh error scales with the largest eigenvalue (~eps_machine * lam_max), so on a FULL
@@ -889,13 +953,18 @@ def guard_saturation(
         scale = max(abs(boundary), eps)
         return float(((x - boundary).abs() < max(rtol * scale, atol)).float().mean())
 
-    return {
+    out = {
         "sigma_floor_frac":   _frac(spec, eps, atol=spec_atol),
         "sigma_ceil_frac":    (_frac(spec, sigma_max, atol=spec_atol)
                                 if sigma_max is not None else 0.0),
         "energy_klmax_frac":  _frac(energy, kl_max),
         "selfdiv_klmax_frac": _frac(self_div, kl_max),
     }
+    if log_prior is not None:
+        live = torch.isfinite(log_prior).expand_as(energy)
+        out["energy_klmax_frac_live"] = _frac(energy[live], kl_max)
+        out["energy_live_pair_frac"] = float(live.float().mean())
+    return out
 
 
 # --- gauge invariants (group-dispatched; fixes gauge_trace_spread's det-blindness) ---

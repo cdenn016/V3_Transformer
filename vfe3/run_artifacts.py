@@ -3033,8 +3033,14 @@ def finalize_run(
         scaling_point.update(_cost_model_fields(model, cfg, n_params, tokens_seen, wall_time=wall_time))
     except Exception as exc:
         logger.warning("cost-model fields failed (%s); scaling_point keeps the 6ND proxy only", exc)
+    # "n_steps" is the CONFIGURED budget. The realized counts sit beside it rather than replacing it
+    # (audit 2026-08-06 F5): the LR scheduler clocks on accepted updates, so a run that rejected a
+    # third of its steps trained on a different schedule than its config claims, and sweep arms with
+    # different skip rates are not comparable. Absent on a train() call that had no artifacts.
+    _realized = dict(getattr(artifacts, "realized_updates", None) or {})
     artifacts.save_json("summary.json", {
         "n_steps":      cfg.max_steps,
+        **_realized,
         "n_params":     n_params,
         "best_val_ppl": best_val_ppl,
         "best_step":    artifacts.best_step,

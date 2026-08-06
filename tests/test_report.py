@@ -197,7 +197,13 @@ def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
                 "hyper_prior_centroid", "hyper_prior_coupling", "attention_maps",
                 "diagnostics_per_layer"}
     assert {name for name, _ in seen} == expected
-    assert all(snapshot is built[0] for _, snapshot in seen)
+    # attention_maps is called with snapshot=None: it scores at "entry" now, which a snapshot
+    # cannot serve, so it REPLAYS from the model (audit 2026-08-06 F19 -- the figure and the CSV
+    # column had been measuring different objects under the same name). Every OTHER consumer still
+    # shares the one snapshot, and nothing builds a second, which is what this test pins.
+    assert all(snapshot is built[0] for name, snapshot in seen if name != "attention_maps")
+    assert all(snapshot is None for name, snapshot in seen if name == "attention_maps")
+    assert len(built) == 1
     written = {path.name for path in paths}
     assert {
         "s_channel_refinement.png",
