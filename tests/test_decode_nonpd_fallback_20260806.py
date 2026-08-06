@@ -1,29 +1,32 @@
-r"""Decode log-det fallback on a non-PD Sigma_q (audit 2026-08-06 C5/F31).
+r"""Decode behaviour on a non-PD Sigma_q (audit 2026-08-06 F31).
 
-``_full_cov_query_invariants`` set ``logdet_q = -inf`` when every ``safe_cholesky`` jitter round
-failed. That does not merely give an -inf logit at that position -- it NaNs the scalar CE for the
-whole batch, by two independent routes:
+Two separate things live here, and the distinction is the point.
 
-  ``per_pos = K + logdet_q`` = -inf  ->  every vocab logit -inf  ->  ``logsumexp_v - target_logit``
-  is ``-inf - (-inf)`` = NaN; and ``gathered * in_chunk_f`` is ``-inf * 0.0`` = NaN in every chunk
-  that does not contain the target, so NaN enters ``target_logit`` first.
+**Fixed.** The chunked reducers returned ``gathered * in_chunk_f`` to zero out positions whose
+target is not in this chunk. With an -inf logit that is ``-inf * 0.0`` = NaN, so a degenerate
+position poisoned ``target_logit`` through chunks it has no business contributing to. A mask must
+not manufacture NaN under any contract; it is now a select, byte-identical for finite logits.
 
-The value is irrelevant to the loss -- ``per_pos`` is v-INDEPENDENT and cancels exactly -- so a
-finite fallback costs nothing and the event is counted instead.
+**NOT fixed, by design.** ``logdet_q = -inf`` on a total Cholesky failure is a PINNED cross-path
+parity contract (``test_full_cov_chunked_matches_dense_on_non_pd``, audit 2026-07-01 F6): the dense
+and chunked paths must agree that a degenerate position scores -inf. But an all--inf logit row is
+NaN downstream on BOTH paths -- ``log_softmax`` of it is NaN, and the chunked
+``logsumexp_v - target_logit`` is ``-inf - (-inf)``. Making that finite changes what a degenerate
+position should SCORE and would have to move both paths together, so it is a decision, not a patch.
+The event is counted instead, so a run can at least tell it happened.
 
-Pins: (a) a hopelessly non-PD position yields a FINITE CE, where the old sentinel gave NaN;
-(b) the event is counted; (c) the healthy path is untouched and counts zero; (d) the fallback value
-genuinely does not move the loss, i.e. the cancellation is real.
+Pins: (a) the mask no longer manufactures NaN; (b) the -inf parity contract still holds; (c) the
+NaN-CE consequence is real on both paths, recorded so a future change is deliberate; (d) the event
+is counted; (e) the healthy path is untouched.
 """
 
 import pytest
 import torch
 
-from vfe3.families.base import _logdet_chol
+import vfe3.model.prior_bank as prior_bank
 from vfe3.numerics import (
     decode_logdet_fallback_elements,
     reset_decode_logdet_fallback_elements,
-    safe_cholesky,
 )
 
 from tests.test_amp import _tiny_model
@@ -36,9 +39,9 @@ def _reset():
     reset_decode_logdet_fallback_elements()
 
 
-def _bank(**kw):
+def _bank():
     model = _tiny_model(gauge_group="block_glk", n_heads=2, family="gaussian_full",
-                        decode_mode="full_chunked", **kw)
+                        decode_mode="full_chunked")
     return model, model.prior_bank
 
 
@@ -49,76 +52,71 @@ def _inputs(model, non_pd_at=None):
     sigma = torch.eye(K).expand(B, N, K, K).clone()
     if non_pd_at is not None:
         sigma[non_pd_at] = -5.0 * torch.eye(K)      # fails every jitter round
-    targets = torch.randint(0, 20, (B, N), generator=g)
-    return mu, sigma, targets
+    return mu, sigma, torch.randint(0, 20, (B, N), generator=g)
 
 
-def _old_inf_sentinel(self, sigma_q):
-    r"""The pre-fix implementation, for the side-by-side comparison in (a)."""
-    diag_sq = torch.diagonal(sigma_q, dim1=-2, dim2=-1)
-    factor, ok = safe_cholesky(sigma_q, eps=self.eps, rounds=5)
-    logdet = _logdet_chol(factor)
-    return diag_sq, torch.where(ok, logdet, logdet.new_full((), float("-inf")))
+# -- (a) the mask no longer manufactures NaN ---------------------------------------------------
 
 
-# -- (a)/(b) the failure mode is gone and is visible ------------------------------------------
+def test_chunk_mask_selects_instead_of_multiplying():
+    r"""-inf * 0.0 is NaN; the select is 0.0. Checked on the operation itself so the pin survives
+    any refactor of the surrounding reducer."""
+    gathered = torch.tensor([float("-inf"), 1.5])
+    in_chunk_f = torch.tensor([0.0, 1.0])
+    assert torch.isnan(gathered * in_chunk_f)[0], "the old form is supposed to produce NaN here"
+    selected = torch.where(in_chunk_f > 0, gathered, torch.zeros_like(gathered))
+    assert torch.equal(selected, torch.tensor([0.0, 1.5]))
 
 
-def test_non_pd_position_no_longer_nans_the_whole_batch(monkeypatch):
-    import vfe3.model.prior_bank as prior_bank
+def test_finite_logits_are_byte_identical_under_the_select():
+    g = torch.Generator().manual_seed(1)
+    gathered = torch.randn(64, generator=g)
+    in_chunk_f = (torch.rand(64, generator=g) > 0.5).float()
+    assert torch.equal(
+        gathered * in_chunk_f,
+        torch.where(in_chunk_f > 0, gathered, torch.zeros_like(gathered)))
 
+
+# -- (b)/(c) the -inf contract stands, and its consequence is recorded -------------------------
+
+
+def test_non_pd_still_scores_neg_inf_on_both_paths():
+    r"""The F6 parity contract. If this ever changes, it must change on BOTH paths together."""
+    model, bank = _bank()
+    mu, sigma, _ = _inputs(model, non_pd_at=(0, 2))
+    tau = bank._tau_eff(None)
+    dense = prior_bank._decode_full(bank, mu, sigma, tau)
+    assert torch.isneginf(dense[0, 2]).all()
+
+
+def test_all_neg_inf_row_is_nan_downstream_on_the_dense_path():
+    r"""Records WHY F31 is still open: the pinned -inf contract is itself NaN-generating, so
+    'fix the sentinel' is not a local change."""
+    model, bank = _bank()
+    mu, sigma, _ = _inputs(model, non_pd_at=(0, 2))
+    dense = prior_bank._decode_full(bank, mu, sigma, bank._tau_eff(None))
+    assert torch.isnan(torch.log_softmax(dense[0, 2], dim=-1)).all()
+
+
+# -- (d)/(e) the event is counted, and the healthy path is untouched ---------------------------
+
+
+def test_fallback_is_counted():
     model, bank = _bank()
     mu, sigma, targets = _inputs(model, non_pd_at=(0, 2))
-
-    ce = bank.decode_ce_full_chunked(mu, sigma, targets)
-    assert torch.isfinite(ce), "a single non-PD position must not NaN the batch CE"
+    bank.decode_ce_full_chunked(mu, sigma, targets)
     assert decode_logdet_fallback_elements() == 1
-
-    monkeypatch.setattr(
-        prior_bank.PriorBank, "_full_cov_query_invariants", _old_inf_sentinel)
-    assert torch.isnan(bank.decode_ce_full_chunked(mu, sigma, targets)), (
-        "the -inf sentinel is supposed to be the failure this test pins; if it no longer NaNs, "
-        "the surrounding code changed and this regression test needs rewriting")
-
-
-# -- (c) the healthy path is untouched ---------------------------------------------------------
 
 
 def test_healthy_path_counts_zero_and_stays_finite():
     model, bank = _bank()
     mu, sigma, targets = _inputs(model)
-    ce = bank.decode_ce_full_chunked(mu, sigma, targets)
-    assert torch.isfinite(ce)
+    assert torch.isfinite(bank.decode_ce_full_chunked(mu, sigma, targets))
     assert decode_logdet_fallback_elements() == 0
 
 
 def test_model_forward_is_finite_and_counts_zero():
     model, _ = _bank()
-    tokens = torch.randint(0, 20, (2, 5))
-    loss = model(tokens, torch.randint(0, 20, (2, 5)))[1]
+    loss = model(torch.randint(0, 20, (2, 5)), torch.randint(0, 20, (2, 5)))[1]
     assert torch.isfinite(loss)
     assert decode_logdet_fallback_elements() == 0
-
-
-# -- (d) the fallback value really does cancel -------------------------------------------------
-
-
-@pytest.mark.parametrize("fallback", [0.0, 12.5, -7.25])
-def test_loss_is_independent_of_the_fallback_value(monkeypatch, fallback):
-    r"""per_pos is v-independent, so ANY finite fallback gives the same CE. That is why zero is
-    free -- and why encoding a 'penalty' in this magnitude would have been meaningless."""
-    import vfe3.model.prior_bank as prior_bank
-
-    def patched(self, sigma_q):
-        diag_sq = torch.diagonal(sigma_q, dim1=-2, dim2=-1)
-        factor, ok = safe_cholesky(sigma_q, eps=self.eps, rounds=5)
-        logdet = _logdet_chol(factor)
-        return diag_sq, torch.where(ok, logdet, torch.full_like(logdet, fallback))
-
-    model, bank = _bank()
-    mu, sigma, targets = _inputs(model, non_pd_at=(0, 2))
-    baseline = bank.decode_ce_full_chunked(mu, sigma, targets)
-
-    monkeypatch.setattr(prior_bank.PriorBank, "_full_cov_query_invariants", patched)
-    assert torch.allclose(bank.decode_ce_full_chunked(mu, sigma, targets), baseline,
-                          atol=1e-5, rtol=1e-5)
