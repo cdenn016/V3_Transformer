@@ -521,6 +521,61 @@ def _certify_public_spd(
     return output.reshape_as(symmetric)
 
 
+_NONFINITE_TANGENT_COUNTS: Dict[str, torch.Tensor] = {}
+
+
+def _neutralize_nonfinite_tangent(
+    tangent:    torch.Tensor,               # (..., K) diagonal or (..., K, K) full whitened tangent
+    event_ndim: int,                        # 1 diagonal, 2 full -- the trailing axes of ONE element
+) -> torch.Tensor:
+    r"""Zero any tangent ELEMENT that is not entirely finite, and count it (audit 2026-08-06).
+
+    The trust region below bounds the tangent's NORM, which is the guard against a large step. It is
+    NOT a guard against a non-finite one: ``||R||_F`` of a matrix holding a single NaN is NaN, so
+    ``clamp(trust_region / (NaN + eps), max=1.0)`` is NaN and the clamp MULTIPLIES the poison through
+    instead of stopping it. Downstream the two arms then fail differently and both badly -- the full
+    arm hands the NaN to ``torch.linalg.eigh``, which raises
+    ``_LinAlgError: the algorithm failed to converge`` and kills the whole run mid-training (observed
+    2026-08-06 at step 4253 of an ``e_q_mu_lr=0.01`` sweep cell), while the diagonal arm propagates it
+    silently, since ``clamp`` and ``exp`` both pass NaN through and the result is a NaN covariance
+    that no later clamp repairs.
+
+    Zeroing the offending element is the conservative recovery and the one the geometry already
+    means: a zero tangent retracts along ``exp(0) = I``, i.e. that element's covariance is left
+    UNCHANGED for this step, exactly as a fully-binding trust region would in the limit. One bad
+    token no longer decides the fate of a multi-hour run.
+
+    It is deliberately NOT silent. Masking a non-finite gradient without saying so would turn a
+    crash into a quietly wrong number, which is worse in a research setting: the count accumulates
+    per device in a plain on-device tensor -- an async add, NO host sync in the hot path -- and
+    :func:`nonfinite_tangent_elements` reads it at whatever cadence the caller already syncs on.
+    A nonzero count means some belief received a non-finite natural gradient; the retraction is
+    where that surfaced, not where it was caused.
+    """
+    reduce_axes = tuple(range(-event_ndim, 0))
+    finite = torch.isfinite(tangent).all(dim=reduce_axes, keepdim=True)
+    key = str(tangent.device)
+    counter = _NONFINITE_TANGENT_COUNTS.get(key)
+    if counter is None:
+        counter = torch.zeros((), dtype=torch.int64, device=tangent.device)
+        _NONFINITE_TANGENT_COUNTS[key] = counter
+    counter += (~finite).sum()
+    return torch.where(finite, tangent, torch.zeros_like(tangent))
+
+
+def nonfinite_tangent_elements() -> int:
+    r"""Total tangent elements neutralized by :func:`_neutralize_nonfinite_tangent` since the last
+    reset. Reads the on-device counters, so it host-syncs: call it at an existing logging cadence,
+    not inside the E-step."""
+    return int(sum(int(count) for count in _NONFINITE_TANGENT_COUNTS.values()))
+
+
+def reset_nonfinite_tangent_elements() -> None:
+    r"""Zero the neutralized-tangent counters (per-run or per-interval accounting)."""
+    for count in _NONFINITE_TANGENT_COUNTS.values():
+        count.zero_()
+
+
 def retract_spd_diagonal(
     sigma_diag:   torch.Tensor,             # (..., K) diagonal variances
     delta_sigma:  torch.Tensor,             # (..., K) diagonal tangent
@@ -548,6 +603,9 @@ def retract_spd_diagonal(
         delta_sigma = delta_sigma.to(compute_dtype)
         whitened = delta_sigma / sigma_safe
         exp_arg = step_size * whitened
+        # Before the NORM guard, because a non-finite entry makes that norm NaN and the clamp then
+        # multiplies the poison through rather than bounding it (see the helper).
+        exp_arg = _neutralize_nonfinite_tangent(exp_arg, event_ndim=1)
         if trust_region is not None and trust_region > 0:
             tangent_norm = torch.linalg.vector_norm(exp_arg, dim=-1, keepdim=True)
             exp_arg = exp_arg * torch.clamp(trust_region / (tangent_norm + eps), max=1.0)
@@ -609,6 +667,10 @@ def retract_spd_full(
 
         R = sigma_inv_sqrt @ (step_size * delta_sigma) @ sigma_inv_sqrt
         R = 0.5 * (R + R.transpose(-1, -2))
+        # Guard R itself, not delta_sigma: sigma_inv_sqrt reaches 1/sqrt(eps) at the variance floor,
+        # so a finite-but-extreme tangent can overflow to +-inf HERE, and eigh cannot be handed
+        # either that or a NaN. Placed before the norm guard for the reason given in the helper.
+        R = _neutralize_nonfinite_tangent(R, event_ndim=2)
         if trust_region is not None and trust_region > 0:
             R_norm = torch.linalg.norm(R, ord='fro', dim=(-2, -1), keepdim=True)
             R = R * torch.clamp(trust_region / (R_norm + eps), max=1.0)
