@@ -248,27 +248,35 @@ def test_m3_regime_ii_edge_factor_exact_for_non_orthonormal_son():
 #      the result-storage dtype is still the fundamental fp32 limit at extreme cond.
 # ---------------------------------------------------------------------------
 def test_m4_full_cov_sandwich_is_float64_island():
-    from vfe3.geometry.transport import transport_covariance
+    from vfe3.geometry.transport import (
+        set_full_cov_congruence_precision,
+        transport_covariance,
+    )
+    # Asserts what the FLOAT64 island does, not what the default is (audit 2026-08-06 C1):
+    # pin it so flipping full_cov_congruence_precision cannot retarget this test.
+    previous = set_full_cov_congruence_precision("fp64")
+    try:
 
-    torch.manual_seed(0)
-    K, N = 6, 2
-    a = 4.0                                                       # ill-conditioned, non-orthogonal
-    Q, _ = torch.linalg.qr(torch.randn(K, K))
-    evals = torch.zeros(K)
-    evals[0], evals[1] = a, -a
-    A = (Q @ torch.diag(evals) @ Q.transpose(-1, -2)).float()
-    Omega1 = torch.matrix_exp(A)
-    omega = Omega1.expand(N, N, K, K).contiguous()
-    S = torch.randn(N, K, K)
-    sigma = (S @ S.transpose(-1, -2) + torch.eye(K)).contiguous()
+        torch.manual_seed(0)
+        K, N = 6, 2
+        a = 4.0                                                       # ill-conditioned, non-orthogonal
+        Q, _ = torch.linalg.qr(torch.randn(K, K))
+        evals = torch.zeros(K)
+        evals[0], evals[1] = a, -a
+        A = (Q @ torch.diag(evals) @ Q.transpose(-1, -2)).float()
+        Omega1 = torch.matrix_exp(A)
+        omega = Omega1.expand(N, N, K, K).contiguous()
+        S = torch.randn(N, K, K)
+        sigma = (S @ S.transpose(-1, -2) + torch.eye(K)).contiguous()
 
-    got = transport_covariance(omega, sigma, diagonal_out=False)
-    # the fix evaluates the contraction in float64 then casts back: the result must be bit-identical
-    # to the float64-computed-then-cast reference (the old fp32 einsum differed by accumulation)
-    ref = torch.einsum("ijkl,jlm,ijnm->ijkn",
-                       omega.double(), sigma.double(), omega.double()).to(torch.float32)
-    assert torch.equal(got, ref)
-
+        got = transport_covariance(omega, sigma, diagonal_out=False)
+        # the fix evaluates the contraction in float64 then casts back: the result must be bit-identical
+        # to the float64-computed-then-cast reference (the old fp32 einsum differed by accumulation)
+        ref = torch.einsum("ijkl,jlm,ijnm->ijkn",
+                           omega.double(), sigma.double(), omega.double()).to(torch.float32)
+        assert torch.equal(got, ref)
+    finally:
+        set_full_cov_congruence_precision(previous)
 
 def test_m4_full_cov_sandwich_diagonal_path_unchanged():
     # the diagonal default path (the hot path) must NOT be upcast / changed

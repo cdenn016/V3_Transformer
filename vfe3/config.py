@@ -164,6 +164,9 @@ class VFE3Config:
     # "high"/"medium" permit TF32/bf16x3 reductions. Set it to pin the policy a run was trained
     # under; leave it None to keep the current numerics.
     fp32_matmul_precision: Optional[str] = None       # None (leave as-is) | "highest" | "high" | "medium"
+    
+    
+    
     log_interval:              int   = 100           # console log every N steps (0 = off)
     eval_interval:             int   = 2000            # periodic validation every N steps (0 = off)
     checkpoint_interval:       int   = 25000            # save a resumable checkpoint every N steps (0 = off)
@@ -933,7 +936,7 @@ class VFE3Config:
     # "fp32_escalate" contracts in float32 and redoes a batch in float64 only if the float32 result
     # lost finiteness; the congruence SQUARES cond(Omega), so it is a real accuracy trade at high
     # ||phi||. A float64 SOURCE contracts in float64 under either setting.
-    full_cov_congruence_precision: str = "fp64"      # "fp64" | "fp32_escalate"
+    full_cov_congruence_precision: str = "fp32_escalate"      # "fp64" | "fp32_escalate"
 
     # Scaling of safe_cholesky's jitter ladder (audit 2026-08-06 C3/F18). The ridge eps*10^t is
     # ABSOLUTE by default, so at an eigenvalue on the eps=1e-6 SPD floor the t=0 ridge DOUBLES it
@@ -941,14 +944,14 @@ class VFE3Config:
     # ridge is a 1e-8 relative no-op. "relative" scales by diagonal_mean(M) so every element gets
     # the same relative perturbation. Default "absolute" keeps every run on disk reproducible; the
     # two coincide exactly when diagonal_mean(M) == 1, and the ladder only fires above cond ~1e8.
-    safe_cholesky_jitter_mode: str = "absolute"      # "absolute" | "relative"
+    safe_cholesky_jitter_mode: str = "relative"      # "absolute" | "relative"
 
     # Jitter-escalation rounds for the mu-trust-region whitening Cholesky (audit 2026-08-06
     # C6/F29). At 0 (the historical value) one marginally non-PD sigma_q silently drops that belief
     # to a diagonal whitening that is NOT GL-equivariant, masked in by torch.where. A positive
     # value lets the ladder rescue it and keep it on the equivariant path. Default 0 for
     # bit-reproducibility; guard_mu_trust_fallback in the run report says whether it ever fires.
-    mu_trust_cholesky_rounds: int = 0
+    mu_trust_cholesky_rounds: int = 3
 
     # Working precision of the decode's a_v reduction (audit 2026-08-06 F32). a_v accumulates
     # terms of size 1/sigma_v and the result is divided by 2*tau (0.016 live), so the fp32 error is

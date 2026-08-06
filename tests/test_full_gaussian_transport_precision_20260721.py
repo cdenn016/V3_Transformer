@@ -21,6 +21,23 @@ from vfe3.geometry.transport import (
 from vfe3.metrics import gauge_equivariance_residual
 
 
+@pytest.fixture(autouse=True)
+def _pin_fp64_congruence():
+    r"""Pin the float64 congruence island for this file (audit 2026-08-06 C1).
+
+    Every test here asserts what the FLOAT64 path does -- the sandwich retained in float64, its
+    backward staying finite, the flag reaching the structural wrappers. None is about which policy
+    happens to be the shipped default, so relying on that default silently retargeted the whole file
+    at the float32 path the moment the default was flipped. Pinning states the intent and keeps the
+    file meaningful under either default.
+    """
+    from vfe3.geometry.transport import set_full_cov_congruence_precision
+
+    previous = set_full_cov_congruence_precision("fp64")
+    yield
+    set_full_cov_congruence_precision(previous)
+
+
 _OMEGA = torch.tensor(
     [[
         0.057695649564266205,
