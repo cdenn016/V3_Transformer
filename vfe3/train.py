@@ -55,6 +55,10 @@ from vfe3.geometry.retraction import (                          # SPD-retraction
     nonfinite_tangent_elements,
     reset_nonfinite_tangent_elements,
 )
+from vfe3.numerics import (                                     # mu-trust-region equivariance fallback
+    mu_trust_fallback_elements,
+    reset_mu_trust_fallback_elements,
+)
 
 
 _PHI_CLAMP_WARNED:   bool = False
@@ -953,7 +957,8 @@ _VAL_DIAG_KEYS = (
     "val_builder_resid",
     # held-out gauge / SPD / Fisher geometry (surfaced from the already-computed val diagnostics dict)
     "val_holonomy_wilson", "val_cocycle_residual", "val_gauge_invariant_spread",
-    "val_fisher_trace_mean", "val_belief_cond_p95", "val_phi_norm_mean", "val_phi_norm_std",
+    "val_fisher_trace_mean", "val_belief_cond_p95", "val_belief_lam_min", "val_belief_lam_max",
+    "val_phi_norm_mean", "val_phi_norm_std",
     "val_phi_matrix_norm_p95", "val_phi_matrix_norm_p99", "val_phi_matrix_norm_max",
     "val_phi_exp_clamp_frac", "val_phi_exp_scale_min", "val_vertex_cond_p99",
     "val_pos_phi_matrix_norm_p95", "val_pos_phi_matrix_norm_p99", "val_pos_phi_matrix_norm_max",
@@ -1024,6 +1029,10 @@ def _val_diagnostics(
     out["val_gauge_invariant_spread"]  = vd["gauge_invariant_spread"]
     out["val_fisher_trace_mean"]       = vd["fisher_trace_mean"]
     out["val_belief_cond_p95"]         = vd["belief_cond_p95"]
+    # Raw extremes so the ratio above is interpretable (audit 2026-08-06 F16): once
+    # val_guard_sigma_floor_frac > 0 the condition number is lam_max/eps, a guard readout.
+    out["val_belief_lam_min"]          = vd["belief_lam_min"]
+    out["val_belief_lam_max"]          = vd["belief_lam_max"]
     out["val_phi_norm_mean"]           = vd["phi_norm_mean"]
     out["val_phi_norm_std"]            = vd["phi_norm_std"]
     for _source, _target in (
@@ -1544,6 +1553,7 @@ def train(
     skipped_steps = 0                 # cumulative REJECTED optimizer updates (audit 2026-08-06 F5)
     consecutive_skips = 0
     reset_nonfinite_tangent_elements()   # per-run accounting for the SPD-retraction guard
+    reset_mu_trust_fallback_elements()   # ... and for the mu-trust-region equivariance fallback
 
     def _step_indices() -> Iterable[int]:
         if not show_bar:
@@ -2090,6 +2100,7 @@ def train(
     attempted = int(n_steps - start_step)
     if artifacts is not None:
         neutralized = nonfinite_tangent_elements()
+        mu_fallbacks = mu_trust_fallback_elements()
         artifacts.realized_updates = {
             "attempted_steps":      attempted,
             "accepted_updates":     int(attempted - skipped_steps),
@@ -2097,13 +2108,16 @@ def train(
             "accepted_update_frac": (float(attempted - skipped_steps) / attempted
                                      if attempted else float("nan")),
             "nonfinite_tangent_elements": int(neutralized),
+            "mu_trust_fallback_elements": int(mu_fallbacks),
         }
-        if skipped_steps or neutralized:
+        if skipped_steps or neutralized or mu_fallbacks:
             logger.warning(
                 " realized budget: %d/%d optimizer updates accepted (%.3f%%); "
-                "%d SPD tangent element(s) neutralized as non-finite",
+                "%d SPD tangent element(s) neutralized as non-finite; "
+                "%d belief(s) whitened by the non-equivariant mu-trust fallback",
                 attempted - skipped_steps, attempted,
-                100.0 * (attempted - skipped_steps) / max(attempted, 1), neutralized)
+                100.0 * (attempted - skipped_steps) / max(attempted, 1),
+                neutralized, mu_fallbacks)
     if ema is not None:
         ema.copy_to(model)                               # the trained model IS the averaged weights
     return losses

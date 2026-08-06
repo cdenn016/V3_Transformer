@@ -573,6 +573,15 @@ def belief_spectrum(
     result: Dict[str, Any] = {
         "eigenvalues":            lam_desc,
         "condition":              condition,
+        # lam_min alongside the ratio (audit 2026-08-06 F16). `condition` divides by
+        # lam_min.clamp(min=covariance_floor), so once an eigenvalue reaches the floor the ratio
+        # stops measuring the belief and starts reporting lam_max/eps -- a readout of the GUARD.
+        # Worked example from 183.05's final row: guard_sigma_floor_frac 0.003125 x 1280 = exactly 4
+        # floored eigenvalues, and belief_cond_max 1453861.5 x 1e-6 = 1.4538615, i.e. a plausible
+        # lam_max divided by the floor. Read `condition` as invalid whenever floor_frac > 0; lam_min
+        # is what tells you which regime you are in.
+        "lam_min":                lam_min,
+        "lam_max":                lam_max,
         "effective_rank":         _family_effective_rank(
             lam.clamp(min=0.0),
             family=family,

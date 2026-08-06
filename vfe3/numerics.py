@@ -165,6 +165,12 @@ def apply_mu_trust_region(
         return whitened.clamp(-trust, trust) * scale
 
     factor, ok = safe_cholesky(sigma_q, eps=eps, rounds=0)
+    # rounds=0 means ZERO jitter escalation here, so one marginally non-PD sigma_q routes that batch
+    # element to the diagonal-whitening fallback below -- which is NOT GL-equivariant in either mode
+    # (measured relative equivariance error 9.3e-2 / 6.6e-1 / 1.1e-1 at gauge scales 0.06/0.5/1.5,
+    # against the ball path's 1.1e-15 / 1.1e-13 / 9.8e-11). It is masked in by torch.where with no
+    # signal, so a run could not tell it happened (audit 2026-08-06 F29). Counted on-device, no sync.
+    _count_mu_trust_fallback(ok)
     eye = torch.eye(sigma_q.shape[-1], device=sigma_q.device, dtype=sigma_q.dtype)
     safe_factor = torch.where(ok.unsqueeze(-1).unsqueeze(-1), factor, eye.expand_as(factor))
     whitened = torch.linalg.solve_triangular(
@@ -194,6 +200,31 @@ def apply_mu_trust_region(
     else:
         fallback = fallback_white.clamp(-trust, trust) * scale
     return torch.where(ok.unsqueeze(-1), full_out, fallback)
+
+
+_MU_TRUST_FALLBACK_COUNTS: Dict[str, torch.Tensor] = {}
+
+
+def _count_mu_trust_fallback(ok: torch.Tensor) -> None:
+    r"""Accumulate mu-trust-region Cholesky failures per device (async add, no host sync)."""
+    key = str(ok.device)
+    counter = _MU_TRUST_FALLBACK_COUNTS.get(key)
+    if counter is None:
+        counter = torch.zeros((), dtype=torch.int64, device=ok.device)
+        _MU_TRUST_FALLBACK_COUNTS[key] = counter
+    counter += (~ok).sum()
+
+
+def mu_trust_fallback_elements() -> int:
+    r"""Belief elements whitened by the NON-equivariant diagonal fallback since the last reset.
+    Reads the on-device counters, so it host-syncs: call it at an existing logging cadence."""
+    return int(sum(int(count) for count in _MU_TRUST_FALLBACK_COUNTS.values()))
+
+
+def reset_mu_trust_fallback_elements() -> None:
+    r"""Zero the mu-trust-region fallback counters (per-run accounting)."""
+    for count in _MU_TRUST_FALLBACK_COUNTS.values():
+        count.zero_()
 
 
 def safe_cholesky(

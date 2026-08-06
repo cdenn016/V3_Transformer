@@ -3150,6 +3150,12 @@ class VFEModel(nn.Module):
         d["belief_cond_median"] = float(cond.median())
         d["belief_cond_p95"]    = float(torch.quantile(cond, 0.95))
         d["belief_cond_max"]    = float(cond.max())
+        # The RAW extremes beside the ratio (audit 2026-08-06 F16). Once an eigenvalue reaches the
+        # eps floor, belief_cond_* is lam_max/eps -- a guard readout, not a belief property -- and
+        # the three reductions above cannot distinguish "the belief became ill-conditioned" from
+        # "the floor engaged". lam_min does, and it is the quantity the SPD trust region moves.
+        d["belief_lam_min"]     = float(bs["lam_min"].float().min())
+        d["belief_lam_max"]     = float(bs["lam_max"].float().max())
         # clamp lam_min at eps before dividing -- matches the floor belief_spectrum's condition number
         # uses, so a floored / sub-floor belief reads ~1.0 (not 0.0) consistently across the reductions.
         d["belief_pd_margin"]   = float((bs["eigenvalues"][..., -1].clamp(min=cfg.eps).float() / cfg.eps).min())
