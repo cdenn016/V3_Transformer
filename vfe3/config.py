@@ -101,6 +101,18 @@ class VFE3Config:
                                                      # adds torch.use_deterministic_algorithms(warn_only) + cudnn.deterministic
                                                      # + CUBLAS_WORKSPACE_CONFIG (env var takes full effect only if set
                                                      # before the first CUDA op). Default False = today's byte-identical path.
+    # fp32 matmul / TF32 policy (audit 2026-08-06 C7/F25). `deterministic` above does NOT constrain
+    # TF32 -- so production ran under whatever policy the card defaulted to, while
+    # tests/conftest.py:61-99 pins and restores one. Every numeric tolerance in the suite was
+    # therefore asserted under a policy the training run neither stated nor logged, and
+    # provenance.json could not record the drift.
+    #
+    # RECORDING is unconditional and already live (runtime.deterministic_state). SETTING is this
+    # knob, and None means "leave the card as it is" -- the historical behavior, so no run changes
+    # unless you ask. "highest" disables TF32 (full fp32 mantissa, slowest, most reproducible);
+    # "high"/"medium" permit TF32/bf16x3 reductions. Set it to pin the policy a run was trained
+    # under; leave it None to keep the current numerics.
+    fp32_matmul_precision: Optional[str] = None       # None (leave as-is) | "highest" | "high" | "medium"
     log_interval:              int   = 100           # console log every N steps (0 = off)
     eval_interval:             int   = 2000            # periodic validation every N steps (0 = off)
     checkpoint_interval:       int   = 25000            # save a resumable checkpoint every N steps (0 = off)
@@ -886,6 +898,29 @@ class VFE3Config:
     # value lets the ladder rescue it and keep it on the equivariant path. Default 0 for
     # bit-reproducibility; guard_mu_trust_fallback in the run report says whether it ever fires.
     mu_trust_cholesky_rounds: int = 0
+
+    # Working precision of the decode's a_v reduction (audit 2026-08-06 F32). a_v accumulates
+    # terms of size 1/sigma_v and the result is divided by 2*tau (0.016 live), so the fp32 error is
+    # amplified twice. Measured max |a_v - fp64| at K=20: 5.2e-6 at sigma_v=4, 2.5e-3 at 1e-2,
+    # 2.2e-1 at 1e-4 -- the last being ~12 logits. NOTE the audit filed this as a cancellation
+    # defect in the expanded square and proposed differencing before squaring; that was measured and
+    # buys only ~1.8x, while the SAME algebra in float64 buys nine decades. It is a precision
+    # problem, not a factorization problem. sigma_log_embed trains freely against only the eps=1e-6
+    # floor, so this is harmless at init and about one order of magnitude of shrinkage from
+    # material; watch decode_sigma_v_min. Default "fp32" is bit-identical to every run on disk.
+    decode_av_precision: str = "fp32"     # "fp32" | "fp64"
+
+    # How many validation batches the held-out val_* probes average over (audit 2026-08-06 F6).
+    # At 1 -- the historical value, and bit-identical -- EVERY val_* column is a statistic of one
+    # fixed 64-token sequence: _val_diagnostics takes next(iter(val_loader)) then [:1], the loader is
+    # shuffle=False, and the sampler is sequential, so the same sequence is scored at every eval of
+    # every run. It shows up in the artifacts as guard fractions that are exact multiples of 1/1280
+    # (K*N) and 1/8192 (H*N^2), which only holds at B=1. That is a sample size of one standing behind
+    # every held-out number the project reports, including estep_f_nondecreasing_frac, which at
+    # n_e_steps=1 is a single Bernoulli draw (see estep_f_comparisons). Raising this costs one extra
+    # held-out forward per batch per eval and is the cheapest way to make the val_* columns mean what
+    # they appear to mean; the attention FIGURES still come from the first sequence either way.
+    val_diagnostic_batches: int = 1
 
     # Working precision of the FULL-covariance pair KL (family="gaussian_full" only; the diagonal
     # family already keys its island on operand dtypes). "fp64" is the historical unconditional
@@ -2266,6 +2301,21 @@ class VFE3Config:
             raise ValueError(
                 "mu_trust_cholesky_rounds must be a nonnegative int, got "
                 f"{self.mu_trust_cholesky_rounds!r}")
+        if (not isinstance(self.val_diagnostic_batches, int)
+                or isinstance(self.val_diagnostic_batches, bool)
+                or self.val_diagnostic_batches < 1):
+            raise ValueError(
+                "val_diagnostic_batches must be an int >= 1, got "
+                f"{self.val_diagnostic_batches!r}")
+        if self.decode_av_precision not in ("fp32", "fp64"):
+            raise ValueError(
+                "decode_av_precision must be one of ('fp32', 'fp64'), "
+                f"got {self.decode_av_precision!r}")
+        if self.fp32_matmul_precision is not None and self.fp32_matmul_precision not in (
+                "highest", "high", "medium"):
+            raise ValueError(
+                "fp32_matmul_precision must be None (leave the card as-is) or one of "
+                f"('highest', 'high', 'medium'), got {self.fp32_matmul_precision!r}")
         # Full-covariance KL working precision (audit 2026-08-05). Validated here rather than left
         # to the family so an unreachable spelling fails at construction, not mid-forward.
         # FAIL CLOSED rather than falling back. The right insertion folds R into the VERTEX frame, so

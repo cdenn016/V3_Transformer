@@ -582,6 +582,13 @@ def belief_spectrum(
         # is what tells you which regime you are in.
         "lam_min":                lam_min,
         "lam_max":                lam_max,
+        # The validity flag FOR ``condition``, carried on the same tensor rather than left to a
+        # cross-reference (audit 2026-08-06 F16). ``condition`` is a belief property only where
+        # lam_min is strictly above the floor; at or below it the ratio is lam_max/floor and says
+        # nothing about the belief. Emitting this beside the ratio means a reader of
+        # ``belief_cond_p95`` does not have to know that ``guard_sigma_floor_frac`` exists, is
+        # denominated over K*N, and is the column that invalidates this one.
+        "condition_is_belief":    lam_min > covariance_floor,
         "effective_rank":         _family_effective_rank(
             lam.clamp(min=0.0),
             family=family,

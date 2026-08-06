@@ -60,12 +60,14 @@ from vfe3.model.prior_bank import (
     PriorBank,
     get_decode_registration,
     normalize_legacy_model_state,
+    set_decode_av_precision,
 )
 from vfe3.model.stack import vfe_stack
 from vfe3.families.base import get_family
 from vfe3.families.gaussian import set_full_cov_kl_precision
 from vfe3.geometry.transport import set_full_cov_congruence_precision
 from vfe3.numerics import set_mu_trust_cholesky_rounds, set_safe_cholesky_jitter_mode
+from vfe3.runtime import set_fp32_matmul_precision
 
 
 # Transport-mode state-routing sets: which regimes' Omega builders read mu/sigma. Sourced from the
@@ -246,6 +248,14 @@ class VFEModel(nn.Module):
         set_full_cov_congruence_precision(cfg.full_cov_congruence_precision)
         set_safe_cholesky_jitter_mode(cfg.safe_cholesky_jitter_mode)
         set_mu_trust_cholesky_rounds(cfg.mu_trust_cholesky_rounds)
+        # ... and the fp32 matmul / TF32 policy (audit 2026-08-06 C7/F25), which is process-global
+        # for the same reason and belongs to the same one-place-set rule. It lives here rather than
+        # in `seed_everything` because that is called by four separate driver entry points, only one
+        # of which is canonical -- so wiring it there would leave the policy applied on some runs and
+        # not others, which is the exact failure C7 exists to close. None (the default) leaves the
+        # card untouched, so this line changes nothing unless a config asks for it.
+        set_fp32_matmul_precision(cfg.fp32_matmul_precision)
+        set_decode_av_precision(cfg.decode_av_precision)   # audit 2026-08-06 F32; "fp32" = historical
         self._transport_status = {"regime_ii_covariant_feature_exact": True}
         self.group = build_group(cfg)
         # ALiBi-family priors carry a per-head (n_heads, N, N) axis, while the energy's head axis
@@ -3174,6 +3184,17 @@ class VFEModel(nn.Module):
         # "the floor engaged". lam_min does, and it is the quantity the SPD trust region moves.
         d["belief_lam_min"]     = float(bs["lam_min"].float().min())
         d["belief_lam_max"]     = float(bs["lam_max"].float().max())
+        # What fraction of the belief_cond_* reductions above are actually about the belief
+        # (audit 2026-08-06 F16). 1.0 = every token's lam_min clears the floor and the ratios mean
+        # what they say; below 1.0 the floored tokens report lam_max/eps, and once the floored set
+        # exceeds 5% the p95 itself lands inside it -- which is exactly how "val_belief_cond_p95
+        # 7.76 -> 1.236e+06" was read as the belief degrading when it was the guard engaging.
+        d["belief_cond_valid_frac"] = float(bs["condition_is_belief"].float().mean())
+        # Headroom behind the decode's a_v accuracy (audit 2026-08-06 F32): a_v sums terms of size
+        # 1/sigma_v and is divided by 2*tau, so this is the number that says how many digits the
+        # working precision still has. Free -- one reduction over a parameter table, off the graph.
+        if self.cfg.use_prior_bank:
+            d["decode_sigma_v_min"] = self.prior_bank.decode_sigma_v_min()
         # clamp lam_min at eps before dividing -- matches the floor belief_spectrum's condition number
         # uses, so a floored / sub-floor belief reads ~1.0 (not 0.0) consistently across the reductions.
         d["belief_pd_margin"]   = float((bs["eigenvalues"][..., -1].clamp(min=cfg.eps).float() / cfg.eps).min())

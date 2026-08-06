@@ -83,6 +83,7 @@ class _DiagnosticSnapshotSpy(torch.nn.Module):
             "belief_cond_p95":        1.0,
             "belief_lam_min":         1.0,      # audit 2026-08-06 F16 raw spectrum extremes
             "belief_lam_max":         1.0,
+            "belief_cond_valid_frac": 1.0,      # ... and the validity flag for belief_cond_*
             "phi_norm_mean":          0.0,
             "phi_norm_std":           0.0,
             "guard_sigma_floor_frac": 0.0,
@@ -397,7 +398,11 @@ def test_periodic_eval_releases_snapshot_before_next_training_step(
         _model: object,
         _loader: object,
         _device: torch.device,
-    ) -> ValidationDiagnostics:
+
+        *,
+        batches: int = 1,      # audit 2026-08-06 F6; the caller now passes it, and the train loop's
+    ) -> ValidationDiagnostics:   # best-effort except would otherwise swallow the TypeError as NaNs
+        del batches
         snapshot = _SnapshotProbe()
         snapshot_refs.append(weakref.ref(snapshot))
         return ValidationDiagnostics({}, val_tokens[:1], snapshot)  # type: ignore[arg-type]

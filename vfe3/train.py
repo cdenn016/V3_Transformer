@@ -952,7 +952,8 @@ _VAL_DIAG_KEYS = (
     "val_attn_entropy_min_all", "val_attn_entropy_min_norm",
     "val_attn_collapsed_heads", "val_future_leakage", "val_row_sum_error",
     "val_pos_content_r2", "val_prev_token_mass", "val_period_match_mass", "val_head_redundancy_js",
-    "estep_f_drop", "estep_f_nondecreasing_frac", "estep_r_mu_last", "estep_r_sigma_last",
+    "estep_f_drop", "estep_f_nondecreasing_frac", "estep_f_comparisons",
+    "estep_r_mu_last", "estep_r_sigma_last",
     "estep_r_phi_last", "estep_fp_kl", "estep_fp_mu_rms", "estep_fp_sigma_rms",
     "estep_fp_phi_rms", "estep_target_gap", "estep_beta_js", "estep_alpha_rms_delta",
     "pos_loss_first_q", "pos_loss_last_q", "pos_loss_ratio",
@@ -960,6 +961,7 @@ _VAL_DIAG_KEYS = (
     # held-out gauge / SPD / Fisher geometry (surfaced from the already-computed val diagnostics dict)
     "val_holonomy_wilson", "val_cocycle_residual", "val_gauge_invariant_spread",
     "val_fisher_trace_mean", "val_belief_cond_p95", "val_belief_lam_min", "val_belief_lam_max",
+    "val_belief_cond_valid_frac",
     "val_phi_norm_mean", "val_phi_norm_std",
     "val_phi_matrix_norm_p95", "val_phi_matrix_norm_p99", "val_phi_matrix_norm_max",
     "val_phi_exp_clamp_frac", "val_phi_exp_scale_min", "val_vertex_cond_p99",
@@ -984,6 +986,64 @@ def _val_diagnostics(
     model:      VFEModel,
     val_loader: Iterable,
     device:     torch.device,
+
+    *,
+    batches:    int = 1,
+) -> ValidationDiagnostics:
+    r"""Held-out per-eval probes, averaged over the first ``batches`` validation batches.
+
+    EVERY ``val_*`` column used to be a statistic of ONE fixed 64-token sequence (audit 2026-08-06
+    F6): the worker below takes ``next(iter(val_loader))`` and then ``[:1]``, the loader is
+    ``shuffle=False``, and the sampler is sequential -- so the same sequence was scored at every eval
+    of every run. It was visible in the artifacts: the guard fractions are exact multiples of
+    1/1280 (K*N) and 1/8192 (H*N^2), which only holds at B=1. That is a sample size of one, not a
+    held-out estimate, and it is the denominator behind every held-out number the project reports.
+
+    ``batches=1`` (the default) is the historical behavior EXACTLY -- one batch, one worker call, no
+    averaging -- so runs on disk stay reproducible. Above 1, each batch contributes its own first
+    sequence and the numeric columns are averaged.
+
+    The token_ids and snapshot come from the FIRST batch regardless, because they feed the attention
+    figures, which are a picture of one sequence and would be meaningless averaged. Later batches'
+    snapshots are dropped as soon as their metrics are read: each carries dense held-out logits, and
+    holding N of them is exactly the regression tests/test_audit_diagnostic_memory_20260720.py
+    exists to prevent.
+
+    Non-finite probes are skipped per column rather than poisoning the mean, so one failed replay
+    costs that column one sample instead of the whole eval.
+    """
+    if batches <= 1:
+        return _val_diagnostics_one(model, next(iter(val_loader)), device)
+
+    first: Optional[ValidationDiagnostics] = None
+    sums:   Dict[str, float] = {}
+    counts: Dict[str, int]   = {}
+    for index, batch in enumerate(val_loader):
+        if index >= batches:
+            break
+        one = _val_diagnostics_one(model, batch, device)
+        for key, value in one.metrics.items():
+            if math.isfinite(value):
+                sums[key]   = sums.get(key, 0.0) + value
+                counts[key] = counts.get(key, 0) + 1
+        if first is None:
+            first = one
+        else:
+            del one                      # release this batch's snapshot (dense logits) immediately
+    if first is None:                    # empty loader: preserve the old failure mode
+        return _val_diagnostics_one(model, next(iter(val_loader)), device)
+    averaged = {
+        key: (sums[key] / counts[key]) if counts.get(key) else float("nan")
+        for key in first.metrics
+    }
+    return ValidationDiagnostics(averaged, first.token_ids, first.snapshot)
+
+
+@torch.no_grad()
+def _val_diagnostics_one(
+    model:      VFEModel,
+    batch:      object,
+    device:     torch.device,
 ) -> ValidationDiagnostics:
     r"""Held-out per-eval probes (the train-loop ``diagnostics`` runs on the live TRAIN batch).
 
@@ -999,7 +1059,6 @@ def _val_diagnostics(
     from vfe3.viz import extract as ex
 
     out: Dict[str, float] = {}
-    batch = next(iter(val_loader))
     val_tok, val_tgt = (batch if isinstance(batch, (tuple, list)) else (batch, None))
     diagnostic_tokens = val_tok[:1].to(device)
     diagnostic_targets = val_tgt[:1].to(device) if val_tgt is not None else None
@@ -1035,6 +1094,10 @@ def _val_diagnostics(
     # val_guard_sigma_floor_frac > 0 the condition number is lam_max/eps, a guard readout.
     out["val_belief_lam_min"]          = vd["belief_lam_min"]
     out["val_belief_lam_max"]          = vd["belief_lam_max"]
+    # ... and the validity flag on the same row, so val_belief_cond_p95 can be read without
+    # knowing that val_guard_sigma_floor_frac exists and is what invalidates it. 1.0 = the ratio
+    # is a belief property everywhere; anything less and that fraction of tokens reports lam_max/eps.
+    out["val_belief_cond_valid_frac"]  = vd["belief_cond_valid_frac"]
     out["val_phi_norm_mean"]           = vd["phi_norm_mean"]
     out["val_phi_norm_std"]            = vd["phi_norm_std"]
     for _source, _target in (
@@ -1125,6 +1188,14 @@ def _val_diagnostics(
     # a descent-quality readout, not a convergence-FAILURE flag.
     out["estep_f_nondecreasing_frac"] = (
         float((f[1:] > f[:-1] + 1e-9).float().mean()) if f.numel() > 1 else 0.0)
+    # The DENOMINATOR of that fraction, because without it the column is unreadable (audit
+    # 2026-08-06 F6). The trace has n_e_steps+1 entries, so at the live n_e_steps=1 the "fraction"
+    # is a mean over exactly ONE comparison -- a single Bernoulli draw that can only be 0.0 or 1.0,
+    # which is precisely what every run on disk shows (one run all-0.0, five all-1.0). Reporting
+    # "1.0" from one coin flip and "1.0" from twenty is the same number with wildly different
+    # evidential weight; this column is what tells them apart. It also rises with
+    # val_diagnostic_batches, since each batch contributes its own draws to the average.
+    out["estep_f_comparisons"] = float(max(f.numel() - 1, 0))
     res = M.estep_residuals(                                      # last-iter belief change (SPD metric for sigma)
         tr["mu"], tr["sigma"], tr["phi"], diagonal=model.cfg.diagonal_covariance)
     for _nm, _key in (("r_mu", "estep_r_mu_last"), ("r_sigma", "estep_r_sigma_last"),
@@ -1742,6 +1813,20 @@ def train(
             )
 
         if do_eval:
+            # RNG ISOLATION (audit 2026-08-06 F30). Everything in this block that builds a DataLoader
+            # iterator -- ``evaluate`` below and ``_val_diagnostics`` further down -- draws a
+            # base_seed from the GLOBAL CPU RNG, and the TRAIN loader's RandomSampler draws every
+            # epoch permutation from that same stream (datasets.py:686-687). So without this, two
+            # runs with the same seed but different eval cadences see different data orders from the
+            # first epoch boundary onward, and eval_interval silently becomes a training
+            # hyperparameter. Sampling and figure generation are inside the guard for the same
+            # reason. The resume path already applies exactly this snapshot/restore (:1612).
+            #
+            # CPU only, matching that precedent: the permutation is a CPU draw, and reading the CUDA
+            # state costs a host sync per eval. INERT on every run currently on disk -- at
+            # max_steps=10000 on wikitext-103 the run covers 0.26 epochs, so no boundary is reached
+            # and no permutation is ever redrawn.
+            eval_cpu_rng = torch.get_rng_state().clone()
             if ema is not None:                          # eval / best-save / samples on the averaged weights
                 ema.store(model)
                 ema.copy_to(model)
@@ -1787,7 +1872,9 @@ def train(
                 # kills training.
                 validation_diagnostics: Optional[ValidationDiagnostics] = None
                 try:
-                    validation_diagnostics = _val_diagnostics(model, val_loader, device)
+                    validation_diagnostics = _val_diagnostics(
+                        model, val_loader, device,
+                        batches=getattr(cfg, "val_diagnostic_batches", 1))
                     last_val_diag.update(validation_diagnostics.metrics)
                 except Exception as exc:
                     logger.warning("       (validation diagnostics failed: %s); continuing", exc)
@@ -1817,6 +1904,7 @@ def train(
                     validation_diagnostics = None
             if ema is not None:
                 ema.restore(model)                       # live SGD weights back before the next train_step
+            torch.set_rng_state(eval_cpu_rng)            # F30: hand the training stream back untouched
 
         # Periodic resumable checkpoint (opt-in; needs the artifacts dir and the optimizer state).
         if (artifacts is not None and cfg.checkpoint_interval
