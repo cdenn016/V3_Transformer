@@ -7,10 +7,61 @@ variant swaps without editing call sites.
 """
 
 import math
+import os
 import warnings
 from dataclasses import MISSING, dataclass, fields
 from numbers import Real
 from typing import Any, List, Mapping, Optional, Tuple
+
+
+class ConfigNotice(UserWarning):
+    r"""An advisory that a setting is INERT -- read by no active path under this config.
+
+    Separate from the other config warnings ON PURPOSE. These say "this value does nothing here",
+    which matters when you are composing a config and is pure noise on every run afterwards. The
+    correctness advisories -- a detached E-step freezing a parameter, a diagonal family silently
+    truncating a congruence, an auto-enabled override -- stay ordinary ``UserWarning`` and are NOT
+    suppressed by the switch below, because those change what the run MEANS rather than what it
+    ignores.
+
+    Subclasses ``UserWarning``, so anything already filtering or asserting on ``UserWarning``
+    (``pytest.warns``, the ablation inertness guard) keeps matching without changes.
+    """
+
+
+# Console visibility of ConfigNotice. Default HIDDEN: on a settled config these fire on every single
+# construction -- every ablation arm, every worker -- and say nothing new after the first read.
+# Suppression is a DISPLAY filter, not a removal: ``warnings.catch_warnings`` with an explicit
+# ``simplefilter`` still sees them, which is why ``ablation.validate_sweeps``'s dead-sweep detector
+# (audit 2026-08-06 A1/F20) is unaffected and keeps failing a sweep whose swept parameter is inert.
+#
+# Enable with ``VFE3_CONFIG_NOTICES=1`` in the environment, or ``set_config_notices(True)`` before
+# constructing the config.
+_CONFIG_NOTICES_SHOWN: bool = os.environ.get(
+    "VFE3_CONFIG_NOTICES", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def set_config_notices(shown: bool) -> bool:
+    r"""Show or hide :class:`ConfigNotice` on the console; returns the previous setting."""
+    global _CONFIG_NOTICES_SHOWN
+    previous = _CONFIG_NOTICES_SHOWN
+    _CONFIG_NOTICES_SHOWN = bool(shown)
+    _apply_config_notice_filter()
+    return previous
+
+
+def config_notices_shown() -> bool:
+    r"""Whether :class:`ConfigNotice` advisories currently reach the console."""
+    return _CONFIG_NOTICES_SHOWN
+
+
+def _apply_config_notice_filter() -> None:
+    r"""Install the display filter for :class:`ConfigNotice` matching the current setting."""
+    warnings.filterwarnings(
+        "default" if _CONFIG_NOTICES_SHOWN else "ignore", category=ConfigNotice)
+
+
+_apply_config_notice_filter()
 
 # Seams with a live registry (gauge_group, lambda_alpha_mode, attention priors, norms; alongside
 # transport/retraction/positional/divergence) are validated against that registry in __post_init__
@@ -1783,7 +1834,7 @@ class VFE3Config:
                     f"emission_mode={self.emission_mode!r} with emission_weight=0.0 is INERT: the "
                     "factor is built and then scaled to zero, so the run is byte-identical to "
                     "emission_mode='off' at the cost of building it. Set emission_weight>0.",
-                    UserWarning,
+                    ConfigNotice,
                     stacklevel=2,
                 )
         if (not math.isfinite(self.mstep_self_coupling_weight)
@@ -2038,7 +2089,7 @@ class VFE3Config:
                     "learnable_r=True has no effect: the hyper-prior centroid r is created only when "
                     "lambda_h>0 or s_e_step=True. Set lambda_h>0 (with prior_source='model_channel') "
                     "to train r.",
-                    UserWarning, stacklevel=2,
+                    ConfigNotice, stacklevel=2,
                 )
             elif self.prior_source != "model_channel":
                 # Collapse guard: un-freezing r while the forward hyper-prior term is live but s is NOT
@@ -2063,7 +2114,7 @@ class VFE3Config:
                 "channel (and its centroid r) is created only when lambda_h>0 or s_e_step=True, and the "
                 "weight defaults to lambda_h. Set lambda_h>0 to activate the state-dependent "
                 "hyper-prior precision.",
-                UserWarning, stacklevel=2,
+                ConfigNotice, stacklevel=2,
             )
         # r_update_mode='barycenter' is a no-op unless r is un-frozen (learnable_r=True); a frozen r
         # is never updated by either mechanism.
@@ -2072,7 +2123,7 @@ class VFE3Config:
             warnings.warn(
                 "r_update_mode='barycenter' has no effect with learnable_r=False: a frozen centroid r "
                 "is never updated. Set learnable_r=True to enable the closed-form barycenter M-step.",
-                UserWarning, stacklevel=2,
+                ConfigNotice, stacklevel=2,
             )
         # r_update_mode='barycenter' is the EXACT M-step only when KL(s||r) is r's sole objective, i.e.
         # the scored s_e_step=False regime. Under s_e_step=True the scored hyper-prior term is gated off
@@ -2453,13 +2504,13 @@ class VFE3Config:
             import warnings
             warnings.warn(
                 "decode_bias=True is inert when use_prior_bank=True",
-                UserWarning,
+                ConfigNotice,
             )
         if not self.use_prior_bank and self.decode_tau != 1.0:
             import warnings
             warnings.warn(
                 f"decode_tau={self.decode_tau} is inert when use_prior_bank=False",
-                UserWarning,
+                ConfigNotice,
             )
         # precision_weighted_attention's per-key reliability -log(b0 + tr Sigma_j) needs a positive b0.
         if self.precision_weighted_attention and not (
@@ -2483,7 +2534,7 @@ class VFE3Config:
             warnings.warn(
                 "precision_attention_per_head=True is inert when precision_weighted_attention=False: "
                 "there is no reliability bias to shape per head. Enable precision_weighted_attention.",
-                UserWarning,
+                ConfigNotice,
             )
         # PB-14 capability validation (replaces the old decode/E-step divergence-mismatch WARNINGS).
         # The optimized 'diagonal'/'full' kernels hardcode a gaussian alpha=1 KL readout and ignore
@@ -3085,7 +3136,7 @@ class VFE3Config:
             warnings.warn(
                 "untie_decode_bank=True is inert under use_prior_bank=False (the linear decode is "
                 "already untied by construction); the toggle is read only by the KL-to-bank decode.",
-                UserWarning, stacklevel=2,
+                ConfigNotice, stacklevel=2,
             )
 
         # ------------------------------------------------------------------------------------------
@@ -3222,7 +3273,7 @@ class VFE3Config:
             warnings.warn(
                 "inert configuration setting(s) -- these values are read by no active path, so "
                 "changing them will have no effect:\n  - " + "\n  - ".join(_inert),
-                UserWarning, stacklevel=2,
+                ConfigNotice, stacklevel=2,
             )
 
         # F12: a phi update policy whose optimizer-group metadata overrides weight_decay silently

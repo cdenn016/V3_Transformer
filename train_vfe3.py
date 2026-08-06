@@ -24,6 +24,13 @@ import os
 if os.environ.get("VFE3_ALLOW_DUPLICATE_OPENMP") == "1":
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+# Third-party toolchain noise, filtered BEFORE torch is imported (triton emits its
+# "Failed to find cuobjdump/nvdisasm" UserWarnings while torch is loading, and a warning
+# already emitted cannot be un-emitted). Disassembly tools only -- absent on the Windows pip
+# wheel, unused by this project, and irrelevant to numerics or throughput. See vfe3/quiet.py.
+from vfe3.quiet import silence_toolchain_warnings
+silence_toolchain_warnings()
+
 import logging
 from pathlib import Path
 from typing import Dict, List, Sequence, Optional
