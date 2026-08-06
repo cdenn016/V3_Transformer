@@ -645,6 +645,81 @@ class FullGaussian(BeliefParams):
         )
 
     @classmethod
+    def coupling_energy(
+        cls,
+        mu_q:         torch.Tensor,       # (..., N, K) query locations
+        dispersion_q: torch.Tensor,       # (..., N, K, K) query covariance
+        mu_k:         torch.Tensor,       # (..., N, K) key locations, PRE-transport
+        dispersion_k: torch.Tensor,       # (..., N, K, K) key covariance, PRE-transport
+        omega:        object,             # dense/factored/direct-link/RoPE transport container
+
+        *,
+        alpha:             float = 1.0,
+        kl_max:            float = 100.0,
+        eps:               float = 1e-6,
+        divergence_family: str   = "renyi",
+
+        irrep_dims:        Optional[List[int]] = None,
+        diagonal_out:      Optional[bool]      = None,
+    ) -> torch.Tensor:                    # (..., N, N) or (..., H, N, N)
+        r"""Full-covariance coupling energy, taking the head blocks directly when it can.
+
+        Identical in value to :meth:`BeliefParams.coupling_energy`, which it falls back to whenever
+        the fast route does not apply. The fast route exists because this family is the only one
+        whose transported dispersion is a full ``(K, K)`` congruence, and because the base seam's own
+        ``marginal_blocks`` promise means the cross-head output blocks are provably never read:
+        ``transport_covariance`` still has to hand back a dense ``(..., N, N, K, K)`` (every other
+        caller is typed against it), so it scatters the head blocks into a 629 MB zero tensor at the
+        live shape and ``pairwise_energy`` slices them straight back out. Asking the geometry for the
+        ``(..., N, N, H, d, d)`` blocks instead removes that round trip entirely
+        (audit 2026-08-06 B2/F14).
+
+        BIT-IDENTICAL, and the reason is narrow enough to state: the blocks are the SAME einsum on
+        the SAME operands the dense route already runs -- the scatter and the re-slice are pure data
+        movement -- and the ``.contiguous()`` below reproduces the exact strides ``torch.stack``
+        produced, so nothing downstream sees a different memory layout and reassociates.
+
+        The rank guard replicates :func:`~vfe3.free_energy._stackable_for_batching`, which the dense
+        route applies AFTER transport. Checking it here on the pre-transport inputs is equivalent:
+        transport adds one key axis to the mean and one to the covariance, and
+        ``broadcast_over_keys`` adds one to each, so ``sigma.dim() - mu.dim()`` is invariant along
+        the whole chain. Failing it falls back rather than stacking a spurious broadcast.
+        """
+        blocks = None
+        if (irrep_dims is not None and len(irrep_dims) > 1
+                and len(set(irrep_dims)) == 1
+                and dispersion_q.dim() == mu_q.dim() + 1
+                and dispersion_k.dim() == mu_k.dim() + 1):
+            from vfe3.geometry.transport import transport_covariance_head_blocks
+            blocks = transport_covariance_head_blocks(       # None unless the compact route applies
+                omega, dispersion_k,
+                retain_full_precision=(_FULL_COV_KL_PRECISION == "fp64"),
+                diagonal_out=diagonal_out,
+                marginal_blocks=irrep_dims,
+            )
+        if blocks is None:
+            return super().coupling_energy(
+                mu_q, dispersion_q, mu_k, dispersion_k, omega,
+                alpha=alpha, kl_max=kl_max, eps=eps,
+                divergence_family=divergence_family,
+                irrep_dims=irrep_dims, diagonal_out=diagonal_out,
+            )
+
+        from vfe3.free_energy import head_stacked_energy
+        H, d = len(irrep_dims), irrep_dims[0]
+        mu_t = cls.transport_location(mu_k, omega)                     # (..., N, N, K)
+        key_stack = cls.from_transported(
+            mu_t.reshape(*mu_t.shape[:-1], H, d).movedim(-2, 0).contiguous(),   # (H,...,N,N,d)
+            blocks.movedim(-3, 0).contiguous(),                                 # (H,...,N,N,d,d)
+            dispersion_k,
+        )
+        return head_stacked_energy(
+            cls(mu_q, dispersion_q).broadcast_over_keys(), key_stack,
+            alpha=alpha, kl_max=kl_max, eps=eps,
+            divergence_family=divergence_family, irrep_dims=irrep_dims,
+        )
+
+    @classmethod
     def diagnostic_labels(cls) -> dict[str, str]:
         return {
             "dispersion":             "Gaussian covariance",

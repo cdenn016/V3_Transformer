@@ -170,6 +170,42 @@ def _stackable_for_batching(
     return True
 
 
+def head_stacked_energy(
+    q_b:               BeliefParams,        # (..., N, 1, K) BROADCAST query (post broadcast_over_keys)
+    key_stack:         BeliefParams,        # (H, ..., N, N, d) key ALREADY stacked on a leading head axis
+
+    *,
+    alpha:             float = 1.0,
+    kl_max:            float = 100.0,
+    eps:               float = 1e-6,
+    divergence_family: str   = "renyi",
+
+    irrep_dims:        List[int],
+) -> torch.Tensor:                          # (..., H, N, N)
+    r"""Per-head energy from a key whose head axis is ALREADY stacked leading.
+
+    The single definition of the equal-block batched contraction and of its output convention: the
+    head axis is created leading (so the H equal blocks ride one functional call) and then moved to
+    -3 to match the per-block loop's ``torch.stack(..., dim=-3)`` layout EXACTLY.
+
+    Factored out of :func:`pairwise_energy` (audit 2026-08-06 B2) so a caller that can produce the
+    stacked key WITHOUT first materializing a dense ``(..., N, N, K, K)`` covariance -- see
+    :func:`~vfe3.geometry.transport.transport_covariance_head_blocks` -- reuses this convention
+    rather than restating it. The query side is sliced here either way: it is ``(..., N, 1, K)``,
+    broadcast over keys, so slicing it is negligible next to the pair grid.
+
+    The caller owns the guard: stacking is bit-identical to the loop only when the new leading axis
+    does not perturb the mu/sigma broadcast (see :func:`_stackable_for_batching`), and this function
+    assumes that has already been established.
+    """
+    functional = get_functional(divergence_family)
+    d = irrep_dims[0]
+    q_parts = [q_b.block(h * d, (h + 1) * d) for h in range(len(irrep_dims))]
+    q_stk = type(q_b).stack(q_parts, dim=0)                            # (H, ..., N, 1, d)
+    e = functional(q_stk, key_stack, alpha=alpha, kl_max=kl_max, eps=eps)   # (H, ..., N, N)
+    return torch.movedim(e, 0, -3)         # (..., H, N, N), matching the loop's stack(dim=-3)
+
+
 def pairwise_energy(
     q:                 BeliefParams,        # (..., N, K) query belief
     key:               BeliefParams,        # (..., N, N, K) transported key belief Omega_ij q_j
@@ -215,12 +251,12 @@ def pairwise_energy(
     H = len(irrep_dims)
     d = irrep_dims[0]
     if len(set(irrep_dims)) == 1 and _stackable_for_batching(q_b, key):
-        q_parts   = [q_b.block(h * d, (h + 1) * d) for h in range(H)]      # H x (..., N, 1, d)
         key_parts = [key.block(h * d, (h + 1) * d) for h in range(H)]      # H x (..., N, N, d)
-        q_stk   = type(q_b).stack(q_parts, dim=0)                          # (H, ..., N, 1, d)
-        key_stk = type(key).stack(key_parts, dim=0)                        # (H, ..., N, N, d)
-        e = functional(q_stk, key_stk, alpha=alpha, kl_max=kl_max, eps=eps)  # (H, ..., N, N)
-        return torch.movedim(e, 0, -3)     # (..., H, N, N), matching the loop's stack(dim=-3)
+        return head_stacked_energy(
+            q_b, type(key).stack(key_parts, dim=0),                        # (H, ..., N, N, d)
+            alpha=alpha, kl_max=kl_max, eps=eps,
+            divergence_family=divergence_family, irrep_dims=irrep_dims,
+        )
 
     energies = []
     start = 0

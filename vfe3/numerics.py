@@ -151,10 +151,15 @@ def apply_mu_trust_region(
     # 'ball' norm inf, the ratio 0, and the whole step vanish). A saturated coordinate then simply
     # pins at the trust bound in 'box' and dominates the projected direction in 'ball', which is the
     # intended response to an overshoot, while its finite neighbors keep their values.
-    if not bool(torch.isfinite(delta_mu).all()):
-        finfo = torch.finfo(delta_mu.dtype)
-        sentinel = (finfo.max / max(delta_mu.shape[-1], 1)) ** 0.5 / 2.0
-        delta_mu = torch.nan_to_num(delta_mu, nan=0.0, posinf=sentinel, neginf=-sentinel)
+    #
+    # UNCONDITIONAL (audit 2026-08-06 B3/F15). The guard used to be behind
+    # ``if not bool(torch.isfinite(delta_mu).all())``, which is a device->host sync on every call --
+    # and the branch it guards is idempotent on finite input, so the sync bought nothing. ``nan_to_num``
+    # replaces only non-finite entries, and its backward is ``grad * isfinite(input)``, so on the
+    # healthy path both the value and the gradient are BIT-IDENTICAL to the guarded form.
+    finfo = torch.finfo(delta_mu.dtype)
+    sentinel = (finfo.max / max(delta_mu.shape[-1], 1)) ** 0.5 / 2.0
+    delta_mu = torch.nan_to_num(delta_mu, nan=0.0, posinf=sentinel, neginf=-sentinel)
 
     if is_diagonal:
         scale = family_cls.trust_region_scale(sigma_q, eps=eps)
@@ -184,18 +189,22 @@ def apply_mu_trust_region(
         upper=False,
     ).squeeze(-1)
     # A near-singular safe_factor can still emit a non-finite whitened coordinate from finite input.
-    if not bool(torch.isfinite(whitened).all()):
-        finfo = torch.finfo(whitened.dtype)
-        whitened = torch.nan_to_num(whitened, nan=0.0, posinf=finfo.max, neginf=-finfo.max)
+    # Unconditional for the same reason as the delta_mu guard above (audit 2026-08-06 B3/F15).
+    whitened_finfo = torch.finfo(whitened.dtype)
+    whitened = torch.nan_to_num(
+        whitened, nan=0.0, posinf=whitened_finfo.max, neginf=-whitened_finfo.max)
     if mode == "ball":
         norm2 = whitened.norm(dim=-1, keepdim=True)
         bounded = whitened * (trust / norm2.clamp(min=eps)).clamp(max=1.0)
     else:
         bounded = whitened.clamp(-trust, trust)
     full_out = (safe_factor @ bounded.unsqueeze(-1)).squeeze(-1)
-    if bool(ok.all()):
-        return full_out
-
+    # The fallback is computed UNCONDITIONALLY (audit 2026-08-06 B3/F15). It used to sit behind an
+    # ``if bool(ok.all()): return full_out`` early exit, which is a device->host sync on every call
+    # to save a handful of elementwise ops on a (..., K) tensor -- far less than the triangular solve
+    # and (K, K) matmul already spent above. The trailing ``torch.where`` returns exactly ``full_out``
+    # wherever ``ok``, so the value is BIT-IDENTICAL; so is the gradient, because ``torch.where``
+    # routes grad by SELECTION (the unselected branch receives an exact 0, not 0 * something).
     sigma_diag = family_cls.covariance_diagonal(sigma_q, eps=eps)
     scale = sigma_diag.clamp(min=eps).sqrt()
     fallback_white = delta_mu / scale

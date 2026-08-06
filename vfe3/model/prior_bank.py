@@ -1124,10 +1124,31 @@ class PriorBank(nn.Module):
             ce = ce + z_loss_weight * (logsumexp_v ** 2 * valid).sum() / valid.sum().clamp_min(1)
         return ce
 
+    def decode_degenerate_positions(
+        self,
+        sigma_q: torch.Tensor,           # (B, N, K) diagonal or (B, N, K, K) full posterior dispersion
+    ) -> Optional[torch.Tensor]:         # (B, N) True where the decode cannot score, else None
+        r"""Positions the full-covariance decode cannot score, for a CE consumer holding its own targets.
+
+        The fused chunked kernels own their ignore mask and fold this in directly
+        (``decode_ce_full_chunked``). The DENSE branch instead hands ``(B, N, V)`` logits to
+        ``F.cross_entropy`` in the model, which has no way to learn that a position is degenerate --
+        so it asks here and marks those positions ``ignore_index``, keeping the two paths in parity
+        on the exclusion contract (audit 2026-08-06 F31).
+
+        ``None`` means "nothing to exclude": a diagonal dispersion is scored without a Cholesky and
+        has no failure mode to report. Does NOT touch the fallback counter -- the decode kernel this
+        accompanies has already counted the same event.
+        """
+        if sigma_q.dim() < 4 or sigma_q.shape[-1] != sigma_q.shape[-2]:
+            return None                                       # diagonal dispersion: no factorization
+        _, ok = safe_cholesky(sigma_q, eps=self.eps, rounds=5)
+        return ~ok
+
     def _full_cov_query_invariants(
         self,
         sigma_q: torch.Tensor,           # (B, N, K, K) posterior covariances
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:   # diag_sq, logdet_q, SPD-ok mask
         r"""Per-position, v-INDEPENDENT pieces of the full-cov KL against a DIAGONAL prior.
 
         Scoring a full q = N(mu_q, Sigma_q) against a diagonal prior pi_v = N(mu_v, diag(sigma_v))
@@ -1147,23 +1168,34 @@ class PriorBank(nn.Module):
         (audit 2026-07-01 F6). The SPD retraction keeps Sigma_q PD in training, so ok is all-True
         and the -inf branch never engages on the pure path.
 
-        OPEN DESIGN QUESTION (audit 2026-08-06 F31), deliberately NOT resolved here: an all--inf
-        logit row is not merely an -inf score, it is NaN downstream -- ``log_softmax`` of an
-        all--inf row is NaN (measured on the DENSE path too), and in the chunked reduction
-        ``logsumexp_v - target_logit`` is ``-inf - (-inf)`` = NaN. So one degenerate position NaNs
-        the scalar CE for the whole batch on BOTH paths. Making it finite is a change to what a
-        degenerate position should SCORE: it would have to move both paths together and rewrite the
-        F6 parity pin, so it needs a decision rather than a patch. The value itself is free --
-        ``per_pos`` is v-INDEPENDENT and cancels exactly -- so any finite sentinel would do. What IS
-        fixed is the part that is a bug under any contract: the ``-inf * 0.0`` mask multiply in the
-        chunked reducers. The event is now counted, so a run can tell that it happened.
+        RESOLVED (audit 2026-08-06 F31): a degenerate position is EXCLUDED from the cross-entropy,
+        not scored. It used to take ``logdet_q = -inf``, pinned as a cross-path parity contract by
+        test_fullcov_alpha_roadmap_2026_06_13::test_full_cov_chunked_matches_dense_on_non_pd (audit
+        2026-07-01 F6) -- but an all--inf logit row is not merely an -inf score, it is NaN
+        downstream: ``log_softmax`` of it is NaN (on the DENSE path too), and in the chunked
+        reduction ``logsumexp_v - target_logit`` is ``-inf - (-inf)``. So the pinned contract was
+        itself the NaN generator, and one degenerate position NaN'd the scalar CE for the whole
+        batch on BOTH paths.
+
+        A position whose ``Sigma_q`` is not positive definite has no valid likelihood, so scoring it
+        is a fiction under any sentinel; the honest reading is that it contributes nothing and its
+        absence is visible in the token count. ``ok`` is therefore returned for the CE seams to fold
+        into their ignore mask, and ``logdet_q`` gets a FINITE placeholder so nothing NaNs before the
+        exclusion applies (the value is free: ``per_pos`` is v-INDEPENDENT and cancels exactly in
+        every logit difference, so it cannot bias a surviving position). The event stays counted, so
+        a run can tell how many tokens the denominator lost.
         """
         diag_sq = torch.diagonal(sigma_q, dim1=-2, dim2=-1)                # (B, N, K) = diag(Sigma_q)
         L, ok = safe_cholesky(sigma_q, eps=self.eps, rounds=5)
-        logdet_q = _logdet_chol(L)                                         # (B, N)
         _count_decode_logdet_fallback(ok)
-        logdet_q = torch.where(ok, logdet_q, logdet_q.new_full((), float("-inf")))
-        return diag_sq, logdet_q
+        # Mask the FACTOR, not the log-det. A failed cholesky_ex returns a finite PARTIAL factor
+        # whose diagonal can be zero or negative, so ``log(diag L)`` is -inf/NaN and masking
+        # afterwards would leave a ``0 * inf`` NaN in the gradient to L even though the value came
+        # out clean. Substituting the identity makes the value (logdet = 0) and the gradient exactly
+        # zero there. Byte-identical wherever ``ok``, which on the pure path is everywhere.
+        eye = torch.eye(L.shape[-1], device=L.device, dtype=L.dtype)
+        logdet_q = _logdet_chol(torch.where(ok[..., None, None], L, eye))   # (B, N)
+        return diag_sq, logdet_q, ok
 
     def decode_ce_full_chunked(
         self,
@@ -1204,7 +1236,7 @@ class PriorBank(nn.Module):
         c = mu_v_all.mean(dim=0, keepdim=True)                              # (1, K) global v-independent shift
         u_all = self._unigram_bias() if self.decode_unigram_prior else None  # (V,) kappa*log pi_v or None
 
-        diag_sq, logdet_q = self._full_cov_query_invariants(sigma_q)       # (B,N,K), (B,N)
+        diag_sq, logdet_q, spd_ok = self._full_cov_query_invariants(sigma_q)  # (B,N,K), (B,N), (B,N)
         mc_q = mu_q - c                                                     # (B, N, K) centered query means
         lhs = torch.cat([diag_sq + mc_q ** 2, -2.0 * mc_q], dim=-1)         # (B, N, 2K)
         # v-INDEPENDENT term of -KL/tau_eff (cancels in the CE difference, carried so each chunk's
@@ -1237,7 +1269,11 @@ class PriorBank(nn.Module):
             # Byte-identical for finite logits (x*1.0 == x, x*0.0 == 0.0).
             return lse_chunk, torch.where(in_chunk_f > 0, gathered, torch.zeros_like(gathered))
 
-        valid = targets != ignore_index                                    # (B, N) bool
+        # A position whose Sigma_q is not PD is EXCLUDED, exactly like an ignore_index token, rather
+        # than scored (audit 2026-08-06 F31); it leaves both the numerator and the denominator, and
+        # _count_decode_logdet_fallback has already recorded it. The dense path drops the same
+        # positions via PriorBank.decode_degenerate_positions, so the two stay in parity.
+        valid = (targets != ignore_index) & spd_ok                         # (B, N) bool
         lse_chunks = []
         target_logit = torch.zeros(mu_q.shape[:-1], device=mu_q.device, dtype=mu_q.dtype)  # (B, N)
 
@@ -1767,6 +1803,12 @@ def _decode_full(
         kl_max=float("inf"),
         eps=pb.eps,
     )                                                                       # (B, N, V)
+    # Same exclusion contract as the chunked twin (audit 2026-08-06 F31). Here the -inf arrived
+    # indirectly -- the family seam maps a failed Cholesky to NaN and ``kl_max=inf`` maps that to
+    # inf -- so the row has to be neutralized after the fact. One extra (B, N) Cholesky against this
+    # kernel's own O(B*N*V*K^3) per-pair factorization is not measurable.
+    spd_ok = pb._full_cov_query_invariants(sigma_q)[2]                      # (B, N)
+    kl_v = torch.where(spd_ok.unsqueeze(-1), kl_v, torch.zeros_like(kl_v))
     return -kl_v / tau_eff
 
 
@@ -1797,7 +1839,7 @@ def _decode_full_chunked(
     mu_v = pb._decode_mu_table()                                         # (V, K) decode table (untied if set)
     inv_v = 1.0 / sigma_v                                                # (V, K) = 1/sigma_v
 
-    diag_sq, logdet_q = pb._full_cov_query_invariants(sigma_q)           # (B,N,K), (B,N)
+    diag_sq, logdet_q, spd_ok = pb._full_cov_query_invariants(sigma_q)   # (B,N,K), (B,N), (B,N)
     c = mu_v.mean(dim=0, keepdim=True)                                   # (1, K) v-independent shift
     mc_v = mu_v - c                                                      # (V, K) centered prior means
     mc_q = mu_q - c                                                      # (B, N, K) centered query means
@@ -1808,6 +1850,11 @@ def _decode_full_chunked(
     a_v = a_v + (mc_v ** 2 * inv_v).sum(-1) + torch.log(sigma_v).sum(-1)  # + sum_k(mc_v^2/sigma_v + log sigma_v)
     per_pos = pb.K + logdet_q.unsqueeze(-1)                              # (B, N, 1) = K + log|Sigma_q|
     kl_v = (0.5 * (a_v - per_pos)).clamp(min=0.0)                        # (B, N, V); KL>=0 floor matches
+    # A non-PD Sigma_q has no valid likelihood: emit an INFORMATIONLESS uniform row rather than a
+    # score built on a placeholder log-det (audit 2026-08-06 F31). log_softmax of a uniform row is
+    # -log V, finite; the all--inf row this used to produce maps to NaN. The CE seams exclude the
+    # position outright -- see decode_ce_full_chunked and decode_degenerate_positions.
+    kl_v = torch.where(spd_ok.unsqueeze(-1), kl_v, torch.zeros_like(kl_v))
     return -kl_v / tau_eff                                               # _decode_diagonal (audit 2026-07-05 m5)
 
 

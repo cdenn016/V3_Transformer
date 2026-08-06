@@ -358,10 +358,11 @@ def test_full_cov_query_invariants_use_raw_spd_on_round_zero() -> None:
     pb = _full_prior_bank(eps=1e-3)
     sigma_q = torch.tensor([[[[0.004, 0.001], [0.001, 0.003]]]])
 
-    diag_q, logdet_q = pb._full_cov_query_invariants(sigma_q)
+    diag_q, logdet_q, spd_ok = pb._full_cov_query_invariants(sigma_q)
     factor = torch.linalg.cholesky(sigma_q)
     expected_logdet = 2.0 * torch.log(torch.diagonal(factor, dim1=-2, dim2=-1)).sum(-1)
 
+    assert bool(spd_ok.all())
     assert torch.equal(diag_q, torch.diagonal(sigma_q, dim1=-2, dim2=-1))
     assert torch.equal(logdet_q, expected_logdet)
 
