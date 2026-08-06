@@ -731,11 +731,20 @@ def train_step(
         metrics_out["grad_finite"] = float(grad_finite)
     if grad_clip is not None and grad_clip > 0 and not skip_step:
         if getattr(model.cfg, "grad_clip_per_role", False):
-            # Per-role clipping (default OFF): the global L2 norm below is dominated by phi_embed
-            # (V x n_gen, the bulk of all parameters), so when it binds it silently rescales every
-            # OTHER role's effective LR by a phi-noise-coupled factor -- the kl_max silent-bind
-            # pattern. Clip each role's parameter set to grad_clip separately instead (the roles
-            # partition the optimizer groups; see build_optimizer).
+            # Per-role clipping: the global L2 norm below couples the roles, so when it binds it
+            # rescales every OTHER role's effective LR -- the kl_max silent-bind pattern. Clip each
+            # role's parameter set to grad_clip separately instead (the roles partition the
+            # optimizer groups; see build_optimizer).
+            #
+            # Correction (audit 2026-08-06 F33): phi_embed dominates the SPIKES, not the steady
+            # state. At the live K=20 / N=64 settings sigma dominates the global norm and neither
+            # clip binds, so this toggle is inert there and matters on the tail. The measurement it
+            # was flipped on came from run 221.24, which is K=20/N=64 -- not the K=30/N=128 believed
+            # at the time; what separates that run from the live cells is m_phi_lr, e_q_mu_lr,
+            # mu_trust_mode, prior_source and lambda_h, not K or N. Per-role clipping does change
+            # direction (median 0 deg, p95 12.9 deg, max 37.6 deg from the global-clipped vector) and
+            # raises the post-clip bound to sqrt(3)*grad_clip, but AdamW attenuates a CONSTANT
+            # rescale to 4.26e-4 relative, so it acts only through that factor's time-variation.
             role_params: dict = {}
             for _g in optimizer.param_groups:
                 role_params.setdefault(_g.get("role", "other"), []).extend(_g["params"])
