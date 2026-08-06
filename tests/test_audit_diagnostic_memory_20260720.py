@@ -81,6 +81,8 @@ class _DiagnosticSnapshotSpy(torch.nn.Module):
             "gauge_invariant_spread": 0.0,
             "fisher_trace_mean":      0.0,
             "belief_cond_p95":        1.0,
+            "belief_lam_min":         1.0,      # audit 2026-08-06 F16 raw spectrum extremes
+            "belief_lam_max":         1.0,
             "phi_norm_mean":          0.0,
             "phi_norm_std":           0.0,
             "guard_sigma_floor_frac": 0.0,

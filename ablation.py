@@ -2299,6 +2299,16 @@ def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True
         duplicate_labels = sorted({label for label in labels if labels.count(label) > 1})
         if duplicate_labels:
             raise ValueError(f"sweep {name!r} has duplicate expanded label(s): {duplicate_labels}")
+        # Keys whose value actually DIFFERS across this sweep's arms -- the sweep's contrast. For a
+        # 'param' sweep that is the swept parameter; for a 'configs' sweep it is whatever the arm
+        # dicts disagree on. Everything else in an arm dict is a constant REGIME setting shared by
+        # every arm (e.g. cg_coupling pins phi_precond_mode='killing' on both arms), and an inert
+        # regime setting is not a broken measurement -- only an inert CONTRAST is.
+        varying_keys = {
+            key for key in {k for _label, ov in runs for k in ov}
+            if len({repr(ov.get(key)) for _label, ov in runs}) > 1
+        }
+        inert_per_arm: List[set] = []
         for label, overrides in runs:
             cfg = dict(BASELINE_CONFIG)
             cfg.update(overrides)
@@ -2314,8 +2324,13 @@ def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True
                 # own inert settings -- under e_step_update='gradient' the whole mm_exact family
                 # (mm_damping, ...) is inert by construction -- and failing on those would reject all
                 # ten currently-scheduled sweeps at startup, which is the opposite of useful. So
-                # intersect the reported inert names with this arm's overridden keys: "the parameter
-                # this sweep varies is read by no active path" is precisely the F20 defect.
+                # intersect the reported inert names with the keys this sweep actually VARIES,
+                # and require the key to be inert on EVERY arm before calling it a defect:
+                # "the parameter this sweep varies is read by no active path in any arm" is
+                # precisely the F20 failure. An inert constant shared by every arm is not (it is a
+                # regime setting), and a key that is inert on one arm but LIVE on another is not
+                # either -- gauge_mstep_optim's phi_precond_mode is inert on the adamw arm and live
+                # on the pullback_group arm, and that contrast is exactly what the sweep measures.
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
                     VFE3Config(**cfg)
@@ -2326,16 +2341,18 @@ def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True
                     if entry.strip().startswith("- ")
                     for entry in [entry.strip()[2:]]
                 }
-                dead_knobs = sorted(inert_names & set(overrides))
-                if dead_knobs:
-                    construction_errors.append((
-                        name, label,
-                        f"swept parameter(s) {', '.join(dead_knobs)} are INERT under this arm's "
-                        f"config -- every arm would produce the baseline number. Add the enabling "
-                        f"setting(s) to the sweep's 'requires'.",
-                    ))
+                inert_per_arm.append(inert_names & varying_keys)
             except (TypeError, ValueError) as exc:
                 construction_errors.append((name, label, str(exc)))
+        if inert_per_arm and len(inert_per_arm) == len(runs):
+            always_dead = sorted(set.intersection(*inert_per_arm))
+            if always_dead:
+                construction_errors.append((
+                    name, "all arms",
+                    f"swept parameter(s) {', '.join(always_dead)} are INERT on EVERY arm -- each "
+                    f"arm would reproduce the baseline number. Add the enabling setting(s) to the "
+                    f"sweep's 'requires'.",
+                ))
     if construction_errors:
         if require_construction:
             lines = "\n".join(
