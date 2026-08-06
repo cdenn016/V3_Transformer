@@ -155,14 +155,16 @@ class FrameDiagonalGaussian(DiagonalGaussian):
         omega:        object,            # transport container; unused, the frame cancels
 
         *,
-        diagonal_out: Optional[bool] = None,
+        diagonal_out:    Optional[bool]      = None,
+        marginal_blocks: Optional[List[int]] = None,
     ) -> torch.Tensor:                   # (..., N, N, K) transported variances
         r"""Identity transport: :math:`\Omega_{ij}\Sigma_j\Omega_{ij}^{\top}
         = U_i \operatorname{diag}(\sigma_j) U_i^{\top}`, i.e. ``sigma_j`` in the receiver frame.
 
-        ``diagonal_out`` is accepted for interface symmetry with the base seam and is intentionally
-        unused: this family is diagonal by declaration and the sandwich is never formed. ``omega``
-        is not read for its values but IS checked -- the cancellation is a precondition
+        ``diagonal_out`` and ``marginal_blocks`` are accepted for interface symmetry with the base
+        seam and are intentionally unused: this family is diagonal by declaration and the sandwich
+        is never formed, so there is no cross-head block to skip either. ``omega`` is not read for
+        its values but IS checked -- the cancellation is a precondition
         (see :meth:`_require_coboundary`).
         """
         cls._require_coboundary(omega, "transport a dispersion")

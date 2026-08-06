@@ -168,12 +168,16 @@ class DiagonalLaplace(BeliefParams):
         omega:      object,               # dense/factored/direct-link/RoPE transport container
 
         *,
-        diagonal_out: Optional[bool] = True,
+        diagonal_out:    Optional[bool]      = True,
+        marginal_blocks: Optional[List[int]] = None,
     ) -> torch.Tensor:
         r"""Degree-one scale action, exact on signed diagonal/permutation gauges.
 
         Off that subgroup the result is the variance-matching factorized-Laplace projection, not
         an assertion that the pushed-forward joint law remains factorized Laplace.
+
+        ``marginal_blocks`` is accepted for interface symmetry with the base seam and intentionally
+        unused: the marginal scale ``b`` carries no cross-head block to skip.
         """
         from vfe3.geometry.transport import transport_scale
         return transport_scale(dispersion, omega, diagonal_out=diagonal_out)
