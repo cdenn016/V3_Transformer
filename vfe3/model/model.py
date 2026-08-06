@@ -3176,8 +3176,11 @@ class VFEModel(nn.Module):
         d["fisher_trace_median"] = float(fish.median())
 
         # Numerical safety rails inert (pure path) vs load-bearing (fixed point is a clamp artifact)?
+        # log_prior carries the causal mask as -inf, so it splits the kl_max pin into masked vs live
+        # pairs without changing the existing whole-grid column (audit 2026-08-06 F17).
         gs = metrics.guard_saturation(out.sigma, energy, self_div, diagonal=_diag,
-                                      eps=cfg.eps, sigma_max=cfg.sigma_max, kl_max=cfg.kl_max)
+                                      eps=cfg.eps, sigma_max=cfg.sigma_max, kl_max=cfg.kl_max,
+                                      log_prior=log_prior)
         for _k, _v in gs.items():
             d[f"guard_{_k}"] = float(_v)
         # Renyi cancellation-band proximity: fraction of energies in [0.9, 1.0)*kl_max where the fp32

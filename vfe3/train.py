@@ -946,6 +946,7 @@ _VAL_DIAG_KEYS = (
     "val_pos_phi_matrix_norm_p95", "val_pos_phi_matrix_norm_p99", "val_pos_phi_matrix_norm_max",
     "val_pos_phi_exp_clamp_frac", "val_pos_phi_exp_scale_min",
     "val_guard_sigma_floor_frac", "val_guard_sigma_ceil_frac", "val_guard_energy_klmax_frac",
+    "val_guard_energy_klmax_frac_live", "val_live_pair_frac",
     "val_nonfinite_frac",
 )
 
@@ -1030,6 +1031,11 @@ def _val_diagnostics(
     out["val_guard_sigma_floor_frac"]  = vd["guard_sigma_floor_frac"]
     out["val_guard_sigma_ceil_frac"]   = vd["guard_sigma_ceil_frac"]
     out["val_guard_energy_klmax_frac"] = vd["guard_energy_klmax_frac"]
+    # Companion restricted to causally-admissible pairs (audit 2026-08-06 F17). The whole-grid
+    # column above is KEPT as-is: masked pairs are not numerically inert, so their kl_max pin is a
+    # real firewall reading. The pair tells you which triangle is actually saturating.
+    out["val_guard_energy_klmax_frac_live"] = vd.get("guard_energy_klmax_frac_live", float("nan"))
+    out["val_live_pair_frac"]               = vd.get("guard_energy_live_pair_frac", float("nan"))
     out["val_nonfinite_frac"]          = vd["nonfinite_frac"]
 
     # score_at="entry" is the beta the FORWARD actually used (audit 2026-08-05: the "converged"

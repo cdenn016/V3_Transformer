@@ -907,6 +907,7 @@ def guard_saturation(
     sigma_max: Optional[float] = 5.0,
     kl_max:    float = 100.0,
     rtol:      float = 1e-3,
+    log_prior: Optional[torch.Tensor] = None,   # (..., N, N) additive prior; -inf marks masked pairs
 ) -> Dict[str, float]:
     r"""Fraction of converged-belief entries pinned at each numerical guard boundary.
 
@@ -914,6 +915,19 @@ def guard_saturation(
     (``kl_max`` on E_ij and on D(q||p)) are INERT on the pure path or load-bearing. sat_frac =
     mean(|x - boundary| < rtol * |boundary|) over the relevant entries; the variance spectrum is
     the eigenvalues for a full covariance. A near-zero map means the clamps never bind.
+
+    ``energy_klmax_frac`` denominates over the WHOLE ``(..., N, N)`` grid, masked pairs included,
+    and that is deliberate: a masked pair is not numerically inert, because ``-inf + NaN`` would
+    poison its whole softmax row, and the ``kl_max`` clamp is exactly the firewall this metric
+    certifies. Passing ``log_prior`` adds ``energy_klmax_frac_live`` restricted to the pairs the
+    causal mask actually admits (``isfinite(log_prior)``), WITHOUT changing the existing column
+    (audit 2026-08-06 F17).
+
+    Both are needed because the obvious "the denominator is 2x too big" correction is probably
+    sign-wrong: across seven runs on disk ``energy_klmax_frac * 8192`` peaks at 4163 against a
+    masked-set cardinality of 4158, the signature of the MASKED triangle saturating while the live
+    triangle does not. Re-denominatoring to the live half alone would have doubled an alarm that
+    is already overstated. Reporting both is what settles it.
     """
     spec = _spectrum(sigma, diagonal=diagonal)
     # eigvalsh error scales with the largest eigenvalue (~eps_machine * lam_max), so on a FULL
@@ -930,13 +944,18 @@ def guard_saturation(
         scale = max(abs(boundary), eps)
         return float(((x - boundary).abs() < max(rtol * scale, atol)).float().mean())
 
-    return {
+    out = {
         "sigma_floor_frac":   _frac(spec, eps, atol=spec_atol),
         "sigma_ceil_frac":    (_frac(spec, sigma_max, atol=spec_atol)
                                 if sigma_max is not None else 0.0),
         "energy_klmax_frac":  _frac(energy, kl_max),
         "selfdiv_klmax_frac": _frac(self_div, kl_max),
     }
+    if log_prior is not None:
+        live = torch.isfinite(log_prior).expand_as(energy)
+        out["energy_klmax_frac_live"] = _frac(energy[live], kl_max)
+        out["energy_live_pair_frac"] = float(live.float().mean())
+    return out
 
 
 # --- gauge invariants (group-dispatched; fixes gauge_trace_spread's det-blindness) ---
