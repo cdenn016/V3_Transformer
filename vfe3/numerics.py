@@ -215,6 +215,30 @@ def _count_mu_trust_fallback(ok: torch.Tensor) -> None:
     counter += (~ok).sum()
 
 
+_DECODE_LOGDET_FALLBACK_COUNTS: Dict[str, torch.Tensor] = {}
+
+
+def _count_decode_logdet_fallback(ok: torch.Tensor) -> None:
+    r"""Accumulate decode log-det Cholesky failures per device (async add, no host sync)."""
+    key = str(ok.device)
+    counter = _DECODE_LOGDET_FALLBACK_COUNTS.get(key)
+    if counter is None:
+        counter = torch.zeros((), dtype=torch.int64, device=ok.device)
+        _DECODE_LOGDET_FALLBACK_COUNTS[key] = counter
+    counter += (~ok).sum()
+
+
+def decode_logdet_fallback_elements() -> int:
+    r"""Decode positions whose Sigma_q failed every jitter round since the last reset. Host-syncs."""
+    return int(sum(int(c) for c in _DECODE_LOGDET_FALLBACK_COUNTS.values()))
+
+
+def reset_decode_logdet_fallback_elements() -> None:
+    r"""Zero the decode log-det fallback counters (per-run accounting)."""
+    for c in _DECODE_LOGDET_FALLBACK_COUNTS.values():
+        c.zero_()
+
+
 def mu_trust_fallback_elements() -> int:
     r"""Belief elements whitened by the NON-equivariant diagonal fallback since the last reset.
     Reads the on-device counters, so it host-syncs: call it at an existing logging cadence."""

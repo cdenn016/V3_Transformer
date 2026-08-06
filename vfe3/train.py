@@ -55,8 +55,10 @@ from vfe3.geometry.retraction import (                          # SPD-retraction
     nonfinite_tangent_elements,
     reset_nonfinite_tangent_elements,
 )
-from vfe3.numerics import (                                     # mu-trust-region equivariance fallback
+from vfe3.numerics import (                    # non-equivariant / non-PD fallback accounting
+    decode_logdet_fallback_elements,
     mu_trust_fallback_elements,
+    reset_decode_logdet_fallback_elements,
     reset_mu_trust_fallback_elements,
 )
 
@@ -1553,7 +1555,8 @@ def train(
     skipped_steps = 0                 # cumulative REJECTED optimizer updates (audit 2026-08-06 F5)
     consecutive_skips = 0
     reset_nonfinite_tangent_elements()   # per-run accounting for the SPD-retraction guard
-    reset_mu_trust_fallback_elements()   # ... and for the mu-trust-region equivariance fallback
+    reset_mu_trust_fallback_elements()   # ... the mu-trust-region equivariance fallback
+    reset_decode_logdet_fallback_elements()   # ... and the decode log-det non-PD fallback
 
     def _step_indices() -> Iterable[int]:
         if not show_bar:
@@ -2109,6 +2112,7 @@ def train(
                                      if attempted else float("nan")),
             "nonfinite_tangent_elements": int(neutralized),
             "mu_trust_fallback_elements": int(mu_fallbacks),
+            "decode_logdet_fallback_elements": int(decode_logdet_fallback_elements()),
         }
         if skipped_steps or neutralized or mu_fallbacks:
             logger.warning(

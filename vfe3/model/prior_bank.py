@@ -54,7 +54,11 @@ from vfe3.families.covariance_tables import (
     packed_strict_lower_size,
 )
 from vfe3.geometry.lie_ops import CompactBlockElement
-from vfe3.numerics import bounded_variance_from_log, safe_cholesky
+from vfe3.numerics import (
+    _count_decode_logdet_fallback,
+    bounded_variance_from_log,
+    safe_cholesky,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1071,7 +1075,11 @@ class PriorBank(nn.Module):
                 logit_chunk = logit_chunk + u_c                            # unigram log-prior chunk slice
             lse_chunk = torch.logsumexp(logit_chunk, dim=-1)               # (B, N)
             gathered = logit_chunk.gather(-1, local_idx.unsqueeze(-1)).squeeze(-1)  # (B, N)
-            return lse_chunk, gathered * in_chunk_f                        # zero where target not in chunk
+            # SELECT rather than multiply (audit 2026-08-06 F31): `gathered * in_chunk_f` is
+            # `-inf * 0.0` = NaN in every chunk that does NOT contain the target, so a degenerate
+            # position poisoned target_logit through chunks it has no business contributing to.
+            # Byte-identical for finite logits (x*1.0 == x, x*0.0 == 0.0).
+            return lse_chunk, torch.where(in_chunk_f > 0, gathered, torch.zeros_like(gathered))
 
         valid = targets != ignore_index                                    # (B, N) bool
         lse_chunks = []
@@ -1134,13 +1142,26 @@ class PriorBank(nn.Module):
         workspace. ``safe_cholesky`` (jittered, never raises) yields a finite log-det where its
         ``ok`` mask is True; a position where every jitter round fails (non-PD Sigma_q) gets
         logdet_q = -inf, so per_pos = K + logdet_q drives every vocab logit to -inf there --
-        matching the dense ``_decode_full`` path (gaussian_full's ok-gating -> NaN -> kl_max=inf
-        -> -inf logit). The SPD retraction keeps Sigma_q PD in training, so ok is all-True and
-        the -inf branch never engages on the pure path.
+        matching the dense ``_decode_full`` path and PINNED as a cross-path parity contract by
+        test_fullcov_alpha_roadmap_2026_06_13::test_full_cov_chunked_matches_dense_on_non_pd
+        (audit 2026-07-01 F6). The SPD retraction keeps Sigma_q PD in training, so ok is all-True
+        and the -inf branch never engages on the pure path.
+
+        OPEN DESIGN QUESTION (audit 2026-08-06 F31), deliberately NOT resolved here: an all--inf
+        logit row is not merely an -inf score, it is NaN downstream -- ``log_softmax`` of an
+        all--inf row is NaN (measured on the DENSE path too), and in the chunked reduction
+        ``logsumexp_v - target_logit`` is ``-inf - (-inf)`` = NaN. So one degenerate position NaNs
+        the scalar CE for the whole batch on BOTH paths. Making it finite is a change to what a
+        degenerate position should SCORE: it would have to move both paths together and rewrite the
+        F6 parity pin, so it needs a decision rather than a patch. The value itself is free --
+        ``per_pos`` is v-INDEPENDENT and cancels exactly -- so any finite sentinel would do. What IS
+        fixed is the part that is a bug under any contract: the ``-inf * 0.0`` mask multiply in the
+        chunked reducers. The event is now counted, so a run can tell that it happened.
         """
         diag_sq = torch.diagonal(sigma_q, dim1=-2, dim2=-1)                # (B, N, K) = diag(Sigma_q)
         L, ok = safe_cholesky(sigma_q, eps=self.eps, rounds=5)
         logdet_q = _logdet_chol(L)                                         # (B, N)
+        _count_decode_logdet_fallback(ok)
         logdet_q = torch.where(ok, logdet_q, logdet_q.new_full((), float("-inf")))
         return diag_sq, logdet_q
 
@@ -1210,7 +1231,11 @@ class PriorBank(nn.Module):
                 logit_chunk = logit_chunk + u_c                            # unigram log-prior chunk slice
             lse_chunk = torch.logsumexp(logit_chunk, dim=-1)               # (B, N)
             gathered = logit_chunk.gather(-1, local_idx.unsqueeze(-1)).squeeze(-1)  # (B, N)
-            return lse_chunk, gathered * in_chunk_f                        # zero where target not in chunk
+            # SELECT rather than multiply (audit 2026-08-06 F31): `gathered * in_chunk_f` is
+            # `-inf * 0.0` = NaN in every chunk that does NOT contain the target, so a degenerate
+            # position poisoned target_logit through chunks it has no business contributing to.
+            # Byte-identical for finite logits (x*1.0 == x, x*0.0 == 0.0).
+            return lse_chunk, torch.where(in_chunk_f > 0, gathered, torch.zeros_like(gathered))
 
         valid = targets != ignore_index                                    # (B, N) bool
         lse_chunks = []
@@ -1287,7 +1312,11 @@ class PriorBank(nn.Module):
                 logit_chunk = logit_chunk + u_c                            # fixed unigram log-prior slice
             lse_chunk = torch.logsumexp(logit_chunk, dim=-1)               # (B, N)
             gathered = logit_chunk.gather(-1, local_idx.unsqueeze(-1)).squeeze(-1)  # (B, N)
-            return lse_chunk, gathered * in_chunk_f                        # zero where target not in chunk
+            # SELECT rather than multiply (audit 2026-08-06 F31): `gathered * in_chunk_f` is
+            # `-inf * 0.0` = NaN in every chunk that does NOT contain the target, so a degenerate
+            # position poisoned target_logit through chunks it has no business contributing to.
+            # Byte-identical for finite logits (x*1.0 == x, x*0.0 == 0.0).
+            return lse_chunk, torch.where(in_chunk_f > 0, gathered, torch.zeros_like(gathered))
 
         valid = targets != ignore_index                                    # (B, N) bool
         lse_chunks = []
@@ -1368,7 +1397,11 @@ class PriorBank(nn.Module):
                 logit_chunk = logit_chunk + u_c                            # unigram log-prior chunk slice
             lse_chunk = torch.logsumexp(logit_chunk, dim=-1)               # (B, N)
             gathered = logit_chunk.gather(-1, local_idx.unsqueeze(-1)).squeeze(-1)  # (B, N)
-            return lse_chunk, gathered * in_chunk_f                        # zero where target not in chunk
+            # SELECT rather than multiply (audit 2026-08-06 F31): `gathered * in_chunk_f` is
+            # `-inf * 0.0` = NaN in every chunk that does NOT contain the target, so a degenerate
+            # position poisoned target_logit through chunks it has no business contributing to.
+            # Byte-identical for finite logits (x*1.0 == x, x*0.0 == 0.0).
+            return lse_chunk, torch.where(in_chunk_f > 0, gathered, torch.zeros_like(gathered))
 
         valid = targets != ignore_index                                    # (B, N) bool
         lse_chunks = []
@@ -1466,7 +1499,11 @@ class PriorBank(nn.Module):
                 logit_chunk = logit_chunk + u_c                            # unigram log-prior chunk slice
             lse_chunk = torch.logsumexp(logit_chunk, dim=-1)               # (B, N)
             gathered = logit_chunk.gather(-1, local_idx.unsqueeze(-1)).squeeze(-1)  # (B, N)
-            return lse_chunk, gathered * in_chunk_f                        # zero where target not in chunk
+            # SELECT rather than multiply (audit 2026-08-06 F31): `gathered * in_chunk_f` is
+            # `-inf * 0.0` = NaN in every chunk that does NOT contain the target, so a degenerate
+            # position poisoned target_logit through chunks it has no business contributing to.
+            # Byte-identical for finite logits (x*1.0 == x, x*0.0 == 0.0).
+            return lse_chunk, torch.where(in_chunk_f > 0, gathered, torch.zeros_like(gathered))
 
         valid = targets != ignore_index                                    # (B, N) bool
         lse_chunks = []
