@@ -54,7 +54,11 @@ from vfe3.families.covariance_tables import (
     packed_strict_lower_size,
 )
 from vfe3.geometry.lie_ops import CompactBlockElement
-from vfe3.numerics import bounded_variance_from_log, safe_cholesky
+from vfe3.numerics import (
+    _count_decode_logdet_fallback,
+    bounded_variance_from_log,
+    safe_cholesky,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1132,16 +1136,31 @@ class PriorBank(nn.Module):
         (families/gaussian.py renyi_closed_form), so the diagonal-prior closed form is value-equal
         to ``_decode_full`` (the per-pair Cholesky seam) without ever forming a (B, N, V, K, K)
         workspace. ``safe_cholesky`` (jittered, never raises) yields a finite log-det where its
-        ``ok`` mask is True; a position where every jitter round fails (non-PD Sigma_q) gets
-        logdet_q = -inf, so per_pos = K + logdet_q drives every vocab logit to -inf there --
-        matching the dense ``_decode_full`` path (gaussian_full's ok-gating -> NaN -> kl_max=inf
-        -> -inf logit). The SPD retraction keeps Sigma_q PD in training, so ok is all-True and
-        the -inf branch never engages on the pure path.
+        ``ok`` mask is True; a position where every jitter round fails (non-PD Sigma_q) falls back
+        to a FINITE log-det.
+
+        That fallback used to be ``-inf`` (audit 2026-08-06 C1/F31), which does not merely produce
+        an -inf logit -- it produces NaN, and the NaN reaches the scalar CE for the WHOLE batch:
+        ``per_pos = K + logdet_q`` becomes -inf, so every vocab logit in the chunk is -inf, and then
+        ``logsumexp_v - target_logit`` is ``-inf - (-inf) = NaN``. Independently,
+        ``gathered * in_chunk_f`` is ``-inf * 0.0 = NaN`` in every chunk that does NOT contain the
+        target, so NaN enters ``target_logit`` even before that subtraction.
+
+        The fallback value is otherwise IRRELEVANT to the loss, which is why a finite one is free:
+        ``per_pos`` is v-INDEPENDENT, so it cancels exactly in ``logsumexp_v - target_logit`` here
+        and shifts the softmax by a constant in ``_decode_full_diagonal_prior``. Zero is therefore
+        the neutral choice, and the event is COUNTED instead of being encoded in a magnitude that
+        cancels anyway.
+
+        Byte-identical on the healthy path: the jitter ladder repairs every float32 PD loss at
+        round 0 (measured 3000/3000 across cond 1e4..1e12), so ``ok`` is all-True, ``torch.where``
+        selects the computed log-det, and this branch never engages.
         """
         diag_sq = torch.diagonal(sigma_q, dim1=-2, dim2=-1)                # (B, N, K) = diag(Sigma_q)
         L, ok = safe_cholesky(sigma_q, eps=self.eps, rounds=5)
         logdet_q = _logdet_chol(L)                                         # (B, N)
-        logdet_q = torch.where(ok, logdet_q, logdet_q.new_full((), float("-inf")))
+        _count_decode_logdet_fallback(ok)
+        logdet_q = torch.where(ok, logdet_q, torch.zeros_like(logdet_q))
         return diag_sq, logdet_q
 
     def decode_ce_full_chunked(
