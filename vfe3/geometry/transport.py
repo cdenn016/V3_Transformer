@@ -2668,13 +2668,39 @@ def _compact_factored_diagonal_covariance(
 
 
 def _compact_factored_full_covariance(
-    factored: CompactFactoredTransport,
-    sigma:    torch.Tensor,               # (..., N, K, K) full SPD covariances
+    factored:    CompactFactoredTransport,
+    sigma:       torch.Tensor,            # (..., N, K, K) full SPD covariances
+    blocks_only: bool = False,            # True -> compute ONLY the h == g head-diagonal blocks
 ) -> torch.Tensor:                        # (..., N, N, K, K) full congruence output
-    r"""Full congruence from compact blocks; the output is full but no dense operator is built."""
+    r"""Full congruence from compact blocks; the output is full but no dense operator is built.
+
+    ``out[h,k,g,n] = sum_{l,m} Omega^(h)[k,l] Sigma^(h,g)[l,m] Omega^(g)[n,m]``, i.e. the (h,g)
+    output block is ``Omega_h Sigma^(h,g) Omega_g^T``.
+
+    ``blocks_only`` (audit 2026-08-05) computes only the head-DIAGONAL blocks and leaves the
+    cross-head blocks exactly zero, which drops the pair contraction from H^2 to H block products.
+    It is a semantic change on general input, so it is opt-in and defaults off: it is exact only
+    when the caller either (a) supplies a block-diagonal ``sigma`` -- then the cross-head outputs
+    are identically zero anyway, since ``Sigma^(h,g) = 0`` for ``h != g`` -- or (b) consumes only
+    the head marginals. ``pairwise_energy`` is case (b): it slices ``block(h*d, (h+1)*d)`` per
+    irrep and never reads an off-block. Under the live gaussian_full config BOTH hold, because the
+    token prior enters ``diag_embed``-promoted and nothing ever writes a cross-head entry.
+    """
     H, d = factored.n_blocks, factored.block_dim
     sigma_blocks = sigma.reshape(*sigma.shape[:-3], sigma.shape[-3], H, d, H, d)
     omega_blocks = _compact_pair_blocks(factored).double()
+    if blocks_only:
+        # sigma_blocks is (..., N, H_row, d, H_col, d); take the H_row == H_col diagonal. torch
+        # .diagonal appends the diagonal axis last, so move it back into the head slot.
+        sigma_diag = torch.diagonal(                              # (..., N, H, d, d)
+            sigma_blocks, dim1=-4, dim2=-2).movedim(-1, -3)
+        diag_out = torch.einsum(                                  # (..., Ni, Nj, H, d, d)
+            "...ijhkl,...jhlm,...ijhnm->...ijhkn",
+            omega_blocks, sigma_diag.double(), omega_blocks)
+        out = diag_out.new_zeros((*diag_out.shape[:-3], H, d, H, d))
+        for h in range(H):                                        # H is the head count (2 here)
+            out[..., h, :, h, :] = diag_out[..., h, :, :]
+        return out.reshape(*out.shape[:-4], factored.K, factored.K).to(sigma.dtype)
     out = torch.einsum(
         "...ijhkl,...jhlgm,...ijgnm->...ijhkgn",
         omega_blocks, sigma_blocks.double(), omega_blocks)
