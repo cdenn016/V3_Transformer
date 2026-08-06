@@ -959,8 +959,10 @@ $$
 \end{aligned}
 $$
 
-These equations describe the reusable registered gradient route, which is inactive under the
-checked-in `mm_exact` selection. They do not describe the frame AdamW update, and they do not imply
+These equations describe the reusable registered gradient route, which is the ACTIVE one under the
+checked-in `e_step_update="gradient"` selection (corrected 2026-08-06: this previously said the
+route was inactive under an `mm_exact` selection, which is exactly inverted -- and `mm_exact` is in
+any case structurally unreachable for `family="gaussian_full"`, see `gradients/kernels.py`). They do not describe the frame AdamW update, and they do not imply
 convergence of the finite refinement schedule.
 
 **Objective boundary.** $\mathcal F_s$ and $\mathcal F_q$ are target-blind structural objectives;
@@ -1043,17 +1045,17 @@ z_{iv} &= -\frac{D_{\mathrm{KL}}\left(q_i^{\ast}\Vert p_v^{\mathrm{decode}}\righ
 $$
 
 The first and second logit equations are alternatives, not additive score terms. The checked-in
-experiment sets `use_prior_bank=False` and `decode_bias=True`, so it selects the registered linear
-boundary. Its logits depend on the refined mean and learned bias; belief covariance and
-$\tau_{\mathrm{decode}}$ do not enter them. Setting `use_prior_bank=True` exposes the registered
-prior-bank modes, including the displayed KL-to-prior boundary, while other registered decode
-modes retain their own stated scoring rules.
+experiment sets `use_prior_bank=True` with `decode_mode='full_chunked'`, so it selects the
+displayed KL-to-prior boundary and its logits DO depend on the belief covariance and
+$\tau_{\mathrm{decode}}$ (corrected 2026-08-06). Setting `use_prior_bank=False` selects the
+registered linear boundary instead, whose logits depend only on the refined mean and a learned
+bias; other registered decode modes retain their own stated scoring rules.
 
 The causal training windows use $x_i=t_i$ and $y_i=t_{i+1}$. At the checked-in values
 `mass_phi=0`, `mstep_self_coupling_weight=0`, and `z_loss_weight=0`, no corresponding outer
-penalty augments cross-entropy. Because `s_e_step=True`, the explicit hyper-prior and gamma outer
-blocks are also gated off rather than scored a second time after their structural role in the
-model refinement. The backpropagated scalar is therefore exactly next-token cross-entropy through
+penalty augments cross-entropy. Because `s_e_step=False` (corrected 2026-08-06), there is no
+`s -> q` refinement stage at all, so the explicit hyper-prior and gamma outer blocks are not
+scored. The backpropagated scalar is therefore exactly next-token cross-entropy through
 the unrolled `s` and `q` paths. This outer scalar is not identical to either target-blind inner
 structural objective $\mathcal F_s$ or $\mathcal F_q$.
 
