@@ -1024,7 +1024,10 @@ def test_compact_phi_block_transport_reaches_shared_and_gamma_model_paths(
     token_ids = torch.tensor([[0, 1, 2, 3, 4]], dtype=torch.long)
     targets = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long)
 
-    dense_logits, dense_loss, _ = dense_model(token_ids, targets)
+    # logits is None on the fused-CE branch by design and the default decode_mode is chunked
+    # (audit 2026-08-06), so the logit parity is checked on the unfused no-targets path.
+    dense_logits = dense_model(token_ids)
+    _, dense_loss, _ = dense_model(token_ids, targets)
     dense_grad, = torch.autograd.grad(dense_loss, dense_model.prior_bank.phi_embed)
 
     seen: list[object] = []
@@ -1036,7 +1039,8 @@ def test_compact_phi_block_transport_reaches_shared_and_gamma_model_paths(
         return result
 
     monkeypatch.setattr(e_step_module, "build_belief_transport", _spy)
-    compact_logits, compact_loss, _ = compact_model(token_ids, targets)
+    compact_logits = compact_model(token_ids)
+    _, compact_loss, _ = compact_model(token_ids, targets)
     compact_grad, = torch.autograd.grad(compact_loss, compact_model.prior_bank.phi_embed)
     encoded_phi = compact_model.prior_bank.encode(token_ids).phi
     compact_model._gamma_energy(token_ids, encoded_phi)

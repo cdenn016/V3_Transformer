@@ -49,9 +49,11 @@ def test_default_off_forward_is_deterministic_and_finite():
     tok = torch.randint(0, 20, (2, 5)); tgt = torch.randint(0, 20, (2, 5))
     torch.manual_seed(0); m1 = _tiny_model()
     torch.manual_seed(0); m2 = _tiny_model()
-    l1, loss1, _ = m1(tok, tgt)
-    l2, loss2, _ = m2(tok, tgt)
-    assert torch.equal(l1, l2) and torch.equal(loss1, loss2)
+    _, loss1, _ = m1(tok, tgt)
+    _, loss2, _ = m2(tok, tgt)
+    # logits is None on the fused-CE branch by design (audit 2026-08-06) -- the default
+    # decode_mode is chunked -- so compare logits via the unfused no-targets path.
+    assert torch.equal(m1(tok), m2(tok)) and torch.equal(loss1, loss2)
 
 
 def test_bf16_forward_runs_and_is_finite():
@@ -62,9 +64,9 @@ def test_bf16_forward_runs_and_is_finite():
     tok = torch.randint(0, 20, (2, 5)); tgt = torch.randint(0, 20, (2, 5))
     torch.manual_seed(0); m_fp32 = _tiny_model()
     torch.manual_seed(0); m_bf16 = _tiny_model(amp_dtype="bf16")
-    logits_fp32, loss_fp32, _ = m_fp32(tok, tgt)
-    logits_bf16, loss_bf16, _ = m_bf16(tok, tgt)
-    assert logits_bf16.shape == logits_fp32.shape
+    _, loss_fp32, _ = m_fp32(tok, tgt)
+    _, loss_bf16, _ = m_bf16(tok, tgt)
+    assert m_bf16(tok).shape == m_fp32(tok).shape      # unfused path; fused CE returns no logits
     assert torch.isfinite(loss_bf16)
     # bf16 mantissa is ~3 decimal digits; the loss should be in the same ballpark as fp32.
     assert torch.allclose(loss_bf16, loss_fp32, atol=0.5, rtol=0.1)
@@ -97,8 +99,13 @@ def test_decode_and_ce_stay_fp32_under_bf16():
         seen["logits_out"] = out.dtype
         return out
 
+    # No targets: the fused-CE branch bypasses prior_bank.decode entirely (it calls the registered
+    # fused_ce), so the spy would never fire and this dtype contract would go unchecked. The
+    # unfused path is the one that runs `decode`, which is what this test is about (audit
+    # 2026-08-06). The fused branch's own finiteness is asserted separately below.
     with mock.patch.object(model.prior_bank, "decode", _spy):
-        _, loss, _ = model(tok, tgt)
+        model(tok)
+    _, loss, _ = model(tok, tgt)
 
     # Decode inputs are .float()-ed (the load-bearing fp32 guard), so the cancellation-sensitive
     # matmul runs in fp32, and the logits feeding CE are fp32.
