@@ -55,7 +55,10 @@ def test_model_forward_matches_frozen_oracle():
     tok = torch.tensor([[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 0]])
     tgt = torch.tensor([[2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 0, 1]])
     with torch.no_grad():
-        logits, loss, ce = m(tok, tgt)
+        _, loss, ce = m(tok, tgt)
+        # logits is None on the fused-CE branch by design (audit 2026-08-06); the default
+        # decode_mode is chunked now, so take them from the unfused no-targets path.
+        logits = m(tok)
     assert logits.shape == (2, 6, 12)
     assert abs(float(loss) - _FWD_LOSS) < 1e-5
     assert abs(float(logits.sum()) - _FWD_LOGITS_SUM) < 1e-5

@@ -37,7 +37,30 @@ def _full_gaussian_public_dtype(*dtypes: torch.dtype) -> torch.dtype:
 #         attention weights moving by at most 4.0e-6 at the trained operating point.
 # Process-global by design: see the note in FullGaussian.renyi_closed_form. It is set in exactly
 # one place (VFEModel.__init__) so no two consumers of coupling_energy can disagree.
-_FULL_COV_KL_PRECISIONS = ("fp64", "fp32_escalate")
+_FULL_COV_KL_PRECISIONS = ("fp64", "fp32_escalate", "fp32_escalate_cond")
+# Pivot-ratio floor at which "fp32_escalate_cond" promotes the grid to float64.
+#
+# CALIBRATED, NOT DERIVED. The proxy is min(diag L)^2 / max(diag L)^2, which is a lower bound on
+# 1/cond and under-reports true conditioning by 2-3 decades, so the threshold was measured rather
+# than reasoned (K=20, 20 draws per row, random orthogonal eigenbasis):
+#
+#   true cond   pivot ratio   fp32 relative KL error
+#   1e2         1.04e-1       4.1e-07
+#   1e3         1.98e-2       1.3e-06
+#   1e4         3.63e-3       2.0e-05
+#   1e5         4.35e-4       1.4e-04
+#   1e6         5.69e-5       8.8e-04      <- error becomes material here
+#   1e7         9.44e-6       9.0e-03
+#   1e8         1.12e-6       1.3e-01
+#   1e9         1.85e-5       9.8e-01      <- NOT monotone: the jitter ladder has ridged the
+#                                             matrix, so the pivots describe the RIDGED input
+#
+# 1e-4 escalates from true cond ~1e6 (ratio 5.7e-5) and leaves cond 1e5 alone (4.35e-4), i.e. it
+# fires exactly where the float32 error crosses 1e-3 relative. The trained operating point (cond
+# median 2.7e3 / p95 2.1e4, config.py:854-856) sits at ratio ~2e-2..1.5e-3, one to two decades
+# clear, so this does not fire during normal training. The 1e9 row is non-monotone but still below
+# the floor, so the trigger holds there too.
+_FULL_COV_KL_COND_FLOOR: float = 1e-4
 _FULL_COV_KL_PRECISION: str = "fp64"
 
 
@@ -67,6 +90,14 @@ def _full_cov_kl_compute_dtype(result_dtype: torch.dtype) -> torch.dtype:
     return torch.float32
 
 
+def _inv_cond_from_chol(factor: torch.Tensor) -> torch.Tensor:
+    r"""``min(diag L)^2 / max(diag L)^2`` -- a free lower bound on ``1 / cond(L L^T)``."""
+    diag = torch.diagonal(factor, dim1=-2, dim2=-1).abs()
+    lo = diag.amin(dim=-1)
+    hi = diag.amax(dim=-1).clamp_min(torch.finfo(diag.dtype).tiny)
+    return (lo / hi) ** 2
+
+
 def _full_gaussian_kl_terms(
     mu_q:    torch.Tensor,             # (..., K) query means
     sigma_q: torch.Tensor,             # (..., K, K) query covariances
@@ -74,7 +105,7 @@ def _full_gaussian_kl_terms(
     sigma_t: torch.Tensor,             # (..., K, K) transported key covariances
     K:       int,
     eps:     float,
-) -> Tuple[torch.Tensor, torch.Tensor]:   # (unclamped KL (...), ok mask (...))
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:  # KL, ok mask, 1/cond estimate
     r"""Exact full-covariance KL(q||t) and its per-element factorization mask.
 
     Lifted verbatim out of ``FullGaussian.renyi_closed_form``'s alpha==1 branch so the float64
@@ -94,7 +125,11 @@ def _full_gaussian_kl_terms(
     logdet_p = _logdet_chol(L_p)
     logdet_q = _logdet_chol(L_q)
     div = 0.5 * (trace_term + mahal_term - K + logdet_p - logdet_q)
-    return div, ok_p & ok_q
+    # Free conditioning estimate from the factors already computed: for Sigma = L L^T the squared
+    # Cholesky pivots bracket the spectrum, so min(diag L)^2 / max(diag L)^2 is a lower bound on
+    # 1/cond(Sigma). Costs two reductions over an existing tensor -- no extra factorization.
+    inv_cond = torch.minimum(_inv_cond_from_chol(L_p), _inv_cond_from_chol(L_q))
+    return div, ok_p & ok_q, inv_cond
 
 
 def diag_kl_unclamped(
@@ -715,16 +750,38 @@ class FullGaussian(BeliefParams):
             # This matches the robustness the alpha != 1 branch already has. Round 0 adds zero
             # jitter, so valid-SPD inputs stay byte-identical to torch.linalg.cholesky; an element
             # that fails every round -> NaN -> safe_kl_clamp -> kl_max (mirroring that branch).
-            div, ok = _full_gaussian_kl_terms(mu_q, sigma_q, mu_t, sigma_t, K, eps)
-            # Data-keyed escalation: under a float32 policy a pair whose factorization failed is
-            # recomputed in float64 rather than being written off to kl_max. The whole grid is
-            # escalated (not the failed subset) so the returned tensor keeps one dtype and one
-            # autograd graph; the branch is skipped entirely on the float64 policy, which is why
-            # that path stays bit-identical to the pre-policy build.
-            if compute_dtype is not torch.float64 and bool((~ok).any()):
-                div_escalated, ok = _full_gaussian_kl_terms(
-                    mu_q.double(), sigma_q.double(), mu_t.double(), sigma_t.double(), K, eps)
-                div = div_escalated.to(compute_dtype)
+            div, ok, inv_cond = _full_gaussian_kl_terms(mu_q, sigma_q, mu_t, sigma_t, K, eps)
+            # Data-keyed escalation: under a float32 policy a pair is recomputed in float64 rather
+            # than being written off to kl_max. The whole grid is escalated (not the failed subset)
+            # so the returned tensor keeps one dtype and one autograd graph; the branch is skipped
+            # entirely on the float64 policy, which is why that path stays bit-identical to the
+            # pre-policy build.
+            #
+            # TRIGGER (audit 2026-08-06 C2/F1). "fp32_escalate" keys on the Cholesky `ok` mask, and
+            # that mask is effectively always True: safe_cholesky's jitter ladder repairs every
+            # float32 PD loss at t=0 -- measured 3000/3000 across cond 1e4..1e12, with ZERO failures
+            # below cond 1e8 -- so the branch is dead code and the policy is unconditional float32.
+            # Cholesky failure is not a proxy for ACCURACY; the two are decoupled by ~6 decades of
+            # conditioning (measured fp32-vs-fp64 KL error at K=20: cond 1e6 -> median 3.4e-2, cond
+            # 1e7 -> median 3.4e-1 / max 8.24, while the factorization still succeeds).
+            #
+            # "fp32_escalate_cond" keys on an ACCURACY proxy instead: the free Cholesky conditioning
+            # estimate from the factors already computed. It is a separate policy spelling rather
+            # than a change to "fp32_escalate" so runs already on disk stay reproducible.
+            #
+            # Severity, so this is not over-read: at the trained operating point the repo's own
+            # recorded conditioning is median 2.7e3 / p95 2.1e4 (config.py:854-856), where the fp32
+            # error gives an attention-weight ratio of 1.0000-1.0002 -- the documented 4e-6 bound is
+            # CORRECT where the model actually lives. This guards an excursion, which
+            # e_sigma_q_trust=10 makes reachable in ONE step, not a live error.
+            if compute_dtype is not torch.float64:
+                escalate = bool((~ok).any())
+                if _FULL_COV_KL_PRECISION == "fp32_escalate_cond":
+                    escalate = escalate or bool((inv_cond < _FULL_COV_KL_COND_FLOOR).any())
+                if escalate:
+                    div_escalated, ok, _ = _full_gaussian_kl_terms(
+                        mu_q.double(), sigma_q.double(), mu_t.double(), sigma_t.double(), K, eps)
+                    div = div_escalated.to(compute_dtype)
             div = torch.where(ok, div, div.new_tensor(float("nan")))
         else:
             # alpha > 1 leaves the convex regime: the blend can be indefinite for some

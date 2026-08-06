@@ -65,6 +65,7 @@ from vfe3.model.stack import vfe_stack
 from vfe3.families.base import get_family
 from vfe3.families.gaussian import set_full_cov_kl_precision
 from vfe3.geometry.transport import set_full_cov_congruence_precision
+from vfe3.numerics import set_mu_trust_cholesky_rounds, set_safe_cholesky_jitter_mode
 
 
 # Transport-mode state-routing sets: which regimes' Omega builders read mu/sigma. Sourced from the
@@ -243,6 +244,8 @@ class VFEModel(nn.Module):
         set_full_cov_kl_precision(cfg.full_cov_kl_precision)
         # Same one-place-set rule for the congruence that feeds it (audit 2026-08-06 C1).
         set_full_cov_congruence_precision(cfg.full_cov_congruence_precision)
+        set_safe_cholesky_jitter_mode(cfg.safe_cholesky_jitter_mode)
+        set_mu_trust_cholesky_rounds(cfg.mu_trust_cholesky_rounds)
         self._transport_status = {"regime_ii_covariant_feature_exact": True}
         self.group = build_group(cfg)
         # ALiBi-family priors carry a per-head (n_heads, N, N) axis, while the energy's head axis

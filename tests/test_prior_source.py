@@ -35,6 +35,14 @@ from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
 
 
+# NOTE (audit 2026-08-06): ``model(tokens, targets)`` returns logits=None whenever the active
+# decode mode supports chunking -- the fused CE branch never materializes a (B, N, V) logit tensor,
+# by design (model.py: "logits is None on the fused branch by design"). The default decode_mode is
+# now ``diagonal_chunked``, so these tests, which predate that default, were comparing None against
+# None and dying in torch.equal. Logits are obtained from a SEPARATE no-targets call, which takes
+# the unfused path; the loss/CE comparisons are unchanged and are the stronger assertion anyway.
+
+
 def _make(prior_source: str = "token", *, lambda_gamma: float = 0.0, lambda_h: float = 0.0,
           seed: int = 0) -> VFEModel:
     cfg = VFE3Config(
@@ -80,11 +88,13 @@ def test_copy_equivalence_model_channel_equals_token():
         m_mc.prior_bank.s_sigma_log_embed.copy_(m_tok.prior_bank.sigma_log_embed)
     tok = torch.randint(0, 20, (3, 5))
     tgt = torch.randint(0, 20, (3, 5))
-    log_t, loss_t, ce_t = m_tok(tok, tgt)
-    log_m, loss_m, ce_m = m_mc(tok, tgt)
-    assert torch.equal(log_t, log_m)     # encode + self-coupling + decode all read the same prior
+    _, loss_t, ce_t = m_tok(tok, tgt)
+    _, loss_m, ce_m = m_mc(tok, tgt)
     assert torch.equal(ce_t, ce_m)
     assert torch.equal(loss_t, loss_m)
+    # encode + self-coupling + decode all read the same prior; logits come from the unfused
+    # no-targets path (see the module note above)
+    assert torch.equal(m_tok(tok), m_mc(tok))
 
 
 def test_copy_equivalence_holds_through_mstep_and_multilayer():
@@ -107,10 +117,10 @@ def test_copy_equivalence_holds_through_mstep_and_multilayer():
         m_mc.prior_bank.s_sigma_log_embed.copy_(m_tok.prior_bank.sigma_log_embed)
     tok = torch.randint(0, 20, (3, 6))
     tgt = torch.randint(0, 20, (3, 6))
-    log_t, loss_t, _ = m_tok(tok, tgt)       # loss_t includes the M-step self-coupling term
-    log_m, loss_m, _ = m_mc(tok, tgt)
-    assert torch.equal(log_t, log_m)
+    _, loss_t, _ = m_tok(tok, tgt)           # loss_t includes the M-step self-coupling term
+    _, loss_m, _ = m_mc(tok, tgt)
     assert torch.equal(loss_t, loss_m)       # the rerouted self-coupling rebuild stays byte-identical
+    assert torch.equal(m_tok(tok), m_mc(tok))
 
 
 # ---- (3) directional: s is the LIVE prior, mu_embed is DEAD, under model_channel --------------
@@ -119,11 +129,11 @@ def test_model_channel_s_is_live_mu_embed_is_dead():
     m = _make("model_channel")
     tok = torch.randint(0, 20, (3, 5))
     tgt = torch.randint(0, 20, (3, 5))
-    log0 = m(tok, tgt)[0]
+    log0 = m(tok)                        # no targets -> unfused decode, real logits
     torch.manual_seed(1)
     with torch.no_grad():                # perturb the LIVE prior -> predictions move
         m.prior_bank.s_mu_embed.add_(torch.randn_like(m.prior_bank.s_mu_embed))
-    log1 = m(tok, tgt)[0]
+    log1 = m(tok)
     assert not torch.equal(log0, log1)
     # The bypassed base tables are absent from parameters and serialized capacity.
     assert m.prior_bank.mu_embed is None
