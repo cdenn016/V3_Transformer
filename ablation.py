@@ -48,6 +48,13 @@ import os
 if os.environ.get("VFE3_ALLOW_DUPLICATE_OPENMP") == "1":
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
+# Third-party toolchain noise, filtered BEFORE torch is imported (triton emits its
+# "Failed to find cuobjdump/nvdisasm" UserWarnings while torch is loading, and a warning
+# already emitted cannot be un-emitted). Disassembly tools only -- absent on the Windows pip
+# wheel, unused by this project, and irrelevant to numerics or throughput. See vfe3/quiet.py.
+from vfe3.quiet import silence_toolchain_warnings
+silence_toolchain_warnings()
+
 import ast
 import copy
 import csv
@@ -70,7 +77,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
-from vfe3.config import VFE3Config
+from vfe3.config import VFE3Config, config_notices_shown
 from vfe3.data.datasets import (
     _sha256_file,
     _tokenizer_tag,
@@ -2394,11 +2401,25 @@ def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True
             f"  {sweep}: {len(labels)} arm(s) -- {first_error[sweep]}"
             for sweep, labels in by_sweep.items()
         )
-        logger.warning(
-            "%d registered sweep(s) do not construct against the current BASELINE_CONFIG and "
-            "are NOT scheduled this session; each needs its own baseline regime:\n%s",
-            len(by_sweep), summary,
-        )
+        # Hidden by default, alongside the config inertness notices (VFE3_CONFIG_NOTICES=1 or
+        # vfe3.config.set_config_notices(True) to expand). The one-line COUNT still goes out at
+        # INFO even when hidden, and deliberately so: this block is not console noise about a
+        # value that does nothing, it is the record that N registered sweeps are being DROPPED
+        # from the session. Silently scheduling 12 sweeps when the registry lists 20 is the exact
+        # failure the dead-sweep guard exists to prevent, so the FACT stays visible even when the
+        # per-sweep detail does not.
+        if config_notices_shown():
+            logger.warning(
+                "%d registered sweep(s) do not construct against the current BASELINE_CONFIG and "
+                "are NOT scheduled this session; each needs its own baseline regime:\n%s",
+                len(by_sweep), summary,
+            )
+        else:
+            logger.info(
+                "%d registered sweep(s) not scheduled (incompatible with BASELINE_CONFIG); "
+                "set VFE3_CONFIG_NOTICES=1 for the per-sweep reason.",
+                len(by_sweep),
+            )
 
 
 # =============================================================================
