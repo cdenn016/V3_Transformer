@@ -3,6 +3,49 @@
 **Status:** wave 1 dispatched. Resume at step 4 below.
 **Skill:** `deep-audit` (follow it exactly; this file only carries state, not the method).
 
+---
+
+## READ THIS FIRST IF YOU ARE A SCHEDULED CLOUD RUN
+
+You have zero prior context. This file is your entire brief. Three environment facts change
+how you must execute:
+
+1. **The `deep-audit` skill and the `audit-*` domain-expert subagents DO NOT EXIST in your
+   environment.** They live in the user's home directory (`~/.claude/`), not in this repo, so
+   they will not resolve. Dispatch **`general-purpose` subagents** instead and bake each expert
+   role into its own prompt. The method you need is reproduced in "Workflow state" below — you
+   do not need the skill file.
+2. **This clone does NOT contain the user's uncommitted edits** to `ablation.py`,
+   `train_vfe3.py`, and `vfe3/config.py`. The "Active config" section below records the exact
+   configuration those edits produce. **Reason about reachability from that recorded config, not
+   from the committed `ablation.py`.**
+3. **If `audit-2026-08-05.md` already exists at the repo root**, the originating local session
+   finished first. Read it and fill only genuine gaps — do not redo it.
+
+Deliverables, in the user's priority order:
+- **(c) Explain the performance symptom** — `3.12 it/s` while using only 6GB of 32GB on an
+  RTX 5090, at K=20, H=2, N=64, B=48, fp32, `gaussian_full`. Under-utilized memory plus low
+  throughput points at host-device syncs, kernel-launch-bound tiny-tensor work, per-head/per-chunk
+  Python loops, and `torch.linalg` latency on (20,20)/(10,10) blocks. Name concrete speed-ups
+  with expected magnitude.
+- **(a) Shortcomings and BLOCKED FEATURES** in the gaussian_full / pure path that should be built
+  out: `NotImplementedError`, hard-gated branches, config knobs accepted but never read under
+  `gaussian_full`, and diagonal-only implementations with no full-covariance counterpart.
+- **(b) Optimizations** — including whether the idle 26GB can be spent (larger batch/seq) and
+  what currently blocks that.
+
+Highest-value single question, from the user's own observation: **full-covariance runs ASCEND
+the free energy F while diagonal runs descend it.** Investigate whether any code path makes the
+`gaussian_full` E-step update non-descent — wrong sign, wrong metric, missing Jacobian factor,
+preconditioner mismatched to the full-covariance geometry, or a trust-region clip applied in the
+wrong basis.
+
+**Output:** write the finished report to `audit-2026-08-05.md` **at the repo root** (`docs/` is
+gitignored — that is why this file is at the root), commit it on a new branch, and open a PR so
+the user can read it. **Do not fix any of the findings** — present the punch list only.
+
+---
+
 ## User's request (verbatim intent)
 
 > perform an ultradeep audit of the 'gaussian_full'/'pure path' codebase by deploying several
