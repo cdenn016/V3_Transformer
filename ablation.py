@@ -239,8 +239,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     max_seq_len               = 64,                 # N, context length
     eval_stride               = None,
     
-    batch_size                = 48,
-    max_steps                 = 10000,
+    batch_size                = 128,
+    max_steps                 = 3750,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
@@ -516,7 +516,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
                                              # (sigma 4.00 -> 2.59); against the 60k-step trained table the
                                              # decay accounts for -1.32 of a realized -0.78 displacement, i.e.
                                              # it is first-order comparable to the entire likelihood signal.
-    mu_weight_decay           = None,            # AdamW decay for the MEAN-role tables: mu_embed, s_mu_embed,
+    mu_weight_decay           = 0.075,            # AdamW decay for the MEAN-role tables: mu_embed, s_mu_embed,
                                              # decode_mu_embed, output_proj_weight (None = inherit weight_decay).
                                              # Decoupled decay reaches EVERY row of a live embedding table on
                                              # every step, so rare rows are crushed faster than their gather
@@ -557,7 +557,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
                                               # rotation-invariant and is the only correct choice for a
                                               # full-covariance family. (config.py:494 still recommends 'box';
                                               # that recommendation predates the full-cov path.)
-    e_sigma_q_trust           = 10.0,
+    e_sigma_q_trust           = 1.0,
     sigma_max                 = 100,
     
     #################################
@@ -565,7 +565,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #################################     
     amp_dtype                 = None,      # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
         
-    log_interval              = 1250,       # console log every N steps (0 = off)
+    log_interval              = 1000,       # console log every N steps (0 = off)
     eval_interval             = 2500,      # periodic validation every N steps (0 = off)
     checkpoint_interval       = 60000,     # save a resumable checkpoint every N steps (0 = off)
 
@@ -649,6 +649,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
                                              # <=2e-4 on adversarial synthetic spectra, 4e-6 on real trained ones.
 
     full_cov_congruence_precision = "fp32_escalate",      # "fp64" | "fp32_escalate"   
+    
     congruence_cond_escalation           = False,     # True -> slow ...escalate on the conditioning proxy
     emit_expensive_diagnostics           = True,    
     generate_figures                     = True,      # OFF: strict opt-out for all finalization plots, plot-only
@@ -1511,6 +1512,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     
     
+    
     "kappa_gamma": {
         "description": "model-channel temperature tau_gamma = kappa_gamm,a * sqrt(d_head)",
         # audit 2026-08-05: effective_kappa_gamma is reachable only from _refine_s (gated on
@@ -1527,11 +1529,12 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "decode_tau": {
         "description": "KL-to-prior decode temperature",
-        "param": "decode_tau", "values": [0.001, 0.005, 0.0075, 0.01, 0.02, 0.05], "requires": {"use_prior_bank": True},
+        "param": "decode_tau", "values": [0.001, 0.005, 0.008, 0.01, 0.05], "requires": {"use_prior_bank": True},
     },
     
     
 
+    
     
     
     
@@ -1563,13 +1566,13 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "e_q_mu_lr": {
        "description": "E-step natural-gradient step size for mu_q",
-       "param": "e_q_mu_lr", "values": [0.01, 0.05, 0.1, 0.2, 0.3, 0.5],
+       "param": "e_q_mu_lr", "values": [0.3, 0.4],
        "requires": {"e_step_update": "gradient"},   # audit 2026-07-27: unread under mm_exact
     },
    
     "e_q_sigma_lr": {
        "description": "E-step retraction step size for sigma_q",
-       "param": "e_q_sigma_lr", "values": [0, 0.0005, 0.0015],
+       "param": "e_q_sigma_lr", "values": [0.0005, 0.001, 0.005, 0.01, 0.05],
        "requires": {"e_step_update": "gradient"},   # audit 2026-07-27: unread under mm_exact
     },
    
@@ -1657,12 +1660,12 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # "everything else" knob, or drop this sweep and widen mu_weight_decay to the union grid.
     "weight_decay": {
         "description": "AdamW weight decay",
-        "param": "weight_decay", "values": [0.01, 0.015, 0.02, 0.025, 0.03, 0.04],
+        "param": "weight_decay", "values": [0.05, 0.075, 0.1],
     },
 
     "mu_weight_decay": {
         "description": "AdamW weight decay",
-        "param": "mu_weight_decay", "values": [0.00, 0.005, 0.01, 0.02, 0.03],
+        "param": "mu_weight_decay", "values": [0.05, 0.075, 0.1, 0.5],
     }, 
     
     "phi_weight_decay":{
@@ -1806,27 +1809,16 @@ NON_SWEPT_FIELDS = (
 # CONFIG["sweep"]="<name>"); add or remove names to shape a session. Cheap-to-expensive is a good
 # ordering for a single GPU. Set CONFIG["list_only"]=True (with sweep=None) to print every sweep.
 SWEEP_ORDER: List[str] = [
-  #"component_ablation_forest",
-  #"gauge_group",
-  #"transport_mode",
- # "gauge_equivariance",
- # "pos_extrapolation",
-  #"estep_depth_damping",
-  #"e_q_mu_sigma_lr_grid",
- # "s_frame_mode",
-
-    #"alibi_slope",
-  # "mstep_self_coupling_weight",
-  # "mass_phi",  
-   "m_p_sigma_lr",
-   "m_phi_lr",
   
-   "e_q_mu_lr",
+  "e_q_sigma_lr",
+  "decode_tau",
+  # "mu_weight_decay",
+   "weight_decay",
+   "sigma_weight_decay",
+   "phi_weight_decay",
    
-  #"m_p_mu_lr",
    
-   
-   
+   #"sigma_max",
    
    "sigma_init",
    "mu_init_std",
@@ -1834,75 +1826,53 @@ SWEEP_ORDER: List[str] = [
     
    #"pos_phi_scale",
     
-   # "e_s_mu_lr",
-   "mu_weight_decay",
-   "weight_decay",
-   "sigma_weight_decay",
-   "phi_weight_decay",
-
+   #"e_s_mu_lr",
+   #"e_s_sigma_lr",
+   
+   
+   
+   "e_q_mu_lr",
+   
+   "m_p_mu_lr",
+   "m_p_sigma_lr",
+   "m_phi_lr",
+  
+   #"m_s_phi_lr",
+   
+   #"lambda_alpha",
    #"lambda_h",
    #"lambda_gamma",
+   #"lambda_beta",
+  
    
-    
-  # "mm_damping",
-  # "query_tau_c",
+   #"mstep_self_coupling_weight",
+   #"mass_phi",   
+  
+   #"alibi_slope",
+  
+   #"mm_damping",
    
-   
-   
- #"m_s_phi_lr",
-#"gamma_prior_weight",
- 
- #"e_s_sigma_lr",
-    
-   #"e_q_sigma_lr",
+   #"query_tau_c",
 
-   # "lambda_beta",
+   #"gamma_prior_weight",
 
-  #"gauge_transport",
- # "attention_entropy",
- # "gauge_equivariance",
-  #"cg_coupling",
- # "fisher_mu_precond",
-
- # "n_e_steps_em",
- # "gauge_mstep_optim",
-
-  #"m_phi_lr_pullback_group",   not run
-
- # "pos_extrapolation",
- # "rho_handoff",
-
-  #"kappa_beta_per_head",
-
-  # "precision_attention_b0",
-  # "decode_tau",
-
-
-
-
-   # "sigma_max",
-
-
+   #"kappa_beta_per_head",
+   #"kappa_beta",
+   #"kappa_gamma",
 
    # "renyi_order",
 
    #"e_mu_q_trust",
    #"e_mu_q_trust_ball",
-
-   # "lambda_alpha",
-   
-   
-   
-
-
    #"lambda_twohop",
    
-  # "kappa_beta",
-  # "kappa_gamma",
-  
-   
+   #"gauge_transport",
+   #"attention_entropy",
+   #"gauge_equivariance",
+   #"cg_coupling",
+   #"fisher_mu_precond",
 
-
+   # "n_e_steps_em",
 
 ]
 

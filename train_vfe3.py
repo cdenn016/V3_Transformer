@@ -92,8 +92,8 @@ config = dict(
     max_seq_len               = 64,                 # N, context length
     eval_stride               = None,
     
-    batch_size                = 48,
-    max_steps                 = 15000,
+    batch_size                = 32,
+    max_steps                 = 60000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
@@ -142,7 +142,7 @@ config = dict(
     #        Initialization
     #################################
     mu_init_std               = 0.065,     # std of the random mean table mu_embed
-    sigma_init                = 4,         # constant initial coordinate variance (sigma_log = log of this)
+    sigma_init                = 2.5,         # constant initial coordinate variance (sigma_log = log of this)
     phi_scale                 = 0.06,      # std
     pos_phi_scale             = 0.02,                # learned-table init scale AND frozen per-position step
     
@@ -328,7 +328,7 @@ config = dict(
     #         Learning Rates
     #################################
     
-    e_q_mu_lr                 = 0.1,
+    e_q_mu_lr                 = 0.3,
     e_q_sigma_lr              = 0.005,
     e_phi_lr                  = 0.00,     
     
@@ -353,7 +353,7 @@ config = dict(
     #################################
         
     m_p_mu_lr                 = 0.015,     
-    m_p_sigma_lr              = 0.01,     
+    m_p_sigma_lr              = 0.001,     
     m_phi_lr                  = 0.0025,    #0.0025 pure path
     
     m_s_phi_lr                = 0.007,         
@@ -362,7 +362,7 @@ config = dict(
     phi_weight_decay          = 0.03,   
     sigma_weight_decay        = 0.00,           # AdamW decay for log-variance tables (None = inherit weight_decay;
                                              # 0.0 exempts sigma from the unintended log-sigma->0 pull)
-    mu_weight_decay           = None,            # AdamW decay for the MEAN-role tables: mu_embed, s_mu_embed,
+    mu_weight_decay           = 0.075,            # AdamW decay for the MEAN-role tables: mu_embed, s_mu_embed,
                                              # decode_mu_embed, output_proj_weight (None = inherit weight_decay).
                                              # Decoupled decay reaches EVERY row of a live embedding table on
                                              # every step, so rare rows are crushed faster than their gather
@@ -390,7 +390,7 @@ config = dict(
     #################################
     
     e_mu_q_trust              = 1,
-    e_sigma_q_trust           = 10.0,
+    e_sigma_q_trust           = 1,
     sigma_max                 = 100,
     
     #################################
@@ -474,6 +474,11 @@ config = dict(
                                              # data-keyed, not a blanket downcast. Verified single-pass through
                                              # cond(Sigma)~1e6, escalates at ~1e9; post-softmax attention moves
                                              # <=2e-4 on adversarial synthetic spectra, 4e-6 on real trained ones.
+                                             
+    full_cov_congruence_precision = "fp32_escalate",      # "fp64" | "fp32_escalate"                                        
+
+    safe_cholesky_jitter_mode     = "relative",      # "absolute" | "relative"
+    mu_trust_cholesky_rounds = 3,
 
     congruence_cond_escalation           = False,         # True -> slow ...escalate on the conditioning proxy
     emit_expensive_diagnostics           = True,    
