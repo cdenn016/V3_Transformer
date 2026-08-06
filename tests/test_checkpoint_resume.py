@@ -1117,6 +1117,44 @@ def test_generic_iterables_allow_artifacts_until_a_checkpoint_is_due(tmp_path) -
     assert not list(artifacts.ckpt_dir.glob("*.pt"))
 
 
+def test_periodic_selection_binds_validation_identity_with_no_checkpoint_due(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    r"""Best-model SELECTION binds its validation contract even when no data cursor is requested.
+
+    ``checkpoint_interval`` above ``n_steps``, no resume, no terminal callback: nothing needs a
+    resumable cursor, yet ``eval_interval`` still publishes ``best_model.pt`` and a finite
+    ``best_val_ppl``. Binding the identity only under the cursor gate left exactly this cell with
+    selected weights carrying ``selection_data_identity=None``, which ``finalize_run`` refuses to
+    reload -- after the entire training budget had already been spent.
+    """
+    _no_git(monkeypatch)
+    cfg = _cfg(checkpoint_interval=10_000, generate_figures=False)   # never due within n_steps
+    model = VFEModel(cfg)
+    artifacts = RunArtifacts(tmp_path / "run", cfg, model)
+
+    train(
+        model,
+        _const_loader(),
+        cfg,
+        n_steps=1,
+        eval_interval=1,
+        val_loader=_eval_loader(),
+        artifacts=artifacts,
+        generate_samples=False,
+    )
+
+    assert artifacts.best_path.is_file()
+    assert math.isfinite(artifacts.best_val_ppl)                    # selection IS live
+    assert not list(artifacts.ckpt_dir.glob("*.pt"))                # ...but no cursor work was due
+    expected = _loader_data_identity(_eval_loader(), cfg.vocab_size)
+    assert artifacts.selection_data_identity == expected
+    saved = torch.load(artifacts.best_path, weights_only=False)
+    assert saved["selection_data_identity"] == expected             # the SELECTED weights carry it
+    finalize_run(model, artifacts, cfg, test_loader=_const_loader())  # the reported end-of-run crash
+
+
 def test_exact_random_resume_rejects_distinct_sampler_generator(tmp_path) -> None:
     cfg = _cfg(checkpoint_interval=1)
     dataset = TokenWindows(torch.arange(105, dtype=torch.long) % 6, seq_len=8)

@@ -1365,8 +1365,23 @@ def train(
         _loader_data_identity(loader, cfg.vocab_size)
         if cursor_requested and cursor_supported else None
     )
+    # Best-model SELECTION binds the validation contract that chose the published weights, and that
+    # is a different question from whether a resumable data CURSOR is required. Periodic eval calls
+    # maybe_save_best on runs with no resume, no terminal callback, and checkpoint_interval above
+    # n_steps -- all three cursor triggers off. Binding under `cursor_requested` alone left exactly
+    # that cell publishing best_model.pt with selection_data_identity=None and a finite
+    # best_val_ppl, which finalize_run then refuses to reload ("best-model finalization requires a
+    # bound validation-data identity") only AFTER the whole training budget was spent. So bind
+    # whenever selection can run, mirroring `cursor_supported`: a val_loader that cannot state an
+    # identity (a plain iterable of batches, from a library caller) still selects unbound rather
+    # than raising here, which keeps that documented diagnostic path working.
+    selection_requested = bool(
+        artifacts is not None and val_loader is not None and bool(eval_interval))
+    selection_supported = isinstance(
+        getattr(getattr(val_loader, "dataset", None), "tokens", None), torch.Tensor)
     selection_data_identity = None
-    if cursor_requested and artifacts is not None and val_loader is not None:
+    if (artifacts is not None and val_loader is not None
+            and (cursor_requested or (selection_requested and selection_supported))):
         selection_data_identity = _loader_data_identity(val_loader, cfg.vocab_size)
         artifacts.bind_selection_data_identity(selection_data_identity)
     resume_data_state: DataStateBuffer = {}
