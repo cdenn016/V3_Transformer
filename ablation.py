@@ -64,7 +64,7 @@ import sys
 import time
 import warnings
 from collections.abc import Mapping
-from dataclasses import asdict, fields as dataclass_fields
+from dataclasses import MISSING as _DATACLASS_MISSING, asdict, fields as dataclass_fields
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -282,7 +282,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #        Initialization
     #################################
     mu_init_std               = 0.065,     # std of the random mean table mu_embed
-    sigma_init                = 4,         # constant initial coordinate variance (sigma_log = log of this)
+    sigma_init                = 2.5,         # constant initial coordinate variance (sigma_log = log of this)
     phi_scale                 = 0.06,      # std
     pos_phi_scale             = 0.02,                # learned-table init scale AND frozen per-position step
     
@@ -468,7 +468,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #         Learning Rates
     #################################
     
-    e_q_mu_lr                 = 0.1,
+    e_q_mu_lr                 = 0.3,
     e_q_sigma_lr              = 0.005,
     e_phi_lr                  = 0.00,     
     
@@ -493,7 +493,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #################################
         
     m_p_mu_lr                 = 0.015,     
-    m_p_sigma_lr              = 0.01,     
+    m_p_sigma_lr              = 0.001,     
     m_phi_lr                  = 0.0025,
     
     m_s_phi_lr                = 0.007,         
@@ -641,6 +641,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
                                              # cond(Sigma)~1e6, escalates at ~1e9; post-softmax attention moves
                                              # <=2e-4 on adversarial synthetic spectra, 4e-6 on real trained ones.
 
+    full_cov_congruence_precision = "fp32_escalate",      # "fp64" | "fp32_escalate"   
     congruence_cond_escalation           = False,     # True -> slow ...escalate on the conditioning proxy
     emit_expensive_diagnostics           = True,    
     generate_figures                     = True,      # OFF: strict opt-out for all finalization plots, plot-only
@@ -1445,7 +1446,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "sigma_init": {
         "description": "constant initial coordinate variance of the prior table (>0)",
-        "param": "sigma_init", "values": [1, 2.5, 3, 4, 5],
+        "param": "sigma_init", "values": [0.1, 0.5, 1, 1.5, 2],
     },
     
     "phi_scale": {
@@ -1580,7 +1581,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
    
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "values": [0.001, 0.0025, 0.005, 0.0075, 0.01],
+        "param": "m_phi_lr", "values": [0.001, 0.002, 0.0025, 0.003],
     },
    
     "m_p_mu_lr": {
@@ -1590,7 +1591,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "m_p_sigma_lr": {
         "description": "M-step LR for the prior-bank variances",
-        "param": "m_p_sigma_lr", "values": [0.001, 0.005, 0.01, 0.02],
+        "param": "m_p_sigma_lr", "values": [0.0005, 0.001, 0.0015, 0.0025, 0.0035],
     },
     
    
@@ -1810,14 +1811,15 @@ SWEEP_ORDER: List[str] = [
     #"alibi_slope",
   # "mstep_self_coupling_weight",
   # "mass_phi",  
-   
-  # "m_phi_lr",
-  
-  "e_q_mu_lr",
-  "m_p_mu_lr",
-   
-   
    "m_p_sigma_lr",
+   "m_phi_lr",
+  
+   "e_q_mu_lr",
+   
+  #"m_p_mu_lr",
+   
+   
+   
    
    "sigma_init",
    "mu_init_std",
@@ -2309,6 +2311,16 @@ def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True
             if len({repr(ov.get(key)) for _label, ov in runs}) > 1
         }
         inert_per_arm: List[set] = []
+        # An arm that happens to set the swept parameter to its OWN DEFAULT is never reported as
+        # inert, because config.py's detector only flags settings that CHANGED from the default.
+        # Treating that silence as evidence of liveness defeats the every-arm rule below: one
+        # default-valued arm in the grid would hide a completely dead sweep. So default-valued arms
+        # abstain rather than vote (audit 2026-08-06).
+        _cfg_defaults = {
+            f.name: (f.default_factory() if f.default is _DATACLASS_MISSING else f.default)
+            for f in dataclass_fields(VFE3Config)
+        }
+        abstain_per_arm: List[set] = []
         for label, overrides in runs:
             cfg = dict(BASELINE_CONFIG)
             cfg.update(overrides)
@@ -2334,18 +2346,29 @@ def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
                     VFE3Config(**cfg)
+                # config.py emits three shapes of entry: "name=value (reason)", "name (reason)",
+                # and slash-joined "name1/name2 (reason)". Take the leading token (up to the first
+                # space), split it on "/", then drop any "=value" -- splitting on "=" first would
+                # cut inside the REASON text, e.g. "(only read by s_e_step=True)".
                 inert_names = {
-                    entry.split("=", 1)[0].strip()
+                    piece.split("=", 1)[0].strip()
                     for warning in caught if "inert configuration setting" in str(warning.message)
                     for entry in str(warning.message).splitlines()
                     if entry.strip().startswith("- ")
-                    for entry in [entry.strip()[2:]]
+                    for piece in entry.strip()[2:].split(" ", 1)[0].split("/")
                 }
                 inert_per_arm.append(inert_names & varying_keys)
+                abstain_per_arm.append({
+                    key for key in varying_keys
+                    if key in _cfg_defaults and overrides.get(key) == _cfg_defaults[key]
+                })
             except (TypeError, ValueError) as exc:
                 construction_errors.append((name, label, str(exc)))
         if inert_per_arm and len(inert_per_arm) == len(runs):
-            always_dead = sorted(set.intersection(*inert_per_arm))
+            # Dead iff every arm either REPORTS it inert or abstains (is default-valued), and at
+            # least one arm actually reports it -- so an all-abstain key cannot trip the guard.
+            votes = [i | a for i, a in zip(inert_per_arm, abstain_per_arm)]
+            always_dead = sorted(set.intersection(*votes) & set().union(*inert_per_arm))
             if always_dead:
                 construction_errors.append((
                     name, "all arms",

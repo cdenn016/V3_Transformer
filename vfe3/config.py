@@ -3096,6 +3096,17 @@ class VFE3Config:
             _inert.append("b0/c0 (only read by a state_dependent lambda_alpha_mode)")
         if self.lambda_h_mode == "constant" and _changed("b0_h", "c0_h"):
             _inert.append("b0_h/c0_h (only read by a state_dependent lambda_h_mode)")
+        # The hyper-prior WEIGHT gates the whole lambda_h family (audit 2026-08-06 F20). At
+        # lambda_h=0 two independent gates fire -- model.py:877 hard-overrides the mode to
+        # "constant" for _refine_s, and _hyper_prior_weighted returns zeros -- so every arm of a
+        # lambda_h_mode / b0_h / c0_h sweep reproduces the baseline number. Without this rule the
+        # sweep looks guarded (it carries a plausible `requires`) while measuring nothing, which is
+        # exactly the failure the ablation-side inertness guard exists to catch.
+        if self.lambda_h == 0.0 and _changed("lambda_h_mode", "b0_h", "c0_h"):
+            _inert.append(
+                "lambda_h_mode/b0_h/c0_h (the hyper-prior weight lambda_h is 0, so the "
+                "self-coupling form is unread: model.py overrides it to 'constant' and "
+                "_hyper_prior_weighted returns zeros)")
         if self.gauge_parameterization == "phi" and _changed("omega_reorth_every"):
             _inert.append(
                 f"omega_reorth_every={self.omega_reorth_every} "
