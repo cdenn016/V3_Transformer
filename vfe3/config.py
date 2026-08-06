@@ -872,6 +872,21 @@ class VFE3Config:
     # ||phi||. A float64 SOURCE contracts in float64 under either setting.
     full_cov_congruence_precision: str = "fp64"      # "fp64" | "fp32_escalate"
 
+    # Scaling of safe_cholesky's jitter ladder (audit 2026-08-06 C3/F18). The ridge eps*10^t is
+    # ABSOLUTE by default, so at an eigenvalue on the eps=1e-6 SPD floor the t=0 ridge DOUBLES it
+    # and shifts logdet by exactly log 2 per floored direction, while at sigma_max=100 the same
+    # ridge is a 1e-8 relative no-op. "relative" scales by diagonal_mean(M) so every element gets
+    # the same relative perturbation. Default "absolute" keeps every run on disk reproducible; the
+    # two coincide exactly when diagonal_mean(M) == 1, and the ladder only fires above cond ~1e8.
+    safe_cholesky_jitter_mode: str = "absolute"      # "absolute" | "relative"
+
+    # Jitter-escalation rounds for the mu-trust-region whitening Cholesky (audit 2026-08-06
+    # C6/F29). At 0 (the historical value) one marginally non-PD sigma_q silently drops that belief
+    # to a diagonal whitening that is NOT GL-equivariant, masked in by torch.where. A positive
+    # value lets the ladder rescue it and keep it on the equivariant path. Default 0 for
+    # bit-reproducibility; guard_mu_trust_fallback in the run report says whether it ever fires.
+    mu_trust_cholesky_rounds: int = 0
+
     # Working precision of the FULL-covariance pair KL (family="gaussian_full" only; the diagonal
     # family already keys its island on operand dtypes). "fp64" is the historical unconditional
     # float64 island and the default, so leaving this alone is byte-identical to the pre-2026-08-05
@@ -2233,14 +2248,24 @@ class VFE3Config:
         # inlined rather than imported from vfe3.families.gaussian: importing a family module from
         # inside __post_init__ perturbs import order. set_full_cov_kl_precision validates the same
         # set, so the two cannot drift without a test noticing.
-        if self.full_cov_kl_precision not in ("fp64", "fp32_escalate"):
+        if self.full_cov_kl_precision not in ("fp64", "fp32_escalate", "fp32_escalate_cond"):
             raise ValueError(
-                "full_cov_kl_precision must be one of ('fp64', 'fp32_escalate'), "
-                f"got {self.full_cov_kl_precision!r}")
+                "full_cov_kl_precision must be one of ('fp64', 'fp32_escalate', "
+                f"'fp32_escalate_cond'), got {self.full_cov_kl_precision!r}")
         if self.full_cov_congruence_precision not in ("fp64", "fp32_escalate"):
             raise ValueError(
                 "full_cov_congruence_precision must be one of ('fp64', 'fp32_escalate'), "
                 f"got {self.full_cov_congruence_precision!r}")
+        if self.safe_cholesky_jitter_mode not in ("absolute", "relative"):
+            raise ValueError(
+                "safe_cholesky_jitter_mode must be one of ('absolute', 'relative'), "
+                f"got {self.safe_cholesky_jitter_mode!r}")
+        if (not isinstance(self.mu_trust_cholesky_rounds, int)
+                or isinstance(self.mu_trust_cholesky_rounds, bool)
+                or self.mu_trust_cholesky_rounds < 0):
+            raise ValueError(
+                "mu_trust_cholesky_rounds must be a nonnegative int, got "
+                f"{self.mu_trust_cholesky_rounds!r}")
         # Full-covariance KL working precision (audit 2026-08-05). Validated here rather than left
         # to the family so an unreachable spelling fails at construction, not mid-forward.
         # FAIL CLOSED rather than falling back. The right insertion folds R into the VERTEX frame, so

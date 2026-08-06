@@ -1,4 +1,4 @@
-r"""Decode behaviour on a non-PD Sigma_q (audit 2026-08-06 F31).
+r"""Decode behavior on a non-PD Sigma_q (audit 2026-08-06 F31).
 
 Two separate things live here, and the distinction is the point.
 

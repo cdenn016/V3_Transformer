@@ -164,7 +164,12 @@ def apply_mu_trust_region(
             return delta_mu * (trust / norm2.clamp(min=eps)).clamp(max=1.0)
         return whitened.clamp(-trust, trust) * scale
 
-    factor, ok = safe_cholesky(sigma_q, eps=eps, rounds=0)
+    # rounds is a POLICY, not a constant (audit 2026-08-06 C6/F29). At rounds=0 there is zero
+    # jitter escalation, so one marginally non-PD sigma_q routes that element to the diagonal
+    # whitening below -- which is NOT GL-equivariant in either mode. Raising it lets the ladder
+    # rescue the element and keep it on the equivariant path instead. Default 0 keeps every run on
+    # disk bit-reproducible; the counter below makes the fallback visible either way.
+    factor, ok = safe_cholesky(sigma_q, eps=eps, rounds=_MU_TRUST_CHOLESKY_ROUNDS)
     # rounds=0 means ZERO jitter escalation here, so one marginally non-PD sigma_q routes that batch
     # element to the diagonal-whitening fallback below -- which is NOT GL-equivariant in either mode
     # (measured relative equivariance error 9.3e-2 / 6.6e-1 / 1.1e-1 at gauge scales 0.06/0.5/1.5,
@@ -200,6 +205,29 @@ def apply_mu_trust_region(
     else:
         fallback = fallback_white.clamp(-trust, trust) * scale
     return torch.where(ok.unsqueeze(-1), full_out, fallback)
+
+
+_MU_TRUST_CHOLESKY_ROUNDS: int = 0
+
+
+def set_mu_trust_cholesky_rounds(rounds: int) -> int:
+    r"""Set the process-wide jitter-escalation rounds for the mu-trust-region whitening Cholesky.
+
+    Returns the previous value. Default 0 reproduces the historical behavior exactly; a positive
+    value trades a small ridge for staying on the GL-EQUIVARIANT whitening path instead of dropping
+    to the non-equivariant diagonal fallback (measured relative equivariance error 9.3e-2 / 6.6e-1 /
+    1.1e-1 at gauge scales 0.06/0.5/1.5, against the ball path's 1.1e-15 / 1.1e-13 / 9.8e-11)."""
+    global _MU_TRUST_CHOLESKY_ROUNDS
+    if not isinstance(rounds, int) or isinstance(rounds, bool) or rounds < 0:
+        raise ValueError(f"mu_trust_cholesky_rounds must be a nonnegative int, got {rounds!r}")
+    previous = _MU_TRUST_CHOLESKY_ROUNDS
+    _MU_TRUST_CHOLESKY_ROUNDS = rounds
+    return previous
+
+
+def mu_trust_cholesky_rounds() -> int:
+    r"""Return the active mu-trust-region Cholesky jitter rounds."""
+    return _MU_TRUST_CHOLESKY_ROUNDS
 
 
 _MU_TRUST_FALLBACK_COUNTS: Dict[str, torch.Tensor] = {}
@@ -251,12 +279,39 @@ def reset_mu_trust_fallback_elements() -> None:
         count.zero_()
 
 
+_SAFE_CHOLESKY_JITTER_MODES = ("absolute", "relative")
+_SAFE_CHOLESKY_JITTER_MODE: str = "absolute"
+
+
+def set_safe_cholesky_jitter_mode(mode: str) -> str:
+    r"""Set the process-wide ``safe_cholesky`` jitter scaling; returns the previous value.
+
+    Process-global for the same reason the KL and congruence precisions are (see
+    ``FullGaussian.renyi_closed_form``): ``safe_cholesky`` has many call sites across families,
+    numerics and the decode, and threading a config value to each invites exactly the
+    desynchronization where one path ridges differently from another. Set in one place
+    (``VFEModel.__init__``)."""
+    global _SAFE_CHOLESKY_JITTER_MODE
+    if mode not in _SAFE_CHOLESKY_JITTER_MODES:
+        raise ValueError(
+            f"safe_cholesky_jitter_mode must be one of {_SAFE_CHOLESKY_JITTER_MODES}, got {mode!r}")
+    previous = _SAFE_CHOLESKY_JITTER_MODE
+    _SAFE_CHOLESKY_JITTER_MODE = mode
+    return previous
+
+
+def safe_cholesky_jitter_mode() -> str:
+    r"""Return the active ``safe_cholesky`` jitter scaling."""
+    return _SAFE_CHOLESKY_JITTER_MODE
+
+
 def safe_cholesky(
     matrix: torch.Tensor,                # (..., K, K) symmetric ~PD (per-element factored)
 
     *,
     eps:    float = 1e-6,
     rounds: int   = 0,
+    jitter_mode: Optional[str] = None,   # None -> the process policy (audit 2026-08-06 C3)
 ) -> Tuple[torch.Tensor, torch.Tensor]:  # (factor (..., K, K), ok mask (...))
     r"""Per-element Cholesky that never raises, with optional per-element jitter escalation.
 
@@ -272,17 +327,42 @@ def safe_cholesky(
     returns a finite *partial* factor, not NaN, so a downstream ``logdet`` would otherwise be a
     finite-but-wrong value rather than NaN. The mask lets the caller inject NaN for failed
     elements so a ``safe_kl_clamp`` maps them to ``kl_max``.
+
+    JITTER SCALE (audit 2026-08-06 C3/F18). The ridge is ABSOLUTE by default, which makes its
+    meaning depend entirely on where the matrix sits: at an eigenvalue on the ``eps=1e-6`` SPD
+    floor the ``t=0`` ridge DOUBLES it and shifts ``logdet`` by exactly ``log 2 = 0.693`` nats per
+    floored direction, while at ``sigma_max=100`` the same ridge is a 1e-8 relative no-op and at
+    ``sigma_init=4`` it is 2.5e-7. So one ladder is simultaneously an unbounded relative bias where
+    it fires and far too weak to be a conditioning signal anywhere else.
+
+    ``jitter_mode="relative"`` scales the ridge by ``diagonal_mean(M)``, giving every element the
+    same RELATIVE perturbation. It is opt-in and the default stays ``"absolute"`` so every run on
+    disk is bit-reproducible; the two agree exactly when ``diagonal_mean(M) == 1``. Practical
+    severity is capped either way because the ladder only ever fires above cond ~1e8 (measured
+    3000/3000 repaired at t=0 across cond 1e4..1e12), which is why this is a latent-correctness fix
+    rather than a live one.
     """
+    jitter_mode = _SAFE_CHOLESKY_JITTER_MODE if jitter_mode is None else jitter_mode
+    if jitter_mode not in _SAFE_CHOLESKY_JITTER_MODES:
+        raise ValueError(
+            f"jitter_mode must be one of {_SAFE_CHOLESKY_JITTER_MODES}, got {jitter_mode!r}")
     M = _symmetrize(matrix)
     L, info = torch.linalg.cholesky_ex(M)
     ok = info == 0
     if rounds > 0 and not bool(ok.all()):
         K = M.shape[-1]
         eye = torch.eye(K, device=M.device, dtype=M.dtype)
+        if jitter_mode == "relative":
+            # (..., 1, 1) per-element scale; clamped so a near-zero matrix cannot silently disable
+            # the ridge, which would make the escalation a no-op exactly where it is needed.
+            scale = torch.diagonal(M, dim1=-2, dim2=-1).mean(dim=-1)[..., None, None]
+            scale = scale.abs().clamp_min(1.0)
+        else:
+            scale = torch.ones((), device=M.device, dtype=M.dtype)
         for t in range(rounds):
             if bool(ok.all()):
                 break
-            L_t, info_t = torch.linalg.cholesky_ex(M + (eps * (10.0 ** t)) * eye)
+            L_t, info_t = torch.linalg.cholesky_ex(M + (eps * (10.0 ** t)) * scale * eye)
             newly = (~ok) & (info_t == 0)
             L = torch.where(newly.unsqueeze(-1).unsqueeze(-1), L_t, L)
             ok = ok | (info_t == 0)
