@@ -1151,14 +1151,21 @@ def _save_eval_attention_maps(
 ) -> None:
     r"""Save beta/gamma maps from one post-step, post-EMA diagnostic snapshot.
 
-    The shipped ``attention/`` set is emitted from the snapshot unchanged. The ``attention_estep/``
-    set is a REPLAY (audit 2026-07-26 R-3): the snapshot stores only the converged maps, so the
-    entry-belief and prior arms have to be re-scored from the model. A replay failure is swallowed
-    like every other figure -- the shipped maps and the run itself do not depend on it.
+    The shipped ``attention/`` set is scored at ``"entry"`` to match the CSV (audit 2026-08-06 F19).
+    It previously came off the snapshot, which stores only the CONVERGED maps -- so after the metric
+    path moved to ``"entry"`` on 2026-08-05 the same run directory published a figure and a column
+    that measured DIFFERENT objects under the same name. Entry is the beta the forward actually used
+    (measured TV(forward, converged) up to 0.96 per row, TV(forward, entry) == 0.0), so the figure
+    follows the metric rather than the other way round. Scoring at entry cannot come from a snapshot,
+    hence the replay; the converged and prior arms remain available under ``attention_estep/``.
+
+    The ``attention_estep/`` set is a REPLAY (audit 2026-07-26 R-3) for the same reason. A replay
+    failure is swallowed like every other figure -- the shipped maps and the run itself do not
+    depend on it.
     """
     artifacts.save_attention_maps(
         step,
-        model.attention_maps(token_ids, snapshot=snapshot),
+        model.attention_maps(token_ids, score_at="entry"),
         logger=logger,
     )
     artifacts.save_gamma_attention_maps(

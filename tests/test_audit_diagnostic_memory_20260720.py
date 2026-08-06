@@ -349,9 +349,12 @@ def test_periodic_eval_reuses_one_held_out_snapshot_for_metrics_and_maps(
     assert len(builds) == 1
     assert torch.equal(builds[0][0], val_tokens[:1])
     held_out_snapshot = builds[0][1]
+    # attention_maps no longer appears: BOTH its arms (the CSV metrics and the shipped attention/
+    # figure) score at "entry", which a snapshot cannot serve, so both replay (audit 2026-08-06 F19).
+    # gamma still reads the shared snapshot, and no consumer builds a second one -- which is the
+    # memory contract this file exists to pin.
     assert {name for name, _, _ in consumers} == {
         "diagnostics",
-        "attention_maps",
         "gamma_attention_maps",
     }
     assert all(torch.equal(tokens, val_tokens[:1]) for _, tokens, _ in consumers)

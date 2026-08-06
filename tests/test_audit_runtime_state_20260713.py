@@ -162,14 +162,19 @@ def test_eval_attention_pair_uses_one_shared_post_eval_snapshot():
         def __init__(self):
             self.built = 0
             self.seen = []
+            self.score_points = []
 
         def build_diagnostic_snapshot(self, tokens):
             self.built += 1
             self.seen.append(tokens.clone())
             return snapshot
 
-        def attention_maps(self, tokens, *, snapshot=None):
-            assert snapshot is not None
+        # The beta arm is scored at "entry" and therefore REPLAYS with no snapshot (audit 2026-08-06
+        # F19): the snapshot can only serve "converged", which is not the beta the forward used.
+        # The attention_estep/ triple replays all three score points the same way.
+        def attention_maps(self, tokens, *, snapshot=None, score_at="converged"):
+            assert snapshot is None, "an entry/prior replay cannot be served from a snapshot"
+            self.score_points.append(score_at)
             self.seen.append(tokens.clone())
             return torch.ones(1, 1, 2, 2)
 
@@ -188,6 +193,9 @@ def test_eval_attention_pair_uses_one_shared_post_eval_snapshot():
         def save_gamma_attention_maps(self, step, maps, logger=None):
             self.saved.append(("gamma", step, maps))
 
+        def save_estep_attention_maps(self, step, maps, logger=None):
+            self.saved.append(("estep", step, maps))
+
     model = FakeModel()
     artifacts = FakeArtifacts()
     tokens = torch.tensor([[0, 1], [2, 3], [4, 5]], dtype=torch.long)
@@ -199,10 +207,14 @@ def test_eval_attention_pair_uses_one_shared_post_eval_snapshot():
         logging.getLogger(__name__),
         step=3,
     )
-    assert model.built == 0
-    assert len(model.seen) == 2
+    assert model.built == 0                       # the shared snapshot is never rebuilt
+    # beta(entry) + gamma(snapshot) + the attention_estep/ triple = 5 model reads of the same batch.
+    # The beta arm moved off the snapshot on 2026-08-06 (F19) so the figure and the CSV column agree;
+    # gamma still reads the shared snapshot.
+    assert len(model.seen) == 5
+    assert model.score_points == ["entry", "entry", "converged", "prior"]
     assert all(torch.equal(seen, tokens) for seen in model.seen)
-    assert [item[0] for item in artifacts.saved] == ["beta", "gamma"]
+    assert [item[0] for item in artifacts.saved] == ["beta", "gamma", "estep"]
 
 
 def test_gamma_meta_entropy_uses_exact_log_softmax_prior(monkeypatch):
