@@ -1232,14 +1232,26 @@ def positional_content_score(
 ) -> torch.Tensor:                       # (...) per-head R^2 of log beta vs offset |i - j|
     r"""Per-head positional<->content score: R^2 of the OLS fit log(beta_ij) ~ a + b |i - j|.
 
-    Over the causal entries (i >= j). R^2 near 1 means attention is explained by token DISTANCE
-    (positional, the gauge/RoPE machinery); near 0 means it is content-driven (the divergence
-    energy E_ij). Places each head on a positional<->content axis.
+    Over the causal entries the prior actually ADMITS. R^2 near 1 means attention is explained by
+    token DISTANCE (positional, the gauge/RoPE machinery); near 0 means it is content-driven (the
+    divergence energy E_ij). Places each head on a positional<->content axis.
+
+    Structurally masked entries are excluded. A prior that forbids a (i, j) pair sends its logit to
+    -inf, so beta_ij is exactly 0 and ``log(clamp(0, eps))`` is ``-27.63`` at eps=1e-12 -- an
+    outlier two orders of magnitude below any live weight, sitting at a FIXED offset. Including
+    them makes the fit measure the mask instead of the attention: with 'causal_alibi_noself' the
+    64 masked diagonal entries are 3% of the 2080 causal points but carry 91-96% of ss_tot, and a
+    PURE positional prior (R^2 = 1 by construction) scores 1.26e-05 / 0.0315 per head instead of
+    0.962 / 0.310. The support is a property of the prior, not of a head, so it is intersected
+    across the leading dims to keep the (N, N) mask shape the fit's indexing relies on.
     """
     n = beta.shape[-1]
     ii = torch.arange(n, device=beta.device).unsqueeze(-1)
     jj = torch.arange(n, device=beta.device).unsqueeze(0)
-    mask = ii >= jj                                              # causal incl. diagonal (N, N)
+    admitted = (beta > 0).reshape(-1, n, n).all(dim=0)           # prior support, shared (N, N)
+    mask = (ii >= jj) & admitted                                 # causal AND not masked out
+    if int(mask.sum()) < 2:                                      # degenerate: no slope is defined
+        return beta.new_full(beta.shape[:-2], float("nan"))
     x = (ii - jj).to(beta.dtype)[mask]                           # (P,)
     y = torch.log(beta.clamp(min=eps))[..., mask]               # (..., P)
     xc = x - x.mean()
