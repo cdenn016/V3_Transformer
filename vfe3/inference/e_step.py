@@ -41,7 +41,9 @@ from vfe3.geometry.transport import (
     get_transport_registration,
     merge_legacy_transport_state,
 )
-from vfe3.gradients.kernels import belief_gradients, mm_exact_update, uses_kernel_route
+from vfe3.gradients.kernels import (
+    belief_gradients, mm_damped_precision_blend_full, mm_exact_update, uses_kernel_route,
+)
 
 
 _E_STEP_UPDATE_ALIASES = {
@@ -1011,13 +1013,20 @@ def e_step_iteration(
     # tangent unless oracle_unroll_grad=True -- silently severing the unrolled-through-inference
     # signal to the prior tables. The config-time warning covers only the learnable-parameter
     # cases; this fires when the truncation actually happens (default warnings filter: once).
+    # ``e_step_update != 'mm_exact'`` (audit 2026-08-07): under mm_exact the belief update NEVER
+    # calls belief_gradients/the oracle at all (mm_exact_update's own graph stays live under
+    # 'unroll' regardless of oracle_unroll_grad -- see its docstring), so this warning's "routes to
+    # the DETACHED oracle" claim is a false positive there; excluded rather than inherited from the
+    # GRADIENT-route predicate below.
     if (e_step_gradient == "unroll" and not oracle_unroll_grad and belief.mu.requires_grad
+            and e_step_update != "mm_exact"
             and not uses_kernel_route(
                 renyi_order=renyi_order, gradient_mode=gradient_mode, family=family,
                 divergence_family=divergence_family,
                 include_attention_entropy=include_attention_entropy,
                 transport_mode=transport_mode,
-                decoupled_value_gauge=(rope is not None and not rope_on_value))):
+                decoupled_value_gauge=(rope is not None and not rope_on_value),
+                route="gradient")):
         import warnings
         warnings.warn(
             "e_step_gradient='unroll' is being served by the autograd ORACLE with "
@@ -1041,11 +1050,13 @@ def e_step_iteration(
                 divergence_family=divergence_family,
                 include_attention_entropy=include_attention_entropy,
                 transport_mode=transport_mode,
-                decoupled_value_gauge=(rope is not None and not rope_on_value)):
+                decoupled_value_gauge=(rope is not None and not rope_on_value),
+                route="mm_exact"):
             raise ValueError(
-                "e_step_update='mm_exact' requires the closed-form kernel route (filtering + "
-                "gaussian_diagonal + renyi order 1 + attention entropy, flat transport, coupled "
-                "value gauge); this call routes the belief gradient to the autograd oracle."
+                "e_step_update='mm_exact' requires a family that registers the mm_exact closed-form "
+                "capability (filtering + renyi order 1 + attention entropy, flat transport, coupled "
+                "value gauge); this call routes the belief gradient to the autograd oracle (or has no "
+                "closed form at all)."
             )
         mu_star, sigma_star = mm_exact_update(
             belief.mu, belief.sigma, mu_p, sigma_p, omega,
@@ -1078,6 +1089,15 @@ def e_step_iteration(
             # damp the mean in MEAN coordinates instead (eta=1 still lands exactly on mu*).
             mu    = (1.0 - eta) * belief.mu + eta * mu_star
             sigma = belief.sigma
+        elif belief.sigma.dim() == belief.mu.dim() + 1:
+            # Full covariance (audit 2026-08-07): the SAME natural-parameter blend, generalized from
+            # the scalar 1/sigma below to the K x K precision matrix; see
+            # kernels.mm_damped_precision_blend_full for the derivation and the eta=0/eta=1 endpoint
+            # pins. The elementwise [eps, sigma_max] clamp below becomes an eigenvalue projection
+            # (the SAME one retract_spd_full applies for its own ceiling).
+            mu, sigma = mm_damped_precision_blend_full(
+                belief.mu, belief.sigma, mu_star, sigma_star, eta, eps=eps, sigma_max=sigma_max,
+            )
         else:
             lam_old = 1.0 / belief.sigma.clamp(min=eps)
             lam_new = (1.0 - eta) * lam_old + eta / sigma_star           # sigma_star >= eps (kernel floor)

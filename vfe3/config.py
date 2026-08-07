@@ -2832,6 +2832,13 @@ class VFE3Config:
                 stacklevel=2,
             )
         from vfe3.gradients.kernels import uses_kernel_route
+        # route="gradient": this predicate concerns whether belief_gradients' GRADIENT route (the
+        # oracle-vs-kernel dispatch consumed below for the oracle_unroll_grad auto-enable and the
+        # unroll-truncation warning) serves the closed-form kernel -- decoupled from the mm_exact
+        # closed-form capability (audit 2026-08-07), which a family can register independently (see
+        # KernelRegistration / gaussian_full's mm_exact-only registration in kernels.py). Keeping
+        # this call at route="gradient" (its historical, only, meaning) means registering a new
+        # family's mm_exact fusion cannot change any of the warnings gated on _routes_to_oracle below.
         _routes_to_oracle = not uses_kernel_route(
             renyi_order=self.renyi_order,
             gradient_mode=self.gradient_mode,
@@ -2840,7 +2847,18 @@ class VFE3Config:
             include_attention_entropy=self.include_attention_entropy,
             transport_mode=self.transport_mode,
             decoupled_value_gauge=(self.pos_rotation == "rope" and not self.rope_on_value),
+            route="gradient",
         )
+        # Hoisted for the unroll-truncation warning just below (audit 2026-08-07): mm_exact_update
+        # never calls belief_gradients/the oracle at all (its own graph stays live under 'unroll'
+        # regardless of oracle_unroll_grad -- see its docstring), so that warning's "routes to the
+        # DETACHED oracle" claim is a false positive under e_step_update='mm_exact' and must be
+        # excluded rather than merely inherited from _routes_to_oracle (a GRADIENT-route predicate).
+        # Registry-driven, exactly as the later canonicalization it is hoisted from (audit 2026-07-25
+        # F11); reused verbatim there instead of a second lookup.
+        from vfe3.inference.e_step import _E_STEP_UPDATE_ALIASES, canonical_e_step_update as _canon
+        _require(self.e_step_update, tuple(sorted(_E_STEP_UPDATE_ALIASES)), "e_step_update")
+        canonical_e_step_update = _canon(self.e_step_update)
         # Stateful belief-independent registrations are kernel-eligible on the canonical knobs, so
         # the closed-form kernel carries their parameter gradient with no oracle (and
         # oracle_unroll_grad stays False on the default operating point). On a
@@ -2870,6 +2888,7 @@ class VFE3Config:
             self.e_step_gradient == "unroll"
             and not self.oracle_unroll_grad
             and _routes_to_oracle
+            and canonical_e_step_update != "mm_exact"
             and (
                 _stateful_transport
                 or (self.learnable_r and self.r_update_mode == "gradient" and self.s_e_step)
@@ -2989,21 +3008,65 @@ class VFE3Config:
         # key set AND the alias collapse both live in vfe3/inference/e_step.py, which e_step.py:879 and
         # extract.py:870 already consume via canonical_e_step_update(). Duplicating them here meant
         # adding an updater required editing config.py as well as registering it.
-        from vfe3.inference.e_step import _E_STEP_UPDATE_ALIASES, canonical_e_step_update as _canon
-        _require(self.e_step_update, tuple(sorted(_E_STEP_UPDATE_ALIASES)), "e_step_update")
-        canonical_e_step_update = _canon(self.e_step_update)
+        # (``e_step_update`` validated and ``canonical_e_step_update`` computed earlier, ahead of the
+        # unroll-truncation warning that also needs it -- audit 2026-08-07; reused verbatim here.)
         if canonical_e_step_update == "mm_exact":
-            # The closed-form MM minimizer is derived from the diagonal-Gaussian KL filtering
-            # kernel; every other route lacks the closed form (the same eligibility predicate as
-            # uses_kernel_route).
-            if _routes_to_oracle:
+            # The closed-form MM minimizer needs a family that registers the mm_exact CAPABILITY
+            # (audit 2026-08-07: decoupled from the GRADIENT-kernel capability _routes_to_oracle
+            # above checks -- a family can register one closed form without the other, e.g.
+            # gaussian_full's mm_exact fusion below with no analytic gradient kernel, so this must be
+            # its own predicate rather than reusing _routes_to_oracle). Every other route lacks the
+            # closed form (the same STRUCTURAL eligibility predicate as uses_kernel_route, gated on
+            # route="mm_exact").
+            _mm_exact_eligible = uses_kernel_route(
+                renyi_order=self.renyi_order,
+                gradient_mode=self.gradient_mode,
+                family=self.family,
+                divergence_family=self.divergence_family,
+                include_attention_entropy=self.include_attention_entropy,
+                transport_mode=self.transport_mode,
+                decoupled_value_gauge=(self.pos_rotation == "rope" and not self.rope_on_value),
+                route="mm_exact",
+            )
+            if not _mm_exact_eligible:
+                from vfe3.gradients.kernels import mm_exact_families
                 raise ValueError(
-                    "e_step_update='mm_exact' is kernel-route only (gradient_mode='filtering' + "
-                    "family='gaussian_diagonal' + divergence_family='renyi' + renyi_order=1.0 + "
-                    "include_attention_entropy=True, belief-independent transport, coupled value "
-                    "gauge); this "
-                    "config routes the belief gradient to the autograd oracle."
+                    "e_step_update='mm_exact' needs a family that registers the mm_exact closed-form "
+                    "capability under gradient_mode='filtering' + divergence_family='renyi' + "
+                    "renyi_order=1.0 + include_attention_entropy=True, belief-independent transport, "
+                    f"coupled value gauge; this config does not qualify (registered mm_exact "
+                    f"families: {mm_exact_families()}); it routes the belief gradient to the "
+                    "autograd oracle (or has no oracle fallback at all for a closed-form minimizer)."
                 )
+            # gaussian_full's fusion decomposes exactly per gauge-irrep block WHENEVER sigma_p is
+            # block-diagonal (2026-08-07 gauge-audit reversal of the earlier blanket multi-head
+            # ValueError here; see kernels._mm_exact_full_covariance for the derivation). sigma_p is
+            # built by prior_bank._encode_prior_sigma: prior_source='token' (the default) returns
+            # torch.diag_embed(...) -- diagonal, hence block-diagonal under ANY partition -- while
+            # prior_source='model_channel' returns covariance_from_packed(...), a genuinely dense
+            # packed-Cholesky covariance with no block-zero guarantee. That is the one thing this
+            # STATIC config-time check can rule out; kernels.py additionally verifies the ACTUAL
+            # sigma_p tensor on every call (an executed check, not a name-based one, since a
+            # multi-layer prior advancement this validator cannot see could in principle still
+            # produce a non-block-diagonal sigma_p under prior_source='token').
+            from vfe3.divergence import family_cov_kind
+            if family_cov_kind(self.family) == "full":
+                from vfe3.geometry.groups import get_group
+                _builder = get_group(self.gauge_group)
+                try:                                 # builders differ: only the block groups take n_heads
+                    _dims = _builder(K=self.embed_dim, n_heads=self.n_heads).irrep_dims
+                except TypeError:
+                    _dims = _builder(K=self.embed_dim).irrep_dims
+                if len(_dims) > 1 and self.prior_source == "model_channel":
+                    raise ValueError(
+                        f"e_step_update='mm_exact' with family={self.family!r} and a multi-head gauge "
+                        f"group (gauge_group={self.gauge_group!r}, {len(_dims)} irrep blocks {_dims}) "
+                        "needs a BLOCK-DIAGONAL encode prior covariance, but "
+                        "prior_source='model_channel' builds one via covariance_from_packed -- a "
+                        "genuinely dense packed-Cholesky covariance with no block-zero guarantee. Use "
+                        "prior_source='token' (the default; a diagonal, hence block-diagonal, encode "
+                        "prior), gauge_group='glk' (a single block), or e_step_update='gradient'."
+                    )
             if not (0.0 < self.mm_damping <= 1.0):
                 raise ValueError(f"mm_damping must be in (0, 1], got {self.mm_damping}")
             if self.lambda_alpha_mode in ("state_dependent", "state_dependent_per_coord"):

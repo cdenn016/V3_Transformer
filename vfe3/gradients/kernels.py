@@ -8,7 +8,8 @@ oracle -- so a new divergence works immediately and correctly, accelerated later
 registering a kernel. Kernels return RAW Euclidean dF (no preconditioning/retraction).
 """
 
-from typing import Callable, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Callable, Dict, FrozenSet, List, Optional, Tuple
 
 import torch
 
@@ -27,21 +28,92 @@ from vfe3.geometry.transport import (
 )
 from vfe3.gradients.oracle import _transport_to_float, belief_gradients_autograd
 from vfe3.gradients.pairwise_stats import diagonal_kl_pair_stats
+from vfe3.numerics import safe_cholesky
 
 _KERNELS: Dict[str, Callable] = {}
 _COMPILED_KERNELS: Dict[str, Callable] = {}   # lazy torch.compile cache (compile_pair_kernel toggle)
 
 
-def register_kernel(name: str, *, override: bool = False) -> Callable:
+@dataclass(frozen=True)
+class KernelRegistration:
+    r"""A registered closed form and the capabilities it declares.
+
+    Mirrors ``DecodeRegistration.covariance_kinds`` (``vfe3/model/prior_bank.py``): the route
+    predicate (``uses_kernel_route``) gates on a declared capability rather than a family-name
+    literal, so registering a new family's closed form is sufficient to unlock the route it
+    declares -- and ONLY that route.
+
+    ``covariance_kinds`` is the resolved set of family covariance structures ("diagonal" and/or
+    "full") this registration covers, validated against the registered family's OWN ``cov_kind`` at
+    registration time (unlike decoders, a kernel is keyed by exact family name, so mismatch is
+    always a registration bug, not a legitimate multi-family share -- caught here rather than
+    mis-routed later).
+
+    ``provides_gradient`` / ``provides_mm_exact`` are DECOUPLED capabilities (audit 2026-08-07): a
+    family may register the analytic ``(grad_mu, grad_sigma)`` kernel ``belief_gradients`` fetches
+    through ``callable``, the closed-form MM minimizer ``mm_exact_update`` implements as its own
+    dedicated branch, or both. Registering one never silently unlocks the other -- this is why
+    ``gaussian_full``'s mm_exact fusion below declares ``provides_gradient=False``: it has no
+    analytic gradient kernel, and ``e_step_update='gradient'`` must keep routing to the autograd
+    oracle exactly as it did before this registration existed.
+    """
+
+    callable:           Callable
+    covariance_kinds:   FrozenSet[str]
+    provides_gradient:  bool = True
+    provides_mm_exact:  bool = True
+
+
+_KERNEL_REGISTRATIONS: Dict[str, KernelRegistration] = {}
+
+
+def register_kernel(
+    name: str,
+
+    *,
+    override:          bool                       = False,
+    covariance_kinds:  Optional[FrozenSet[str]]    = None,
+    provides_gradient: bool                        = True,
+    provides_mm_exact: bool                        = True,
+) -> Callable:
     """Decorator registering a query-side belief-gradient kernel under family ``name``.
 
     Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
     existing name silently shadowed the first. Pass ``override=True`` to replace deliberately.
+
+    ``covariance_kinds`` declares the family covariance structure(s) this registration covers
+    (mirrors ``register_decode``'s ``covariance_kinds``, ``vfe3/model/prior_bank.py``). OMITTED
+    (the common case) resolves to the registered family's OWN ``cov_kind``; SUPPLIED is validated
+    against it and rejected if inconsistent, so a registration cannot silently claim a capability
+    its own family does not have. ``provides_gradient`` / ``provides_mm_exact`` declare which
+    route(s) this registration serves -- see :class:`KernelRegistration`.
     """
     def _wrap(fn: Callable) -> Callable:
         if name in _KERNELS and not override:
             raise KeyError(f"kernel {name!r} already registered; pass override=True to replace")
+        family_cov_kind = get_family(name).cov_kind
+        resolved_kinds = (frozenset({family_cov_kind}) if covariance_kinds is None
+                          else frozenset(covariance_kinds))
+        if not resolved_kinds or not resolved_kinds <= {"diagonal", "full"}:
+            raise ValueError(
+                f"kernel {name!r} covariance_kinds must be a nonempty subset of "
+                f"{{'diagonal', 'full'}}, got {sorted(resolved_kinds)}"
+            )
+        if family_cov_kind not in resolved_kinds:
+            raise ValueError(
+                f"kernel {name!r} declares covariance_kinds={sorted(resolved_kinds)} but family "
+                f"{name!r} has cov_kind={family_cov_kind!r}; a kernel must cover its own family's "
+                "covariance structure"
+            )
+        if not (provides_gradient or provides_mm_exact):
+            raise ValueError(
+                f"kernel {name!r} must declare at least one of provides_gradient/provides_mm_exact"
+            )
         _KERNELS[name] = fn
+        _KERNEL_REGISTRATIONS[name] = KernelRegistration(
+            callable=fn, covariance_kinds=resolved_kinds,
+            provides_gradient=provides_gradient, provides_mm_exact=provides_mm_exact,
+        )
         _COMPILED_KERNELS.pop(name, None)
         return fn
     return _wrap
@@ -50,6 +122,20 @@ def register_kernel(name: str, *, override: bool = False) -> Callable:
 def has_kernel(name: str) -> bool:
     """Whether a hand kernel is registered for family ``name``."""
     return name in _KERNELS
+
+
+def get_kernel_registration(name: str) -> KernelRegistration:
+    """Return the registration-owned capabilities for kernel family ``name`` (KeyError if absent)."""
+    if name not in _KERNELS or name not in _KERNEL_REGISTRATIONS:
+        raise KeyError(f"no belief-gradient kernel for family {name!r}; available: {sorted(_KERNELS)}")
+    return _KERNEL_REGISTRATIONS[name]
+
+
+def mm_exact_families() -> Tuple[str, ...]:
+    """Sorted family names whose registration declares the mm_exact closed-form capability."""
+    return tuple(sorted(
+        name for name, reg in _KERNEL_REGISTRATIONS.items() if reg.provides_mm_exact
+    ))
 
 
 def _raw_diag_kl(
@@ -276,36 +362,52 @@ def uses_kernel_route(
     include_attention_entropy: bool,
     transport_mode:            str  = "flat",
     decoupled_value_gauge:     bool = False,
+    route:                     str  = "gradient",   # "gradient" (belief_gradients) | "mm_exact" (mm_exact_update)
 ) -> bool:
-    r"""Whether ``belief_gradients`` serves the closed-form KERNEL (else the autograd oracle).
+    r"""Whether the closed-form route is served for ``family`` (else the autograd oracle / a raise).
 
     The single source of truth for the kernel-coverage predicate, exposed so callers (the
     E-step's unroll-truncation warning, the config-time freeze warning) cannot drift from the
-    dispatch below.
+    dispatch below. Capability-driven (audit 2026-08-07), NOT a family-name literal: a family is
+    eligible once its registration (``register_kernel``) declares the matching capability for
+    ``route`` -- see :class:`KernelRegistration`. ``route="gradient"`` (the default, every
+    pre-existing call site) checks ``provides_gradient``; ``route="mm_exact"`` checks
+    ``provides_mm_exact``. The two are independent: registering ONE never silently unlocks the
+    other, so a family that adds an mm_exact closed form without an analytic gradient kernel (e.g.
+    ``gaussian_full``) cannot redirect ``e_step_update='gradient'`` onto an unvalidated path.
 
-    A registration that declares ``needs_mu`` or ``needs_sigma`` excludes the kernel (audit
-    2026-06-10 F1): the hand kernel treats transported keys as constants in the belief variables,
-    so it would silently omit the derivative of a belief-dependent transport. Such registrations
-    route to the autograd oracle, which rebuilds Omega from its differentiation leaves through
-    ``omega_builder``.
+    A registration that declares ``needs_mu`` or ``needs_sigma`` excludes both routes (audit
+    2026-06-10 F1): a frozen-transport closed form treats transported keys as constants in the
+    belief variables, so it would silently omit the derivative of a belief-dependent transport.
+    Such registrations route to the autograd oracle, which rebuilds Omega from its differentiation
+    leaves through ``omega_builder``.
 
-    ``decoupled_value_gauge`` (RopeTransport.on_value=False) likewise excludes the kernel: with the
+    ``decoupled_value_gauge`` (RopeTransport.on_value=False) likewise excludes both routes: with the
     attention gauge and value gauge factored apart (GL(K)_attention.tex:1909), beta is the softmax of
     the rotated SCORE energy but the coupling sum uses the un-rotated value energy, so beta is no
-    longer that sum's stationary point and the closed-form envelope kernel (which assumes it is) does
+    longer that sum's stationary point and the closed-form envelope (which assumes it is) does
     not apply. The oracle differentiates the decoupled F directly and carries the extra d beta/d mu
     term."""
+    if route not in ("gradient", "mm_exact"):
+        raise ValueError(f"route must be 'gradient' or 'mm_exact', got {route!r}")
+    if not has_kernel(family):
+        return False
+    registration = get_kernel_registration(family)
+    capability_ok = (registration.provides_gradient if route == "gradient"
+                     else registration.provides_mm_exact)
+    if not capability_ok:
+        return False
+    family_cov_kind = get_family(family).cov_kind
     transport_registration = get_transport_registration(transport_mode)
     return (
         gradient_mode == "filtering"
-        and family == "gaussian_diagonal"
+        and family_cov_kind in registration.covariance_kinds
         and divergence_family == "renyi"
         and abs(renyi_order - 1.0) < 1e-9
         and include_attention_entropy
         and not transport_registration.needs_mu
         and not transport_registration.needs_sigma
         and not decoupled_value_gauge
-        and has_kernel(family)
     )
 
 
@@ -380,6 +482,7 @@ def belief_gradients(
         include_attention_entropy=include_attention_entropy,
         transport_mode=transport_mode,
         decoupled_value_gauge=decoupled_value,
+        route="gradient",
     )
     if not use_kernel:
         return belief_gradients_autograd(
@@ -595,27 +698,31 @@ def mm_exact_update(
                 emission=(tuple(t.float() for t in emission) if emission is not None else None),
             )
 
-    # Route predicate (audit 2026-07-26 D-02). The fusion below is the stationary point of the
-    # diagonal-Gaussian-KL kernel: alpha = 1 is hardcoded (there is no renyi_order argument at all),
-    # the precision expressions are the hand-written diagonal-KL ones, and the grid is built from
-    # ``pairwise_energy`` rather than ``fam.coupling_energy`` -- so a family whose coupling energy is
-    # NOT that truncated form silently received the wrong grid (``gaussian_diagonal_exact`` returned a
-    # mu* bit-identical to ``gaussian_diagonal``), and a non-Renyi divergence drove beta and pair_mask
-    # before being fused with diagonal-Gaussian-KL algebra. The sibling ``belief_gradients`` gates on
-    # this same predicate at :377 and hands an uncovered config to the oracle; there is no oracle for a
-    # closed-form minimizer, so this seam fails closed instead. Both live callers (e_step.py:994,
-    # config.py) already gate, so no shipped config changes. The gradient_mode / entropy / renyi_order
-    # arguments are the values this derivation assumes rather than caller inputs; ``transport_mode`` is
-    # not among this seam's arguments, so the belief-dependent-transport exclusion stays with the
-    # callers that own that name.
+    # Route predicate (audit 2026-07-26 D-02; capability split 2026-08-07). The fusion below is the
+    # stationary point of a Gaussian-KL kernel: alpha = 1 is hardcoded (there is no renyi_order
+    # argument at all), the precision expressions are the hand-written Gaussian-KL ones, and the
+    # grid is built from ``pairwise_energy`` rather than ``fam.coupling_energy`` -- so a family whose
+    # coupling energy is NOT that truncated form silently received the wrong grid
+    # (``gaussian_diagonal_exact`` returned a mu* bit-identical to ``gaussian_diagonal``), and a
+    # non-Renyi divergence drove beta and pair_mask before being fused with Gaussian-KL algebra.
+    # ``route="mm_exact"`` checks the mm_exact CAPABILITY specifically (``KernelRegistration.
+    # provides_mm_exact``), decoupled from the sibling ``belief_gradients`` gradient-kernel route at
+    # :479 -- a family (e.g. ``gaussian_full``) can register one without the other. There is no
+    # oracle for a closed-form minimizer, so this seam fails closed instead. All three live callers
+    # (e_step.py, config.py, here) gate on the SAME predicate, so no shipped config changes. The
+    # gradient_mode / entropy / renyi_order arguments are the values this derivation assumes rather
+    # than caller inputs; ``transport_mode`` is not among this seam's arguments, so the
+    # belief-dependent-transport exclusion stays with the callers that own that name.
     if not uses_kernel_route(
             renyi_order=1.0, gradient_mode="filtering", family=family,
             divergence_family=divergence_family, include_attention_entropy=True,
-            decoupled_value_gauge=(isinstance(omega, RopeTransport) and not omega.on_value)):
+            decoupled_value_gauge=(isinstance(omega, RopeTransport) and not omega.on_value),
+            route="mm_exact"):
         raise ValueError(
-            f"mm_exact_update is the closed-form minimizer of the diagonal-Gaussian-KL kernel and "
-            f"does not cover family={family!r}, divergence_family={divergence_family!r} "
-            f"(coupled value gauge required); its precision fusion would score one objective and "
+            f"mm_exact_update is the closed-form minimizer of a Gaussian-KL kernel and does not "
+            f"cover family={family!r}, divergence_family={divergence_family!r} (coupled value gauge "
+            f"required, and family must register the mm_exact capability -- registered mm_exact "
+            f"families: {mm_exact_families()}); its precision fusion would score one objective and "
             f"fuse another. Use e_step_update='gradient' for this configuration."
         )
 
@@ -666,7 +773,18 @@ def mm_exact_update(
     # The correct MM weight at D = 0 is the envelope alpha* = c0/(b0+0). The upper gate stays:
     # the kl_max clamp flattens the objective in a neighborhood there.
     # docs/2026-07-10-mm-exact-prior-anchor-fix.md
-    if coef.shape[-1] == 1:                                          # per-position alpha
+    if fam.cov_kind == "full":
+        # Full covariance: reuse the already-computed CLAMPED self-divergence ``sd`` (built above,
+        # generic over family) rather than a second family-specific raw-KL implementation.
+        # ``safe_kl_clamp`` (families/base.py) maps exactly {raw >= kl_max, NaN, +inf} -> kl_max and
+        # leaves every other value untouched, so ``sd < kl_max`` is IDENTICAL to the diagonal
+        # branch's ``raw_self < kl_max`` upper gate. ``lambda_alpha_mode='state_dependent_per_coord'``
+        # is unreachable here: it needs a per-coordinate self-divergence, which
+        # ``self_divergence_for_alpha`` (building ``sd`` above) already raises for a non-diagonal
+        # family (free_energy.py ``self_divergence_per_coord``; config.py independently rejects the
+        # combination), so ``coef``/``sd`` are always per-position ((..., N, 1) / (..., N)) here.
+        self_mask = (sd < kl_max).to(mu.dtype).unsqueeze(-1)         # UPPER gate only (see comment above)
+    elif coef.shape[-1] == 1:                                        # per-position alpha
         raw_self  = _raw_diag_kl(mu, sigma, mu_p, sigma_p, eps=eps)
         self_mask = (raw_self < kl_max).to(mu.dtype).unsqueeze(-1)   # UPPER gate only (see comment above)
     else:                                                            # per-coordinate alpha
@@ -678,6 +796,16 @@ def mm_exact_update(
     if lambda_twohop != 0.0:
         w2 = torch.matmul(beta.detach(), beta.detach())              # raw detached hop factors
         w = w + lambda_twohop * (w2 * pair_mask)                     # mask destination derivative only
+
+    if fam.cov_kind == "full":
+        # Dense K x K precision fusion (WAVE4 audit derivation); see ``_mm_exact_full_covariance``.
+        # Returns directly: the scalar-diagonal algebra below does not apply to a (..., K, K) sigma.
+        return _mm_exact_full_covariance(
+            mu=mu, sigma=sigma, mu_p=mu_p, sigma_p=sigma_p, mu_t=mu_t, sigma_t=sigma_t,
+            a=a, w=w, eps=eps, irrep_dims=irrep_dims,
+            need_sigma_update=need_sigma_update,
+            emission=emission, emission_weight=emission_weight,
+        )
 
     sp = sigma_p.clamp(min=eps)
     K = mu.shape[-1]
@@ -722,6 +850,283 @@ def mm_exact_update(
     return mu_star, sigma_star
 
 
+def _mm_exact_dense_fusion(
+    mu:                torch.Tensor,           # (..., N, d) live belief means (pass-through on a degenerate row)
+    sigma:             torch.Tensor,           # (..., N, d, d) live belief covariance (pass-through on a degenerate row)
+    mu_p:              torch.Tensor,           # (..., N, d) prior means
+    sigma_p:           torch.Tensor,           # (..., N, d, d) prior covariance
+    mu_t:              torch.Tensor,           # (..., N, N, d) transported key means
+    sigma_t:           torch.Tensor,           # (..., N, N, d, d) transported key covariance (dense sandwich)
+    a:                 torch.Tensor,           # (..., N, 1) self/prior coupling weight m_i a_i
+    w:                 torch.Tensor,           # (..., N, N) frozen pair weights for THIS block
+
+    *,
+    eps:               float,
+    need_sigma_update: bool,
+    emission:          Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    emission_weight:   float,
+) -> Tuple[torch.Tensor, torch.Tensor]:        # (mu_star, sigma_star), each (..., N, d) / (..., N, d, d)
+    r"""Dense d x d precision-fusion minimizer, no irrep/head awareness (WAVE4 audit derivation).
+
+    The full-covariance analogue of ``mm_exact_update``'s diagonal precision fusion, at the SAME
+    frozen (a, w) coupling weights the diagonal branch consumes:
+
+        Lambda*      =  a_i Sigma_p_i^{-1}       +  Sum_j w_ij (Omega_ij Sigma_j Omega_ij^T)^{-1},
+        Lambda* mu*  =  a_i Sigma_p_i^{-1} mu_p_i +  Sum_j w_ij (Omega_ij Sigma_j Omega_ij^T)^{-1} mu_t,ij,
+        Sigma*       =  (a_i + Sum_j w_ij) Lambda*^{-1},
+
+    i.e. the diagonal kernel's scalar ``1/sigma`` divisions become d x d Cholesky-based precisions
+    and solves (never an explicit ``torch.linalg.inv``). Per-pair precisions are built with
+    ``FullGaussian.mean_fisher_precision`` -- the SAME Cholesky-then-``cholesky_inverse`` route (with
+    the SAME ``pinv`` degenerate-factorization fallback) the rest of the full-covariance code already
+    uses for "get a precision from a covariance" (``natural_gradient``'s preconditioner, the
+    diagnostics in ``metrics.py``), rather than a new convention.
+
+    d is EITHER the full K (the single-irrep-block route, ``w`` shape ``(..., N, N)``) OR one gauge
+    head's own ``d_head`` (the multi-head per-block route, called once per head by
+    ``_mm_exact_full_covariance`` with every tensor already sliced to that head's coordinates and
+    that head's OWN pair weight ``w_ij^(h)``) -- this function has no irrep concept at all, so both
+    callers share one implementation and one set of numerics.
+
+    Reused Choleskys: unlike the diagonal branch (whose ``pair_stats`` hoist can share graph-live
+    diagonal-KL statistics with ``belief_gradients``), this fusion factors ``sigma_p``/``sigma_t``
+    FRESH rather than threading the factor ``FullGaussian.renyi_closed_form`` already computed while
+    scoring the self/pair energy above -- the existing factor lives inside a private helper
+    (``_full_gaussian_kl_terms``) with three OTHER callers, and reaching into it here would either
+    change that shared helper's signature (a wider, riskier edit) or duplicate its algebra. Correct,
+    not maximally efficient; a documented opportunity, not a defect.
+    """
+    fam = get_family("gaussian_full")
+    sp_prec = fam.mean_fisher_precision(sigma_p, eps=eps)              # (..., N, d, d)     Sigma_p^{-1}
+    st_prec = fam.mean_fisher_precision(sigma_t, eps=eps)              # (..., N, N, d, d)  Sigma_t_ij^{-1}
+
+    prior_prec_term = a.unsqueeze(-1) * sp_prec                                       # (..., N, d, d)
+    prior_num_term  = a * torch.einsum("...nkl,...nl->...nk", sp_prec, mu_p)          # (..., N, d)
+
+    pair_prec_term = torch.einsum("...ij,...ijkl->...ikl", w, st_prec)                # (..., N, d, d)
+    st_prec_mu     = torch.einsum("...ijkl,...ijl->...ijk", st_prec, mu_t)            # (..., N, N, d)
+    pair_num_term  = torch.einsum("...ij,...ijk->...ik", w, st_prec_mu)               # (..., N, d)
+
+    prec      = prior_prec_term + pair_prec_term                       # Lambda*, pre-emission (..., N, d, d)
+    numerator = prior_num_term + pair_num_term                         # (..., N, d)
+
+    if emission is not None and emission_weight != 0.0:
+        # Categorical emission factor, Bohning majorizer (vfe3/emission.py). ``emission.py`` states
+        # the diagonal restriction is an APPROXIMATION ("a strictly majorizing variant would need the
+        # full (K, K) curvature and a full-covariance family") -- this branch does not add that full
+        # curvature (still ``d``, (K,) or one head's slice of it, the documented diagonal Bohning
+        # bound), but the diagonal curvature IS exactly addable to a full precision's diagonal: it is
+        # a per-coordinate quadratic penalty, valid regardless of what else is in Lambda*.
+        emission_prec, emission_pull, emission_z0 = emission
+        prec = prec + emission_weight * torch.diag_embed(emission_prec)
+        numerator = numerator + emission_weight * (emission_prec * emission_z0 + emission_pull)
+
+    mass = a.squeeze(-1) + w.sum(dim=-1)                                # (..., N) total precision mass
+    # m12 analogue (see the diagonal branch above): a fully saturated row (a==0, all w==0) leaves
+    # Lambda* at (numerically) zero; keep the live belief there instead of solving against a
+    # near-singular matrix, matching the diagonal path's "stay put" degenerate convention.
+    degenerate = mass <= eps
+
+    L_star, _ = safe_cholesky(prec, eps=eps, rounds=5)
+    mu_star = torch.cholesky_solve(numerator.unsqueeze(-1), L_star).squeeze(-1)
+    mu_star = torch.where(degenerate.unsqueeze(-1), mu, mu_star)
+
+    if not need_sigma_update:
+        return mu_star, sigma
+
+    lambda_inv = torch.cholesky_inverse(L_star)                        # (..., N, d, d)  Lambda*^{-1}
+    sigma_star = mass.unsqueeze(-1).unsqueeze(-1) * lambda_inv
+    sigma_star = torch.where(degenerate.unsqueeze(-1).unsqueeze(-1), sigma, sigma_star)
+    return mu_star, sigma_star
+
+
+_BLOCK_DIAGONAL_RTOL: float = 1e-6   # calibrated against fp32 accumulation noise on a genuinely diagonal input
+
+
+def _block_diagonal_relative_residual(
+    matrix:     torch.Tensor,             # (..., K, K)
+    irrep_dims: List[int],
+) -> torch.Tensor:                        # () scalar: max|off-block| / max|on-block|, over every batch element
+    r"""Cross-block residual of ``matrix`` under the ``irrep_dims`` partition, relative to its own
+    on-block scale. The EXECUTED check ``_verify_prior_block_diagonal`` gates the per-head mm_exact
+    route on, rather than trusting the gauge-group name."""
+    K = matrix.shape[-1]
+    on_block = torch.zeros(K, K, dtype=torch.bool, device=matrix.device)
+    start = 0
+    for d in irrep_dims:
+        on_block[start:start + d, start:start + d] = True
+        start += d
+    on_scale = matrix[..., on_block].abs().amax()
+    off_scale = matrix[..., ~on_block].abs().amax() if bool((~on_block).any()) else matrix.new_zeros(())
+    return off_scale / on_scale.clamp_min(torch.finfo(matrix.dtype).tiny)
+
+
+def _verify_prior_block_diagonal(sigma_p: torch.Tensor, irrep_dims: List[int]) -> None:
+    r"""Raise unless ``sigma_p`` is (numerically) block-diagonal under ``irrep_dims``.
+
+    EXECUTED, not name-based (2026-08-07 gauge-audit reversal of the earlier blanket multi-head
+    ValueError): the per-head fusion below is exact precisely because, and only because, the
+    self/prior term's full-matrix inverse ``Sigma_p^{-1}`` is block-diagonal whenever ``Sigma_p``
+    is -- true for the default ``prior_source='token'`` encode prior
+    (``prior_bank._encode_prior_sigma``: ``torch.diag_embed(...)``, trivially block-diagonal), but
+    NOT for ``prior_source='model_channel'`` (``covariance_from_packed`` -- a genuinely dense packed
+    Cholesky covariance with no block-zero constraint). Gating on the gauge-group name alone would
+    silently mis-fuse that combination; this checks the actual tensor every call.
+    """
+    residual = _block_diagonal_relative_residual(sigma_p, irrep_dims)
+    if bool(residual > _BLOCK_DIAGONAL_RTOL):
+        raise ValueError(
+            "mm_exact_update's per-head full-covariance fusion "
+            f"(irrep_dims={irrep_dims!r}, {len(irrep_dims)} blocks) requires a BLOCK-DIAGONAL "
+            "sigma_p: the self/prior term's stationarity condition forces Sigma* off-block entries "
+            "to equal Sigma_p^{-1}'s off-block entries (both zero only when Sigma_p is "
+            "block-diagonal), while the coupling term never reads Sigma's off-block entries at all "
+            "(FullGaussian.coupling_energy slices each head's OWN diagonal submatrix). Measured "
+            f"cross-block/on-block residual {float(residual):.3e} > {_BLOCK_DIAGONAL_RTOL:.0e}. "
+            "This holds for the default prior_source='token' encode prior (diag_embed -> diagonal, "
+            "hence block-diagonal) but NOT for prior_source='model_channel' (a genuinely dense "
+            "packed-Cholesky covariance). Use prior_source='token', a single-block gauge_group, or "
+            "e_step_update='gradient'."
+        )
+
+
+def _mm_exact_full_covariance(
+    *,
+    mu:                torch.Tensor,           # (..., N, K) live belief means (pass-through on a degenerate row)
+    sigma:             torch.Tensor,           # (..., N, K, K) live belief covariance (pass-through on a degenerate row)
+    mu_p:              torch.Tensor,           # (..., N, K) prior means
+    sigma_p:           torch.Tensor,           # (..., N, K, K) prior covariance
+    mu_t:              torch.Tensor,           # (..., N, N, K) transported key means
+    sigma_t:           torch.Tensor,           # (..., N, N, K, K) transported key covariance (dense sandwich)
+    a:                 torch.Tensor,           # (..., N, 1) self/prior coupling weight m_i a_i
+    w:                 torch.Tensor,           # (..., N, N) single-block OR (..., H, N, N) per-head pair weights
+    eps:               float,
+    irrep_dims:        Optional[List[int]],
+    need_sigma_update: bool,
+    emission:          Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    emission_weight:   float,
+) -> Tuple[torch.Tensor, torch.Tensor]:        # (mu_star, sigma_star), each (..., N, K) / (..., N, K, K)
+    r"""K x K precision-fusion minimizer for a full-covariance family (WAVE4 audit derivation).
+
+    SINGLE IRREP BLOCK (``irrep_dims`` None or length 1): the dense ``_mm_exact_dense_fusion`` runs
+    directly on the whole K.
+
+    MULTI-HEAD (length > 1, e.g. ``gauge_group='block_glk'``): PROVEN exact whenever ``sigma_p`` is
+    block-diagonal (2026-08-07 gauge-audit reversal of the earlier blanket ValueError here -- the
+    original probe used a DENSE random ``sigma_p``, an input the live encode path never produces;
+    measured on the CORRECT construction, ``torch.diag_embed`` as ``prior_bank._encode_prior_sigma``
+    builds it, the cross-block ``grad_sigma`` is exactly 0.0 across 6 seeds and H in {2, 3}).
+    Derivation: ``FullGaussian.coupling_energy`` scores each head h off ONLY its own diagonal
+    K_h x K_h submatrix of Sigma (``.block()``), so as a function of the FULL dense Sigma_i the
+    coupling term has EXACTLY ZERO partial derivative with respect to any off-block entry, for every
+    Sigma_i (not just a block-diagonal one -- verified: perturbing a dense, non-block-diagonal
+    Sigma's off-block entries left grad_sigma's cross-block components matching
+    ``-0.5 a (Sigma^{-1})^{(h,h')}`` from the SELF term alone, to the last float). So the total
+    gradient's off-block component is exactly ``0.5 a (Sigma_p^{-1} - Sigma*^{-1})^{(h,h')}``; zeroing
+    it forces ``(Sigma*^{-1})^{(h,h')} = (Sigma_p^{-1})^{(h,h')} = 0`` whenever Sigma_p is
+    block-diagonal (an SPD matrix's inverse is block-diagonal under a partition iff the matrix
+    itself is), hence Sigma* itself is exactly block-diagonal, and each diagonal block's own
+    stationarity equation is the per-head fusion below -- an EXACT decomposition, not an ansatz.
+    ``w`` already carries the per-head axis here (``pairwise_energy(..., irrep_dims=...)`` returns
+    ``(..., H, N, N)`` for H > 1, unconditionally), so each head keeps its OWN pair weight w_ij^(h);
+    the outer preamble does not need to (and does not) collapse it to one shared weight.
+
+    Any group whose Sigma is genuinely NOT block-diagonal (``prior_source='model_channel'``'s packed
+    Cholesky covariance, per the gauge audit) fails the EXECUTED ``_verify_prior_block_diagonal``
+    check below rather than silently fusing the wrong objective.
+    """
+    if irrep_dims is None or len(irrep_dims) == 1:
+        return _mm_exact_dense_fusion(
+            mu, sigma, mu_p, sigma_p, mu_t, sigma_t, a, w,
+            eps=eps, need_sigma_update=need_sigma_update,
+            emission=emission, emission_weight=emission_weight,
+        )
+    _verify_prior_block_diagonal(sigma_p, irrep_dims)
+    if emission is not None and emission_weight != 0.0:
+        emission_prec_all, emission_pull_all, emission_z0_all = emission
+    else:
+        emission_prec_all = emission_pull_all = emission_z0_all = None
+    mu_parts:    List[torch.Tensor] = []
+    sigma_parts: List[torch.Tensor] = []
+    start = 0
+    for h, d in enumerate(irrep_dims):
+        end = start + d
+        emission_h = None
+        if emission_prec_all is not None:
+            emission_h = (
+                emission_prec_all[..., start:end],
+                emission_pull_all[..., start:end],
+                emission_z0_all[..., start:end],
+            )
+        mu_star_h, sigma_star_h = _mm_exact_dense_fusion(
+            mu[..., start:end], sigma[..., start:end, start:end],
+            mu_p[..., start:end], sigma_p[..., start:end, start:end],
+            mu_t[..., start:end], sigma_t[..., start:end, start:end],
+            a, w[..., h, :, :],
+            eps=eps, need_sigma_update=need_sigma_update,
+            emission=emission_h, emission_weight=emission_weight,
+        )
+        mu_parts.append(mu_star_h)
+        sigma_parts.append(sigma_star_h)
+        start = end
+    mu_star = torch.cat(mu_parts, dim=-1)                               # (..., N, K)
+    # Block-diagonal assembly: pad each head's (..., N, d_h, d_h) block with exact zeros on every
+    # other head's rows/cols, then sum (the padded blocks never overlap, so sum == placement). Avoids
+    # in-place slice writes into a fresh zeros tensor, which is autograd-safe but less obviously so.
+    K = mu.shape[-1]
+    sigma_star = sigma.new_zeros(sigma.shape)
+    start = 0
+    for sigma_star_h, d in zip(sigma_parts, irrep_dims):
+        end = start + d
+        pad = (start, K - end, start, K - end)                          # (left, right, top, bottom)
+        sigma_star = sigma_star + torch.nn.functional.pad(sigma_star_h, pad)
+        start = end
+    return mu_star, sigma_star
+
+
+def mm_damped_precision_blend_full(
+    mu_old:     torch.Tensor,      # (..., N, K) current belief mean
+    sigma_old:  torch.Tensor,      # (..., N, K, K) current belief covariance
+    mu_star:    torch.Tensor,      # (..., N, K) mm_exact_update's exact-minimizer mean
+    sigma_star: torch.Tensor,      # (..., N, K, K) mm_exact_update's exact-minimizer covariance
+    eta:        float,             # mm_damping in (0, 1]
+
+    *,
+    eps:        float,
+    sigma_max:  Optional[float],
+) -> Tuple[torch.Tensor, torch.Tensor]:        # (mu, sigma), each (..., N, K) / (..., N, K, K)
+    r"""Full-covariance analogue of the diagonal mm_damping blend (``e_step.py``'s mm_exact branch).
+
+    A mirror-descent step on the Gaussian natural parameters, generalizing the diagonal path's scalar
+    ``1/sigma`` to the K x K precision:
+
+        Lambda     <- (1 - eta) Lambda_old + eta Lambda_star,
+        Lambda mu  <- (1 - eta) Lambda_old mu_old + eta Lambda_star mu_star,
+
+    with ``Lambda = Sigma^{-1}``. ``eta=1`` reproduces ``mu_star, sigma_star`` (modulo the extra
+    factorization round-trip); ``eta=0`` leaves ``(mu_old, sigma_old)`` unchanged -- both match the
+    diagonal path's convention at the two damping endpoints. The blended covariance is projected to
+    the eigenvalue interval ``[eps, sigma_max]`` with the SAME spectral map ``retract_spd_full`` uses
+    for its own ceiling (a natural-parameter blend of two matrices already inside the interval is not
+    itself guaranteed to stay there), then hardened with the same public-SPD certificate.
+    """
+    from vfe3.geometry.retraction import _certify_public_spd, _symmetric_spectral_map
+    L_old, _  = safe_cholesky(sigma_old,  eps=eps, rounds=5)
+    L_star, _ = safe_cholesky(sigma_star, eps=eps, rounds=5)
+    lam_old  = torch.cholesky_inverse(L_old)
+    lam_star = torch.cholesky_inverse(L_star)
+    lam_new = (1.0 - eta) * lam_old + eta * lam_star
+    numerator = ((1.0 - eta) * torch.einsum("...kl,...l->...k", lam_old, mu_old)
+                 + eta * torch.einsum("...kl,...l->...k", lam_star, mu_star))
+    L_new, _ = safe_cholesky(lam_new, eps=eps, rounds=5)
+    mu = torch.cholesky_solve(numerator.unsqueeze(-1), L_new).squeeze(-1)
+    sigma = torch.cholesky_inverse(L_new)
+    sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
+    sigma = _symmetric_spectral_map(sigma, "project", lower=eps, upper=sigma_max)
+    sigma = _certify_public_spd(sigma, eps=eps, sigma_max=sigma_max)
+    return mu, sigma
+
+
 def _beta_to_coordinate(
     beta:       torch.Tensor,             # (N, N) single-block OR (H, N, N) per-head
     irrep_dims: Optional[List[int]],      # block sizes; None/[K] -> single block
@@ -748,3 +1153,26 @@ def get_kernel(name: str) -> Callable:
     if name not in _KERNELS:
         raise KeyError(f"no belief-gradient kernel for family {name!r}; available: {sorted(_KERNELS)}")
     return _KERNELS[name]
+
+
+def _gaussian_full_no_gradient_kernel(*_args: object, **_kwargs: object) -> None:
+    r"""Marker callable: ``gaussian_full`` declares ONLY the mm_exact capability (no analytic
+    (grad_mu, grad_sigma) kernel exists), so ``belief_gradients`` must never actually call this --
+    ``uses_kernel_route(route="gradient")`` gates on ``KernelRegistration.provides_gradient=False``
+    and keeps routing ``e_step_update='gradient'`` + ``family='gaussian_full'`` to the autograd
+    oracle, exactly as before this registration existed. Raises loudly rather than mis-scoring if
+    that capability gate ever has a bug and this is reached anyway."""
+    raise NotImplementedError(
+        "gaussian_full has no analytic (grad_mu, grad_sigma) kernel; its _KERNELS entry exists "
+        "only to declare the mm_exact closed-form capability (see mm_exact_update / "
+        "_mm_exact_full_covariance). This function must be unreachable through belief_gradients "
+        "(uses_kernel_route(route='gradient') checks KernelRegistration.provides_gradient=False for "
+        "this family) -- if you are seeing this, that capability gate has a bug."
+    )
+
+
+register_kernel(
+    "gaussian_full",
+    provides_gradient=False,           # no analytic gradient kernel; belief_gradients keeps using the oracle
+    provides_mm_exact=True,            # mm_exact_update's _mm_exact_full_covariance branch covers it
+)(_gaussian_full_no_gradient_kernel)
