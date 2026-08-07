@@ -610,6 +610,21 @@ class VFE3Config:
     # materializes the (B,N,V) logit tensor). Ignored by every other decode_mode. Default
     # 8192; validated positive.
     decode_chunk_size:         int   = 8192
+
+    # decode_ce_checkpoint: gates the gradient checkpoint every decode_ce_*_chunked fused-CE kernel
+    # (prior_bank.py) wraps around its per-chunk (B, N, chunk_width) reduction. "always" reproduces
+    # the pre-2026-08-07 unconditional behavior (checkpoint -- i.e. recompute the chunk in backward
+    # -- whenever grad is live, regardless of chunk_width). "never" always keeps the chunk workspace
+    # live for backward and pays no recompute. "auto" (default) checkpoints only when the (B, N,
+    # chunk_width) tensor the chunk's _chunk_summaries closure would otherwise save, AT ITS OWN
+    # DTYPE ITEMSIZE, exceeds DECODE_CE_CHECKPOINT_AUTO_BYTES = 2 GiB (vfe3/model/prior_bank.py) --
+    # a fixed byte budget rather than a live device-memory query, so the decision is reproducible
+    # run-to-run and degrades to the same constant on CPU. Read by every decode_ce_*_chunked kernel
+    # (diagonal_chunked / full_chunked / family_chunked / expected_likelihood_chunked / linear);
+    # inert when the active decode route has no fused_ce registration ('full', 'family' -- the dense
+    # KL-to-vocab path has no chunk loop to checkpoint).
+    decode_ce_checkpoint:      str   = "auto"    #"always", "never"
+
     encode_mode:               str   = "per_token"   #"per_token_additive"
 
     # cross-block belief handoff (mu_q -> mu_p)
@@ -2499,6 +2514,7 @@ class VFE3Config:
             )
         if self.decode_chunk_size < 1:
             raise ValueError(f"decode_chunk_size must be >= 1, got {self.decode_chunk_size}")
+        _require(self.decode_ce_checkpoint, ("auto", "always", "never"), "decode_ce_checkpoint")
         # decode_bias is a learned per-vocab log-unigram bias on the use_prior_bank=False LINEAR
         # decode (logits = mu_q @ W^T + b). On the prior-bank KL path the per-vocab priors
         # (mu_p, sigma_p) already carry the unigram role, so the bias is never created there; warn
@@ -3334,6 +3350,21 @@ class VFE3Config:
             _inert.append(
                 f"phi_precond_mode={self.phi_precond_mode!r} (reached only by e_phi_lr>0 or "
                 "m_phi_update_mode='pullback_group')")
+        # decode_ce_checkpoint is read only inside decode_ce_*_chunked, which model.py reaches
+        # exclusively through a decode registration whose fused_ce is not None
+        # (get_decode_registration(active_decode_mode).supports_chunked). 'full'/'family' have no
+        # fused_ce (the dense decode() -> F.cross_entropy path has no per-chunk loop to checkpoint),
+        # so the toggle does nothing there; every other decode_mode, and use_prior_bank=False
+        # (routed to 'linear' regardless of decode_mode), keep it live.
+        from vfe3.model.prior_bank import _DECODERS as _decode_registry
+        _active_decode_mode = self.decode_mode if self.use_prior_bank else "linear"
+        if (not _decode_registry[_active_decode_mode].supports_chunked
+                and _changed("decode_ce_checkpoint")):
+            _inert.append(
+                f"decode_ce_checkpoint={self.decode_ce_checkpoint!r} (decode_mode="
+                f"{self.decode_mode!r} has no fused_ce registration; only "
+                "'diagonal_chunked'/'full_chunked'/'family_chunked'/'expected_likelihood_chunked', "
+                "or use_prior_bank=False, route through a checkpointed chunked CE kernel)")
         if _inert:
             import warnings
             warnings.warn(

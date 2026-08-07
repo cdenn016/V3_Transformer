@@ -288,6 +288,7 @@ class VFEModel(nn.Module):
             use_prior_bank=cfg.use_prior_bank, decode_bias=cfg.decode_bias,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
             decode_chunk_size=cfg.decode_chunk_size,
+            decode_ce_checkpoint=cfg.decode_ce_checkpoint,
             lambda_h=cfg.lambda_h, lambda_gamma=cfg.lambda_gamma,
             prior_source=cfg.prior_source, s_frame_mode=cfg.s_frame_mode,
             s_e_step=cfg.s_e_step,

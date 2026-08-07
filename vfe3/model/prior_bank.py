@@ -107,6 +107,50 @@ def decode_av_precision() -> str:
     return _DECODE_AV_PRECISION
 
 
+DECODE_CE_CHECKPOINT_AUTO_BYTES: int = 2 * 1024 ** 3   # 2 GiB; see decode_ce_checkpoint in config.py
+
+
+def _decode_ce_chunk_activation_bytes(
+    ref:         torch.Tensor,            # (B, N, ...) tensor sharing the closure's (B, N) and dtype
+    chunk_width: int,                     # Vc for this iteration
+    inner:       int                = 1,   # extra trailing-dim multiplier (e.g. K or K*K) the
+                                            # closure's largest workspace carries beyond (B, N, Vc)
+) -> int:
+    r"""Bytes of the largest (B, N, chunk_width[, inner]) tensor a decode_ce_*_chunked kernel's
+    ``_chunk_summaries`` closure actually materializes for THIS chunk, at ``ref``'s dtype -- the
+    exact quantity ``decode_ce_checkpoint='auto'`` (config.py) gates the per-chunk checkpoint on.
+    Computed from the real shapes/dtype in play (batch, positions, chunk_width, dtype.itemsize),
+    not a guessed formula; ``inner`` lets callers whose chunk workspace carries an extra (K) or
+    (K, K) axis (``decode_ce_expected_likelihood_chunked``, ``decode_ce_family_chunked``) report
+    that workspace's true size rather than under-counting it as (B, N, Vc).
+    """
+    batch, positions = ref.shape[0], ref.shape[1]
+    return batch * positions * chunk_width * inner * ref.element_size()
+
+
+def _decode_ce_should_checkpoint(
+    checkpoint_mode:  str,                # pb.decode_ce_checkpoint: "always" | "never" | "auto"
+    grad_active:      bool,               # torch.is_grad_enabled() and the checkpointed input requires_grad
+    activation_bytes: int,                # _decode_ce_chunk_activation_bytes(...) for this chunk
+) -> bool:
+    r"""Central dispatch for every ``decode_ce_*_chunked`` kernel's per-chunk gradient checkpoint.
+
+    Grad-inactive calls (eval / ``no_grad``, or a checkpointed input that itself carries no grad)
+    never checkpoint in any mode -- there is nothing for a checkpoint to save memory against, and
+    checkpointing it anyway would only pay a pointless recompute. Under grad: "always" reproduces
+    the pre-2026-08-07 unconditional behavior (checkpoint every chunk); "never" always keeps the
+    chunk workspace live for backward; "auto" checkpoints only when ``activation_bytes`` -- the size
+    of the tensor the checkpoint would actually be saving -- exceeds ``DECODE_CE_CHECKPOINT_AUTO_BYTES``.
+    """
+    if not grad_active:
+        return False
+    if checkpoint_mode == "always":
+        return True
+    if checkpoint_mode == "never":
+        return False
+    return activation_bytes > DECODE_CE_CHECKPOINT_AUTO_BYTES               # "auto"
+
+
 def _decode_av_lhs(
     sq:   torch.Tensor,                   # (..., N, K) query variances
     mc_q: torch.Tensor,                   # (..., N, K) centered query means
@@ -443,6 +487,7 @@ class PriorBank(nn.Module):
         encode_mode:         str   = "per_token",
         decode_mode:         str   = "diagonal",
         decode_chunk_size:   int   = 8192,
+        decode_ce_checkpoint: str  = "auto",
         lambda_h:            float = 0.0,
         lambda_gamma:        float = 0.0,
         prior_source:        str   = "token",
@@ -527,6 +572,7 @@ class PriorBank(nn.Module):
         self.encode_mode = encode_mode
         self.decode_mode = decode_mode
         self.decode_chunk_size = decode_chunk_size
+        self.decode_ce_checkpoint = decode_ce_checkpoint
         self.prior_source = prior_source
         self.s_frame_mode = s_frame_mode
         self.s_e_step = s_e_step
@@ -1201,7 +1247,9 @@ class PriorBank(nn.Module):
             in_chunk = (targets >= v0) & (targets < v1)                    # (B, N) bool
             in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
             local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
-            if torch.is_grad_enabled() and lhs.requires_grad:
+            grad_active = torch.is_grad_enabled() and lhs.requires_grad
+            activation_bytes = _decode_ce_chunk_activation_bytes(lhs, v1 - v0)
+            if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
                 lse_chunk, contrib = _checkpoint.checkpoint(
                     _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, lsum_c, in_chunk_f, local_idx,
                     u_c, sigma_q, mc_q, use_reentrant=False,
@@ -1398,7 +1446,9 @@ class PriorBank(nn.Module):
             in_chunk = (targets >= v0) & (targets < v1)                    # (B, N) bool
             in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
             local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
-            if torch.is_grad_enabled() and lhs.requires_grad:
+            grad_active = torch.is_grad_enabled() and lhs.requires_grad
+            activation_bytes = _decode_ce_chunk_activation_bytes(lhs, v1 - v0)
+            if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
                 lse_chunk, contrib = _checkpoint.checkpoint(
                     _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, lsum_c, in_chunk_f, local_idx,
                     u_c, diag_sq, mc_q, use_reentrant=False,
@@ -1479,7 +1529,9 @@ class PriorBank(nn.Module):
             in_chunk = (targets >= v0) & (targets < v1)                    # (B, N) bool
             in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
             local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
-            if torch.is_grad_enabled() and (mu_q.requires_grad or W.requires_grad):
+            grad_active = torch.is_grad_enabled() and (mu_q.requires_grad or W.requires_grad)
+            activation_bytes = _decode_ce_chunk_activation_bytes(mu_q, v1 - v0)
+            if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
                 lse_chunk, contrib = _checkpoint.checkpoint(
                     _chunk_summaries, mu_q, w_c, in_chunk_f, local_idx, b_c, u_c,
                     use_reentrant=False,
@@ -1564,7 +1616,12 @@ class PriorBank(nn.Module):
             in_chunk = (targets >= v0) & (targets < v1)                    # (B, N) bool
             in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
             local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
-            if torch.is_grad_enabled() and (mu_q.requires_grad or mu_v_all.requires_grad):
+            grad_active = torch.is_grad_enabled() and (mu_q.requires_grad or mu_v_all.requires_grad)
+            # This closure's largest workspace is (B, N, Vc, K) (the `d`/`s` broadcast the diagonal
+            # kernel's single-matmul trick cannot use, per the docstring above), so the byte estimate
+            # carries the extra K factor a bare (B, N, Vc) count would miss.
+            activation_bytes = _decode_ce_chunk_activation_bytes(mu_q, v1 - v0, inner=self.K)
+            if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
                 lse_chunk, contrib = _checkpoint.checkpoint(
                     _chunk_summaries, mu_q, sigma_q, mu_v_c, sigma_v_c, in_chunk_f, local_idx,
                     u_c, use_reentrant=False,
@@ -1667,7 +1724,13 @@ class PriorBank(nn.Module):
             in_chunk = (targets >= v0) & (targets < v1)                    # (B, N) bool
             in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
             local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
-            if torch.is_grad_enabled() and (mu_q.requires_grad or mu_v_all.requires_grad):
+            grad_active = torch.is_grad_enabled() and (mu_q.requires_grad or mu_v_all.requires_grad)
+            # The functional workspace is (B, N, Vc) for a diagonal family but (B, N, Vc, K, K) for a
+            # full one (diag_embed-promoted chunk, per the docstring above); size the estimate off
+            # the SAME is_full this closure branches on so 'auto' sees the workspace it really pays.
+            activation_bytes = _decode_ce_chunk_activation_bytes(
+                mu_q, v1 - v0, inner=(self.K * self.K if is_full else 1))
+            if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
                 lse_chunk, contrib = _checkpoint.checkpoint(
                     _chunk_summaries, q_mu, q_sigma, mu_v_c, sigma_v_c, in_chunk_f, local_idx,
                     u_c, use_reentrant=False,
