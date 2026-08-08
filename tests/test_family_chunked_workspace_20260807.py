@@ -34,6 +34,7 @@ import pytest
 import torch
 
 import vfe3.model.prior_bank as prior_bank
+from vfe3.families.gaussian import FullGaussian, set_full_cov_kl_precision
 from vfe3.model.prior_bank import (
     DECODE_CE_FAMILY_WORKSETS,
     _decode_ce_chunk_activation_bytes,
@@ -44,9 +45,9 @@ from vfe3.model.prior_bank import (
 from tests.test_amp import _tiny_model
 
 
-def _bank(**kw):
+def _bank(*, renyi_order=0.5, **kw):
     model = _tiny_model(gauge_group="block_glk", n_heads=2, family="gaussian_full",
-                        decode_mode="family_chunked", **kw)
+                        decode_mode="family_chunked", renyi_order=renyi_order, **kw)
     return model, model.prior_bank
 
 
@@ -90,6 +91,35 @@ def test_effective_chunk_never_widens_the_request():
     r"""The ceiling is a cap, not a target: a user asking for a narrow slice keeps it."""
     ref = torch.empty(2, 5, 20)
     assert _decode_ce_family_effective_chunk(ref, 3, 20 * 20) == 3
+
+
+def test_effective_chunk_honors_an_explicit_fp64_scalar_cost(monkeypatch):
+    r"""An fp64 functional workspace admits half as many entries as fp32 at the same budget."""
+    monkeypatch.setattr(prior_bank, "DECODE_CE_FAMILY_WORKSPACE_BYTES", 960)
+    ref = torch.empty(1, 1, 4)
+
+    fp32_width = _decode_ce_family_effective_chunk(
+        ref, 100, inner=10, workspace_bytes_per_scalar=4,
+    )
+    fp64_width = _decode_ce_family_effective_chunk(
+        ref, 100, inner=10, workspace_bytes_per_scalar=8,
+    )
+
+    assert fp32_width == 12
+    assert fp64_width == 6
+
+
+@pytest.mark.parametrize("invalid", [0, -1, 1.5, True])
+def test_workspace_scalar_byte_overrides_require_positive_plain_integers(invalid):
+    r"""Byte counts are discrete; floats and bools must not leak into workspace arithmetic."""
+    ref = torch.empty(1, 1, 4)
+
+    with pytest.raises(ValueError, match="positive integer"):
+        _decode_ce_chunk_activation_bytes(ref, 1, workspace_bytes_per_scalar=invalid)
+    with pytest.raises(ValueError, match="positive integer"):
+        _decode_ce_family_effective_chunk(
+            ref, 1, inner=4, workspace_bytes_per_scalar=invalid,
+        )
 
 
 # -- (b) narrowing is value- and gradient-identical ---------------------------------------------
@@ -169,6 +199,130 @@ def test_narrowed_slices_match_the_unnarrowed_gradient(monkeypatch, spy):
     assert narrow.abs().sum() > 0, "a zero gradient would satisfy the equality vacuously"
 
 
+def test_registered_chunked_logits_tile_full_family_at_the_workspace_ceiling(monkeypatch, spy):
+    r"""``decode`` must bound the real full-family functional, not merely fused CE."""
+    model, pb = _bank(decode_chunk_size=20)
+    mu, sigma, _ = _inputs(model)
+    V = pb.vocab_size
+    monkeypatch.setattr(prior_bank, "DECODE_CE_FAMILY_WORKSPACE_BYTES", _one_entry_budget(model))
+
+    logits = pb.decode(mu, sigma)
+
+    assert logits.shape[-1] == V
+    assert spy == [1] * V
+
+
+def test_registered_chunked_logits_preserve_values_when_workspace_retiles(monkeypatch, spy):
+    r"""Changing only the workspace tiling cannot change logits or omit a vocabulary slice."""
+    model, pb = _bank(decode_chunk_size=20)
+    mu, sigma, _ = _inputs(model)
+    V = pb.vocab_size
+
+    wide = pb.decode(mu, sigma)
+    wide_widths = list(spy)
+    spy.clear()
+    monkeypatch.setattr(prior_bank, "DECODE_CE_FAMILY_WORKSPACE_BYTES", _one_entry_budget(model))
+    narrow = pb.decode(mu, sigma)
+
+    assert wide_widths == [V]
+    assert spy == [1] * V
+    assert sum(spy) == V
+    assert torch.allclose(wide, narrow, rtol=0, atol=1e-6)
+
+
+def test_dense_family_logits_remain_one_full_vocabulary_call_under_workspace_cap(monkeypatch, spy):
+    r"""The dense ``family`` mode intentionally has no workspace-retiling contract."""
+    model = _tiny_model(
+        gauge_group="block_glk", n_heads=2, family="gaussian_full", decode_mode="family",
+        renyi_order=0.5, decode_chunk_size=20,
+    )
+    pb = model.prior_bank
+    mu, sigma, _ = _inputs(model)
+    monkeypatch.setattr(prior_bank, "DECODE_CE_FAMILY_WORKSPACE_BYTES", _one_entry_budget(model))
+
+    logits = pb.decode(mu, sigma)
+
+    assert logits.shape[-1] == pb.vocab_size
+    assert spy == [pb.vocab_size]
+
+
+def test_fp64_full_family_uses_eight_byte_workspace_for_fused_ce_and_registered_logits(
+        monkeypatch, spy):
+    r"""The full Gaussian's fp64 compute island governs both public fp32 family routes."""
+    previous = set_full_cov_kl_precision("fp64")
+    try:
+        model, pb = _bank(decode_chunk_size=20)
+        mu, sigma, targets = _inputs(model)
+        V = pb.vocab_size
+        # This admits all V fp32 entries but only half as many fp64 entries.
+        fp32_whole_vocab = _one_entry_budget(model) * V
+        monkeypatch.setattr(prior_bank, "DECODE_CE_FAMILY_WORKSPACE_BYTES", fp32_whole_vocab)
+
+        ce = pb.decode_ce_family_chunked(mu, sigma, targets)
+        fused_widths = list(spy)
+        spy.clear()
+        logits = pb.decode(mu, sigma)
+
+        assert torch.isfinite(ce)
+        assert logits.shape[-1] == V
+        assert fused_widths == [V // 2, V - V // 2]
+        assert spy == [V // 2, V - V // 2]
+    finally:
+        set_full_cov_kl_precision(previous)
+
+
+def test_fp64_full_family_checkpoint_gate_uses_eight_byte_whole_vocabulary_estimate(monkeypatch):
+    r"""The fp64 full family must checkpoint when its eight-byte estimate crosses the threshold."""
+    previous = set_full_cov_kl_precision("fp64")
+    try:
+        model, pb = _bank(decode_chunk_size=20, decode_ce_checkpoint="auto")
+        mu, sigma, targets = _inputs(model)
+        V = pb.vocab_size
+        four_byte = _decode_ce_chunk_activation_bytes(
+            mu, V, inner=model.cfg.embed_dim ** 2 * DECODE_CE_FAMILY_WORKSETS,
+        )
+        eight_byte = 2 * four_byte
+        assert four_byte < 38_400 < eight_byte
+        monkeypatch.setattr(prior_bank, "DECODE_CE_CHECKPOINT_AUTO_BYTES", 38_400)
+        seen = []
+        real_gate = prior_bank._decode_ce_should_checkpoint
+
+        def _recording_gate(mode, grad_active, activation_bytes):
+            decision = real_gate(mode, grad_active, activation_bytes)
+            seen.append((activation_bytes, decision))
+            return decision
+
+        monkeypatch.setattr(prior_bank, "_decode_ce_should_checkpoint", _recording_gate)
+        pb.decode_ce_family_chunked(mu, sigma, targets)
+
+        assert seen == [(eight_byte, True)]
+    finally:
+        set_full_cov_kl_precision(previous)
+
+
+def test_fp64_workspace_override_leaves_diagonal_family_sizing_unchanged():
+    r"""Only full-family workspaces enter the fp64 island; diagonal family sizing stays inert."""
+    previous = set_full_cov_kl_precision("fp64")
+    try:
+        ref = torch.empty(2, 5, 4)
+        assert _decode_ce_family_effective_chunk(
+            ref, 17, inner=1, workspace_bytes_per_scalar=8,
+        ) == 17
+    finally:
+        set_full_cov_kl_precision(previous)
+
+
+@pytest.mark.parametrize("policy", ["fp32_escalate", "fp32_escalate_cond"])
+def test_full_gaussian_workspace_reserves_fp64_for_escalation_policies(policy):
+    r"""Both escalation policies can recompute a full-family grid in fp64."""
+    previous = set_full_cov_kl_precision(policy)
+    try:
+        ref = torch.empty(2, 5, 4)
+        assert prior_bank._full_family_workspace_bytes_per_scalar(FullGaussian, ref, ref) == 8
+    finally:
+        set_full_cov_kl_precision(previous)
+
+
 def test_declining_the_prior_hoist_still_promotes_each_slice(monkeypatch, spy):
     r"""The (V, K, K) promotion is hoisted only when it is small; the fallback must still promote.
 
@@ -228,30 +382,88 @@ def test_workspace_estimate_counts_both_solve_buffers():
     assert both == 2 * one
 
 
-# -- (f) decode_av_precision is reported inert on the family route -------------------------------
+# -- (f) decode_av_precision is inert only on generic family routes -------------------------------
 
 def test_decode_av_precision_is_reported_inert_on_the_family_route():
-    r"""The family route never calls _decode_av, so tuning its precision must not fail silently.
+    r"""The canonical full family dispatch reads the precision policy; generic routes do not.
 
-    ``decode_av_precision`` is accepted, validated (config.py:2379) and published process-wide
-    (model.py:258), but its only reader is ``_decode_av`` (prior_bank.py:180), which the
-    family-consistent kernels do not call -- they hand the pair to the registered functional, whose
-    precision is ``full_cov_kl_precision``. Before audit 2026-08-07 the dead-knob oracle had no rule
-    for it, so the setting was silently ignored.
+    Under built-in full Gaussian / built-in Renyi(alpha=1) with ``full_cov_kl_precision='fp32_escalate'``,
+    switching ``decode_av_precision`` selects between the analytic and generic family routes, so it
+    must not be reported inert. A noncanonical order remains generic and must retain the warning.
     """
     from vfe3.config import VFE3Config
 
     base = dict(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                 use_prior_bank=True, family="gaussian_full", gauge_group="block_glk")
 
-    def _inert_mentions(mode):
+    def _inert_mentions(mode, **overrides):
         with pytest.warns(Warning) as record:
-            VFE3Config(**base, decode_mode=mode, decode_av_precision="fp64")
+            VFE3Config(**base, decode_mode=mode, decode_av_precision="fp64", **overrides)
         return any("decode_av_precision" in str(r.message) for r in record)
 
-    assert _inert_mentions("family_chunked"), "the family route must report the knob inert"
+    canonical = dict(renyi_order=1.0, full_cov_kl_precision="fp32_escalate")
+    assert not _inert_mentions("family_chunked", **canonical)
+    assert _inert_mentions("family_chunked", renyi_order=0.5,
+                           full_cov_kl_precision="fp32_escalate")
     # full_chunked genuinely reads it, so it must NOT be reported inert there.
     assert not _inert_mentions("full_chunked"), "full_chunked reads _decode_av -- not inert"
+
+
+def test_same_name_family_chunked_override_keeps_decode_av_precision_inert():
+    r"""The mode name alone must not make a custom family decoder inherit the analytic dependency."""
+    from vfe3.config import VFE3Config
+
+    original = prior_bank.get_decode_registration("family_chunked")
+
+    def generic_logits(pb, mu_q, sigma_q, tau_eff):
+        return prior_bank._family_logits(pb, mu_q, sigma_q, tau_eff, chunk=pb.decode_chunk_size)
+
+    def generic_fused_ce(pb, mu_q, sigma_q, targets, *, z_loss_weight=0.0, tau=None,
+                         chunk_size=None, ignore_index=-100):
+        logits = generic_logits(pb, mu_q, sigma_q, pb._tau_eff(tau))
+        valid = targets != ignore_index
+        local_targets = targets.clamp_min(0)
+        ce = (torch.logsumexp(logits, dim=-1) - logits.gather(
+            -1, local_targets.unsqueeze(-1),
+        ).squeeze(-1))
+        return (ce * valid).sum() / valid.sum().clamp_min(1)
+
+    prior_bank.register_decode(
+        "family_chunked",
+        covariance_kinds=frozenset({"diagonal", "full"}),
+        family_consistent=True,
+        supports_chunked=True,
+        fused_ce=generic_fused_ce,
+        can_omit_base_mean=True,
+        can_omit_base_variance=True,
+        override=True,
+    )(generic_logits)
+    try:
+        with pytest.warns(Warning) as record:
+            VFE3Config(
+                vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+                use_prior_bank=True, family="gaussian_full", gauge_group="block_glk",
+                decode_mode="family_chunked", renyi_order=1.0,
+                full_cov_kl_precision="fp32_escalate", decode_av_precision="fp64",
+            )
+        assert any("decode_av_precision" in str(warning.message) for warning in record)
+    finally:
+        prior_bank.register_decode(
+            "family_chunked",
+            supports_full=original.supports_full,
+            supports_chunked=original.supports_chunked,
+            family_consistent=original.family_consistent,
+            fused_ce=original.fused_ce,
+            covariance_kinds=original.covariance_kinds,
+            can_omit_base_mean=original.can_omit_base_mean,
+            can_omit_base_variance=original.can_omit_base_variance,
+            override=True,
+        )(original.callable)
+
+    restored = prior_bank.get_decode_registration("family_chunked")
+    assert restored.callable is original.callable
+    assert restored.fused_ce is original.fused_ce
+    assert restored == original
 
 
 # -- (e) the route still runs end to end at a binding ceiling ------------------------------------

@@ -46,8 +46,9 @@ import torch.utils.checkpoint as _checkpoint
 from torch import nn
 
 from vfe3.belief import BeliefState
-from vfe3.divergence import family_cov_kind, get_family, get_functional, kl
+from vfe3.divergence import family_cov_kind, get_family, get_functional, kl, renyi
 from vfe3.families.base import _logdet_chol
+from vfe3.families.gaussian import FullGaussian, full_cov_kl_precision
 from vfe3.families.covariance_tables import (
     covariance_from_packed,
     packed_from_covariance,
@@ -129,11 +130,68 @@ DECODE_CE_FAMILY_WORKSPACE_BYTES: int = 1024 ** 3      # 1 GiB transient ceiling
 DECODE_CE_FAMILY_WORKSETS: int = 2
 
 
+def _uses_canonical_full_family_decode(
+    pb:       'PriorBank',
+    mu_q:     torch.Tensor,
+    sigma_q:  torch.Tensor,
+) -> bool:
+    r"""Whether a family-consistent full decode is exactly the analytic KL decoder.
+
+    This deliberately resolves the live registries and compares identities rather than names:
+    users may replace the ``gaussian_full`` family or ``renyi`` functional under their original
+    public names, in which case the generic family route remains the authoritative behavior.
+    """
+    if get_family(pb.family) is not FullGaussian or get_functional(pb.divergence_family) is not renyi:
+        return False
+    if type(pb.renyi_order) not in (int, float) or pb.renyi_order != 1.0:
+        return False
+    if full_cov_kl_precision() != "fp32_escalate" or decode_av_precision() != "fp32":
+        return False
+
+    # Do not call _decode_sigma_log_table() here.  For the model-channel full path it materializes
+    # marginal decode variances from the packed table, and the analytic delegate must materialize
+    # that vocabulary table only once in its actual scoring body.
+    if pb.untie_decode_bank:
+        raw_decode_tables = (
+            getattr(pb, "decode_mu_embed", None),
+            getattr(pb, "decode_sigma_log_embed", None),
+        )
+    elif pb.prior_source == "model_channel":
+        raw_decode_tables = (
+            getattr(pb, "s_mu_embed", None),
+            getattr(pb, "s_sigma_log_embed", None),
+            getattr(pb, "s_sigma_lower_embed", None),
+        )
+    else:
+        raw_decode_tables = (
+            getattr(pb, "mu_embed", None),
+            getattr(pb, "sigma_log_embed", None),
+        )
+    if any(table is None for table in raw_decode_tables):
+        return False
+    dtypes = (mu_q.dtype, sigma_q.dtype, *(table.dtype for table in raw_decode_tables),
+              pb.decode_log_scale.dtype)
+    return dtypes[0] in (torch.float32, torch.float64) and all(dtype == dtypes[0] for dtype in dtypes)
+
+
+def _decode_ce_workspace_scalar_bytes(
+    ref: torch.Tensor,
+    workspace_bytes_per_scalar: Optional[int],
+) -> int:
+    r"""Resolve the optional scalar-byte override while keeping byte arithmetic integral."""
+    scalar_bytes = ref.element_size() if workspace_bytes_per_scalar is None else workspace_bytes_per_scalar
+    if type(scalar_bytes) is not int or scalar_bytes <= 0:
+        raise ValueError("workspace_bytes_per_scalar must be a positive integer")
+    return scalar_bytes
+
+
 def _decode_ce_chunk_activation_bytes(
     ref:         torch.Tensor,            # (B, N, ...) tensor sharing the closure's (B, N) and dtype
     chunk_width: int,                     # Vc for this iteration
     inner:       int                = 1,   # extra trailing-dim multiplier (e.g. K or K*K) the
                                             # closure's largest workspace carries beyond (B, N, Vc)
+    *,
+    workspace_bytes_per_scalar: Optional[int] = None,
 ) -> int:
     r"""Bytes of the largest (B, N, chunk_width[, inner]) tensor a decode_ce_*_chunked kernel's
     ``_chunk_summaries`` closure actually materializes for THIS chunk, at ``ref``'s dtype -- the
@@ -143,8 +201,9 @@ def _decode_ce_chunk_activation_bytes(
     (K, K) axis (``decode_ce_expected_likelihood_chunked``, ``decode_ce_family_chunked``) report
     that workspace's true size rather than under-counting it as (B, N, Vc).
     """
+    scalar_bytes = _decode_ce_workspace_scalar_bytes(ref, workspace_bytes_per_scalar)
     batch, positions = ref.shape[0], ref.shape[1]
-    return batch * positions * chunk_width * inner * ref.element_size()
+    return batch * positions * chunk_width * inner * scalar_bytes
 
 
 def _decode_ce_should_checkpoint(
@@ -175,6 +234,8 @@ def _decode_ce_family_effective_chunk(
     requested: int,                       # pb.decode_chunk_size (or an explicit chunk_size override)
     inner:     int,                       # trailing-dim multiplier the functional workspace carries
     worksets:  int = DECODE_CE_FAMILY_WORKSETS,
+    *,
+    workspace_bytes_per_scalar: Optional[int] = None,
 ) -> int:                                 # vocab slice width that keeps the transient under the cap
     r"""Narrow a decode vocab slice so a FULL family's functional workspace stays bounded.
 
@@ -190,12 +251,33 @@ def _decode_ce_family_effective_chunk(
     a slice is a TILING change, not a numerical one: the vocabulary reduction is a logsumexp over
     independent slices, so value and gradient are identical at any width.
     """
+    scalar_bytes = _decode_ce_workspace_scalar_bytes(ref, workspace_bytes_per_scalar)
     if inner <= 1:
         return requested
-    per_entry = ref.shape[0] * ref.shape[1] * inner * worksets * ref.element_size()
+    per_entry = ref.shape[0] * ref.shape[1] * inner * worksets * scalar_bytes
     if per_entry <= 0:
         return requested
     return max(1, min(requested, DECODE_CE_FAMILY_WORKSPACE_BYTES // per_entry))
+
+
+def _full_family_workspace_bytes_per_scalar(
+    family_cls: type,
+    ref: torch.Tensor,
+    *public_operands: torch.Tensor,
+) -> int:
+    r"""Return a conservative call-time workspace scalar size for the built-in full Gaussian.
+
+    The full Gaussian may compute its pair grid in fp64 under every supported full-covariance
+    precision policy (unconditionally for ``fp64`` and on escalation for the fp32 policies), and
+    any public fp64 operand selects that public dtype directly.  This is intentionally identity-
+    scoped to the resolved built-in :class:`FullGaussian`: custom family/functionals expose no
+    workspace contract, so their existing reference-dtype sizing remains untouched.
+    """
+    if family_cls is FullGaussian and (
+            any(operand.dtype == torch.float64 for operand in public_operands)
+            or full_cov_kl_precision() in ("fp64", "fp32_escalate", "fp32_escalate_cond")):
+        return 8
+    return ref.element_size()
 
 
 def _decode_av_lhs(
@@ -1715,6 +1797,17 @@ class PriorBank(nn.Module):
         ``family`` decode -> cross-entropy. The unigram-prior chunk-slice add and the z_loss_weight
         term follow ``decode_ce_diagonal_chunked`` (see there); both default OFF.
         """
+        if _uses_canonical_full_family_decode(self, mu_q, sigma_q):
+            return self.decode_ce_full_chunked(
+                mu_q,
+                sigma_q,
+                targets,
+                z_loss_weight=z_loss_weight,
+                tau=tau,
+                chunk_size=chunk_size,
+                ignore_index=ignore_index,
+            )
+
         self._validate_fused_ce_targets(targets, ignore_index=ignore_index)
         tau_eff = self._tau_eff(tau)
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
@@ -1728,7 +1821,12 @@ class PriorBank(nn.Module):
         # the shared decode_chunk_size -- sized for the (B, N, Vc) kernels -- has to be re-read in
         # this route's own units (audit 2026-08-07). Inert for a diagonal family (inner == 1).
         inner = self.K * self.K if is_full else 1
-        chunk = _decode_ce_family_effective_chunk(mu_q, chunk, inner)
+        workspace_bytes_per_scalar = _full_family_workspace_bytes_per_scalar(
+            family_cls, mu_q, mu_q, sigma_q,
+        )
+        chunk = _decode_ce_family_effective_chunk(
+            mu_q, chunk, inner, workspace_bytes_per_scalar=workspace_bytes_per_scalar,
+        )
 
         sigma_v_all = bounded_variance_from_log(
             self._decode_sigma_log_table(), eps=self.eps,
@@ -1822,7 +1920,9 @@ class PriorBank(nn.Module):
         # triangular-solve buffers the full route really allocates (families/gaussian.py:117-118),
         # which the one-tensor estimate halved.
         activation_bytes = _decode_ce_chunk_activation_bytes(
-            mu_q, V, inner=inner * (DECODE_CE_FAMILY_WORKSETS if is_full else 1))
+            mu_q, V, inner=inner * (DECODE_CE_FAMILY_WORKSETS if is_full else 1),
+            workspace_bytes_per_scalar=workspace_bytes_per_scalar,
+        )
         should_checkpoint = _decode_ce_should_checkpoint(
             self.decode_ce_checkpoint, grad_active, activation_bytes)
 
@@ -2180,7 +2280,17 @@ def _family_logits(
     )                                                                       # (V, K) diagonal prior variances
     mu_v_all = pb._decode_mu_table()                                        # (V, K) decode table (untied if set)
 
-    width = V if chunk is None else max(1, min(int(chunk), V))
+    if chunk is None:
+        width = V
+    else:
+        requested = max(1, min(int(chunk), V))
+        inner = pb.K * pb.K if is_full else 1
+        workspace_bytes_per_scalar = _full_family_workspace_bytes_per_scalar(
+            family_cls, mu_q, mu_q, sigma_q,
+        )
+        width = _decode_ce_family_effective_chunk(
+            mu_q, requested, inner, workspace_bytes_per_scalar=workspace_bytes_per_scalar,
+        )
     slices = []
     for v0 in range(0, V, width):
         v1 = min(v0 + width, V)
@@ -2254,6 +2364,8 @@ def _decode_family_chunked(
     here, which is what makes the mode usable at realistic N. Value-identical to ``decode_mode=
     'family'``: both call ``_family_logits``, differing only in the slice width.
     """
+    if _uses_canonical_full_family_decode(pb, mu_q, sigma_q):
+        return _decode_full_chunked(pb, mu_q, sigma_q, tau_eff)
     return _family_logits(pb, mu_q, sigma_q, tau_eff, chunk=pb.decode_chunk_size)
 
 
