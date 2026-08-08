@@ -34,6 +34,7 @@ import pytest
 import torch
 
 import vfe3.model.prior_bank as prior_bank
+from vfe3.families.gaussian import FullGaussian, set_full_cov_kl_precision
 from vfe3.model.prior_bank import (
     DECODE_CE_FAMILY_WORKSETS,
     _decode_ce_chunk_activation_bytes,
@@ -90,6 +91,35 @@ def test_effective_chunk_never_widens_the_request():
     r"""The ceiling is a cap, not a target: a user asking for a narrow slice keeps it."""
     ref = torch.empty(2, 5, 20)
     assert _decode_ce_family_effective_chunk(ref, 3, 20 * 20) == 3
+
+
+def test_effective_chunk_honors_an_explicit_fp64_scalar_cost(monkeypatch):
+    r"""An fp64 functional workspace admits half as many entries as fp32 at the same budget."""
+    monkeypatch.setattr(prior_bank, "DECODE_CE_FAMILY_WORKSPACE_BYTES", 960)
+    ref = torch.empty(1, 1, 4)
+
+    fp32_width = _decode_ce_family_effective_chunk(
+        ref, 100, inner=10, workspace_bytes_per_scalar=4,
+    )
+    fp64_width = _decode_ce_family_effective_chunk(
+        ref, 100, inner=10, workspace_bytes_per_scalar=8,
+    )
+
+    assert fp32_width == 12
+    assert fp64_width == 6
+
+
+@pytest.mark.parametrize("invalid", [0, -1, 1.5, True])
+def test_workspace_scalar_byte_overrides_require_positive_plain_integers(invalid):
+    r"""Byte counts are discrete; floats and bools must not leak into workspace arithmetic."""
+    ref = torch.empty(1, 1, 4)
+
+    with pytest.raises(ValueError, match="positive integer"):
+        _decode_ce_chunk_activation_bytes(ref, 1, workspace_bytes_per_scalar=invalid)
+    with pytest.raises(ValueError, match="positive integer"):
+        _decode_ce_family_effective_chunk(
+            ref, 1, inner=4, workspace_bytes_per_scalar=invalid,
+        )
 
 
 # -- (b) narrowing is value- and gradient-identical ---------------------------------------------
@@ -167,6 +197,130 @@ def test_narrowed_slices_match_the_unnarrowed_gradient(monkeypatch, spy):
     assert torch.allclose(wide, narrow, rtol=0, atol=1e-6)
     assert torch.isfinite(narrow).all()
     assert narrow.abs().sum() > 0, "a zero gradient would satisfy the equality vacuously"
+
+
+def test_registered_chunked_logits_tile_full_family_at_the_workspace_ceiling(monkeypatch, spy):
+    r"""``decode`` must bound the real full-family functional, not merely fused CE."""
+    model, pb = _bank(decode_chunk_size=20)
+    mu, sigma, _ = _inputs(model)
+    V = pb.vocab_size
+    monkeypatch.setattr(prior_bank, "DECODE_CE_FAMILY_WORKSPACE_BYTES", _one_entry_budget(model))
+
+    logits = pb.decode(mu, sigma)
+
+    assert logits.shape[-1] == V
+    assert spy == [1] * V
+
+
+def test_registered_chunked_logits_preserve_values_when_workspace_retiles(monkeypatch, spy):
+    r"""Changing only the workspace tiling cannot change logits or omit a vocabulary slice."""
+    model, pb = _bank(decode_chunk_size=20)
+    mu, sigma, _ = _inputs(model)
+    V = pb.vocab_size
+
+    wide = pb.decode(mu, sigma)
+    wide_widths = list(spy)
+    spy.clear()
+    monkeypatch.setattr(prior_bank, "DECODE_CE_FAMILY_WORKSPACE_BYTES", _one_entry_budget(model))
+    narrow = pb.decode(mu, sigma)
+
+    assert wide_widths == [V]
+    assert spy == [1] * V
+    assert sum(spy) == V
+    assert torch.allclose(wide, narrow, rtol=0, atol=1e-6)
+
+
+def test_dense_family_logits_remain_one_full_vocabulary_call_under_workspace_cap(monkeypatch, spy):
+    r"""The dense ``family`` mode intentionally has no workspace-retiling contract."""
+    model = _tiny_model(
+        gauge_group="block_glk", n_heads=2, family="gaussian_full", decode_mode="family",
+        renyi_order=0.5, decode_chunk_size=20,
+    )
+    pb = model.prior_bank
+    mu, sigma, _ = _inputs(model)
+    monkeypatch.setattr(prior_bank, "DECODE_CE_FAMILY_WORKSPACE_BYTES", _one_entry_budget(model))
+
+    logits = pb.decode(mu, sigma)
+
+    assert logits.shape[-1] == pb.vocab_size
+    assert spy == [pb.vocab_size]
+
+
+def test_fp64_full_family_uses_eight_byte_workspace_for_fused_ce_and_registered_logits(
+        monkeypatch, spy):
+    r"""The full Gaussian's fp64 compute island governs both public fp32 family routes."""
+    previous = set_full_cov_kl_precision("fp64")
+    try:
+        model, pb = _bank(decode_chunk_size=20)
+        mu, sigma, targets = _inputs(model)
+        V = pb.vocab_size
+        # This admits all V fp32 entries but only half as many fp64 entries.
+        fp32_whole_vocab = _one_entry_budget(model) * V
+        monkeypatch.setattr(prior_bank, "DECODE_CE_FAMILY_WORKSPACE_BYTES", fp32_whole_vocab)
+
+        ce = pb.decode_ce_family_chunked(mu, sigma, targets)
+        fused_widths = list(spy)
+        spy.clear()
+        logits = pb.decode(mu, sigma)
+
+        assert torch.isfinite(ce)
+        assert logits.shape[-1] == V
+        assert fused_widths == [V // 2, V - V // 2]
+        assert spy == [V // 2, V - V // 2]
+    finally:
+        set_full_cov_kl_precision(previous)
+
+
+def test_fp64_full_family_checkpoint_gate_uses_eight_byte_whole_vocabulary_estimate(monkeypatch):
+    r"""The fp64 full family must checkpoint when its eight-byte estimate crosses the threshold."""
+    previous = set_full_cov_kl_precision("fp64")
+    try:
+        model, pb = _bank(decode_chunk_size=20, decode_ce_checkpoint="auto")
+        mu, sigma, targets = _inputs(model)
+        V = pb.vocab_size
+        four_byte = _decode_ce_chunk_activation_bytes(
+            mu, V, inner=model.cfg.embed_dim ** 2 * DECODE_CE_FAMILY_WORKSETS,
+        )
+        eight_byte = 2 * four_byte
+        assert four_byte < 38_400 < eight_byte
+        monkeypatch.setattr(prior_bank, "DECODE_CE_CHECKPOINT_AUTO_BYTES", 38_400)
+        seen = []
+        real_gate = prior_bank._decode_ce_should_checkpoint
+
+        def _recording_gate(mode, grad_active, activation_bytes):
+            decision = real_gate(mode, grad_active, activation_bytes)
+            seen.append((activation_bytes, decision))
+            return decision
+
+        monkeypatch.setattr(prior_bank, "_decode_ce_should_checkpoint", _recording_gate)
+        pb.decode_ce_family_chunked(mu, sigma, targets)
+
+        assert seen == [(eight_byte, True)]
+    finally:
+        set_full_cov_kl_precision(previous)
+
+
+def test_fp64_workspace_override_leaves_diagonal_family_sizing_unchanged():
+    r"""Only full-family workspaces enter the fp64 island; diagonal family sizing stays inert."""
+    previous = set_full_cov_kl_precision("fp64")
+    try:
+        ref = torch.empty(2, 5, 4)
+        assert _decode_ce_family_effective_chunk(
+            ref, 17, inner=1, workspace_bytes_per_scalar=8,
+        ) == 17
+    finally:
+        set_full_cov_kl_precision(previous)
+
+
+@pytest.mark.parametrize("policy", ["fp32_escalate", "fp32_escalate_cond"])
+def test_full_gaussian_workspace_reserves_fp64_for_escalation_policies(policy):
+    r"""Both escalation policies can recompute a full-family grid in fp64."""
+    previous = set_full_cov_kl_precision(policy)
+    try:
+        ref = torch.empty(2, 5, 4)
+        assert prior_bank._full_family_workspace_bytes_per_scalar(FullGaussian, ref, ref) == 8
+    finally:
+        set_full_cov_kl_precision(previous)
 
 
 def test_declining_the_prior_hoist_still_promotes_each_slice(monkeypatch, spy):
