@@ -10,8 +10,15 @@ import torch
 
 import vfe3.model.prior_bank as prior_bank
 from tests.test_amp import _tiny_model
-from vfe3.divergence import get_functional, register_functional, renyi
+from vfe3.divergence import (
+    get_family,
+    get_functional,
+    register_family,
+    register_functional,
+    renyi,
+)
 from vfe3.families.gaussian import (
+    FullGaussian,
     full_cov_kl_precision,
     set_full_cov_kl_precision,
 )
@@ -24,17 +31,19 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 def _restore_process_globals():
     previous_full = set_full_cov_kl_precision("fp32_escalate")
     previous_av = prior_bank.set_decode_av_precision("fp32")
+    previous_family = get_family("gaussian_full")
     previous_renyi = get_functional("renyi")
     try:
         yield
     finally:
+        register_family("gaussian_full", override=True)(previous_family)
         register_functional("renyi", override=True)(previous_renyi)
         set_full_cov_kl_precision(previous_full)
         prior_bank.set_decode_av_precision(previous_av)
 
 
 def _bank(*, decode_mode="family_chunked", renyi_order=1.0, divergence_family="renyi",
-          decode_unigram_prior=True):
+          decode_unigram_prior=True, untie_decode_bank=True, prior_source="model_channel"):
     model = _tiny_model(
         vocab_size=17,
         embed_dim=4,
@@ -47,7 +56,8 @@ def _bank(*, decode_mode="family_chunked", renyi_order=1.0, divergence_family="r
         decode_chunk_size=5,
         renyi_order=renyi_order,
         divergence_family=divergence_family,
-        untie_decode_bank=True,
+        untie_decode_bank=untie_decode_bank,
+        prior_source=prior_source,
         decode_unigram_prior=decode_unigram_prior,
         unigram_kappa=0.7 if decode_unigram_prior else 1.0,
     ).to(DEVICE)
@@ -205,8 +215,12 @@ def test_same_name_runtime_renyi_override_keeps_the_generic_oracle():
 
     register_functional("renyi", override=True)(overridden)
     try:
-        _assert_generic_oracle(pb, mu, sigma)
-        assert calls > 0
+        logits = pb.decode(mu, sigma, tau=0.83)
+        assert calls > 0, "the registered family decode must invoke the override itself"
+        calls_after_decode = calls
+        reference = pb.reference_decode(mu, sigma, tau=0.83)
+        assert calls > calls_after_decode, "the reference oracle must be a separate functional call"
+        torch.testing.assert_close(logits, reference, atol=5e-6, rtol=2e-5)
     finally:
         register_functional("renyi", override=True)(builtin)
 
@@ -244,3 +258,31 @@ def test_canonical_non_pd_query_is_uniform_and_excluded_like_ignore_index():
     ignored[0, 1] = -100
     explicit = pb.decode_ce_family_chunked(mu, sigma, ignored)
     assert torch.equal(automatic, explicit)
+
+
+def test_same_name_family_override_then_restore_falls_closed_to_generic_logits_and_ce():
+    """A bank built under a diagonal same-name override has no packed full-covariance table."""
+    builtin = get_family("gaussian_full")
+
+    class DiagonalClaimingFullGaussian(FullGaussian):
+        cov_kind = "diagonal"
+
+    register_family("gaussian_full", override=True)(DiagonalClaimingFullGaussian)
+    try:
+        _, pb = _bank(untie_decode_bank=False, prior_source="model_channel")
+    finally:
+        register_family("gaussian_full", override=True)(builtin)
+
+    assert not hasattr(pb, "s_sigma_lower_embed")
+    mu, sigma, targets = _spd_inputs()
+    logits = pb.decode(mu, sigma)
+    reference = pb.reference_decode(mu, sigma)
+    torch.testing.assert_close(logits, reference, atol=5e-6, rtol=2e-5)
+    fused = pb.decode_ce_family_chunked(mu, sigma, targets)
+    valid = targets != -100
+    local_targets = targets.clamp_min(0)
+    expected_per_position = torch.logsumexp(reference, dim=-1) - reference.gather(
+        -1, local_targets.unsqueeze(-1),
+    ).squeeze(-1)
+    expected = expected_per_position[valid].mean()
+    torch.testing.assert_close(fused, expected, atol=5e-6, rtol=2e-5)

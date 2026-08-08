@@ -228,28 +228,29 @@ def test_workspace_estimate_counts_both_solve_buffers():
     assert both == 2 * one
 
 
-# -- (f) decode_av_precision is reported inert on the family route -------------------------------
+# -- (f) decode_av_precision is inert only on generic family routes -------------------------------
 
 def test_decode_av_precision_is_reported_inert_on_the_family_route():
-    r"""The family route never calls _decode_av, so tuning its precision must not fail silently.
+    r"""The canonical full family dispatch reads the precision policy; generic routes do not.
 
-    ``decode_av_precision`` is accepted, validated (config.py:2379) and published process-wide
-    (model.py:258), but its only reader is ``_decode_av`` (prior_bank.py:180), which the
-    family-consistent kernels do not call -- they hand the pair to the registered functional, whose
-    precision is ``full_cov_kl_precision``. Before audit 2026-08-07 the dead-knob oracle had no rule
-    for it, so the setting was silently ignored.
+    Under built-in full Gaussian / built-in Renyi(alpha=1) with ``full_cov_kl_precision='fp32_escalate'``,
+    switching ``decode_av_precision`` selects between the analytic and generic family routes, so it
+    must not be reported inert. A noncanonical order remains generic and must retain the warning.
     """
     from vfe3.config import VFE3Config
 
     base = dict(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                 use_prior_bank=True, family="gaussian_full", gauge_group="block_glk")
 
-    def _inert_mentions(mode):
+    def _inert_mentions(mode, **overrides):
         with pytest.warns(Warning) as record:
-            VFE3Config(**base, decode_mode=mode, decode_av_precision="fp64")
+            VFE3Config(**base, decode_mode=mode, decode_av_precision="fp64", **overrides)
         return any("decode_av_precision" in str(r.message) for r in record)
 
-    assert _inert_mentions("family_chunked"), "the family route must report the knob inert"
+    canonical = dict(renyi_order=1.0, full_cov_kl_precision="fp32_escalate")
+    assert not _inert_mentions("family_chunked", **canonical)
+    assert _inert_mentions("family_chunked", renyi_order=0.5,
+                           full_cov_kl_precision="fp32_escalate")
     # full_chunked genuinely reads it, so it must NOT be reported inert there.
     assert not _inert_mentions("full_chunked"), "full_chunked reads _decode_av -- not inert"
 

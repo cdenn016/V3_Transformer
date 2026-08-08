@@ -152,11 +152,21 @@ def _uses_canonical_full_family_decode(
     # marginal decode variances from the packed table, and the analytic delegate must materialize
     # that vocabulary table only once in its actual scoring body.
     if pb.untie_decode_bank:
-        raw_decode_tables = (pb.decode_mu_embed, pb.decode_sigma_log_embed)
+        raw_decode_tables = (
+            getattr(pb, "decode_mu_embed", None),
+            getattr(pb, "decode_sigma_log_embed", None),
+        )
     elif pb.prior_source == "model_channel":
-        raw_decode_tables = (pb.s_mu_embed, pb.s_sigma_log_embed, pb.s_sigma_lower_embed)
+        raw_decode_tables = (
+            getattr(pb, "s_mu_embed", None),
+            getattr(pb, "s_sigma_log_embed", None),
+            getattr(pb, "s_sigma_lower_embed", None),
+        )
     else:
-        raw_decode_tables = (pb.mu_embed, pb.sigma_log_embed)
+        raw_decode_tables = (
+            getattr(pb, "mu_embed", None),
+            getattr(pb, "sigma_log_embed", None),
+        )
     if any(table is None for table in raw_decode_tables):
         return False
     dtypes = (mu_q.dtype, sigma_q.dtype, *(table.dtype for table in raw_decode_tables),

@@ -3376,18 +3376,31 @@ class VFE3Config:
                 "'diagonal_chunked'/'full_chunked'/'family_chunked'/'expected_likelihood_chunked', "
                 "or use_prior_bank=False, route through a checkpointed chunked CE kernel)")
         # decode_av_precision governs the working dtype of _decode_av (prior_bank.py:180), the
-        # expanded a_v form. Only the closed-form kernels call it -- diagonal / diagonal_chunked /
-        # full / full_chunked (prior_bank.py:1196, 1218, 1394, 1416, 1938, 2050). A FAMILY-consistent
-        # decode does not: it builds the pair and hands it to the registered functional, whose
-        # precision is governed by full_cov_kl_precision instead. Setting it there was silently
-        # ignored (audit 2026-08-07) -- the dead-knob oracle had no rule for it, so a user tuning
-        # decode precision on the family route got no signal at all.
+        # expanded a_v form. Generic family-consistent decodes hand the pair to a registered
+        # functional and therefore leave it inert, but the built-in full-Gaussian / built-in
+        # Renyi(alpha=1) family_chunked configuration now delegates to full_chunked under the
+        # fp32-escalate policy. There it selects whether that analytic delegate is eligible, so it
+        # is live even when its changed value disables the delegate and keeps the generic route.
+        from vfe3.divergence import get_functional, renyi
+        from vfe3.families.gaussian import FullGaussian
+        canonical_family_dispatch_reachable = (
+            self.use_prior_bank
+            and _active_decode_mode == "family_chunked"
+            and _family_cls is FullGaussian
+            and get_functional(self.divergence_family) is renyi
+            and type(self.renyi_order) in (int, float)
+            and self.renyi_order == 1.0
+            and self.full_cov_kl_precision == "fp32_escalate"
+        )
         if (_decode_registry[_active_decode_mode].family_consistent
+                and not canonical_family_dispatch_reachable
                 and _changed("decode_av_precision")):
             _inert.append(
                 f"decode_av_precision={self.decode_av_precision!r} (decode_mode="
-                f"{self.decode_mode!r} is family-consistent: it routes through the registered "
-                "divergence functional, not _decode_av -- use full_cov_kl_precision instead)")
+                f"{self.decode_mode!r} is on the generic family-consistent route: it invokes the "
+                "registered divergence functional, not _decode_av -- the analytic exception is "
+                "built-in gaussian_full + built-in Renyi(alpha=1) + "
+                "full_cov_kl_precision='fp32_escalate')")
         if _inert:
             import warnings
             warnings.warn(
