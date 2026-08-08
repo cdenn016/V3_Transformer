@@ -1,6 +1,6 @@
 # Gaussian-Full Chunked Decoder Speedups Design
 
-Date: 2026-08-08  
+Date: 2026-08-08
 Approved basis: `docs/audits/gaussian-full-chunked-performance-2026-08-08.md` and the user's instruction to begin fixes.
 
 ## Goal
