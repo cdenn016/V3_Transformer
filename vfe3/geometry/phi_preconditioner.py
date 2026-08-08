@@ -97,6 +97,32 @@ _PHI_GROUP_MIN_UNDAMPED_EIG: float = 1e-8
 _PHI_GROUP_MAX_DAMPED_COND: float  = 1e6
 _PHI_GROUP_SOLVE_RESIDUAL: float   = 1e-10
 
+# How the trivialized exponential differentials Psi_R / Psi_L are evaluated (audit 2026-08-08).
+#
+# "series"   -- the truncated power series with the geometric-majorant certificate. The historical
+#               default, and still the default: it is basis-agnostic, real-arithmetic, and has no
+#               conditioning failure mode.
+# "spectral" -- the exact Daleckii-Krein closed form. Psi(ad_X) is diagonal in the eigenbasis of
+#               ad_X, whose eigenvalues are lam_i - lam_j for lam = eig(X), so ONE d x d
+#               eigendecomposition replaces the whole matmul ladder. Exact in exact arithmetic:
+#               there is no truncation and hence no order to certify.
+#
+# OPT-IN, because the closed form trades a truncation error for a CONDITIONING one. It needs
+# P = eigenvectors(X), and X is a general real matrix built from an unconstrained gradient: it can
+# be defective (P singular, no eigenbasis at all) and is near-defective on a set of positive
+# measure. Measured loss is about 2*log10(kappa(P)) digits. At the live phi scale kappa(P) has
+# median 11 / p99 70 / max 117 over 400 draws, i.e. ~12 digits retained -- comfortable -- but the
+# guards below fall back to the series rather than trusting that in general.
+_PHI_GROUP_DIFFERENTIAL_MODES = ("series", "spectral")
+_PHI_GROUP_DIFFERENTIAL_MODE: str = "series"
+# kappa_F(P) = ||P||_F ||P^-1||_F, an upper bound on kappa_2(P), so the trigger is conservative:
+# it can fall back when the true conditioning is fine, never the reverse.
+_PHI_GROUP_SPECTRAL_MAX_COND: float = 1e6
+# Psi(ad_X) is a real operator on a real algebra, so its coordinate matrix must come out real. A
+# nonneglible imaginary residue is the eigendecomposition telling us it failed -- a free check on
+# tensors already computed, and the reason the spectral route can fail closed rather than silently.
+_PHI_GROUP_SPECTRAL_MAX_IMAG: float = 1e-8
+
 _STRICT_PULLBACK_PREP_CACHE_MAXSIZE: int = 32
 _STRICT_PULLBACK_PREP_CACHE: OrderedDict[
     tuple,
@@ -325,6 +351,131 @@ def _adaptive_phi_differentials(
     )
 
 
+def set_phi_group_differential_mode(mode: str) -> str:
+    r"""Set the process-wide Psi evaluation route; returns the previous value."""
+    global _PHI_GROUP_DIFFERENTIAL_MODE
+    if mode not in _PHI_GROUP_DIFFERENTIAL_MODES:
+        raise ValueError(
+            f"phi group differential mode must be one of {_PHI_GROUP_DIFFERENTIAL_MODES}, "
+            f"got {mode!r}"
+        )
+    previous = _PHI_GROUP_DIFFERENTIAL_MODE
+    _PHI_GROUP_DIFFERENTIAL_MODE = mode
+    return previous
+
+
+def phi_group_differential_mode() -> str:
+    r"""Return the active Psi evaluation route."""
+    return _PHI_GROUP_DIFFERENTIAL_MODE
+
+
+def _sinhc(u: torch.Tensor) -> torch.Tensor:
+    r"""``sinh(u)/u`` continued to ``u = 0``, for complex ``u``.
+
+    This is what makes the closed form need no branch at a repeated eigenvalue. The naive quotient
+    ``(exp(z) - 1)/z`` is 0/0 exactly where ``lam_i == lam_j``, which is not a rare input -- it is
+    the ENTIRE diagonal ``i == j`` of every single evaluation. Rewriting through ``sinh`` moves the
+    singularity into a function that is entire, so the limit is a value rather than a special case.
+    The small-argument series is for floating point, not for the mathematics: near zero the
+    subtraction inside ``sinh`` cancels, so the quotient loses precision long before it loses
+    meaning.
+    """
+    small = u.abs() < 1e-6
+    u_safe = torch.where(small, torch.ones_like(u), u)
+    series = 1.0 + u * u / 6.0 + (u ** 4) / 120.0
+    return torch.where(small, series, torch.sinh(u_safe) / u_safe)
+
+
+def _spectral_phi_differentials(
+    phi:         torch.Tensor,            # (..., n_gen) float64 chart coordinates
+    preparation: "_StrictBasisPreparation",
+) -> "tuple[torch.Tensor, torch.Tensor] | None":
+    r"""Exact ``Psi_R(ad_X)`` and ``Psi_L(ad_X)`` in generator coordinates, or None to fall back.
+
+    ``ad_X`` acting on the algebra has eigenvectors ``P E_ij P^-1`` with eigenvalues
+    ``lam_i - lam_j``, where ``X = P diag(lam) P^-1``. So for any analytic ``f``,
+
+        f(ad_X)(T) = P [ f(lam_i - lam_j) . (P^-1 T P) ] P^-1              (. = entrywise)
+
+    -- the Daleckii-Krein divided-difference form (Higham, *Functions of Matrices*, 2008, §3.2).
+    With ``z = lam_i - lam_j`` and ``u = z/2``:
+
+        Psi_R(z) = (e^z - 1)/z = e^u sinhc(u),   Psi_L(z) = (1 - e^-z)/z = e^-u sinhc(u)
+
+    which is ``Psi_L(z) = Psi_R(-z)``, matching the alternating sign the series branch carries.
+    NOTE this is Psi ALONE, not the full differential: the caller multiplies by ``exp(phi)``
+    separately, so the ``e^{(lam_i + lam_j)/2}`` factor of the combined ``D exp`` does not belong
+    here.
+
+    Returned in the SAME convention the series branch produces -- column ``a`` holds the
+    coordinates of ``Psi(ad_X)(G_a)`` -- so the caller is unchanged. Coordinates are recovered
+    through the Gram matrix, so a non-orthonormal generator basis is handled rather than assumed.
+
+    Returns ``None`` (never raises) when the eigendecomposition fails, when ``kappa_F(P)`` exceeds
+    the bound, or when the imaginary residue is too large; the caller then runs the series.
+    """
+    basis = preparation.basis                                        # (n_gen, K, K) float64
+    X = torch.einsum("...a,aij->...ij", phi, basis)                  # (..., K, K)
+    try:
+        lam, P = torch.linalg.eig(X)                                 # complex (..., K), (..., K, K)
+        P_inv = torch.linalg.inv(P)
+    except Exception:                                                # defective X: no eigenbasis
+        return None
+    if not (bool(torch.isfinite(lam.real).all()) and bool(torch.isfinite(P.real).all())
+            and bool(torch.isfinite(P_inv.real).all())):
+        return None
+    cond = (torch.linalg.matrix_norm(P, dim=(-2, -1))
+            * torch.linalg.matrix_norm(P_inv, dim=(-2, -1))).abs()
+    if not bool((cond <= _PHI_GROUP_SPECTRAL_MAX_COND).all()):
+        return None
+
+    u = 0.5 * (lam.unsqueeze(-1) - lam.unsqueeze(-2))                # (..., K, K), u_ij
+    sinhc = _sinhc(u)
+    psi_r_entries = torch.exp(u) * sinhc                             # Psi_R(lam_i - lam_j)
+    psi_l_entries = torch.exp(-u) * sinhc                            # Psi_L(lam_i - lam_j)
+
+    basis_c = basis.to(P.dtype)
+
+    def _conjugate(entries: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        r"""``P [entries . (P^-1 target P)] P^-1`` over a trailing (..., m, K, K) stack."""
+        inner = torch.einsum("...ij,...ajk,...kl->...ail", P_inv, target, P)
+        return torch.einsum(
+            "...ij,...ajk,...kl->...ail", P, entries.unsqueeze(-3) * inner, P_inv,
+        )
+
+    def _real(value: torch.Tensor) -> "torch.Tensor | None":
+        scale = value.real.abs().amax(dim=(-2, -1), keepdim=True).clamp_min(1.0)
+        if not bool((value.imag.abs() <= _PHI_GROUP_SPECTRAL_MAX_IMAG * scale).all()):
+            return None                                              # eig failed; fail closed
+        return value.real.contiguous()
+
+    # RIGHT: return the pushed MATRICES, not coordinates. The caller's next line is
+    # ``pushed = einsum("...ca,cij->...aij", psi_right, basis)`` -- it expands the coordinate matrix
+    # straight back into matrices, so projecting onto the basis here only to have it undone is the
+    # single most expensive step in the routine (n_gen^2 K^2 per row, in complex arithmetic) and it
+    # is pure round trip. Handing back the matrices skips both halves.
+    pushed = _real(_conjugate(psi_r_entries, basis_c.expand(*P.shape[:-2], *basis_c.shape)))
+    if pushed is None:
+        return None
+
+    def _apply_left(v_phi: torch.Tensor) -> torch.Tensor:
+        r"""``Psi_L(ad_X) v_phi`` in coordinates, WITHOUT materializing Psi_L.
+
+        The series branch builds the full (n_gen, n_gen) operator and then uses it exactly once, on
+        one vector. Embedding that vector, conjugating it, and projecting the single result back is
+        O(K^3 + n_gen K^2) against O(n_gen^2 K^2) for build-then-apply.
+        """
+        embedded = torch.einsum("...b,bij->...ij", v_phi.to(P.dtype), basis_c)
+        conjugated = _conjugate(psi_l_entries, embedded.unsqueeze(-3)).squeeze(-3)
+        proj = torch.einsum("bij,...ij->...b", basis_c, conjugated)
+        coeff = (proj if preparation.gram_is_identity
+                 else torch.cholesky_solve(
+                     proj.unsqueeze(-1), preparation.gram_factor.to(proj.dtype)).squeeze(-1))
+        return coeff.real
+
+    return pushed, _apply_left
+
+
 def _build_strict_basis_preparation(
     basis: torch.Tensor,                  # (n_gen, K, K) float64 target-device basis
 ) -> _StrictBasisPreparation:
@@ -540,12 +691,26 @@ def _full_pullback_group_direction(
     basis_64 = preparation.basis
     structure = preparation.structure
     gram = preparation.gram
-    ad = torch.einsum("...a,abc->...cb", phi_64, structure)
-    psi_right, psi_left, series_order = _adaptive_phi_differentials(
-        ad,
-        require_uniform_leading_batch=require_uniform_series_order,
-    )
-    pushed = torch.einsum("...ca,cij->...aij", psi_right, basis_64)
+    # Psi_R / Psi_L, either exactly (spectral) or by certified truncation (series). Both return the
+    # SAME coordinate convention -- column a holds Psi(ad_X)(G_a) -- so everything below, including
+    # every certificate, the ridge and the Cholesky, is untouched by the choice (audit 2026-08-08).
+    # series_order = 0 marks the closed form: there is no truncation, so there is no order.
+    pushed = apply_left = None
+    series_order = 0
+    if _PHI_GROUP_DIFFERENTIAL_MODE == "spectral":
+        spectral = _spectral_phi_differentials(phi_64, preparation)
+        if spectral is not None:
+            pushed, apply_left = spectral
+    if pushed is None:
+        # Also the fallback when the spectral route declines (defective or ill-conditioned P),
+        # which is why that helper returns None rather than raising.
+        ad = torch.einsum("...a,abc->...cb", phi_64, structure)
+        psi_right, psi_left, series_order = _adaptive_phi_differentials(
+            ad,
+            require_uniform_leading_batch=require_uniform_series_order,
+        )
+        pushed = torch.einsum("...ca,cij->...aij", psi_right, basis_64)
+        apply_left = lambda v: torch.einsum("...ab,...b->...a", psi_left, v)   # noqa: E731
     exp_phi = torch.linalg.matrix_exp(torch.einsum("...a,aij->...ij", phi_64, basis_64))
     differential = torch.einsum("...aij,...jk->...aik", pushed, exp_phi)
     metric = torch.einsum("...aij,...bij->...ab", differential, differential)
@@ -603,7 +768,7 @@ def _full_pullback_group_direction(
             "strict phi group direction scaled solve residual "
             f"{maximum:.3e} exceeds {_PHI_GROUP_SOLVE_RESIDUAL:.1e}"
         )
-    xi = torch.einsum("...ab,...b->...a", psi_left, v_phi)
+    xi = apply_left(v_phi)
     finite = all(
         bool(torch.isfinite(value).all())
         for value in (v_phi, xi, undamped_condition)
