@@ -109,6 +109,25 @@ def decode_av_precision() -> str:
 
 DECODE_CE_CHECKPOINT_AUTO_BYTES: int = 2 * 1024 ** 3   # 2 GiB; see decode_ce_checkpoint in config.py
 
+# Transient per-chunk workspace ceiling for a FULL family's functional route (audit 2026-08-07).
+# ``decode_ce_family_chunked`` promotes the diagonal vocabulary prior with ``diag_embed`` and hands
+# the pair to the registered functional, whose workspace is (B, N, Vc, K, K) -- K^2 times the
+# (B, N, Vc) a diagonal family pays. ``decode_chunk_size`` is ONE knob shared by every decode kernel
+# and is sized for the inner=1 kernels, so the raw value reaches this route unscaled: at the live
+# B=64, N=128, K=20, chunk=8192 that is a measured 100.00 GiB allocation per chunk and an outright
+# ``CUDA out of memory``, against 6.9 GiB peak for the whole ``full_chunked`` decode at the identical
+# shape. This ceiling bounds the TRANSIENT peak by narrowing the slice; it does not change the
+# reduction, which is value-equal across widths (pinned by
+# tests/test_family_chunked_decode_20260807.py::test_decode_chunk_size_bounds_the_functional_workspace).
+DECODE_CE_FAMILY_WORKSPACE_BYTES: int = 1024 ** 3      # 1 GiB transient ceiling per vocab slice
+
+# ``_full_gaussian_kl_terms`` materializes TWO (B, N, Vc, K, K) tensors, not one: the forward
+# substitution ``Y = solve_triangular(L_p, sigma_q)`` and the back substitution
+# ``Z = solve_triangular(L_p^T, Y)`` (families/gaussian.py:117-118), both live simultaneously and
+# both retained into backward. Counting one was a 2x undercount of the only quantity the checkpoint
+# gate and the workspace ceiling are allowed to reason about.
+DECODE_CE_FAMILY_WORKSETS: int = 2
+
 
 def _decode_ce_chunk_activation_bytes(
     ref:         torch.Tensor,            # (B, N, ...) tensor sharing the closure's (B, N) and dtype
@@ -149,6 +168,34 @@ def _decode_ce_should_checkpoint(
     if checkpoint_mode == "never":
         return False
     return activation_bytes > DECODE_CE_CHECKPOINT_AUTO_BYTES               # "auto"
+
+
+def _decode_ce_family_effective_chunk(
+    ref:       torch.Tensor,              # (B, N, ...) tensor sharing the closure's (B, N) and dtype
+    requested: int,                       # pb.decode_chunk_size (or an explicit chunk_size override)
+    inner:     int,                       # trailing-dim multiplier the functional workspace carries
+    worksets:  int = DECODE_CE_FAMILY_WORKSETS,
+) -> int:                                 # vocab slice width that keeps the transient under the cap
+    r"""Narrow a decode vocab slice so a FULL family's functional workspace stays bounded.
+
+    ``decode_chunk_size`` is a single knob read by five decode kernels (prior_bank.py:1185, 1382,
+    1496, 1580, 1673) and is sized for the ones whose per-chunk workspace is ``(B, N, Vc)``. A full
+    family's is ``(B, N, Vc, K, K)`` -- ``K*K`` times larger, times ``worksets`` simultaneous copies
+    -- so the same integer means two very different amounts of memory depending on the family, and
+    the config validator has no family-aware rule for it (config.py:2515 checks only ``>= 1``).
+
+    Returns ``requested`` unchanged when ``inner <= 1`` (every diagonal kernel: byte-identical, this
+    helper is inert for them) and otherwise the largest width whose transient fits
+    ``DECODE_CE_FAMILY_WORKSPACE_BYTES``, floored at 1 so the loop always makes progress. Narrowing
+    a slice is a TILING change, not a numerical one: the vocabulary reduction is a logsumexp over
+    independent slices, so value and gradient are identical at any width.
+    """
+    if inner <= 1:
+        return requested
+    per_entry = ref.shape[0] * ref.shape[1] * inner * worksets * ref.element_size()
+    if per_entry <= 0:
+        return requested
+    return max(1, min(requested, DECODE_CE_FAMILY_WORKSPACE_BYTES // per_entry))
 
 
 def _decode_av_lhs(
@@ -1677,6 +1724,12 @@ class PriorBank(nn.Module):
         is_full = family_cls.cov_kind == "full"
         functional = get_functional(self.divergence_family)
 
+        # A FULL family's functional workspace is (B, N, Vc, K, K) x DECODE_CE_FAMILY_WORKSETS, so
+        # the shared decode_chunk_size -- sized for the (B, N, Vc) kernels -- has to be re-read in
+        # this route's own units (audit 2026-08-07). Inert for a diagonal family (inner == 1).
+        inner = self.K * self.K if is_full else 1
+        chunk = _decode_ce_family_effective_chunk(mu_q, chunk, inner)
+
         sigma_v_all = bounded_variance_from_log(
             self._decode_sigma_log_table(), eps=self.eps,
         )                                                                             # (V, K) diagonal prior
@@ -1740,22 +1793,50 @@ class PriorBank(nn.Module):
         lse_chunks = []
         target_logit = torch.zeros(mu_q.shape[:-1], device=mu_q.device, dtype=mu_q.dtype)  # (B, N)
 
+        # Promote the whole diagonal prior table ONCE rather than per slice when it is small enough
+        # to be worth it (audit 2026-08-07). The per-slice ``diag_embed`` writes the same (V, K, K)
+        # bytes in total but pays one kernel launch per slice, and this route now runs many more,
+        # narrower slices than the raw chunk implied; ``[v0:v1]`` of a promoted table is a view.
+        #
+        # GATED, because hoisting is not free at every shape. Under grad the per-slice tensors are
+        # all retained anyway (``checkpoint`` saves its inputs), so the totals match and hoisting is
+        # strictly fewer launches -- but under ``no_grad`` each slice would otherwise be freed as the
+        # loop advances, and materializing the whole table would raise the peak from one slice to
+        # V*K*K. At the live V=50257, K=20 that table is 80 MB; at K=210 it would be 8.9 GB. The
+        # ceiling keeps the hoist to shapes where it cannot become the new memory problem.
+        promoted_bytes = V * inner * sigma_v_all.element_size()
+        hoist_prior = is_full and promoted_bytes <= DECODE_CE_FAMILY_WORKSPACE_BYTES
+        sigma_v_full = torch.diag_embed(sigma_v_all) if hoist_prior else sigma_v_all   # (V, K[, K])
+
+        # Both of these are loop-INVARIANT: the checkpoint decision is now keyed on the whole-vocab
+        # retention (see below), and grad_active reads only the two leaves. Computing them per slice
+        # re-derived the same answer once per iteration.
+        grad_active = torch.is_grad_enabled() and (mu_q.requires_grad or mu_v_all.requires_grad)
+        # What "not checkpointing" actually costs is the workspace of EVERY slice, held live into
+        # backward at once -- not one slice's (audit 2026-08-07). That total is B*N*V*inner*itemsize,
+        # INVARIANT under the slice width, so gating on the per-slice figure made the decision a
+        # function of the very knob that cannot change it: narrowing the slice (which this route now
+        # does above to bound the transient) would have walked the per-slice estimate under the
+        # threshold and silently switched checkpointing OFF, retaining every slice instead of one.
+        # The width is passed as V, and `worksets` counts the two simultaneous (B, N, Vc, K, K)
+        # triangular-solve buffers the full route really allocates (families/gaussian.py:117-118),
+        # which the one-tensor estimate halved.
+        activation_bytes = _decode_ce_chunk_activation_bytes(
+            mu_q, V, inner=inner * (DECODE_CE_FAMILY_WORKSETS if is_full else 1))
+        should_checkpoint = _decode_ce_should_checkpoint(
+            self.decode_ce_checkpoint, grad_active, activation_bytes)
+
         for v0 in range(0, V, chunk):
             v1 = min(v0 + chunk, V)
             mu_v_c = mu_v_all[v0:v1]                                       # (Vc, K)
-            sigma_v_c = (torch.diag_embed(sigma_v_all[v0:v1]) if is_full
-                         else sigma_v_all[v0:v1])                          # (Vc, K[, K]) diag-embedded if full
+            sigma_v_c = sigma_v_full[v0:v1]                                # (Vc, K[, K])
+            if is_full and not hoist_prior:
+                sigma_v_c = torch.diag_embed(sigma_v_c)                    # table too large to hoist: promote per slice
             u_c = u_all[v0:v1] if u_all is not None else None              # (Vc,) or None
             in_chunk = (targets >= v0) & (targets < v1)                    # (B, N) bool
             in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
             local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
-            grad_active = torch.is_grad_enabled() and (mu_q.requires_grad or mu_v_all.requires_grad)
-            # The functional workspace is (B, N, Vc) for a diagonal family but (B, N, Vc, K, K) for a
-            # full one (diag_embed-promoted chunk, per the docstring above); size the estimate off
-            # the SAME is_full this closure branches on so 'auto' sees the workspace it really pays.
-            activation_bytes = _decode_ce_chunk_activation_bytes(
-                mu_q, v1 - v0, inner=(self.K * self.K if is_full else 1))
-            if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
+            if should_checkpoint:
                 lse_chunk, contrib = _checkpoint.checkpoint(
                     _chunk_summaries, q_mu, q_sigma, mu_v_c, sigma_v_c, in_chunk_f, local_idx,
                     u_c, use_reentrant=False,

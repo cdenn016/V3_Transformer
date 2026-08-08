@@ -605,10 +605,20 @@ class VFE3Config:
     decode_tau:                float = 1.0
     decode_mode:               str   = "diagonal_chunked"    #"full_chunked", "diagonal_chunked", "expected_liklihood_chunked", "diagonal_untied", "full"
     
-    # decode_chunk_size: vocabulary-chunk width V is iterated over by the fused
-    # decode_mode='diagonal_chunked' CE path (the training-path memory win that never
-    # materializes the (B,N,V) logit tensor). Ignored by every other decode_mode. Default
-    # 8192; validated positive.
+    # decode_chunk_size: vocabulary-chunk width V is iterated over by the fused CE kernels (the
+    # training-path memory win that never materializes the (B,N,V) logit tensor). Read by FIVE
+    # kernels, not one -- diagonal_chunked, full_chunked, expected_likelihood_chunked, linear and
+    # family_chunked (prior_bank.py:1185, 1382, 1496, 1580, 1673) -- plus both logits kernels
+    # (:2176, :2216). Default 8192; validated positive.
+    #
+    # It is ONE integer measured in vocabulary entries, but an entry does not cost the same
+    # everywhere (audit 2026-08-07). The (B,N,Vc) kernels pay one scalar per entry; a FULL family on
+    # the family-consistent route pays a (K,K) functional workspace per entry, twice over, so the
+    # same 8192 meant a measured 100 GiB per slice at B=64, N=128, K=20 and an outright CUDA OOM.
+    # decode_ce_family_chunked therefore re-reads this value in its own units and narrows the slice
+    # to DECODE_CE_FAMILY_WORKSPACE_BYTES (prior_bank.py); the number set here is an upper bound for
+    # that route, not the width it will use. Narrowing is value- and gradient-identical -- the
+    # vocabulary reduction is a logsumexp over independent slices.
     decode_chunk_size:         int   = 8192
 
     # decode_ce_checkpoint: gates the gradient checkpoint every decode_ce_*_chunked fused-CE kernel
@@ -3365,6 +3375,19 @@ class VFE3Config:
                 f"{self.decode_mode!r} has no fused_ce registration; only "
                 "'diagonal_chunked'/'full_chunked'/'family_chunked'/'expected_likelihood_chunked', "
                 "or use_prior_bank=False, route through a checkpointed chunked CE kernel)")
+        # decode_av_precision governs the working dtype of _decode_av (prior_bank.py:180), the
+        # expanded a_v form. Only the closed-form kernels call it -- diagonal / diagonal_chunked /
+        # full / full_chunked (prior_bank.py:1196, 1218, 1394, 1416, 1938, 2050). A FAMILY-consistent
+        # decode does not: it builds the pair and hands it to the registered functional, whose
+        # precision is governed by full_cov_kl_precision instead. Setting it there was silently
+        # ignored (audit 2026-08-07) -- the dead-knob oracle had no rule for it, so a user tuning
+        # decode precision on the family route got no signal at all.
+        if (_decode_registry[_active_decode_mode].family_consistent
+                and _changed("decode_av_precision")):
+            _inert.append(
+                f"decode_av_precision={self.decode_av_precision!r} (decode_mode="
+                f"{self.decode_mode!r} is family-consistent: it routes through the registered "
+                "divergence functional, not _decode_av -- use full_cov_kl_precision instead)")
         if _inert:
             import warnings
             warnings.warn(
