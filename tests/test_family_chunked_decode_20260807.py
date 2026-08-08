@@ -39,9 +39,9 @@ import vfe3.model.prior_bank as prior_bank
 from tests.test_amp import _tiny_model
 
 
-def _bank(decode_mode="family_chunked", **kw):
+def _bank(decode_mode="family_chunked", *, renyi_order=0.5, **kw):
     model = _tiny_model(gauge_group="block_glk", n_heads=2, family="gaussian_full",
-                        decode_mode=decode_mode, **kw)
+                        decode_mode=decode_mode, renyi_order=renyi_order, **kw)
     return model, model.prior_bank
 
 

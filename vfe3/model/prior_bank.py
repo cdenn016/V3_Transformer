@@ -46,8 +46,9 @@ import torch.utils.checkpoint as _checkpoint
 from torch import nn
 
 from vfe3.belief import BeliefState
-from vfe3.divergence import family_cov_kind, get_family, get_functional, kl
+from vfe3.divergence import family_cov_kind, get_family, get_functional, kl, renyi
 from vfe3.families.base import _logdet_chol
+from vfe3.families.gaussian import FullGaussian, full_cov_kl_precision
 from vfe3.families.covariance_tables import (
     covariance_from_packed,
     packed_from_covariance,
@@ -127,6 +128,40 @@ DECODE_CE_FAMILY_WORKSPACE_BYTES: int = 1024 ** 3      # 1 GiB transient ceiling
 # both retained into backward. Counting one was a 2x undercount of the only quantity the checkpoint
 # gate and the workspace ceiling are allowed to reason about.
 DECODE_CE_FAMILY_WORKSETS: int = 2
+
+
+def _uses_canonical_full_family_decode(
+    pb:       'PriorBank',
+    mu_q:     torch.Tensor,
+    sigma_q:  torch.Tensor,
+) -> bool:
+    r"""Whether a family-consistent full decode is exactly the analytic KL decoder.
+
+    This deliberately resolves the live registries and compares identities rather than names:
+    users may replace the ``gaussian_full`` family or ``renyi`` functional under their original
+    public names, in which case the generic family route remains the authoritative behavior.
+    """
+    if get_family(pb.family) is not FullGaussian or get_functional(pb.divergence_family) is not renyi:
+        return False
+    if type(pb.renyi_order) not in (int, float) or pb.renyi_order != 1.0:
+        return False
+    if full_cov_kl_precision() != "fp32_escalate" or decode_av_precision() != "fp32":
+        return False
+
+    # Do not call _decode_sigma_log_table() here.  For the model-channel full path it materializes
+    # marginal decode variances from the packed table, and the analytic delegate must materialize
+    # that vocabulary table only once in its actual scoring body.
+    if pb.untie_decode_bank:
+        raw_decode_tables = (pb.decode_mu_embed, pb.decode_sigma_log_embed)
+    elif pb.prior_source == "model_channel":
+        raw_decode_tables = (pb.s_mu_embed, pb.s_sigma_log_embed, pb.s_sigma_lower_embed)
+    else:
+        raw_decode_tables = (pb.mu_embed, pb.sigma_log_embed)
+    if any(table is None for table in raw_decode_tables):
+        return False
+    dtypes = (mu_q.dtype, sigma_q.dtype, *(table.dtype for table in raw_decode_tables),
+              pb.decode_log_scale.dtype)
+    return dtypes[0] in (torch.float32, torch.float64) and all(dtype == dtypes[0] for dtype in dtypes)
 
 
 def _decode_ce_chunk_activation_bytes(
@@ -1715,6 +1750,17 @@ class PriorBank(nn.Module):
         ``family`` decode -> cross-entropy. The unigram-prior chunk-slice add and the z_loss_weight
         term follow ``decode_ce_diagonal_chunked`` (see there); both default OFF.
         """
+        if _uses_canonical_full_family_decode(self, mu_q, sigma_q):
+            return self.decode_ce_full_chunked(
+                mu_q,
+                sigma_q,
+                targets,
+                z_loss_weight=z_loss_weight,
+                tau=tau,
+                chunk_size=chunk_size,
+                ignore_index=ignore_index,
+            )
+
         self._validate_fused_ce_targets(targets, ignore_index=ignore_index)
         tau_eff = self._tau_eff(tau)
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
@@ -2254,6 +2300,8 @@ def _decode_family_chunked(
     here, which is what makes the mode usable at realistic N. Value-identical to ``decode_mode=
     'family'``: both call ``_family_logits``, differing only in the slice width.
     """
+    if _uses_canonical_full_family_decode(pb, mu_q, sigma_q):
+        return _decode_full_chunked(pb, mu_q, sigma_q, tau_eff)
     return _family_logits(pb, mu_q, sigma_q, tau_eff, chunk=pb.decode_chunk_size)
 
 
