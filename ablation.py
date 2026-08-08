@@ -236,11 +236,11 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
     n_heads                   = 2,
     
-    max_seq_len               = 64,                 # N, context length
+    max_seq_len               = 128,                 # N, context length
     eval_stride               = None,
     
-    batch_size                = 128,
-    max_steps                 = 3750,
+    batch_size                = 64,
+    max_steps                 = 15000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
@@ -288,7 +288,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #################################
     #        Initialization
     #################################
-    mu_init_std               = 0.065,     # std of the random mean table mu_embed
+    mu_init_std               = 0.001,     # std of the random mean table mu_embed
     sigma_init                = 2.5,         # constant initial coordinate variance (sigma_log = log of this)
     phi_scale                 = 0.06,      # std
     pos_phi_scale             = 0.02,                # learned-table init scale AND frozen per-position step
@@ -304,8 +304,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     
     use_prior_bank            = True,               # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (encode stays on the prior bank)
-    decode_tau                = 0.008,
-    decode_mode               = 'full_chunked',  #"full_chunked", "diagonal_chunked", "expected_likelihood_chunked", "full", "family", "family_chunked" (family/family_chunked: divergence-consistent KL-to-prior decode, use_prior_bank=True)
+    decode_tau                = 0.01,
+    decode_mode               = 'full_chunked',  #"family_chunked", "full_chunked", "diagonal_chunked", "expected_likelihood_chunked", "full", "family", "family_chunked" (family/family_chunked: divergence-consistent KL-to-prior decode, use_prior_bank=True)
     encode_mode               = "per_token",   #"per_token_additive"
     
     
@@ -476,7 +476,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #################################
     
     e_q_mu_lr                 = 0.3,
-    e_q_sigma_lr              = 0.005,
+    e_q_sigma_lr              = 0.025,
     e_phi_lr                  = 0.00,     
     
     
@@ -506,8 +506,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     m_s_phi_lr                = 0.007,         
     
     weight_decay              = 0.02,   
-    phi_weight_decay          = 0.03,   
-    sigma_weight_decay        = 0.0,            # AdamW decay for log-variance tables (None = inherit weight_decay;
+    phi_weight_decay          = 0.00,   
+    sigma_weight_decay        = 0.0,         # AdamW decay for log-variance tables (None = inherit weight_decay;
                                              # 0.0 exempts sigma from the unintended log-sigma->0 pull)
                                              # audit 2026-08-05: decoupled decay on a LOG-variance table is a
                                              # multiplicative prior pulling sigma -> 1, applied to every row on
@@ -516,7 +516,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
                                              # (sigma 4.00 -> 2.59); against the 60k-step trained table the
                                              # decay accounts for -1.32 of a realized -0.78 displacement, i.e.
                                              # it is first-order comparable to the entire likelihood signal.
-    mu_weight_decay           = 0.075,            # AdamW decay for the MEAN-role tables: mu_embed, s_mu_embed,
+    mu_weight_decay           = 0,        # AdamW decay for the MEAN-role tables: mu_embed, s_mu_embed,
                                              # decode_mu_embed, output_proj_weight (None = inherit weight_decay).
                                              # Decoupled decay reaches EVERY row of a live embedding table on
                                              # every step, so rare rows are crushed faster than their gather
@@ -543,7 +543,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #        Numerical Safety
     #################################
     
-    e_mu_q_trust              = 0.5,          # audit 2026-08-05: pure BLOW-UP GUARD now that e_q_mu_lr=0.1
+    e_mu_q_trust              = 1,          # audit 2026-08-05: pure BLOW-UP GUARD now that e_q_mu_lr=0.1
                                               # already restores E-step descent on its own. Measured whitened
                                               # mean step at e_q_mu_lr=0.9 was 2-norm mean 2.735 / p95 4.255 /
                                               # max 4.941, so at lr=0.1 it is ~0.30 / 0.47 / 0.55: a ball of
@@ -566,7 +566,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     amp_dtype                 = None,      # None=fp32 | 'bf16' , 'fp16'. Sigma must be at least fp32
         
     log_interval              = 1000,       # console log every N steps (0 = off)
-    eval_interval             = 2500,      # periodic validation every N steps (0 = off)
+    eval_interval             = 5000,      # periodic validation every N steps (0 = off)
     checkpoint_interval       = 60000,     # save a resumable checkpoint every N steps (0 = off)
 
     
@@ -577,7 +577,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     e_step_update             = "gradient",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
                                              # coordinate minimizer at frozen beta: precision fusion in ONE
                                              # iteration, same cost; kernel route only)
-    mm_damping                = 0.75,         # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
+    mm_damping                = 1,         # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
 
     # --- randomized-depth E-step (recurrent-depth recipe) ---
     randomize_e_steps         = False,       # training forwards sample T ~ Uniform{e_steps_min..e_steps_max}
@@ -1395,7 +1395,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "SPD variance ceiling sigma_max (binding vs slack) [E1/EXP-20]",
         # audit 2026-08-06 F20: a single-value grid is not a comparison. The point of this sweep is
         # whether the ceiling ever BINDS, so it needs points either side of the baseline 100.
-        "param": "sigma_max", "values": [5, 15, 50, 200],
+        "param": "sigma_max", "values": [None, 1, 5, 10, 20, 50, 100],
     },
     
     
@@ -1449,7 +1449,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # === belief-table init scales (PriorBank) ===============================
     "mu_init_std": {
         "description": "init std of the prior mean table mu_embed ~ N(0, std^2)",
-        "param": "mu_init_std", "values": [0.01, 0.04, 0.065, 0.075, 0.1],
+        "param": "mu_init_std", "values": [0.0005, 0.002, 0.003],
     },
     
     "sigma_init": {
@@ -1529,7 +1529,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "decode_tau": {
         "description": "KL-to-prior decode temperature",
-        "param": "decode_tau", "values": [0.001, 0.005, 0.008, 0.01, 0.05], "requires": {"use_prior_bank": True},
+        "param": "decode_tau", "values": [0.008, 0.0125 ], "requires": {"use_prior_bank": True},
     },
     
     
@@ -1566,13 +1566,13 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "e_q_mu_lr": {
        "description": "E-step natural-gradient step size for mu_q",
-       "param": "e_q_mu_lr", "values": [0.3, 0.4],
+       "param": "e_q_mu_lr", "values": [0.2, 0.3, 0.4],
        "requires": {"e_step_update": "gradient"},   # audit 2026-07-27: unread under mm_exact
     },
    
     "e_q_sigma_lr": {
        "description": "E-step retraction step size for sigma_q",
-       "param": "e_q_sigma_lr", "values": [0.0005, 0.001, 0.005, 0.01, 0.05],
+       "param": "e_q_sigma_lr", "values": [0.015, 0.025, 0.035],
        "requires": {"e_step_update": "gradient"},   # audit 2026-07-27: unread under mm_exact
     },
    
@@ -1591,17 +1591,17 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
    
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "values": [0.001, 0.002, 0.0025, 0.003],
+        "param": "m_phi_lr", "values": [0.0015, 0.0025, 0.0035, 0.005, 0.01],
     },
    
     "m_p_mu_lr": {
         "description": "M-step LR for the prior-bank means",
-        "param": "m_p_mu_lr", "values": [0.001, 0.005, 0.01, 0.015, 0.02, 0.03],
+        "param": "m_p_mu_lr", "values": [0.003],
     },
     
     "m_p_sigma_lr": {
         "description": "M-step LR for the prior-bank variances",
-        "param": "m_p_sigma_lr", "values": [0.0005, 0.001, 0.0015, 0.0025, 0.0035],
+        "param": "m_p_sigma_lr", "values": [0.003],
     },
     
    
@@ -1660,23 +1660,23 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # "everything else" knob, or drop this sweep and widen mu_weight_decay to the union grid.
     "weight_decay": {
         "description": "AdamW weight decay",
-        "param": "weight_decay", "values": [0.05, 0.075, 0.1],
+        "param": "weight_decay", "values": [0, 0.01, 0.02, 0.03, 0.05, 0.075],
     },
 
     "mu_weight_decay": {
         "description": "AdamW weight decay",
-        "param": "mu_weight_decay", "values": [0.05, 0.075, 0.1, 0.5],
+        "param": "mu_weight_decay", "values": [None, 0, 0.001, 0.01, 0.05, 0.075, 0.1, 0.2],
     }, 
     
     "phi_weight_decay":{
         "description": "weight decay on phi",
-        "param": "phi_weight_decay", "values": [0.01, 0.02, 0.03, 0.04, 0.05],
+        "param": "phi_weight_decay", "values": [0, 0.001, 0.01, 0.02, 0.03, 0.04, 0.05],
     },
 
     "sigma_weight_decay": {  # separate AdamW weight decay for the log-variance tables (None = inherit
         # weight_decay). Numeric radii -> LINE plot; the None (inherit) baseline runs via train_vfe3.
         "description": "AdamW weight decay on the log-variance (sigma) tables",
-        "param": "sigma_weight_decay", "values": [0, 0.005, 0.01, 0.02, 0.03, 0.05],
+        "param": "sigma_weight_decay", "values": [0.04, 0.075, 0.1],
     },
 
 
@@ -1688,7 +1688,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "mm_damping": {  # MM-exact E-step damping eta in (0,1]; 'requires' pins e_step_update='mm_exact' so the
         # damped coordinate-minimizer step is actually taken every cell (1.0 = full exact minimizer).
         "description": "MM-exact E-step damping eta in (0,1] (requires mm_exact E-step)",
-        "param": "mm_damping", "values": [0.8, 0.85],
+        "param": "mm_damping", "values": [0.25, 0.5, 0.75, 1],
         "requires": {"e_step_update": "mm_exact"},
     },
 
@@ -1697,7 +1697,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "query_tau_c": {  # query-adaptive temperature strength c >= 0 (0 = inert); 'requires' forces
         # query_adaptive_tau=True so tau_i = tau_h (1 + c * tr_h Sigma_i / d_h) is live on every cell.
         "description": "query-adaptive temperature strength c (requires query_adaptive_tau=True)",
-        "param": "query_tau_c", "values": [0, 0.5, 0.75, 1.0, 2.0, 4.0],
+        "param": "query_tau_c", "values": [0.1, 0.25, 0.5, 0.75, 1.0],
         "requires": {"query_adaptive_tau": True},
     },
 
@@ -1810,19 +1810,30 @@ NON_SWEPT_FIELDS = (
 # ordering for a single GPU. Set CONFIG["list_only"]=True (with sweep=None) to print every sweep.
 SWEEP_ORDER: List[str] = [
   
-  "e_q_sigma_lr",
-  "decode_tau",
+  
+  #"decode_tau",
   # "mu_weight_decay",
-   "weight_decay",
-   "sigma_weight_decay",
-   "phi_weight_decay",
+  
+   #"weight_decay",
+   #"sigma_weight_decay",
+  # "phi_weight_decay",
+   
+  #"mm_damping",
+   
+  # "mu_init_std",
+   
+  # "query_tau_c",
+   
+  # "phi_scale",
+  # "sigma_init",
    
    
-   #"sigma_max",
+   "m_p_mu_lr",
+   "m_p_sigma_lr",
+   "m_phi_lr",
+   "e_q_sigma_lr",
+   "e_q_mu_lr",
    
-   "sigma_init",
-   "mu_init_std",
-   "phi_scale",
     
    #"pos_phi_scale",
     
@@ -1830,13 +1841,7 @@ SWEEP_ORDER: List[str] = [
    #"e_s_sigma_lr",
    
    
-   
-   "e_q_mu_lr",
-   
-   "m_p_mu_lr",
-   "m_p_sigma_lr",
-   "m_phi_lr",
-  
+  #"sigma_max",
    #"m_s_phi_lr",
    
    #"lambda_alpha",
@@ -1850,9 +1855,9 @@ SWEEP_ORDER: List[str] = [
   
    #"alibi_slope",
   
-   #"mm_damping",
+  
    
-   #"query_tau_c",
+   
 
    #"gamma_prior_weight",
 
