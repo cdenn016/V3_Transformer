@@ -1596,7 +1596,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
    
     "m_p_mu_lr": {
         "description": "M-step LR for the prior-bank means",
-        "param": "m_p_mu_lr", "values": [0.003],
+        "param": "m_p_mu_lr", "values": [0.002],
     },
     
     "m_p_sigma_lr": {
