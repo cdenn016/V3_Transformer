@@ -145,30 +145,54 @@ def _require_positive_finite(value: float, name: str) -> float:
     return converted
 
 
-def _pullback_group_product_residual(
-    candidate_phi: torch.Tensor,             # (active, n_gen) BCH4 chart candidate
-    phi:           torch.Tensor,             # (active, n_gen) current chart
-    delta:         torch.Tensor,             # (active, n_gen) accepted right factor
-    group:         GaugeGroup,
-) -> torch.Tensor:                           # (active,) relative exact-product residual
-    r"""Compare ``exp(candidate)`` with the exact right product ``exp(phi) exp(delta)``."""
-    generators = group.generators.to(device=phi.device, dtype=torch.float64)
-    compact_blocks = (
+def _pullback_group_compact_blocks(group: GaugeGroup, generators: torch.Tensor) -> bool:
+    r"""Whether the residual check can read the chart as stacked equal square blocks."""
+    return (
         group.name == "block_glk"
         and len(group.irrep_dims) > 1
         and len(set(group.irrep_dims)) == 1
         and generators.shape[0]
         == len(group.irrep_dims) * group.irrep_dims[0] * group.irrep_dims[0]
     )
-    if compact_blocks:
-        n_blocks = len(group.irrep_dims)
-        block_dim = group.irrep_dims[0]
+
+
+def _pullback_group_current_element(
+    phi:   torch.Tensor,                     # (active, n_gen) current chart
+    group: GaugeGroup,
+) -> torch.Tensor:                           # exp(phi), blocked or embedded per the group layout
+    r"""``exp(phi)`` for the current chart -- LOOP-INVARIANT across backtracking attempts.
+
+    Hoisted out of :func:`_pullback_group_product_residual` (audit 2026-08-07). ``phi`` does not
+    change while the trust factor is halved; only ``delta`` and ``candidate_phi`` do. Recomputing
+    this exponential inside the residual check cost up to ``max_backtracks`` redundant
+    ``matrix_exp`` calls on the whole active batch per M-step.
+    """
+    generators = group.generators.to(device=phi.device, dtype=torch.float64)
+    if _pullback_group_compact_blocks(group, generators):
+        n_blocks, block_dim = len(group.irrep_dims), group.irrep_dims[0]
+        return torch.linalg.matrix_exp(phi.reshape(-1, n_blocks, block_dim, block_dim))
+    return torch.linalg.matrix_exp(torch.einsum("...a,aij->...ij", phi, generators))
+
+
+def _pullback_group_product_residual(
+    candidate_phi:   torch.Tensor,           # (active, n_gen) BCH4 chart candidate
+    current_element: torch.Tensor,           # exp(phi) from _pullback_group_current_element
+    delta:           torch.Tensor,           # (active, n_gen) accepted right factor
+    group:           GaugeGroup,
+) -> torch.Tensor:                           # (active,) relative exact-product residual
+    r"""Compare ``exp(candidate)`` with the exact right product ``exp(phi) exp(delta)``.
+
+    ``current_element`` is supplied by the caller rather than recomputed, so a backtracking loop
+    pays one ``exp(phi)`` instead of one per attempt (audit 2026-08-07). Value-identical.
+    """
+    generators = group.generators.to(device=candidate_phi.device, dtype=torch.float64)
+    if _pullback_group_compact_blocks(group, generators):
+        n_blocks, block_dim = len(group.irrep_dims), group.irrep_dims[0]
 
         def _blocks(coordinates: torch.Tensor) -> torch.Tensor:
             return coordinates.reshape(-1, n_blocks, block_dim, block_dim)
 
         candidate_element = torch.linalg.matrix_exp(_blocks(candidate_phi))
-        current_element = torch.linalg.matrix_exp(_blocks(phi))
         right_element = torch.linalg.matrix_exp(_blocks(delta))
         reference = current_element @ right_element
         error_sq = (candidate_element - reference).square().sum(dim=(-3, -2, -1))
@@ -179,7 +203,6 @@ def _pullback_group_product_residual(
         return torch.einsum("...a,aij->...ij", coordinates, generators)
 
     candidate_element = torch.linalg.matrix_exp(_embedded(candidate_phi))
-    current_element = torch.linalg.matrix_exp(_embedded(phi))
     right_element = torch.linalg.matrix_exp(_embedded(delta))
     reference = current_element @ right_element
     error = torch.linalg.matrix_norm(candidate_element - reference, dim=(-2, -1))
@@ -239,7 +262,12 @@ def stage_pullback_group_candidate(
         grad64 = grad_phi.to(dtype=torch.float64)
         phi64 = phi.to(dtype=torch.float64)
         generators64 = group.generators.to(device=phi.device, dtype=torch.float64)
-        if not bool(torch.isfinite(grad64).all()) or not bool(torch.isfinite(phi64).all()):
+        # ONE host sync, not two (audit 2026-08-07). Every ``bool(tensor)`` on CUDA is a
+        # ``cudaStreamSynchronize``; measured 33 of them per staging call. Reducing on device and
+        # reading the answer once is value-identical -- the same predicate raises the same error for
+        # the same input -- and the `.all()` reductions it stops short-circuiting are negligible
+        # beside the stall they were costing.
+        if not bool((torch.isfinite(grad64).all() & torch.isfinite(phi64).all())):
             raise FloatingPointError("pullback group staging received a nonfinite grad or chart")
         direction = pullback_group_direction(
             grad64,
@@ -257,7 +285,11 @@ def stage_pullback_group_candidate(
             direction.damped_generalized_condition,
             direction.scaled_solve_residual,
         )
-        if not all(bool(torch.isfinite(value).all()) for value in direction_tensors):
+        # Six separate ``bool()`` calls collapsed into one device-side reduction (audit 2026-08-07).
+        certificates_finite = direction_tensors[0].new_tensor(True, dtype=torch.bool)
+        for value in direction_tensors:
+            certificates_finite = certificates_finite & torch.isfinite(value).all()
+        if not bool(certificates_finite):
             raise FloatingPointError("pullback group direction returned a nonfinite certificate")
 
         right_factor = -learning_rate * direction.xi
@@ -275,6 +307,8 @@ def stage_pullback_group_candidate(
             device=grad64.device,
         )
         residual_limit = min(1e-6, bch_residual_max)
+        # exp(phi) does not change while the trust factor is halved (audit 2026-08-07).
+        current_element = _pullback_group_current_element(phi64, group)
         for attempt in range(max_backtracks + 1):
             delta = factor_scale.unsqueeze(-1) * right_factor
             candidate_phi = compose_bch(
@@ -290,11 +324,22 @@ def stage_pullback_group_candidate(
                 group,
                 warn_fallback=False,
             )
-            if not bool(torch.isfinite(candidate_phi).all()) or not bool(
-                torch.isfinite(candidate_chart_norm).all()
-            ):
-                raise FloatingPointError("pullback group staging produced a nonfinite candidate")
-            if bool((candidate_chart_norm > chart_max_norm).any()):
+            # Three per-attempt host syncs fused into one (audit 2026-08-07): candidate finiteness,
+            # chart-norm finiteness, and the chart-norm bound. The bound's diagnostic `.max()` read
+            # is deferred into the failure branch, which runs at most once per step.
+            candidate_ok = (
+                torch.isfinite(candidate_phi).all()
+                & torch.isfinite(candidate_chart_norm).all()
+                & (candidate_chart_norm <= chart_max_norm).all()
+            )
+            if not bool(candidate_ok):
+                if not bool(
+                    torch.isfinite(candidate_phi).all()
+                    & torch.isfinite(candidate_chart_norm).all()
+                ):
+                    raise FloatingPointError(
+                        "pullback group staging produced a nonfinite candidate"
+                    )
                 maximum = float(candidate_chart_norm.max())
                 raise FloatingPointError(
                     "pullback group candidate chart norm "
@@ -302,15 +347,18 @@ def stage_pullback_group_candidate(
                 )
             group_product_residual = _pullback_group_product_residual(
                 candidate_phi,
-                phi64,
+                current_element,
                 delta,
                 group,
             )
-            if not bool(torch.isfinite(group_product_residual).all()):
-                raise FloatingPointError(
-                    "pullback group staging produced a nonfinite group-product residual"
-                )
-            failures = group_product_residual > residual_limit
+            # Finiteness folded INTO the failure mask, not checked separately (audit 2026-08-07).
+            # This is not cosmetic: ``nan > limit`` is False, so testing the bound alone would read
+            # a nonfinite residual as SUCCESS and commit it. Or-ing in ``~isfinite`` makes NaN a
+            # failure, and the accept path then costs one host sync instead of two; the explicit
+            # nonfinite raise moves to the failure branch, which preserves the original error and
+            # its precedence over the backtrack.
+            residual_finite = torch.isfinite(group_product_residual)
+            failures = (group_product_residual > residual_limit) | ~residual_finite
             if not bool(failures.any()):
                 return PullbackGroupCandidate(
                     candidate_phi=candidate_phi,
@@ -319,6 +367,10 @@ def stage_pullback_group_candidate(
                     candidate_chart_norm=candidate_chart_norm,
                     group_product_residual=group_product_residual,
                     direction=direction,
+                )
+            if not bool(residual_finite.all()):
+                raise FloatingPointError(
+                    "pullback group staging produced a nonfinite group-product residual"
                 )
             if attempt == max_backtracks:
                 maximum = float(group_product_residual.max())

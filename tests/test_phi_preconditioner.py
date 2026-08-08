@@ -312,7 +312,9 @@ def test_pullback_group_adaptive_series_accepts_traceless_gl5_norm_five():
         generators,
         mode="pullback",
     )
-    assert result.series_order in range(40, 129, 8)
+    # Candidate grid moved from (40, step 8) to (8, step 4) -- audit 2026-08-07. The certificate
+    # that bounds the error is unchanged; only how early it is TESTED moved.
+    assert result.series_order in range(8, 129, 4)
     assert all(
         torch.isfinite(value).all()
         for value in (
@@ -930,7 +932,9 @@ def test_pullback_group_equal_blocks_with_mixed_series_orders_fall_back_exactly(
         mode="pullback_per_block",
         irrep_dims=[2, 2],
     )
-    assert expected.series_order == 48
+    # 44 on the (8, step 4) candidate grid; was 48 when the grid started at 40 in steps of 8.
+    # The point of the fixture is unchanged: the two blocks certify at DIFFERENT orders.
+    assert expected.series_order == 44
     original = phi_preconditioner._full_pullback_group_direction
     strict_solve_calls = 0
 
