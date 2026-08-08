@@ -394,7 +394,20 @@ def build_optimizer(
                 stacklevel=2,
             )
         # Stored phi factors and direct omega elements use one mixed optimizer; every other group
-        # remains standard AdamW. Fused execution stays off for this opt-in manifold route.
+        # remains standard AdamW.
+        #
+        # FUSED IS FORWARDED HERE (audit 2026-08-07). It used to be left unset on this route, which
+        # is NOT the same as off: torch.optim.AdamW defaults `fused=None`, and with both `fused` and
+        # `foreach` unresolved `adam()` selects the FOREACH multi-tensor path -- 9 kernel launches
+        # per parameter group per step against 1 for the fused kernel. So choosing the manifold
+        # route silently deoptimized every OTHER group (mu_embed, sigma/decode_log_scale,
+        # transport_state, t5_bias, log_kappa_*, LayerNorm affine), none of which the manifold logic
+        # touches. `step()` sets `p.grad = None` on every pullback_group and omega parameter BEFORE
+        # the trailing `super().step()`, so base AdamW skips exactly those and the fused kernel only
+        # ever sees the standard groups.
+        #
+        # NOT VERIFIED ON DEVICE: `fused` is a CUDA-only path, so this change cannot be exercised on
+        # a CPU box. If a manifold run regresses, this line is the first thing to revert.
         return GaugeManifoldAdamW(
             groups,
             model.group,
@@ -413,6 +426,7 @@ def build_optimizer(
             omega_retract_mode=cfg.omega_retract_mode,
             omega_reorth_every=cfg.omega_reorth_every,
             weight_decay=cfg.weight_decay,
+            fused=pb.phi_embed.is_cuda,
         )
     # fused AdamW (one CUDA kernel for the whole M-step) when the priors live on CUDA; it is
     # CUDA-only, so on a CPU box this is the standard AdamW. Per-group LRs are honored either way.

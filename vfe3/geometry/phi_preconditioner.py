@@ -77,9 +77,20 @@ _PHI_GROUP_DIRECTIONS: Dict[str, Callable[..., PullbackGroupDirectionResult]] = 
 _PHI_GROUP_DIRECTION_ACCEPTS_COORDINATE_LAYOUT: Dict[str, bool] = {}
 _PHI_GROUP_DIRECTION_REQUIRES_SOURCE_BASIS: Dict[str, bool] = {}
 
-_PHI_GROUP_MIN_SERIES_ORDER: int   = 40
+# Candidate orders at which the tail certificate below is TESTED. The floor is not a precision
+# setting -- the certificate is what bounds the error, and it is unchanged -- it only decides how
+# early the loop is allowed to notice it has already converged (audit 2026-08-07).
+#
+# It was 40. Measured against the live block_glk structure constants at phi_scale=0.06, the
+# geometric majorant certifies by order 17 (raw term magnitude crosses 1e-12 by order 12), so 40
+# ran ~23 redundant matmuls of the full (n_blocks, active_rows, n_gen, n_gen) workspace -- 78.5% of
+# the staging call at 256 active rows. In the other direction 40 is not conservative either: at 8x
+# the live phi scale the certificate demands 58, and the floor cannot help there because it is a
+# floor, not a target. Testing from 8 in steps of 4 costs at most a few extra certificate
+# evaluations and returns the first order the SAME majorant accepts.
+_PHI_GROUP_MIN_SERIES_ORDER: int   = 8
 _PHI_GROUP_MAX_SERIES_ORDER: int   = 128
-_PHI_GROUP_SERIES_ORDER_STEP: int  = 8
+_PHI_GROUP_SERIES_ORDER_STEP: int  = 4
 _PHI_GROUP_TAIL_TOL: float         = 1e-12
 _PHI_GROUP_GRAM_RIDGE: float       = 1e-6
 _PHI_GROUP_MIN_UNDAMPED_EIG: float = 1e-8
@@ -288,6 +299,20 @@ def _adaptive_phi_differentials(
             leading_certified = certified.reshape(certified.shape[0], -1).all(dim=-1)
             if bool(leading_certified.all()):
                 return psi_right, psi_left, order
+            # Partial certification still falls back, DELIBERATELY (re-affirmed audit 2026-08-07).
+            # The caller catches this to drop out of the batched fast path into the per-block loop,
+            # which is what makes the batched result bit-identical to the per-block one -- the
+            # contract pinned by
+            # test_pullback_group_equal_blocks_with_mixed_series_orders_fall_back_exactly.
+            # Continuing to the first UNIFORMLY certified order instead would keep the fast path but
+            # evaluate the low-order block at a higher order than the per-block route would, which
+            # is equally certified and NOT bit-identical -- so it was rejected.
+            #
+            # Lowering the floor to 8 does not make this fire more often at the live distribution:
+            # both leading blocks draw phi from the same init, so they certify together. Measured at
+            # K=20/H=2 over 108 trials (scale 0.06/0.0632/0.2 x 64/256/1024 active rows): ZERO
+            # fallbacks under both the old (40, step 8) and new (8, step 4) grids. The mixed state
+            # needs blocks with very different ||phi||, which is exactly what that test constructs.
             if bool(leading_certified.any()):
                 raise _MixedPhiDifferentialOrder(
                     "strict phi group blocks require different adaptive series orders"
