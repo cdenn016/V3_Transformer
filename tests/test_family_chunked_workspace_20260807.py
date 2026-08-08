@@ -255,6 +255,63 @@ def test_decode_av_precision_is_reported_inert_on_the_family_route():
     assert not _inert_mentions("full_chunked"), "full_chunked reads _decode_av -- not inert"
 
 
+def test_same_name_family_chunked_override_keeps_decode_av_precision_inert():
+    r"""The mode name alone must not make a custom family decoder inherit the analytic dependency."""
+    from vfe3.config import VFE3Config
+
+    original = prior_bank.get_decode_registration("family_chunked")
+
+    def generic_logits(pb, mu_q, sigma_q, tau_eff):
+        return prior_bank._family_logits(pb, mu_q, sigma_q, tau_eff, chunk=pb.decode_chunk_size)
+
+    def generic_fused_ce(pb, mu_q, sigma_q, targets, *, z_loss_weight=0.0, tau=None,
+                         chunk_size=None, ignore_index=-100):
+        logits = generic_logits(pb, mu_q, sigma_q, pb._tau_eff(tau))
+        valid = targets != ignore_index
+        local_targets = targets.clamp_min(0)
+        ce = (torch.logsumexp(logits, dim=-1) - logits.gather(
+            -1, local_targets.unsqueeze(-1),
+        ).squeeze(-1))
+        return (ce * valid).sum() / valid.sum().clamp_min(1)
+
+    prior_bank.register_decode(
+        "family_chunked",
+        covariance_kinds=frozenset({"diagonal", "full"}),
+        family_consistent=True,
+        supports_chunked=True,
+        fused_ce=generic_fused_ce,
+        can_omit_base_mean=True,
+        can_omit_base_variance=True,
+        override=True,
+    )(generic_logits)
+    try:
+        with pytest.warns(Warning) as record:
+            VFE3Config(
+                vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
+                use_prior_bank=True, family="gaussian_full", gauge_group="block_glk",
+                decode_mode="family_chunked", renyi_order=1.0,
+                full_cov_kl_precision="fp32_escalate", decode_av_precision="fp64",
+            )
+        assert any("decode_av_precision" in str(warning.message) for warning in record)
+    finally:
+        prior_bank.register_decode(
+            "family_chunked",
+            supports_full=original.supports_full,
+            supports_chunked=original.supports_chunked,
+            family_consistent=original.family_consistent,
+            fused_ce=original.fused_ce,
+            covariance_kinds=original.covariance_kinds,
+            can_omit_base_mean=original.can_omit_base_mean,
+            can_omit_base_variance=original.can_omit_base_variance,
+            override=True,
+        )(original.callable)
+
+    restored = prior_bank.get_decode_registration("family_chunked")
+    assert restored.callable is original.callable
+    assert restored.fused_ce is original.fused_ce
+    assert restored == original
+
+
 # -- (e) the route still runs end to end at a binding ceiling ------------------------------------
 
 @pytest.mark.parametrize("multiple", [1, 8])

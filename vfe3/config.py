@@ -3366,7 +3366,11 @@ class VFE3Config:
         # fused_ce (the dense decode() -> F.cross_entropy path has no per-chunk loop to checkpoint),
         # so the toggle does nothing there; every other decode_mode, and use_prior_bank=False
         # (routed to 'linear' regardless of decode_mode), keep it live.
-        from vfe3.model.prior_bank import _DECODERS as _decode_registry
+        from vfe3.model.prior_bank import (
+            PriorBank,
+            _DECODERS as _decode_registry,
+            _decode_family_chunked,
+        )
         _active_decode_mode = self.decode_mode if self.use_prior_bank else "linear"
         if (not _decode_registry[_active_decode_mode].supports_chunked
                 and _changed("decode_ce_checkpoint")):
@@ -3386,6 +3390,8 @@ class VFE3Config:
         canonical_family_dispatch_reachable = (
             self.use_prior_bank
             and _active_decode_mode == "family_chunked"
+            and _decode_registry[_active_decode_mode].callable is _decode_family_chunked
+            and _decode_registry[_active_decode_mode].fused_ce is PriorBank.decode_ce_family_chunked
             and _family_cls is FullGaussian
             and get_functional(self.divergence_family) is renyi
             and type(self.renyi_order) in (int, float)
