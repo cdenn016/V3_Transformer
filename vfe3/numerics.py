@@ -417,6 +417,65 @@ def safe_spd_inverse(
     return out.to(matrix.dtype)
 
 
+# cuSOLVER's batched symmetric eigensolver -- the routine torch dispatches to for n <= 32 -- rejects
+# the CALL past a fixed batch count, with CUSOLVER_STATUS_INVALID_VALUE out of
+# cusolverDnXsyevBatched_bufferSize. Measured last-OK / first-FAIL, IDENTICAL in float32 and float64
+# at each K (which is what rules out a workspace-byte or int32 story): K=2 32016/32017,
+# K=8 29915/29916, K=20 26305/26306, K=32 23325/23326. At K >= 33 torch takes the non-batched path
+# and there is no ceiling at all. PyTorch 2.8.0 regression syevjBatched_bufferSize ->
+# xsyevBatched_bufferSize (PR #155695), tracked as pytorch/pytorch#166004.
+#
+# 16384 is a power of two comfortably under the smallest measured ceiling (23325 at K=32).
+_EIG_MAX_BATCH: int = 16_384
+
+
+def _eig_needs_chunking(matrix: torch.Tensor, max_batch: int) -> bool:
+    r"""True when this call would cross the cuSOLVER batched-eigensolver ceiling."""
+    if matrix.dim() < 3 or not matrix.is_cuda:
+        return False                                  # unbatched, or CPU/MAGMA: no ceiling
+    if matrix.shape[-1] > 32:
+        return False                                  # n > 32 takes the non-batched path
+    return matrix.numel() // (matrix.shape[-1] * matrix.shape[-2]) > max_batch
+
+
+def safe_eigvalsh(
+    matrix:    torch.Tensor,             # (..., K, K) symmetric
+    *,
+    max_batch: int = _EIG_MAX_BATCH,
+) -> torch.Tensor:                       # (..., K) ascending eigenvalues
+    r"""``torch.linalg.eigvalsh`` that cannot trip the cuSOLVER batch ceiling (see ``_EIG_MAX_BATCH``).
+
+    Slices the flattened batch and concatenates. Value-identical -- the decomposition is independent
+    per matrix, so slicing changes nothing but the launch geometry -- and autograd flows through the
+    slice/cat unchanged. Below the ceiling this is exactly ``torch.linalg.eigvalsh``, with no extra
+    allocation and no host sync, so the healthy path is untouched.
+    """
+    if not _eig_needs_chunking(matrix, max_batch):
+        return torch.linalg.eigvalsh(matrix)
+    K = matrix.shape[-1]
+    flat = matrix.reshape(-1, K, K)
+    parts = [torch.linalg.eigvalsh(flat[i:i + max_batch])
+             for i in range(0, flat.shape[0], max_batch)]
+    return torch.cat(parts, dim=0).reshape(*matrix.shape[:-1])
+
+
+def safe_eigh(
+    matrix:    torch.Tensor,             # (..., K, K) symmetric
+    *,
+    max_batch: int = _EIG_MAX_BATCH,
+) -> Tuple[torch.Tensor, torch.Tensor]:  # (..., K) eigenvalues, (..., K, K) eigenvectors
+    r"""``torch.linalg.eigh`` twin of ``safe_eigvalsh``; same ceiling, same routine, same fix."""
+    if not _eig_needs_chunking(matrix, max_batch):
+        return torch.linalg.eigh(matrix)
+    K = matrix.shape[-1]
+    flat = matrix.reshape(-1, K, K)
+    parts = [torch.linalg.eigh(flat[i:i + max_batch])
+             for i in range(0, flat.shape[0], max_batch)]
+    evals = torch.cat([p.eigenvalues for p in parts], dim=0).reshape(*matrix.shape[:-1])
+    evecs = torch.cat([p.eigenvectors for p in parts], dim=0).reshape(matrix.shape)
+    return evals, evecs
+
+
 def floor_eigenvalues(
     matrix: torch.Tensor,                # (..., K, K) symmetric
     *,
@@ -424,7 +483,7 @@ def floor_eigenvalues(
 ) -> torch.Tensor:                       # (..., K, K) SPD with eigenvalues >= floor
     r"""Project a symmetric matrix to SPD by clamping its eigenvalues up to ``floor``."""
     M = _symmetrize(matrix.float())
-    evals, evecs = torch.linalg.eigh(M)
+    evals, evecs = safe_eigh(M)
     evals = evals.clamp(min=floor)
     out = (evecs * evals.unsqueeze(-2)) @ evecs.transpose(-1, -2)
     return _symmetrize(out).to(matrix.dtype)
@@ -463,7 +522,7 @@ def condition_number(
         # non-positive variance -> no condition number; surface +inf, mirroring the full-matrix branch
         # (audit 2026-06-17 round 2 id1), not a large positive value from clamping a zero/negative up to eps.
         return torch.where(lam_min > 0, cond, cond.new_tensor(float("inf"))).to(matrix.dtype)
-    evals = torch.linalg.eigvalsh(_symmetrize(matrix.float()))
+    evals = safe_eigvalsh(_symmetrize(matrix.float()))
     lam_min = evals[..., 0]
     cond = evals[..., -1] / lam_min.clamp(min=eps)
     # A non-PD matrix (lambda_min <= 0) has no condition number; surface +inf rather than the large

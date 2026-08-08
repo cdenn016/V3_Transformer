@@ -15,6 +15,8 @@ from typing import Callable, ClassVar, Dict, List, Optional, Tuple, Type
 
 import torch
 
+from vfe3.numerics import safe_eigvalsh
+
 
 def safe_kl_clamp(
     kl:     torch.Tensor,
@@ -257,7 +259,7 @@ class BeliefParams(ABC):
         covariance_diagonal = cls.covariance_diagonal(dispersion, eps=eps)
         if cls.cov_kind == "full":
             covariance = 0.5 * (dispersion + dispersion.transpose(-1, -2))
-            covariance_spectrum = torch.linalg.eigvalsh(covariance)
+            covariance_spectrum = safe_eigvalsh(covariance)
         else:
             covariance_spectrum = covariance_diagonal
         return {

@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 
 from vfe3.geometry.lie_ops import CompactBlockElement
+from vfe3.numerics import safe_eigvalsh
 from vfe3.geometry.transport import CompactFactoredTransport
 
 
@@ -473,7 +474,7 @@ def _spectrum(
             eps=eps,
         )["covariance_spectrum"]
     if _is_full_cov(sigma, diagonal):
-        return torch.linalg.eigvalsh(0.5 * (sigma + sigma.transpose(-1, -2)))
+        return safe_eigvalsh(0.5 * (sigma + sigma.transpose(-1, -2)))
     return sigma
 
 
@@ -811,7 +812,7 @@ def spd_geodesic_distance(
     generalized = torch.linalg.solve_triangular(
         chol_a, left.transpose(-1, -2), upper=False).transpose(-1, -2)
     generalized = 0.5 * (generalized + generalized.transpose(-1, -2))
-    lam = torch.linalg.eigvalsh(generalized).clamp(min=eps)
+    lam = safe_eigvalsh(generalized).clamp(min=eps)
     distance = torch.sqrt((torch.log(lam) ** 2).sum(dim=-1).clamp(min=0.0))
     return distance.to(dtype=output_dtype)
 

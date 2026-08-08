@@ -899,10 +899,36 @@ class FullGaussian(BeliefParams):
             # safe_cholesky's escalating ridge can factor an INDEFINITE blend as PD (its ok mask
             # True) even though alpha>1 left the convex regime and the Renyi divergence is undefined
             # there -- the fp64 slogdet then drops the sign and the value collapses to ~0 instead of
-            # kl_max. Gate on the SIGN of the (symmetrized) blend spectrum so a non-PD blend -> NaN
-            # -> kl_max regardless of the ridge (audit 2026-06-17). sigma_q/sigma_t are SPD on the
-            # live pipeline (SPD retraction); safe_cholesky owns the off-pipeline non-PD handling.
-            blend_pd = torch.linalg.eigvalsh(sigma_blend)[..., 0] > 0   # smallest eigenvalue > 0
-            ok = blend_pd & ok_q & ok_t            # non-PD blend or failed factor -> NaN -> kl_max
+            # kl_max. Gate on the SIGN of the (symmetrized) blend so a non-PD blend -> NaN -> kl_max
+            # regardless of the ridge (audit 2026-06-17). sigma_q/sigma_t are SPD on the live
+            # pipeline (SPD retraction); safe_cholesky owns the off-pipeline non-PD handling.
+            #
+            # SCOPE (audit 2026-08-07). This gate was unscoped -- it ran for every alpha != 1 -- but
+            # its justification above holds only ABOVE alpha=1. For alpha in (0,1) the blend is a
+            # strict convex combination of two SPD matrices, hence SPD, so the test could only ever
+            # return True: measured min-eigenvalue 5.2e-3 over 2000 pairs x alpha in {.25,.5,.75},
+            # and 0/4000 fp32 non-PD verdicts at every cond from 1e2 to 1e10. Not merely inert --
+            # at cond 1e12 it FALSELY rejected 25/4000 blends whose exact fp64 spectrum is strictly
+            # positive, converting a valid divergence into a gradient-dead kl_max.
+            #
+            # It is also the ONLY batch-limited op in this branch. torch.linalg.eigvalsh routes to
+            # cuSOLVER syevBatched for n <= 32, which rejects the CALL past ~2.6e4-3.2e4 matrices
+            # (K=8: 29915/29916, K=20: 26305/26306; IDENTICAL in fp32 and fp64, so it is a shape-only
+            # parameter rejection, not a workspace-byte limit -- PyTorch 2.8.0 regression
+            # syevjBatched_bufferSize -> xsyevBatched_bufferSize, pytorch/pytorch#166004). That put a
+            # hard ceiling on the whole full-covariance non-KL surface: squared_hellinger and
+            # bhattacharyya both hardcode alpha=0.5, and the E-step pair grid H*B*N^2 crosses it at
+            # batch_size=1 (2*64*128^2 = 2.1e6 at the live config, 71.7x over). cholesky_ex carries
+            # no such ceiling (verified to 2,097,152), reproduces the spectral verdict 20000/20000 at
+            # alpha in {1.5,2.0,5.0}, and costs ~K^3/3 flops against eigvalsh's ~9K^3. Measured 8.0x
+            # end-to-end on family_chunked decode, with max relative value diff 0.000e+00.
+            if alpha > 1.0:
+                # info == 0 IS the numerical PD predicate, and NO ridge is added here (unlike
+                # safe_cholesky above), so an indefinite blend is reported as such.
+                _, blend_info = torch.linalg.cholesky_ex(sigma_blend)
+                blend_pd = blend_info == 0
+                ok = blend_pd & ok_q & ok_t        # non-PD blend or failed factor -> NaN -> kl_max
+            else:
+                ok = ok_q & ok_t                   # convex blend of SPD is SPD; only factors can fail
             div = torch.where(ok, div, div.new_tensor(float("nan")))
         return safe_kl_clamp(div, kl_max=kl_max).to(result_dtype)

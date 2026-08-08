@@ -36,6 +36,7 @@ from typing import Callable, Dict, List, Optional
 import torch
 
 from vfe3.geometry.lie_ops import gram_pinv, warn_if_basis_not_closed
+from vfe3.numerics import safe_eigvalsh
 
 _PRECOND: Dict[str, Callable[..., torch.Tensor]] = {}
 
@@ -526,7 +527,7 @@ def _full_pullback_group_direction(
     metric = 0.5 * (metric + metric.transpose(-1, -2))
     gram_inverse_half = preparation.gram_inverse_half
     whitened = torch.matmul(torch.matmul(gram_inverse_half, metric), gram_inverse_half.transpose(-1, -2))
-    undamped_eigenvalues = torch.linalg.eigvalsh(0.5 * (whitened + whitened.transpose(-1, -2)))
+    undamped_eigenvalues = safe_eigvalsh(0.5 * (whitened + whitened.transpose(-1, -2)))
     min_undamped = undamped_eigenvalues[..., 0]
     max_undamped = undamped_eigenvalues[..., -1]
     undamped_condition = max_undamped / min_undamped

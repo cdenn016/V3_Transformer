@@ -1683,6 +1683,19 @@ class PriorBank(nn.Module):
         mu_v_all = self._decode_mu_table()                                  # (V, K) decode table (untied if set)
         u_all = self._unigram_bias() if self.decode_unigram_prior else None  # (V,) kappa*log pi_v or None
 
+        # Positions the decode cannot score (audit 2026-08-07; see the `valid` mask below). The
+        # covariance is SANITIZED here rather than the energy being masked afterwards: with
+        # kl_max=inf a non-PD Sigma_q yields NaN, `nan * 0.0` is `nan` at the masked mean, and
+        # logsumexp/softmax backward turns the zero gradient into `0 * nan` as well -- so a masked
+        # value would still poison both passes. Substituting a benign SPD covariance at positions
+        # that are excluded anyway keeps the whole graph finite and cannot affect the loss, because
+        # `valid` drops these from the numerator AND the denominator. None => diagonal dispersion,
+        # no factorization, nothing to sanitize (byte-identical for the diagonal family).
+        degenerate = self.decode_degenerate_positions(sigma_q)               # (B, N) bool, or None
+        if degenerate is not None:
+            eye = torch.eye(sigma_q.shape[-1], device=sigma_q.device, dtype=sigma_q.dtype)
+            sigma_q = torch.where(degenerate[..., None, None], eye.expand_as(sigma_q), sigma_q)
+
         q_mu = mu_q.unsqueeze(-2)                                            # (B, N, 1, K)
         q_sigma = sigma_q.unsqueeze(-3 if is_full else -2)                   # (B, N, 1, K[, K])
 
@@ -1711,7 +1724,19 @@ class PriorBank(nn.Module):
             # Byte-identical for finite logits (x*1.0 == x, x*0.0 == 0.0).
             return lse_chunk, torch.where(in_chunk_f > 0, gathered, torch.zeros_like(gathered))
 
+        # A position whose Sigma_q is not PD is EXCLUDED, exactly like an ignore_index token, rather
+        # than scored (audit 2026-08-06 F31). This route was left OUT of that fix (audit 2026-08-07):
+        # the mask here was a bare ``targets != ignore_index``, so one degenerate position sent a
+        # non-finite energy through logsumexp and NaN'd the scalar CE for the WHOLE batch -- measured
+        # ``fused CE=nan`` here against ``3.0012598`` on the full_chunked twin at identical inputs.
+        # The dense branch's guard (model.py) does not cover this route either, because
+        # ``family_chunked`` registers supports_chunked=True and is served by the fused branch.
+        # ``decode_degenerate_positions`` returns None for a diagonal dispersion (no factorization,
+        # so no failure mode to report), which keeps the diagonal family byte-identical. The mask is
+        # computed once above, before the covariance is sanitized.
         valid = targets != ignore_index                                    # (B, N) bool
+        if degenerate is not None:
+            valid = valid & ~degenerate
         lse_chunks = []
         target_logit = torch.zeros(mu_q.shape[:-1], device=mu_q.device, dtype=mu_q.dtype)  # (B, N)
 
@@ -2036,6 +2061,61 @@ def _decode_full_chunked(
     return -kl_v / tau_eff                                               # _decode_diagonal (audit 2026-07-05 m5)
 
 
+def _family_logits(
+    pb:      PriorBank,
+    mu_q:    torch.Tensor,               # (B, N, K) posterior means
+    sigma_q: torch.Tensor,               # (B, N, K) or (B, N, K, K) posterior (co)variances
+    tau_eff: torch.Tensor,               # () effective temperature
+
+    *,
+    chunk:   Optional[int],              # vocab-slice width; None -> one slice (the dense kernel)
+) -> torch.Tensor:                       # (B, N, V) logits = -D_configured(q || pi_v)/tau_eff
+    r"""Shared body of the ``family`` / ``family_chunked`` LOGITS kernels (audit 2026-08-07).
+
+    ``chunk`` is the only difference between the two modes, so they share one implementation and
+    cannot drift. Slicing the vocabulary bounds the live functional workspace to (B, N, chunk[, K, K])
+    instead of (B, N, V[, K, K]); the concatenated result is value-identical because the functional
+    is applied elementwise over the vocabulary axis (each pi_v is scored independently).
+
+    Degenerate positions are handled exactly as ``_decode_full_chunked`` handles them (audit
+    2026-08-06 F31): a non-PD Sigma_q has no valid likelihood, so it is scored on a substituted
+    benign covariance and then overwritten with an INFORMATIONLESS uniform row, rather than emitting
+    the NaN that ``kl_max=inf`` would otherwise produce and that would propagate through any
+    downstream ``log_softmax`` or sampling step.
+    """
+    family_cls = get_family(pb.family)
+    is_full = family_cls.cov_kind == "full"
+    functional = get_functional(pb.divergence_family)
+    V = pb.vocab_size
+
+    degenerate = pb.decode_degenerate_positions(sigma_q)                    # (B, N) bool, or None
+    if degenerate is not None:
+        eye = torch.eye(sigma_q.shape[-1], device=sigma_q.device, dtype=sigma_q.dtype)
+        sigma_q = torch.where(degenerate[..., None, None], eye.expand_as(sigma_q), sigma_q)
+
+    q = family_cls(mu_q.unsqueeze(-2), sigma_q.unsqueeze(-3 if is_full else -2))
+    p_sigma_all = bounded_variance_from_log(
+        pb._decode_sigma_log_table(), eps=pb.eps
+    )                                                                       # (V, K) diagonal prior variances
+    mu_v_all = pb._decode_mu_table()                                        # (V, K) decode table (untied if set)
+
+    width = V if chunk is None else max(1, min(int(chunk), V))
+    slices = []
+    for v0 in range(0, V, width):
+        v1 = min(v0 + width, V)
+        p_sigma_c = p_sigma_all[v0:v1]                                      # (Vc, K)
+        p = family_cls(mu_v_all[v0:v1],
+                       torch.diag_embed(p_sigma_c) if is_full else p_sigma_c)
+        energy = functional(q, p, alpha=pb.renyi_order,
+                            kl_max=float("inf"), eps=pb.eps)                # (B, N, Vc)
+        slices.append(-energy / tau_eff)
+    logits = slices[0] if len(slices) == 1 else torch.cat(slices, dim=-1)   # (B, N, V)
+
+    if degenerate is not None:
+        logits = torch.where(degenerate.unsqueeze(-1), torch.zeros_like(logits), logits)
+    return logits
+
+
 @register_decode(
     "family",
     covariance_kinds=frozenset({"diagonal", "full"}),
@@ -2061,22 +2141,7 @@ def _decode_family(
     (a full family a (B, N, V, K, K) workspace): general but O(B*N*V*...); the training memory win is
     the fused CE twin ``decode_ce_family_chunked``. For a canonical gaussian + renyi + alpha=1 config
     this equals the fast ``diagonal``/``full`` kernels (and ``reference_decode`` is pinned to it)."""
-    family_cls = get_family(pb.family)
-    q_sigma = sigma_q.unsqueeze(-3 if family_cls.cov_kind == "full" else -2)
-    q = family_cls(mu_q.unsqueeze(-2), q_sigma)
-    p_sigma_diag = bounded_variance_from_log(
-        pb._decode_sigma_log_table(), eps=pb.eps
-    )                                                                       # (V, K) diagonal prior variances
-    p_sigma = (
-        torch.diag_embed(p_sigma_diag)
-        if family_cls.cov_kind == "full"
-        else p_sigma_diag
-    )                                                                       # (V, K) or (V, K, K)
-    p = family_cls(pb._decode_mu_table(), p_sigma)
-    functional = get_functional(pb.divergence_family)
-    energy = functional(q, p, alpha=pb.renyi_order,
-                        kl_max=float("inf"), eps=pb.eps)                    # (B, N, V)
-    return -energy / tau_eff
+    return _family_logits(pb, mu_q, sigma_q, tau_eff, chunk=None)
 
 
 @register_decode(
@@ -2097,11 +2162,18 @@ def _decode_family_chunked(
     r"""Inference (targets=None) decode for ``decode_mode='family_chunked'``: full family logits.
 
     The chunked mode's training memory win is the FUSED decode+CE in ``decode_ce_family_chunked``
-    (it never forms (B, N, V)). When ``decode`` is called for logits (sampling / generation /
-    inference), correctness is what matters, so this delegates to the exact ``family`` kernel --
-    the returned logits are byte-identical to ``decode_mode='family'``.
+    (it never forms (B, N, V)). Producing every vocab logit inherently materializes (B, N, V), but
+    the FUNCTIONAL WORKSPACE behind it does not have to be materialized all at once, and for a full
+    family that workspace is the (B, N, V, K, K) tensor -- K^2 times the output.
+
+    Until audit 2026-08-07 this delegated to the unchunked ``_decode_family``, so ``decode_chunk_size``
+    was accepted and silently ignored on this path: measured identical 49.15 MB workspace at both
+    chunk=512 and chunk=8192, and a single 321.6 MB (1, 2, 50257, 20, 20) allocation at the live
+    vocab/embed -- about 41 GB at N=256, against 8 MB for ``full_chunked``. The knob is now honoured
+    here, which is what makes the mode usable at realistic N. Value-identical to ``decode_mode=
+    'family'``: both call ``_family_logits``, differing only in the slice width.
     """
-    return _decode_family(pb, mu_q, sigma_q, tau_eff)
+    return _family_logits(pb, mu_q, sigma_q, tau_eff, chunk=pb.decode_chunk_size)
 
 
 @register_decode(
