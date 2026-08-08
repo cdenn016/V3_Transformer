@@ -89,11 +89,11 @@ config = dict(
     embed_dim                 = 20,                  # K, total belief dim (must be divisible by n_heads)
     n_heads                   = 2,
     
-    max_seq_len               = 64,                 # N, context length
+    max_seq_len               = 128,                 # N, context length
     eval_stride               = None,
     
-    batch_size                = 32,
-    max_steps                 = 60000,
+    batch_size                = 64,
+    max_steps                 = 15000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
@@ -141,7 +141,7 @@ config = dict(
     #################################
     #        Initialization
     #################################
-    mu_init_std               = 0.065,     # std of the random mean table mu_embed
+    mu_init_std               = 0.001, #0.065,     # std of the random mean table mu_embed
     sigma_init                = 2.5,         # constant initial coordinate variance (sigma_log = log of this)
     phi_scale                 = 0.06,      # std
     pos_phi_scale             = 0.02,                # learned-table init scale AND frozen per-position step
@@ -157,8 +157,10 @@ config = dict(
     
     use_prior_bank            = True,               # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (encode stays on the prior bank)
-    decode_tau                = 0.008,
-    decode_mode               = 'full_chunked',  #"full_chunked", "diagonal_chunked", "expected_likelihood_chunked", "full", "family", "family_chunked" (family/family_chunked: divergence-consistent KL-to-prior decode, use_prior_bank=True)
+    decode_tau                = 0.01,
+    decode_mode               = 'full_chunked',  #"family_chunked (set chunks to 512 or default/K^2)", "full_chunked", "diagonal_chunked", "expected_likelihood_chunked", "full", "family", "family_chunked" (family/family_chunked: divergence-consistent KL-to-prior decode, use_prior_bank=True)
+    decode_chunk_size         = 8192,
+    
     encode_mode               = "per_token",   #"per_token_additive"
     
     
@@ -329,7 +331,7 @@ config = dict(
     #################################
     
     e_q_mu_lr                 = 0.3,
-    e_q_sigma_lr              = 0.005,
+    e_q_sigma_lr              = 0.025,
     e_phi_lr                  = 0.00,     
     
     
@@ -352,17 +354,17 @@ config = dict(
     #        Learning Rates
     #################################
         
-    m_p_mu_lr                 = 0.015,     
-    m_p_sigma_lr              = 0.001,     
+    m_p_mu_lr                 = 0.005,     
+    m_p_sigma_lr              = 0.002,     
     m_phi_lr                  = 0.0025,    #0.0025 pure path
     
     m_s_phi_lr                = 0.007,         
     
     weight_decay              = 0.02,   
-    phi_weight_decay          = 0.03,   
-    sigma_weight_decay        = 0.00,           # AdamW decay for log-variance tables (None = inherit weight_decay;
+    phi_weight_decay          = 0.00,   
+    sigma_weight_decay        = 0.0,           # AdamW decay for log-variance tables (None = inherit weight_decay;
                                              # 0.0 exempts sigma from the unintended log-sigma->0 pull)
-    mu_weight_decay           = 0.075,            # AdamW decay for the MEAN-role tables: mu_embed, s_mu_embed,
+    mu_weight_decay           = 0,            # AdamW decay for the MEAN-role tables: mu_embed, s_mu_embed,
                                              # decode_mu_embed, output_proj_weight (None = inherit weight_decay).
                                              # Decoupled decay reaches EVERY row of a live embedding table on
                                              # every step, so rare rows are crushed faster than their gather
@@ -410,7 +412,7 @@ config = dict(
     e_step_update             = "gradient",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
                                              # coordinate minimizer at frozen beta: precision fusion in ONE
                                              # iteration, same cost; kernel route only)
-    mm_damping                = 0.75,         # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
+    mm_damping                = 1,         # mm_exact damping eta in (0,1]; 1.0 = exact minimizer
 
     # --- randomized-depth E-step (recurrent-depth recipe) ---
     randomize_e_steps         = False,       # training forwards sample T ~ Uniform{e_steps_min..e_steps_max}
