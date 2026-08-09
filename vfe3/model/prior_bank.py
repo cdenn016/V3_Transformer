@@ -39,6 +39,7 @@ to EXACTLY (and under ``log_softmax``) on the canonical path.
 import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol, Tuple
 
 import torch
@@ -712,13 +713,15 @@ class PriorBank(nn.Module):
         self.decode_unigram_prior = decode_unigram_prior
         self.gauge_parameterization = gauge_parameterization
         self.gauge_group_name = gauge_group_name
-        self.irrep_dims = tuple(irrep_dims) if irrep_dims is not None else None
+        self.irrep_dims = irrep_dims
         if use_priorbank_head_evidence_mixer:
-            if self.irrep_dims is None:
+            if irrep_dims is None:
                 raise ValueError("head evidence requires explicit gauge-block dimensions")
-            if len(self.irrep_dims) < 2 or any(int(dim) <= 0 for dim in self.irrep_dims):
+            self._head_evidence_irrep_dims = tuple(int(dim) for dim in irrep_dims)
+            if (len(self._head_evidence_irrep_dims) < 2
+                    or any(dim <= 0 for dim in self._head_evidence_irrep_dims)):
                 raise ValueError("head evidence requires at least two positive gauge blocks")
-            self.head_evidence_logits = nn.Parameter(torch.zeros(len(self.irrep_dims)))
+            self.head_evidence_logits = nn.Parameter(torch.zeros(len(self._head_evidence_irrep_dims)))
         # untie applies to the KL-to-bank decode only (the linear ablation is already untied by
         # construction), so the flag is resolved against use_prior_bank once, here.
         self.untie_decode_bank = untie_decode_bank and use_prior_bank
@@ -964,7 +967,7 @@ class PriorBank(nn.Module):
             raise RuntimeError("head evidence weights require use_priorbank_head_evidence_mixer=True")
         weights = normalized_head_evidence_weights(
             self.head_evidence_logits,
-            self.irrep_dims,
+            self._head_evidence_irrep_dims,
             dtype=dtype,
             device=device,
         )
@@ -2471,3 +2474,28 @@ def _decode_linear(
     if pb.output_proj_bias is not None:
         logits = logits + pb.output_proj_bias                           # learned log-unigram prior
     return logits
+
+
+# The evidence mixer has a deliberately narrower contract than the general decode registry: its
+# canonical-KL interpretation is valid only for these import-time registrations. Keeping both the
+# registration records and their callables pins an override=True alias/replacement fail-closed.
+_HEAD_EVIDENCE_CANONICAL_DECODERS: Mapping[str, DecodeRegistration] = MappingProxyType({
+    "diagonal": _DECODERS["diagonal"],
+    "diagonal_chunked": _DECODERS["diagonal_chunked"],
+    "full": _DECODERS["full"],
+    "full_chunked": _DECODERS["full_chunked"],
+})
+_HEAD_EVIDENCE_CANONICAL_DECODER_CALLABLES: Mapping[str, DecodeCallable] = MappingProxyType({
+    name: registration.callable
+    for name, registration in _HEAD_EVIDENCE_CANONICAL_DECODERS.items()
+})
+
+
+def has_builtin_head_evidence_decoder(name: str) -> bool:
+    """Whether *name* still resolves to its import-time canonical KL decoder exactly."""
+    registration = _DECODERS.get(name)
+    return (
+        registration is _HEAD_EVIDENCE_CANONICAL_DECODERS.get(name)
+        and registration is not None
+        and registration.callable is _HEAD_EVIDENCE_CANONICAL_DECODER_CALLABLES[name]
+    )

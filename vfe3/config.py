@@ -2526,7 +2526,7 @@ class VFE3Config:
         # / spd_retract_mode above). Local import avoids a config <- prior_bank cycle. decode_mode must
         # NOT accept 'linear': that kernel is reached only through the use_prior_bank=False second-gate
         # (a learned linear readout), never via decode_mode, so it is excluded from the valid set.
-        from vfe3.model.prior_bank import _DECODERS, _ENCODERS
+        from vfe3.model.prior_bank import _DECODERS, _ENCODERS, has_builtin_head_evidence_decoder
         _require(self.decode_mode, tuple(sorted(set(_DECODERS) - {"linear"})), "decode_mode")
         # decode_mode sets the covariance RANK(s) of the prior-bank decode kernel via its resolved
         # DecodeRegistration.covariance_kinds: 'diagonal'/'diagonal_chunked' -> {'diagonal'};
@@ -2537,7 +2537,6 @@ class VFE3Config:
         # sigma and its own active registration controls dense-vs-fused training; decode_mode does not
         # route that no-prior path, so the cross-check stays gated on use_prior_bank.
         decode_registration = _DECODERS[self.decode_mode]
-        family_kind = family_cov_kind(self.family)
         if self.use_priorbank_head_evidence_mixer:
             canonical_modes = {
                 "gaussian_diagonal": ("diagonal", "diagonal_chunked"),
@@ -2556,6 +2555,23 @@ class VFE3Config:
                     "family='gaussian_full' with decode_mode='full'/'full_chunked'. "
                     f"Got family={self.family!r}, decode_mode={self.decode_mode!r}."
                 )
+            from vfe3.families.base import _FAMILIES, _FUNCTIONALS, renyi
+            from vfe3.families.gaussian import DiagonalGaussian, FullGaussian
+            canonical_families = {
+                "gaussian_diagonal": DiagonalGaussian,
+                "gaussian_full": FullGaussian,
+            }
+            if (
+                _FAMILIES.get(self.family) is not canonical_families[self.family]
+                or _FUNCTIONALS.get("renyi") is not renyi
+                or not has_builtin_head_evidence_decoder(self.decode_mode)
+            ):
+                raise ValueError(
+                    "use_priorbank_head_evidence_mixer=True requires built-in canonical registry "
+                    "identities for its Gaussian family, the renyi functional, and its KL decoder; "
+                    "registry overrides are not eligible."
+                )
+        family_kind = family_cov_kind(self.family)
         if self.use_prior_bank and family_kind not in decode_registration.covariance_kinds:
             raise ValueError(
                 f"decode_mode={self.decode_mode!r} is rank-incompatible with family={self.family!r}: "

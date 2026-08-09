@@ -9,6 +9,16 @@ from vfe3.model.prior_bank import PriorBank
 from vfe3.train import build_optimizer
 
 
+_MISSING = object()
+
+
+def _restore_registry_entry(registry: dict[str, object], name: str, previous: object) -> None:
+    if previous is _MISSING:
+        registry.pop(name, None)
+    else:
+        registry[name] = previous
+
+
 def _enabled_cfg(**overrides: object) -> VFE3Config:
     values = {
         "vocab_size": 11,
@@ -74,6 +84,100 @@ def test_head_evidence_parameter_is_enabled_only_and_starts_at_exact_zero():
     assert not hasattr(off, "head_evidence_logits")
     assert isinstance(on.head_evidence_logits, torch.nn.Parameter)
     torch.testing.assert_close(on.head_evidence_logits, torch.zeros(2), rtol=0, atol=0)
+
+
+def test_disabled_head_evidence_preserves_caller_irrep_dims_list_identity():
+    dims = [2, 2]
+    pb = PriorBank(11, 4, 8, irrep_dims=dims, use_prior_bank=True)
+    assert pb.irrep_dims is dims
+    assert pb.irrep_dims == [2, 2]
+
+
+@pytest.mark.registry_mutation
+def test_head_evidence_rejects_overridden_builtin_family_registration():
+    from vfe3.families.base import _FAMILIES, register_family
+    from vfe3.families.gaussian import DiagonalGaussian
+
+    name = "gaussian_diagonal"
+    previous = _FAMILIES.get(name, _MISSING)
+    try:
+        @register_family(name, override=True)
+        class _ReplacementDiagonal(DiagonalGaussian):
+            pass
+
+        with pytest.raises(ValueError, match="built-in canonical registry identities"):
+            _enabled_cfg()
+    finally:
+        _restore_registry_entry(_FAMILIES, name, previous)
+
+
+@pytest.mark.registry_mutation
+def test_head_evidence_rejects_overridden_builtin_renyi_functional():
+    from vfe3.families.base import _FUNCTIONALS, register_functional
+
+    name = "renyi"
+    previous = _FUNCTIONALS.get(name, _MISSING)
+    try:
+        @register_functional(name, override=True)
+        def _replacement_renyi(*args: object, **kwargs: object) -> torch.Tensor:
+            return previous(*args, **kwargs)
+
+        with pytest.raises(ValueError, match="built-in canonical registry identities"):
+            _enabled_cfg()
+    finally:
+        _restore_registry_entry(_FUNCTIONALS, name, previous)
+
+
+@pytest.mark.registry_mutation
+def test_head_evidence_rejects_replaced_canonical_decoder_registration():
+    from vfe3.model import prior_bank as prior_bank_mod
+
+    name = "diagonal_chunked"
+    previous = prior_bank_mod._DECODERS[name]
+    try:
+        prior_bank_mod.register_decode(
+            name,
+            supports_full=previous.supports_full,
+            supports_chunked=previous.supports_chunked,
+            fused_ce=previous.fused_ce,
+            family_consistent=previous.family_consistent,
+            covariance_kinds=previous.covariance_kinds,
+            can_omit_base_mean=previous.can_omit_base_mean,
+            can_omit_base_variance=previous.can_omit_base_variance,
+            override=True,
+        )(previous.callable)
+
+        with pytest.raises(ValueError, match="built-in canonical registry identities"):
+            _enabled_cfg()
+    finally:
+        prior_bank_mod._DECODERS[name] = previous
+
+
+@pytest.mark.registry_mutation
+def test_head_evidence_rejects_replaced_canonical_decoder_callable():
+    from vfe3.model import prior_bank as prior_bank_mod
+
+    name = "diagonal_chunked"
+    previous = prior_bank_mod._DECODERS[name]
+    try:
+        @prior_bank_mod.register_decode(
+            name,
+            supports_full=previous.supports_full,
+            supports_chunked=previous.supports_chunked,
+            fused_ce=previous.fused_ce,
+            family_consistent=previous.family_consistent,
+            covariance_kinds=previous.covariance_kinds,
+            can_omit_base_mean=previous.can_omit_base_mean,
+            can_omit_base_variance=previous.can_omit_base_variance,
+            override=True,
+        )
+        def _replacement_decoder(*args: object, **kwargs: object) -> torch.Tensor:
+            return previous.callable(*args, **kwargs)
+
+        with pytest.raises(ValueError, match="built-in canonical registry identities"):
+            _enabled_cfg()
+    finally:
+        prior_bank_mod._DECODERS[name] = previous
 
 
 @pytest.mark.parametrize(
