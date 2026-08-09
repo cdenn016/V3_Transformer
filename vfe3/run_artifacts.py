@@ -4077,8 +4077,9 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
     toggles intentionally, so a non-pure run is recorded (``on_pure_path=False`` with the offending
     flags), never flagged as wrong. ``pure_flags`` covers the principal gauge / decode / free-energy
     purity axes (canonical attention entropy, flat transport, constant/static coupling weights,
-    prior-bank decode, full sigma updates, no two-hop/fixed-prior surrogate, no head mixer,
-    unweighted attention); it does NOT enumerate every default-OFF learned-scalar toggle
+    prior-bank decode, full sigma updates, no two-hop/fixed-prior surrogate, no post-belief HeadMixer,
+    no PriorBank decoder head-evidence mixer, unweighted attention); it does NOT enumerate every
+    default-OFF learned-scalar toggle
     (pos_phi, learnable_r, t5_learnable_bias, use_cg_coupling),
     so ``on_pure_path`` certifies these axes rather than a full no-learned-parameter audit.
     ``gauge_flags``/``on_gauge_pure_path`` is a SECOND, independent axis (audit 2026-07-01 F8): the
@@ -4099,6 +4100,9 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
     family_group_invariant = cfg.family in invariant_families
     transport_registration = get_transport_registration(cfg.transport_mode)
     fixed_prior_surrogate = bool(cfg.precision_weighted_attention)
+    priorbank_head_evidence_mixer = bool(
+        getattr(cfg, "use_priorbank_head_evidence_mixer", False)
+    )
     head_mixer_compatibility = getattr(cfg, "head_mixer_compatibility", None)
     if head_mixer_compatibility is None:
         head_mixer_compatibility = VFE3Config.head_mixer_compatibility.fget(cfg)
@@ -4140,6 +4144,7 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
         "constant_lambda_alpha":       cfg.lambda_alpha_mode == "constant",
         "prior_bank_decode":           bool(cfg.use_prior_bank),
         "no_head_mixer":               not cfg.use_head_mixer,
+        "no_priorbank_head_evidence_mixer": not priorbank_head_evidence_mixer,
         "unweighted_attention":        not cfg.precision_weighted_attention,
         "full_sigma_update":           not cfg.skip_belief_sigma_update,
         "no_twohop_coupling":          cfg.lambda_twohop == 0.0,
@@ -4177,6 +4182,11 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             "lambda_beta":                  float(cfg.lambda_beta),
             "use_prior_bank":               bool(cfg.use_prior_bank),
             "use_head_mixer":               bool(cfg.use_head_mixer),
+            "use_priorbank_head_evidence_mixer": priorbank_head_evidence_mixer,
+            "encode_mode":                  getattr(cfg, "encode_mode", "per_token"),
+            "priorbank_head_evidence_role": (
+                "decoder_kl_irrep_weights" if priorbank_head_evidence_mixer else "inactive"
+            ),
             "head_mixer_compatibility":      head_mixer_compatibility,
             "head_mixer_gauge_compatible":   head_mixer_gauge_compatible,
             "precision_weighted_attention": bool(cfg.precision_weighted_attention),

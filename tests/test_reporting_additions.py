@@ -354,6 +354,7 @@ def _pure_ns(**over):
     base = dict(
         include_attention_entropy=True, transport_mode="flat", lambda_alpha_mode="constant",
         use_prior_bank=True, use_head_mixer=False,
+        use_priorbank_head_evidence_mixer=False, encode_mode="per_token",
         lambda_beta=1.0, precision_weighted_attention=False,
         gauge_transport="on", pos_rotation="none", rope_full_gauge=False, rope_on_value=True,
         lambda_gamma=0.0, s_e_step=False,
@@ -378,6 +379,34 @@ def test_pure_path_report_structure_and_flags():
     impure = types.SimpleNamespace(**{**pure.__dict__, "transport_mode": "regime_ii"})
     rep2 = _pure_path_report(impure, history)
     assert rep2["on_pure_path"] is False and rep2["pure_flags"]["flat_transport"] is False
+
+
+def test_pure_path_report_marks_priorbank_head_evidence_mixer_as_opt_in():
+    rep = _pure_path_report(_pure_ns(
+        use_priorbank_head_evidence_mixer=True,
+        encode_mode="canonical_content_projected",
+    ), [])
+
+    assert rep["on_pure_path"] is False
+    assert rep["pure_flags"]["no_priorbank_head_evidence_mixer"] is False
+    assert rep["config_toggles"]["use_priorbank_head_evidence_mixer"] is True
+    assert rep["config_toggles"]["encode_mode"] == "canonical_content_projected"
+    assert rep["config_toggles"]["priorbank_head_evidence_role"] == "decoder_kl_irrep_weights"
+
+
+def test_pure_path_report_keeps_priorbank_evidence_role_separate_from_head_mixer():
+    rep = _pure_path_report(_pure_ns(
+        use_head_mixer=True,
+        use_priorbank_head_evidence_mixer=False,
+        encode_mode="canonical_content_gauge",
+    ), [])
+
+    assert rep["pure_flags"]["no_head_mixer"] is False
+    assert rep["pure_flags"]["no_priorbank_head_evidence_mixer"] is True
+    assert rep["config_toggles"]["use_head_mixer"] is True
+    assert rep["config_toggles"]["use_priorbank_head_evidence_mixer"] is False
+    assert rep["config_toggles"]["encode_mode"] == "canonical_content_gauge"
+    assert rep["config_toggles"]["priorbank_head_evidence_role"] == "inactive"
 
 
 def test_gauge_purity_axis_is_independent_of_fe_axis():
