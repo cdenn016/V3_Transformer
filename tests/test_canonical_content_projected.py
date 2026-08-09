@@ -361,6 +361,32 @@ def test_projected_construction_rejects_overridden_gaussian_full_family(
 
 
 @pytest.mark.registry_mutation
+@pytest.mark.parametrize("construction_seam", ["config", "prior_bank"])
+def test_projected_construction_rejects_overridden_diagonal_family_without_mixer(
+    construction_seam: str,
+) -> None:
+    """Projected materialization must not resolve a same-name custom table family."""
+    from vfe3.families.base import _FAMILIES, register_family
+    from vfe3.families.gaussian import DiagonalGaussian
+
+    name = "gaussian_diagonal"
+    previous = _FAMILIES[name]
+    try:
+        @register_family(name, override=True)
+        class _ReplacementDiagonalGaussian(DiagonalGaussian):
+            pass
+
+        with pytest.raises(ValueError, match=r"canonical_content_projected.*gaussian_diagonal"):
+            if construction_seam == "config":
+                _projected_cfg(use_priorbank_head_evidence_mixer=False)
+            else:
+                _projected_bank()
+    finally:
+        _FAMILIES[name] = previous
+    assert _FAMILIES[name] is previous
+
+
+@pytest.mark.registry_mutation
 @pytest.mark.parametrize("override_kind", ["registration", "callable_map"])
 def test_projected_construction_rejects_overridden_encoder_identity(
     override_kind: str,

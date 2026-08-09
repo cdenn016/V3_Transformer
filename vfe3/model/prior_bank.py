@@ -766,6 +766,12 @@ class PriorBank(nn.Module):
                     "encode_mode='canonical_content_projected' requires its built-in encoder "
                     "registration and callable identities; registry overrides are not eligible."
                 )
+            if not has_builtin_canonical_content_family(encode_mode):
+                raise ValueError(
+                    "encode_mode='canonical_content_projected' requires the import-time "
+                    "gaussian_diagonal family identity used by its canonical table; registry "
+                    "overrides are not eligible."
+                )
             if not has_builtin_projected_full_family():
                 raise ValueError(
                     "encode_mode='canonical_content_projected' requires the import-time "
@@ -2902,6 +2908,7 @@ _CANONICAL_CONTENT_ENCODER_CALLABLES: Mapping[str, EncodeCallable] = MappingProx
 })
 _CANONICAL_CONTENT_FAMILIES: Mapping[str, type] = MappingProxyType({
     "canonical_content_gauge": get_family("gaussian_frame_diagonal"),
+    "canonical_content_projected": get_family("gaussian_diagonal"),
 })
 _PROJECTED_FULL_FAMILY: type = get_family("gaussian_full")
 
@@ -2919,12 +2926,15 @@ def has_builtin_canonical_content_encoder(name: str) -> bool:
 
 
 def has_builtin_canonical_content_family(encode_mode: str) -> bool:
-    """Whether an exact canonical mode still resolves its import-time family implementation."""
+    """Whether a canonical mode still resolves its own import-time table family."""
     expected = _CANONICAL_CONTENT_FAMILIES.get(encode_mode)
-    return (
-        expected is not None
-        and get_family("gaussian_frame_diagonal") is expected
-    )
+    if encode_mode == "canonical_content_gauge":
+        family_name = "gaussian_frame_diagonal"
+    elif encode_mode == "canonical_content_projected":
+        family_name = "gaussian_diagonal"
+    else:
+        return False
+    return get_family(family_name) is expected
 
 
 def has_builtin_projected_full_family() -> bool:

@@ -2633,6 +2633,15 @@ class VFE3Config:
             )
         if (
             self.encode_mode == "canonical_content_projected"
+            and not has_builtin_canonical_content_family(self.encode_mode)
+        ):
+            raise ValueError(
+                "encode_mode='canonical_content_projected' requires the import-time "
+                "gaussian_diagonal family identity used by its canonical table; registry "
+                "overrides are not eligible."
+            )
+        if (
+            self.encode_mode == "canonical_content_projected"
             and not has_builtin_projected_full_family()
         ):
             raise ValueError(
