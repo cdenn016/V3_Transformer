@@ -5,6 +5,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple, TypedDict
 import torch
 
 from vfe3.belief import BeliefState
+from vfe3.model.canonical_content import CanonicalFrameContext
 
 
 class EffectiveBetaPriorContext(NamedTuple):
@@ -66,6 +67,7 @@ class MStepCapture(TypedDict, total=False):
     prior:              BeliefState
     out:                BeliefState
     beta_prior_context: EffectiveBetaPriorContext
+    canonical_frame:    CanonicalFrameContext
     # CG moment-energy participation (PB-13). Present ONLY when cfg.cg_energy_weight>0. Attached
     # E-step estimators append the per-layer D(q_post||q_pre) rows to ``cg_moment_energy_rows``; the
     # 'detach' estimator instead appends the detached pre-CG (mu, sigma) pairs to ``cg_pre_moments``

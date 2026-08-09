@@ -52,6 +52,7 @@ from vfe3.geometry.transport import (
     TransportState,
     get_transport_registration,
 )
+from vfe3.model.canonical_content import CanonicalFrameContext, project_canonical_diagonal
 from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.block import _as_coeff, vfe_block
 from vfe3.model.model_frame import resolve_model_frame
@@ -790,6 +791,31 @@ class VFEModel(nn.Module):
             coords = project_phi_to_slk(coords, self.group.generators, self.group.irrep_dims)
         return coords
 
+    @staticmethod
+    def _canonical_frame_context(
+        transport: 'CompactFactoredTransport | FactoredTransport | RopeTransport',
+    ) -> CanonicalFrameContext:
+        r"""Read dense per-vertex factors from the exact flat transport used by this forward."""
+        base = transport.base if isinstance(transport, RopeTransport) else transport
+        if isinstance(base, FactoredTransport):
+            if not base.same_frame_flat_cocycle:
+                raise RuntimeError(
+                    "projected canonical content requires a certified same-frame flat cocycle")
+            return CanonicalFrameContext(forward=base.exp_phi, inverse=base.exp_neg_phi)
+        if isinstance(base, CompactFactoredTransport):
+            if not base.same_frame_flat_cocycle:
+                raise RuntimeError(
+                    "projected canonical content requires a certified same-frame flat cocycle")
+            # Expand only the O(B N K^2) vertex factors. Never call to_dense_omega(), whose
+            # O(B N^2 K^2) pairwise operator would discard the compact transport's purpose.
+            return CanonicalFrameContext(
+                forward=CompactBlockElement(base.exp_blocks, base.K).to_dense(),
+                inverse=CompactBlockElement(base.inv_blocks, base.K).to_dense(),
+            )
+        raise RuntimeError(
+            "projected canonical content requires FactoredTransport or "
+            f"CompactFactoredTransport vertex factors, got {type(base).__name__}")
+
     def _resolve_model_frame(
         self,
         token_ids:  torch.Tensor,        # (B, N) integer token ids
@@ -1084,18 +1110,21 @@ class VFEModel(nn.Module):
         amp = self._amp_context(token_ids.device)
         with run, amp:
             shared_omega = None
-            if (self.cfg.s_frame_mode == "tied"
-                    and self.cfg.share_refine_s_transport
-                    and self.cfg.transport_mode == "flat"
-                    and self.cfg.e_phi_lr == 0.0
-                    and rope is None):
-                # share_refine_s_transport (default OFF): the flat transport built inside _refine_s's
-                # E-step and the one built inside the belief E-step below consume the IDENTICAL phi
-                # (both hold it fixed at e_phi_lr=0), so ONE build serves both -- skipping a redundant
-                # matrix-exp pair (+ its backward) per forward, and per LAYER at n_layers > 1 (phi is
-                # loop-invariant when e_phi_lr==0). The rope gate matters: the belief channel folds
-                # gauge-RoPE into both channels, so the unwrapped shared transport cannot serve either
-                # rotated hoist. Outside the guard each e_step keeps its own authoritative build.
+            canonical_frame: Optional[CanonicalFrameContext] = None
+            projected_content = self.cfg.encode_mode == "canonical_content_projected"
+            share_refine_s = (
+                self.cfg.s_frame_mode == "tied"
+                and self.cfg.share_refine_s_transport
+                and self.cfg.transport_mode == "flat"
+                and self.cfg.e_phi_lr == 0.0
+                and rope is None
+            )
+            if projected_content or share_refine_s:
+                # Projected canonical content ALWAYS owns one flat build: its exact vertex factors
+                # materialize q0=p and the same object is the E-step's prebuilt transport. The
+                # default-off share_refine_s_transport route reaches this build only when the s and q
+                # channels consume identical fixed phi and no RoPE wrapper is needed. Either route
+                # skips redundant matrix exponentials without reconstructing phi independently.
                 from vfe3.inference.e_step import build_belief_transport
                 shared_omega = build_belief_transport(
                     beliefs.phi, self.group,
@@ -1113,7 +1142,27 @@ class VFEModel(nn.Module):
                     exp_fp64_norm_threshold=self.cfg.exp_fp64_norm_threshold,
                     validity_max_norm=self.cfg.transport_chart_max_norm,
                     exactness_out=self._transport_status,
+                    # Projected content forces this one authoritative build even when gauge-RoPE
+                    # is active. The wrapper (if any) remains the prebuilt E-step transport, while
+                    # canonical materialization reads its underlying token/pos-phi vertex factors.
+                    rope=(rope if projected_content else None),
+                    rope_on_cov=self.cfg.rope_full_gauge,
+                    rope_on_value=self.cfg.rope_on_value,
+                    rope_insertion=self.cfg.rope_insertion,
                 )
+            if projected_content:
+                if not isinstance(shared_omega, (FactoredTransport, CompactFactoredTransport,
+                                                  RopeTransport)):
+                    raise RuntimeError(
+                        "projected canonical content did not receive a factored flat transport")
+                canonical_frame = self._canonical_frame_context(shared_omega)
+                materialized_mu, materialized_sigma = project_canonical_diagonal(
+                    beliefs.mu, beliefs.sigma, canonical_frame.forward)
+                # q(0) and p are the SAME materialized diagonal-family tensors. vfe_stack receives
+                # these exact objects as both its belief and prior arguments below.
+                beliefs = beliefs._replace(mu=materialized_mu, sigma=materialized_sigma)
+                if capture is not None:
+                    capture["canonical_frame"] = canonical_frame
             s_belief = None
             if self.cfg.s_e_step:
                 # Live model channel: refine s (phi0 fixed), then anchor the belief to it -- q0 and

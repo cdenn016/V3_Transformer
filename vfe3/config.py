@@ -1146,6 +1146,42 @@ class VFE3Config:
                     "reflection modes off; got " + ", ".join(incompatible)
                 )
 
+        # Practical canonical-content control: the token tables are intrinsic diagonal moments,
+        # materialized once into the realized token-plus-position frame before the diagonal E-step.
+        # The final query is pulled back to a full canonical covariance at decode, so the otherwise
+        # rank-incompatible full decoder is intentional and mandatory for this one named mode.
+        if self.encode_mode == "canonical_content_projected":
+            incompatible = []
+            if self.family != "gaussian_diagonal":
+                incompatible.append(f"family={self.family!r}")
+            if self.transport_mode != "flat":
+                incompatible.append(f"transport_mode={self.transport_mode!r}")
+            if self.gauge_parameterization != "phi":
+                incompatible.append(
+                    f"gauge_parameterization={self.gauge_parameterization!r}")
+            if self.prior_source != "token":
+                incompatible.append(f"prior_source={self.prior_source!r}")
+            if self.s_e_step:
+                incompatible.append("s_e_step=True")
+            if self.e_phi_lr != 0.0:
+                incompatible.append(f"e_phi_lr={self.e_phi_lr!r}")
+            if not self.use_prior_bank:
+                incompatible.append("use_prior_bank=False")
+            if self.decode_mode not in ("full", "full_chunked"):
+                incompatible.append(f"decode_mode={self.decode_mode!r}")
+            if self.omega_reflection != "off":
+                incompatible.append(f"omega_reflection={self.omega_reflection!r}")
+            if self.phi_reflection != "off":
+                incompatible.append(f"phi_reflection={self.phi_reflection!r}")
+            if incompatible:
+                raise ValueError(
+                    "encode_mode='canonical_content_projected' requires "
+                    "family='gaussian_diagonal', transport_mode='flat', "
+                    "gauge_parameterization='phi', prior_source='token', s_e_step=False, "
+                    "e_phi_lr=0.0, use_prior_bank=True, decode_mode='full'/'full_chunked', "
+                    "and both reflection modes off; got " + ", ".join(incompatible)
+                )
+
         # numerics
         if not (math.isfinite(self.eps) and self.eps > 0.0):
             raise ValueError(f"eps must be finite and positive, got {self.eps}")
@@ -2606,7 +2642,9 @@ class VFE3Config:
                     "registry overrides are not eligible."
                 )
         family_kind = family_cov_kind(self.family)
-        if self.use_prior_bank and family_kind not in decode_registration.covariance_kinds:
+        if (self.use_prior_bank
+                and self.encode_mode != "canonical_content_projected"
+                and family_kind not in decode_registration.covariance_kinds):
             raise ValueError(
                 f"decode_mode={self.decode_mode!r} is rank-incompatible with family={self.family!r}: "
                 f"it scores covariance kinds {sorted(decode_registration.covariance_kinds)} but the "
