@@ -466,6 +466,35 @@ def _learning_rates_by_role(
     return resolved
 
 
+def _learning_rates_by_aux_role(
+    param_groups: Sequence[Dict[str, object]],
+    lrs:          Sequence[float],
+) -> Dict[str, float]:
+    """Resolve optional component-specific CSV learning rates from optimizer metadata.
+
+    Unlike the required mean/sigma/phi report roles, an auxiliary role is absent when its
+    component is disabled. Missing roles therefore resolve to NaN so every metrics row keeps the
+    same two mixer columns and :class:`RunArtifacts` renders inactive values as blank cells.
+    """
+    if len(param_groups) != len(lrs):
+        raise RuntimeError("optimizer parameter groups and scheduler learning rates differ in length")
+    allowed = {"head_evidence", "head_mixer"}
+    resolved = {role: float("nan") for role in allowed}
+    seen = set()
+    for group, lr in zip(param_groups, lrs):
+        role = group.get("lr_aux_role")
+        if role is None:
+            continue
+        role = str(role)
+        if role not in allowed:
+            raise RuntimeError(f"unknown optimizer learning-rate auxiliary role {role!r}")
+        if role in seen:
+            raise RuntimeError(f"duplicate optimizer learning-rate auxiliary role {role!r}")
+        seen.add(role)
+        resolved[role] = float(lr)
+    return resolved
+
+
 def lr_lambda(
     step: int,
     cfg:  VFE3Config,
@@ -1968,6 +1997,7 @@ def train(
             n_tok = max(int(tokens.shape[1]), 1)
             raw_lrs = scheduler.get_last_lr()
             lrs = _learning_rates_by_role(optimizer.param_groups, raw_lrs)
+            aux_lrs = _learning_rates_by_aux_role(optimizer.param_groups, raw_lrs)
             row = {
                 "step":              step + 1,
                 "train_loss":        losses[-1],
@@ -1976,6 +2006,8 @@ def train(
                 "lr_mu":             lrs["mu"],
                 "lr_sigma":          lrs["sigma"],
                 "lr_phi":            lrs["phi"],
+                "lr_head_evidence":  aux_lrs["head_evidence"],
+                "lr_head_mixer":     aux_lrs["head_mixer"],
                 "val_ce":            last_val["ce"]  if do_eval else float("nan"),  # eval-cadence: fresh on
                 "val_ppl":           last_val["ppl"] if do_eval else float("nan"),  # an eval step (last_val just
                 "val_bits_per_token": (last_val["bits_per_token"] if do_eval
@@ -2288,6 +2320,11 @@ def coverage_lines(
     return lines
 
 
+def _fmt_mixer_lr(configured: Optional[float], mean_lr: float) -> str:
+    """Format a dedicated mixer LR while making ``None`` inheritance explicit."""
+    return f"{mean_lr} (inherit mu)" if configured is None else str(configured)
+
+
 def _fmt_tau(cfg: VFE3Config, model: VFEModel) -> str:
     r"""Banner format for the softmax temperature: a scalar kappa -> '1.5000', a per-head
     (list) kappa -> '[t0, t1, ...]' (T1). Converts a list kappa to a tensor first so attention_tau
@@ -2445,6 +2482,8 @@ def _banner(
         *dead_line,
         f" M-LRs: mu={cfg.m_p_mu_lr}  sigma={cfg.m_p_sigma_lr}  "
         f"phi={cfg.m_phi_lr}  s_phi={cfg.m_s_phi_lr}",
+        f" mixer-LRs: head_evidence={_fmt_mixer_lr(cfg.m_head_evidence_lr, cfg.m_p_mu_lr)}  "
+        f"head_mixer={_fmt_mixer_lr(cfg.m_head_mixer_lr, cfg.m_p_mu_lr)}",
         f" VFE: lambda_alpha={cfg.lambda_alpha}  kappa_beta={cfg.kappa_beta}  "
         f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
         f" seed={cfg.seed}",

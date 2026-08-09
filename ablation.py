@@ -500,6 +500,8 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #################################
         
     m_p_mu_lr                 = 0.015,     
+    m_head_evidence_lr        = 0.001,     # PriorBank-native KL irrep evidence weights
+    m_head_mixer_lr           = 0.001,     # post-belief Schur HeadMixer parameters
     m_p_sigma_lr              = 0.001,     
     m_phi_lr                  = 0.0025,
     

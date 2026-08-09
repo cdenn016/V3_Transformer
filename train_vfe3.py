@@ -355,6 +355,8 @@ config = dict(
     #################################
         
     m_p_mu_lr                 = 0.005,     
+    m_head_evidence_lr        = 0.001,     # PriorBank-native KL irrep evidence weights
+    m_head_mixer_lr           = 0.001,     # post-belief Schur HeadMixer parameters
     m_p_sigma_lr              = 0.002,     
     m_phi_lr                  = 0.0025,    #0.0025 pure path
     
@@ -509,7 +511,7 @@ RUN_ROOT = "vfe3_runs"
 
 def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
             train_loader=None, full_corpus_tokens: 'int | None' = None) -> str:
-    from vfe3.train import coverage_lines, parameter_report
+    from vfe3.train import _fmt_mixer_lr, coverage_lines, parameter_report
     rep = parameter_report(model, device=device)
     bar = "=" * 64
     cov = (coverage_lines(train_loader, n_steps, dataset, full_corpus_tokens=full_corpus_tokens)
@@ -531,6 +533,8 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
         *dead_line,
         f" M-LRs: mu={cfg.m_p_mu_lr}  sigma={cfg.m_p_sigma_lr}  "
         f"phi={cfg.m_phi_lr}  s_phi={cfg.m_s_phi_lr}",
+        f" mixer-LRs: head_evidence={_fmt_mixer_lr(cfg.m_head_evidence_lr, cfg.m_p_mu_lr)}  "
+        f"head_mixer={_fmt_mixer_lr(cfg.m_head_mixer_lr, cfg.m_p_mu_lr)}",
         f" VFE: lambda_alpha={cfg.lambda_alpha}  kappa_beta={cfg.kappa_beta}  "
         f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
         f" seed={cfg.seed}",

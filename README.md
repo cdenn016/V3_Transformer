@@ -1058,6 +1058,8 @@ configuration:
 
 ```python
 use_priorbank_head_evidence_mixer = True
+m_head_evidence_lr = 0.001                 # PriorBank-native evidence logits
+m_head_mixer_lr = 0.001                    # post-belief HeadMixer
 encode_mode = "canonical_content_gauge"      # exact intrinsic control; phi cancels
 encode_mode = "canonical_content_projected"  # projected diagonal state; frame-aware full decode
 ```
@@ -1073,6 +1075,12 @@ diagonal query back to full canonical covariance before scoring. Registry substi
 families, and unsupported pairings fail at construction. When enabled, diagnostics expose
 `head_evidence_weights`, `head_evidence_entropy`, and `head_evidence_max_abs_drift`; the existing
 post-belief `HeadMixer` remains a separate component with separate parameters and diagnostics.
+The two components also have independent optimizer rates: `m_head_evidence_lr` owns only the
+PriorBank evidence logits, while `m_head_mixer_lr` owns only the post-belief `HeadMixer`. Either
+field may be `None` to inherit `m_p_mu_lr`; an explicit `0.0` freezes that mixer without disabling
+its forward path. The evidence logits retain zero weight decay, while the post-belief mixer retains
+the ordinary configured AdamW weight decay. Periodic metrics expose the scheduler-adjusted values
+as `lr_head_evidence` and `lr_head_mixer`; an inactive component is recorded as a blank CSV cell.
 
 `encode_mode="canonical_content_gauge"` is the exact scientific control. It interprets the token
 tables as canonical moments $(a_v,s_v)$ for `gaussian_frame_diagonal`. Under the required flat
@@ -1127,7 +1135,9 @@ routes the outer gradients according to the configured unroll or estimator polic
 checked-in experiment uses AdamW for its active model-channel, frame, mixer, and linear-readout
 parameters. Under `prior_source="model_channel"`, the token-prior mean and variance tables remain
 grouped but are inactive: they receive no gradient, parameter update, or weight decay. Other
-optimizer and frame-update routes remain configuration choices.
+optimizer and frame-update routes remain configuration choices. The PriorBank-native evidence
+mixer and post-belief `HeadMixer` use `m_head_evidence_lr` and `m_head_mixer_lr`, respectively;
+`None` preserves the historical `m_p_mu_lr` inheritance behavior.
 
 ## Geometry and mathematical scope
 

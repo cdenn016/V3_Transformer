@@ -1,5 +1,6 @@
 """Regression tests for the July 9 click-to-run script repairs."""
 
+import ast
 import inspect
 from pathlib import Path
 
@@ -7,6 +8,38 @@ import pytest
 
 import check_junit
 from vfe3.inference.e_step import e_step
+
+
+def _dict_keyword_literal(path: str, variable: str, keyword: str):
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"), filename=path)
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == variable for target in targets):
+            continue
+        if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+                and value.func.id == "dict"):
+            raise AssertionError(f"{path}:{variable} is not a dict(...) literal")
+        for item in value.keywords:
+            if item.arg == keyword:
+                return ast.literal_eval(item.value)
+        raise AssertionError(f"{path}:{variable} omits {keyword}")
+    raise AssertionError(f"{path} omits {variable}")
+
+
+def test_launcher_head_mixer_learning_rates_are_explicit():
+    for path, variable in (
+        ("train_vfe3.py", "config"),
+        ("ablation.py", "BASELINE_CONFIG"),
+    ):
+        assert _dict_keyword_literal(path, variable, "m_head_evidence_lr") == 0.001
+        assert _dict_keyword_literal(path, variable, "m_head_mixer_lr") == 0.001
 
 
 def test_read_junit_counts_accepts_testsuite_root(tmp_path):

@@ -7,6 +7,7 @@ silent path (no artifacts object) must write nothing and stay bitwise-identical 
 covered by tests/test_train.py::test_silent_and_logging_paths_are_bitwise_identical).
 """
 
+import csv
 import hashlib
 import json
 import logging
@@ -81,6 +82,7 @@ class TrainedArtifactEvidence:
     relative_files:  frozenset[str]
     checkpoint_names: tuple[str, ...]
     metrics_columns: frozenset[str]
+    metrics_rows: tuple[dict[str, str], ...]
 
 
 @pytest.fixture(scope="module")
@@ -118,10 +120,13 @@ def trained_artifact_evidence(tmp_path_factory) -> TrainedArtifactEvidence:
         metrics_columns = frozenset(
             (run_dir / "metrics.csv").read_text(encoding="utf-8").splitlines()[0].split(",")
         )
+        with (run_dir / "metrics.csv").open(newline="", encoding="utf-8") as metrics_file:
+            metrics_rows = tuple(csv.DictReader(metrics_file))
         evidence = TrainedArtifactEvidence(
             relative_files=relative_files,
             checkpoint_names=checkpoint_names,
             metrics_columns=metrics_columns,
+            metrics_rows=metrics_rows,
         )
     finally:
         for figure_number in set(figs.plt.get_fignums()).difference(open_figures):
@@ -962,6 +967,20 @@ def test_metrics_csv_includes_gauge_geometry_columns(trained_artifact_evidence):
     # spread) must be surfaced in the per-eval CSV, not only the free-energy terms.
     assert "holonomy_deviation" in trained_artifact_evidence.metrics_columns
     assert "gauge_trace_spread" in trained_artifact_evidence.metrics_columns
+
+
+def test_head_mixer_lr_columns_are_rectangular_and_blank_when_inactive(
+    trained_artifact_evidence,
+):
+    assert {
+        "lr_head_evidence",
+        "lr_head_mixer",
+    }.issubset(trained_artifact_evidence.metrics_columns)
+    assert trained_artifact_evidence.metrics_rows
+    assert all(
+        row["lr_head_evidence"] == "" and row["lr_head_mixer"] == ""
+        for row in trained_artifact_evidence.metrics_rows
+    )
 
 
 def test_fd_gradient_check_restores_param_on_midloop_failure():

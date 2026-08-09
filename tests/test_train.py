@@ -189,6 +189,25 @@ def test_floor_lambdas_handle_zero_base_lr_without_dividing():
             assert lr >= cfg.min_lr - 1e-12
 
 
+def test_aux_role_learning_rate_reporting_handles_active_and_inactive_mixers():
+    from vfe3.train import _learning_rates_by_aux_role
+
+    groups = [
+        {"lr_aux_role": "head_evidence"},
+        {"role": "mu"},
+    ]
+    reported = _learning_rates_by_aux_role(groups, [0.0011, 0.0123])
+
+    assert reported["head_evidence"] == pytest.approx(0.0011)
+    assert math.isnan(reported["head_mixer"])
+
+    with pytest.raises(RuntimeError, match="duplicate optimizer learning-rate auxiliary role"):
+        _learning_rates_by_aux_role(
+            [{"lr_aux_role": "head_mixer"}, {"lr_aux_role": "head_mixer"}],
+            [0.0022, 0.0033],
+        )
+
+
 # The active alphabet of the period-3 stream is {0,1,2}; a structure-BLIND predictor
 # (one that learns only the unigram frequencies of the active tokens) is pinned at the
 # marginal entropy ln(3) ~ 1.0986. Beating that floor by a margin is the discriminating
