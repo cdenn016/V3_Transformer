@@ -277,7 +277,8 @@ class VFEModel(nn.Module):
         n_gen = self.group.generators.shape[0]
         # canonical_content_gauge intentionally reaches the existing per-token table path below:
         # gaussian_frame_diagonal reads those values as intrinsic (a_v, s_v), so VFEModel must not
-        # materialize a dense frame pushforward before the flat-cocycle family cancels phi.
+        # materialize a dense frame pushforward before the flat-cocycle family cancels phi. An
+        # optional unigram base-rate is added only after this exact Gaussian-divergence decode.
         self.prior_bank = PriorBank(
             cfg.vocab_size, cfg.embed_dim, n_gen,
             mu_init_std=cfg.mu_init_std, sigma_init=cfg.sigma_init, phi_scale=cfg.phi_scale,

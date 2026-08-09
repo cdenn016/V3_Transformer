@@ -192,3 +192,57 @@ def test_canonical_model_has_no_supervised_phi_gradient_and_emits_one_provenance
     _, loss, _ = model(tokens, targets)
     loss.backward()
     assert model.prior_bank.phi_embed.grad is None
+
+
+def test_canonical_config_accepts_unigram_base_rate_and_names_its_separate_role() -> None:
+    r"""A unigram base-rate bias must not be mistaken for a violation of Gaussian exactness."""
+    with pytest.warns(UserWarning, match="Gaussian divergence.*additive unigram base-rate") as notices:
+        cfg = _exact_cfg(decode_unigram_prior=True, unigram_kappa=1.75)
+    assert len(notices) == 1
+    assert cfg.decode_unigram_prior is True
+    assert cfg.unigram_kappa == 1.75
+
+
+def test_canonical_unigram_logits_add_the_configured_base_rate_after_intrinsic_kl_temperature() -> None:
+    r"""Moving the bias inside the KL temperature or gauge map changes the canonical logits."""
+    bank = PriorBank(
+        vocab_size=3,
+        K=2,
+        n_gen=4,
+        family="gaussian_frame_diagonal",
+        encode_mode="canonical_content_gauge",
+        decode_mode="diagonal",
+        use_prior_bank=True,
+        prior_source="token",
+        s_e_step=False,
+        gauge_parameterization="phi",
+        omega_reflection="off",
+        phi_reflection="off",
+        decode_tau=2.0,
+        decode_unigram_prior=True,
+        unigram_kappa=1.75,
+    )
+    with torch.no_grad():
+        bank.mu_embed.copy_(torch.tensor([[0.0, 0.5], [1.0, -0.5], [-0.25, 0.75]]))
+        bank.sigma_log_embed.copy_(torch.log(torch.tensor([[0.5, 1.0], [1.5, 0.75], [1.25, 2.0]])))
+        bank.decode_log_scale.fill_(0.4)
+    counts = torch.tensor([0.0, 3.0, 8.0])
+    bank.set_unigram_log_prior(counts)
+    query_mu = torch.tensor([[[0.25, -0.75]]])
+    query_sigma = torch.tensor([[[0.75, 1.5]]])
+
+    sigma_v = torch.exp(bank.sigma_log_embed)
+    delta = bank.mu_embed - query_mu[0, 0]
+    intrinsic_kl = 0.5 * (
+        (query_sigma[0, 0] / sigma_v)
+        + (delta.square() / sigma_v)
+        - 1.0
+        + torch.log(sigma_v)
+        - torch.log(query_sigma[0, 0])
+    ).sum(dim=-1)
+    tau_eff = 2.0 * torch.exp(torch.tensor(-0.4))
+    log_pi = torch.log((counts + 1.0) / (counts.sum() + counts.numel()))
+    expected = -intrinsic_kl / tau_eff + 1.75 * log_pi
+
+    got = bank.decode(query_mu, query_sigma)
+    assert torch.allclose(got[0, 0], expected, atol=1e-6, rtol=1e-6)

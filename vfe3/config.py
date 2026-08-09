@@ -2707,8 +2707,11 @@ class VFE3Config:
             import warnings
             warnings.warn(
                 "encode_mode='canonical_content_gauge' is frame-intrinsic: under the exact flat "
-                "cocycle, token phi cancels from the supervised belief/decode path, so phi_embed "
-                "receives no supervised gradient unless another objective explicitly acts on phi.",
+                "cocycle, token phi cancels from the supervised belief/decode path, so its "
+                "Gaussian divergence is exact and phi_embed receives no supervised gradient unless "
+                "another objective explicitly acts on phi. An optional additive unigram base-rate "
+                "bias kappa*log(pi_v) is applied after that divergence and is outside the gauge/"
+                "covariance map.",
                 UserWarning,
                 stacklevel=2,
             )
