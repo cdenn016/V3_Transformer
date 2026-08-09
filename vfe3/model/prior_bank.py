@@ -725,6 +725,16 @@ class PriorBank(nn.Module):
                     "decode_mode='diagonal'/'diagonal_chunked', and both reflection modes off; "
                     "got " + ", ".join(incompatible)
                 )
+            if not has_builtin_canonical_content_encoder(encode_mode):
+                raise ValueError(
+                    "encode_mode='canonical_content_gauge' requires its built-in encoder "
+                    "registration and callable identities; registry overrides are not eligible."
+                )
+            if not has_builtin_canonical_content_family(encode_mode):
+                raise ValueError(
+                    "encode_mode='canonical_content_gauge' requires the import-time "
+                    "gaussian_frame_diagonal family identity; registry overrides are not eligible."
+                )
         if encode_mode == "canonical_content_projected":
             incompatible = []
             if family != "gaussian_diagonal":
@@ -750,6 +760,17 @@ class PriorBank(nn.Module):
                     "prior_source='token', s_e_step=False, use_prior_bank=True, "
                     "decode_mode='full'/'full_chunked', and both reflection modes off; "
                     "got " + ", ".join(incompatible)
+                )
+            if not has_builtin_canonical_content_encoder(encode_mode):
+                raise ValueError(
+                    "encode_mode='canonical_content_projected' requires its built-in encoder "
+                    "registration and callable identities; registry overrides are not eligible."
+                )
+            if not has_builtin_projected_full_family():
+                raise ValueError(
+                    "encode_mode='canonical_content_projected' requires the import-time "
+                    "gaussian_full family identity used by its analytic full decoder; registry "
+                    "overrides are not eligible."
                 )
             if not has_builtin_projected_full_decoder(decode_mode):
                 raise ValueError(
@@ -830,12 +851,17 @@ class PriorBank(nn.Module):
         self.gauge_group_name = gauge_group_name
         self.irrep_dims = irrep_dims
         if use_priorbank_head_evidence_mixer:
-            if irrep_dims is None:
-                raise ValueError("head evidence requires explicit gauge-block dimensions")
-            self._head_evidence_irrep_dims = tuple(int(dim) for dim in irrep_dims)
-            if (len(self._head_evidence_irrep_dims) < 2
-                    or any(dim <= 0 for dim in self._head_evidence_irrep_dims)):
-                raise ValueError("head evidence requires at least two positive gauge blocks")
+            validate_priorbank_head_evidence_contract(
+                K=K,
+                irrep_dims=irrep_dims,
+                use_prior_bank=use_prior_bank,
+                family=family,
+                divergence_family=divergence_family,
+                renyi_order=renyi_order,
+                decode_mode=decode_mode,
+                encode_mode=encode_mode,
+            )
+            self._head_evidence_irrep_dims = tuple(irrep_dims)
             self.head_evidence_logits = nn.Parameter(torch.zeros(len(self._head_evidence_irrep_dims)))
         # untie applies to the KL-to-bank decode only (the linear ablation is already untied by
         # construction), so the flag is resolved against use_prior_bank once, here.
@@ -2832,6 +2858,10 @@ _HEAD_EVIDENCE_CANONICAL_DECODER_CALLABLES: Mapping[str, DecodeCallable] = Mappi
     name: registration.callable
     for name, registration in _HEAD_EVIDENCE_CANONICAL_DECODERS.items()
 })
+_HEAD_EVIDENCE_CANONICAL_FAMILIES: Mapping[str, type] = MappingProxyType({
+    "gaussian_diagonal": get_family("gaussian_diagonal"),
+    "gaussian_full": get_family("gaussian_full"),
+})
 
 
 def has_builtin_head_evidence_decoder(name: str) -> bool:
@@ -2861,6 +2891,114 @@ _PROJECTED_FULL_FUSED_CALLABLES: Mapping[str, Optional[FusedCECallable]] = Mappi
     name: registration.fused_ce
     for name, registration in _PROJECTED_FULL_DECODERS.items()
 })
+
+_CANONICAL_CONTENT_ENCODERS: Mapping[str, EncodeRegistration] = MappingProxyType({
+    "canonical_content_gauge": _ENCODER_REGISTRATIONS["canonical_content_gauge"],
+    "canonical_content_projected": _ENCODER_REGISTRATIONS["canonical_content_projected"],
+})
+_CANONICAL_CONTENT_ENCODER_CALLABLES: Mapping[str, EncodeCallable] = MappingProxyType({
+    name: registration.callable
+    for name, registration in _CANONICAL_CONTENT_ENCODERS.items()
+})
+_CANONICAL_CONTENT_FAMILIES: Mapping[str, type] = MappingProxyType({
+    "canonical_content_gauge": get_family("gaussian_frame_diagonal"),
+})
+_PROJECTED_FULL_FAMILY: type = get_family("gaussian_full")
+
+
+def has_builtin_canonical_content_encoder(name: str) -> bool:
+    """Whether a canonical encoder still has its complete import-time identity."""
+    registration = _ENCODER_REGISTRATIONS.get(name)
+    builtin = _CANONICAL_CONTENT_ENCODERS.get(name)
+    return (
+        registration is builtin
+        and registration is not None
+        and registration.callable is _CANONICAL_CONTENT_ENCODER_CALLABLES.get(name)
+        and _ENCODERS.get(name) is _CANONICAL_CONTENT_ENCODER_CALLABLES.get(name)
+    )
+
+
+def has_builtin_canonical_content_family(encode_mode: str) -> bool:
+    """Whether an exact canonical mode still resolves its import-time family implementation."""
+    expected = _CANONICAL_CONTENT_FAMILIES.get(encode_mode)
+    return (
+        expected is not None
+        and get_family("gaussian_frame_diagonal") is expected
+    )
+
+
+def has_builtin_projected_full_family() -> bool:
+    """Whether projected full decoding still resolves its import-time Gaussian family."""
+    return get_family("gaussian_full") is _PROJECTED_FULL_FAMILY
+
+
+def validate_priorbank_head_evidence_contract(
+    *,
+    K: int,
+    irrep_dims: Optional[List[int]],
+    use_prior_bank: bool,
+    family: str,
+    divergence_family: str,
+    renyi_order: float,
+    decode_mode: str,
+    encode_mode: str,
+) -> None:
+    """Validate every mixer invariant knowable at direct PriorBank construction."""
+    if not use_prior_bank:
+        raise ValueError("head evidence requires use_prior_bank=True")
+    if irrep_dims is None:
+        raise ValueError("head evidence requires explicit gauge-block dimensions")
+    if any(type(dim) is not int or dim <= 0 for dim in irrep_dims):
+        raise ValueError("head evidence irrep_dims must contain plain positive integers")
+    if len(irrep_dims) < 2:
+        raise ValueError("head evidence requires at least two positive gauge blocks")
+    if sum(irrep_dims) != K:
+        raise ValueError(
+            f"head evidence requires sum(irrep_dims)==K; got sum={sum(irrep_dims)}, K={K}")
+    if (
+        divergence_family != "renyi"
+        or type(renyi_order) not in (int, float)
+        or renyi_order != 1.0
+    ):
+        raise ValueError(
+            "head evidence requires the built-in canonical KL functional "
+            "(divergence_family='renyi', renyi_order=1.0)")
+    canonical_modes = {
+        "gaussian_diagonal": ("diagonal", "diagonal_chunked"),
+        "gaussian_full": ("full", "full_chunked"),
+    }
+    projected_exception = (
+        encode_mode == "canonical_content_projected"
+        and family == "gaussian_diagonal"
+        and decode_mode in ("full", "full_chunked")
+    )
+    if (
+        decode_mode not in canonical_modes.get(family, ())
+        and not projected_exception
+    ):
+        raise ValueError(
+            "head evidence requires a supported family/decode contract: "
+            "gaussian_diagonal with diagonal/diagonal_chunked or gaussian_full with "
+            "full/full_chunked; only canonical_content_projected may pair gaussian_diagonal "
+            "with full/full_chunked")
+    canonical_family = {
+        "gaussian_diagonal": get_family("gaussian_diagonal"),
+        "gaussian_full": get_family("gaussian_full"),
+    }[family]
+    import_time_family = (
+        _PROJECTED_FULL_FAMILY
+        if family == "gaussian_full"
+        else _HEAD_EVIDENCE_CANONICAL_FAMILIES["gaussian_diagonal"]
+    )
+    if (
+        canonical_family is not import_time_family
+        or get_functional("renyi") is not renyi
+        or not has_builtin_head_evidence_decoder(decode_mode)
+        or (projected_exception and not has_builtin_projected_full_family())
+    ):
+        raise ValueError(
+            "head evidence requires built-in canonical family, functional, and decoder "
+            "registry identities; registry overrides are not eligible")
 
 
 def has_builtin_projected_full_decoder(name: str) -> bool:

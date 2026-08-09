@@ -296,8 +296,8 @@ def test_model_channel_bank_matches_direct_rope_refine() -> None:
     assert not torch.allclose(expected_mu, unrotated_mu, atol=1e-6, rtol=1e-6)
 
 
-def _projected_extract_model() -> VFEModel:
-    cfg = VFE3Config(
+def _projected_extract_model(**overrides: object) -> VFEModel:
+    values = dict(
         vocab_size=11,
         embed_dim=4,
         n_heads=2,
@@ -324,8 +324,149 @@ def _projected_extract_model() -> VFEModel:
         pos_phi_compose="group_product",
         max_steps=1,
     )
+    values.update(overrides)
+    cfg = VFE3Config(**values)
     torch.manual_seed(151)
     return VFEModel(cfg).to(DEVICE)
+
+
+def _projected_parity_case(**overrides: object):
+    model = _projected_extract_model(n_layers=2, **overrides)
+    model.eval()
+    tokens = torch.tensor([[2, 5, 7]], dtype=torch.long, device=DEVICE)
+    with torch.no_grad():
+        model.prior_bank.mu_embed[tokens[0]] = torch.tensor(
+            [
+                [0.8, -0.3, 0.5, 0.1],
+                [-0.2, 0.9, -0.4, 0.6],
+                [0.7, 0.2, -0.8, 0.4],
+            ],
+            device=DEVICE,
+        )
+        model.prior_bank.sigma_log_embed[tokens[0]] = torch.tensor(
+            [
+                [0.2, -0.4, 0.5, -0.1],
+                [-0.3, 0.6, 0.1, 0.4],
+                [0.5, -0.2, 0.3, -0.5],
+            ],
+            device=DEVICE,
+        )
+        model.prior_bank.phi_embed[tokens[0]].normal_(mean=0.0, std=0.35)
+        model.pos_phi_free[: tokens.shape[1]].normal_(mean=0.0, std=0.25)
+    return model, tokens, model.build_diagnostic_snapshot(tokens)
+
+
+def _assert_tensor_dict_close(
+    actual: dict[str, object],
+    expected: dict[str, object],
+    keys: tuple[str, ...],
+) -> None:
+    for key in keys:
+        assert isinstance(actual[key], torch.Tensor)
+        assert isinstance(expected[key], torch.Tensor)
+        torch.testing.assert_close(actual[key], expected[key], atol=1e-5, rtol=1e-5)
+
+
+def test_projected_encode_one_matches_production_initial_snapshot() -> None:
+    """Returning raw canonical table moments instead of materialized q0 breaks this parity."""
+    model, tokens, snapshot = _projected_parity_case()
+
+    belief, _, _ = extract._encode_one(model, tokens)
+
+    torch.testing.assert_close(belief.mu, snapshot.initial_belief.mu[0], atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        belief.sigma, snapshot.initial_belief.sigma[0], atol=1e-6, rtol=1e-6)
+    assert not torch.allclose(
+        model.prior_bank.mu_embed[tokens[0]], snapshot.initial_belief.mu[0],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_projected_e_step_trajectory_matches_production_snapshot() -> None:
+    """The replayed q0..qT trajectory must begin from production's realized-frame q0."""
+    model, tokens, snapshot = _projected_parity_case()
+
+    replay = extract.e_step_belief_trace(model, tokens)
+    production = extract.e_step_belief_trace(model, tokens, snapshot=snapshot)
+
+    _assert_tensor_dict_close(replay, production, ("mu", "sigma", "phi", "free_energy"))
+
+
+def test_projected_across_layer_trace_matches_production_snapshot() -> None:
+    """Layer replay must use the materialized initial prior captured by production."""
+    model, tokens, snapshot = _projected_parity_case()
+
+    replay = extract.across_layer_belief_trace(model, tokens)
+    production = extract.across_layer_belief_trace(model, tokens, snapshot=snapshot)
+
+    _assert_tensor_dict_close(
+        replay,
+        production,
+        ("mu", "sigma", "d_ai", "effective_rank", "rank_one_residual"),
+    )
+
+
+def test_projected_converged_state_matches_production_snapshot() -> None:
+    """Converged diagnostics must not silently replay canonical rather than realized moments."""
+    model, tokens, snapshot = _projected_parity_case()
+
+    replay = extract.converged_state(model, tokens)
+    production = extract.converged_state(model, tokens, snapshot=snapshot)
+
+    _assert_tensor_dict_close(
+        replay,
+        production,
+        ("mu", "sigma", "phi", "energy", "beta", "self_div"),
+    )
+
+
+def test_projected_rope_detached_replay_matches_production_snapshot() -> None:
+    """Allowed means-only gauge-RoPE and a detached E-step still share the projected q0 seam."""
+    with pytest.warns(UserWarning, match="gauge"):
+        model, tokens, snapshot = _projected_parity_case(
+            pos_rotation="rope",
+            rope_full_gauge=False,
+            e_step_gradient="detach",
+        )
+
+    belief, _, rope = extract._encode_one(model, tokens)
+    assert rope is not None
+    torch.testing.assert_close(belief.mu, snapshot.initial_belief.mu[0], atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        belief.sigma, snapshot.initial_belief.sigma[0], atol=1e-6, rtol=1e-6)
+    replay = extract.converged_state(model, tokens)
+    production = extract.converged_state(model, tokens, snapshot=snapshot)
+    _assert_tensor_dict_close(replay, production, ("mu", "sigma", "phi", "energy", "beta"))
+
+
+def test_shared_refine_transport_preserves_dense_omega_direct_flat_fallback() -> None:
+    """Factoring projected preparation must not narrow the older shared-refinement route."""
+    cfg = VFE3Config(
+        vocab_size=11,
+        embed_dim=4,
+        n_heads=2,
+        max_seq_len=4,
+        n_layers=1,
+        n_e_steps=1,
+        gauge_group="glk",
+        gauge_parameterization="omega_direct",
+        transport_mode="flat",
+        pos_phi="none",
+        prior_source="model_channel",
+        s_e_step=True,
+        lambda_h=0.5,
+        e_phi_lr=0.0,
+        share_refine_s_transport=True,
+    )
+    model = VFEModel(cfg).to(DEVICE).eval()
+    tokens = torch.tensor([[1, 3, 5]], dtype=torch.long, device=DEVICE)
+
+    belief, logits = model.forward_beliefs(tokens, return_logits=True)
+
+    assert logits is not None
+    assert belief.mu.shape == (1, 3, 4)
+    assert torch.isfinite(logits).all()
 
 
 @pytest.mark.parametrize("sequence_length", [1, 3])

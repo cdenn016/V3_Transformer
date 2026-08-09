@@ -817,6 +817,70 @@ class VFEModel(nn.Module):
             "projected canonical content requires FactoredTransport or "
             f"CompactFactoredTransport vertex factors, got {type(base).__name__}")
 
+    def _build_shared_flat_transport(
+        self,
+        beliefs: BeliefState,
+        rope: Optional[torch.Tensor],
+        *,
+        require_vertex_factors: bool,
+    ) -> 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport':
+        r"""Build the one flat transport shared by projected materialization and inference."""
+        from vfe3.inference.e_step import build_belief_transport
+
+        transport = build_belief_transport(
+            beliefs.phi,
+            self.group,
+            transport_mode="flat",
+            gauge_parameterization=self.cfg.gauge_parameterization,
+            omega=beliefs.omega,
+            right_phi=beliefs.right_phi,
+            reflection=beliefs.reflection if beliefs.reflection is not None else None,
+            clamp_monitor=self.cfg.transport_clamp_monitor,
+            transport_mean_per_head=True,
+            congruence_cond_escalation=self.cfg.congruence_cond_escalation,
+            compact_phi_block_transport=self._compact_phi_blocks_enabled(),
+            require_vertex_factors=require_vertex_factors,
+            exp_fp64_mode=self.cfg.exp_fp64_mode,
+            exp_fp64_norm_threshold=self.cfg.exp_fp64_norm_threshold,
+            validity_max_norm=self.cfg.transport_chart_max_norm,
+            exactness_out=self._transport_status,
+            rope=rope,
+            rope_on_cov=self.cfg.rope_full_gauge,
+            rope_on_value=self.cfg.rope_on_value,
+            rope_insertion=self.cfg.rope_insertion,
+        )
+        return transport
+
+    def _prepare_projected_canonical_content(
+        self,
+        beliefs: BeliefState,
+        rope: Optional[torch.Tensor],
+    ) -> 'Tuple[BeliefState, CompactFactoredTransport | FactoredTransport | RopeTransport, CanonicalFrameContext]':
+        r"""Materialize canonical table moments through production's authoritative frame."""
+        if self.cfg.encode_mode != "canonical_content_projected":
+            raise ValueError(
+                "projected canonical-content preparation requires "
+                "encode_mode='canonical_content_projected'")
+        transport = self._build_shared_flat_transport(
+            beliefs,
+            rope,
+            require_vertex_factors=True,
+        )
+        if not isinstance(transport, (FactoredTransport, CompactFactoredTransport, RopeTransport)):
+            raise RuntimeError(
+                "projected canonical content did not receive a factored vertex representation")
+        canonical_frame = self._canonical_frame_context(transport)
+        materialized_mu, materialized_sigma = project_canonical_diagonal(
+            beliefs.mu,
+            beliefs.sigma,
+            canonical_frame.forward,
+        )
+        return (
+            beliefs._replace(mu=materialized_mu, sigma=materialized_sigma),
+            transport,
+            canonical_frame,
+        )
+
     @staticmethod
     def _slice_canonical_frame(
         canonical_frame: Optional[CanonicalFrameContext],
@@ -1154,54 +1218,21 @@ class VFEModel(nn.Module):
                 and self.cfg.e_phi_lr == 0.0
                 and rope is None
             )
-            if projected_content or share_refine_s:
-                # Projected canonical content ALWAYS owns one flat build: its exact vertex factors
-                # materialize q0=p and the same object is the E-step's prebuilt transport. The
-                # default-off share_refine_s_transport route reaches this build only when the s and q
-                # channels consume identical fixed phi and no RoPE wrapper is needed. Either route
-                # skips redundant matrix exponentials without reconstructing phi independently.
-                from vfe3.inference.e_step import build_belief_transport
-                shared_omega = build_belief_transport(
-                    beliefs.phi, self.group,
-                    transport_mode="flat",
-                    gauge_parameterization=self.cfg.gauge_parameterization, omega=beliefs.omega,
-                    right_phi=beliefs.right_phi,
-                    reflection=beliefs.reflection if beliefs.reflection is not None else None,   # phi-path reflection fold (None -> byte-identical)
-                    clamp_monitor=self.cfg.transport_clamp_monitor,
-                    # The shared build carries the same active per-head mean contraction as the
-                    # per-E-step transport hoists.
-                    transport_mean_per_head=True,
-                    congruence_cond_escalation=self.cfg.congruence_cond_escalation,
-                    compact_phi_block_transport=self._compact_phi_blocks_enabled(),
-                    # Single-block groups do not enter the ordinary fused-transport heuristic, but
-                    # projected materialization still requires the exact vertex factors. This asks
-                    # the flat builder for that representation without forming pairwise Omega.
-                    require_vertex_factors=projected_content,
-                    exp_fp64_mode=self.cfg.exp_fp64_mode,
-                    exp_fp64_norm_threshold=self.cfg.exp_fp64_norm_threshold,
-                    validity_max_norm=self.cfg.transport_chart_max_norm,
-                    exactness_out=self._transport_status,
-                    # Projected content forces this one authoritative build even when gauge-RoPE
-                    # is active. The wrapper (if any) remains the prebuilt E-step transport, while
-                    # canonical materialization reads its underlying token/pos-phi vertex factors.
-                    rope=(rope if projected_content else None),
-                    rope_on_cov=self.cfg.rope_full_gauge,
-                    rope_on_value=self.cfg.rope_on_value,
-                    rope_insertion=self.cfg.rope_insertion,
-                )
             if projected_content:
-                if not isinstance(shared_omega, (FactoredTransport, CompactFactoredTransport,
-                                                  RopeTransport)):
-                    raise RuntimeError(
-                        "projected canonical content did not receive a factored flat transport")
-                canonical_frame = self._canonical_frame_context(shared_omega)
-                materialized_mu, materialized_sigma = project_canonical_diagonal(
-                    beliefs.mu, beliefs.sigma, canonical_frame.forward)
-                # q(0) and p are the SAME materialized diagonal-family tensors. vfe_stack receives
-                # these exact objects as both its belief and prior arguments below.
-                beliefs = beliefs._replace(mu=materialized_mu, sigma=materialized_sigma)
+                # q(0) and p are the SAME materialized diagonal-family tensors, produced with the
+                # exact transport object vfe_stack receives below.
+                beliefs, shared_omega, canonical_frame = (
+                    self._prepare_projected_canonical_content(beliefs, rope))
                 if capture is not None:
                     capture["canonical_frame"] = canonical_frame
+            elif share_refine_s:
+                # The default-off refinement optimization shares one fixed flat transport when the
+                # s and q channels consume identical phi and no RoPE wrapper is active.
+                shared_omega = self._build_shared_flat_transport(
+                    beliefs,
+                    None,
+                    require_vertex_factors=False,
+                )
             s_belief = None
             if self.cfg.s_e_step:
                 # Live model channel: refine s (phi0 fixed), then anchor the belief to it -- q0 and

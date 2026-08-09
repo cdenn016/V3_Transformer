@@ -2599,7 +2599,10 @@ class VFE3Config:
         from vfe3.model.prior_bank import (
             _DECODERS,
             _ENCODERS,
+            has_builtin_canonical_content_encoder,
+            has_builtin_canonical_content_family,
             has_builtin_head_evidence_decoder,
+            has_builtin_projected_full_family,
             has_builtin_projected_full_decoder,
         )
         _require(self.decode_mode, tuple(sorted(set(_DECODERS) - {"linear"})), "decode_mode")
@@ -2612,6 +2615,31 @@ class VFE3Config:
         # sigma and its own active registration controls dense-vs-fused training; decode_mode does not
         # route that no-prior path, so the cross-check stays gated on use_prior_bank.
         decode_registration = _DECODERS[self.decode_mode]
+        if (
+            self.encode_mode in ("canonical_content_gauge", "canonical_content_projected")
+            and not has_builtin_canonical_content_encoder(self.encode_mode)
+        ):
+            raise ValueError(
+                f"encode_mode={self.encode_mode!r} requires its built-in encoder registration "
+                "and callable identities; registry overrides are not eligible."
+            )
+        if (
+            self.encode_mode == "canonical_content_gauge"
+            and not has_builtin_canonical_content_family(self.encode_mode)
+        ):
+            raise ValueError(
+                "encode_mode='canonical_content_gauge' requires the import-time "
+                "gaussian_frame_diagonal family identity; registry overrides are not eligible."
+            )
+        if (
+            self.encode_mode == "canonical_content_projected"
+            and not has_builtin_projected_full_family()
+        ):
+            raise ValueError(
+                "encode_mode='canonical_content_projected' requires the import-time "
+                "gaussian_full family identity used by its analytic full decoder; registry "
+                "overrides are not eligible."
+            )
         if (
             self.encode_mode == "canonical_content_projected"
             and not has_builtin_projected_full_decoder(self.decode_mode)

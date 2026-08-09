@@ -114,6 +114,64 @@ def test_direct_prior_bank_construction_rejects_its_locally_knowable_incompatibl
         )
 
 
+@pytest.mark.registry_mutation
+@pytest.mark.parametrize("override_kind", ["registration", "callable_map"])
+def test_exact_construction_rejects_overridden_encoder_identity(
+    override_kind: str,
+) -> None:
+    """The exact-control name cannot authorize a replaced callable or registration record."""
+    from vfe3.model import prior_bank as prior_bank_mod
+
+    name = "canonical_content_gauge"
+    previous_registration = prior_bank_mod._ENCODER_REGISTRATIONS[name]
+    previous_callable = prior_bank_mod._ENCODERS[name]
+
+    def replacement_encoder(pb, token_ids):
+        return previous_callable(pb, token_ids)
+
+    try:
+        if override_kind == "registration":
+            prior_bank_mod.register_encode(
+                name,
+                override=True,
+                can_omit_base_mean=previous_registration.can_omit_base_mean,
+                can_omit_base_variance=previous_registration.can_omit_base_variance,
+            )(previous_callable)
+        else:
+            prior_bank_mod._ENCODERS[name] = replacement_encoder
+
+        with pytest.raises(ValueError, match=r"canonical_content_gauge.*built-in encoder"):
+            _exact_cfg()
+        with pytest.raises(ValueError, match=r"canonical_content_gauge.*built-in encoder"):
+            _bank()
+    finally:
+        prior_bank_mod._ENCODERS[name] = previous_callable
+        prior_bank_mod._ENCODER_REGISTRATIONS[name] = previous_registration
+    assert prior_bank_mod._ENCODERS[name] is previous_callable
+    assert prior_bank_mod._ENCODER_REGISTRATIONS[name] is previous_registration
+
+
+@pytest.mark.registry_mutation
+def test_exact_construction_rejects_overridden_frame_family_identity() -> None:
+    """The exact intrinsic proof depends on the import-time frame-diagonal family."""
+    from vfe3.families.base import _FAMILIES, register_family
+
+    name = "gaussian_frame_diagonal"
+    previous = _FAMILIES[name]
+    try:
+        @register_family(name, override=True)
+        class _ReplacementFrameDiagonal(FrameDiagonalGaussian):
+            pass
+
+        with pytest.raises(ValueError, match=r"canonical_content_gauge.*gaussian_frame_diagonal"):
+            _exact_cfg()
+        with pytest.raises(ValueError, match=r"canonical_content_gauge.*gaussian_frame_diagonal"):
+            _bank()
+    finally:
+        _FAMILIES[name] = previous
+    assert _FAMILIES[name] is previous
+
+
 def test_canonical_tied_and_untied_banks_keep_canonical_coordinates_and_clone_decode_tables() -> None:
     r"""Untying must begin from the exact canonical table, not a pushed-forward surrogate."""
     tied = _bank()

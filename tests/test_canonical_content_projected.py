@@ -321,6 +321,83 @@ def test_projected_config_accepts_full_head_evidence_after_pullback(
 
 
 @pytest.mark.registry_mutation
+@pytest.mark.parametrize("mixer_enabled", [False, True])
+def test_projected_construction_rejects_overridden_gaussian_full_family(
+    mixer_enabled: bool,
+) -> None:
+    """Projected analytic full decoding must not resolve a same-name custom full family."""
+    from vfe3.families.base import _FAMILIES, register_family
+    from vfe3.families.gaussian import FullGaussian
+
+    name = "gaussian_full"
+    previous = _FAMILIES[name]
+    try:
+        @register_family(name, override=True)
+        class _ReplacementFullGaussian(FullGaussian):
+            pass
+
+        with pytest.raises(ValueError, match=r"canonical_content_projected.*gaussian_full"):
+            _projected_cfg(use_priorbank_head_evidence_mixer=mixer_enabled)
+        with pytest.raises(ValueError, match=r"canonical_content_projected.*gaussian_full"):
+            PriorBank(
+                vocab_size=9,
+                K=4,
+                n_gen=8,
+                family="gaussian_diagonal",
+                encode_mode="canonical_content_projected",
+                decode_mode="full",
+                use_prior_bank=True,
+                prior_source="token",
+                s_e_step=False,
+                gauge_parameterization="phi",
+                irrep_dims=[2, 2],
+                use_priorbank_head_evidence_mixer=mixer_enabled,
+                omega_reflection="off",
+                phi_reflection="off",
+            )
+    finally:
+        _FAMILIES[name] = previous
+    assert _FAMILIES[name] is previous
+
+
+@pytest.mark.registry_mutation
+@pytest.mark.parametrize("override_kind", ["registration", "callable_map"])
+def test_projected_construction_rejects_overridden_encoder_identity(
+    override_kind: str,
+) -> None:
+    """The projected name alone cannot authorize another encoder implementation."""
+    from vfe3.model import prior_bank as prior_bank_mod
+
+    name = "canonical_content_projected"
+    previous_registration = prior_bank_mod._ENCODER_REGISTRATIONS[name]
+    previous_callable = prior_bank_mod._ENCODERS[name]
+
+    def replacement_encoder(pb, token_ids):
+        return previous_callable(pb, token_ids)
+
+    try:
+        if override_kind == "registration":
+            prior_bank_mod.register_encode(
+                name,
+                override=True,
+                can_omit_base_mean=previous_registration.can_omit_base_mean,
+                can_omit_base_variance=previous_registration.can_omit_base_variance,
+            )(previous_callable)
+        else:
+            prior_bank_mod._ENCODERS[name] = replacement_encoder
+
+        with pytest.raises(ValueError, match=r"canonical_content_projected.*built-in encoder"):
+            _projected_cfg()
+        with pytest.raises(ValueError, match=r"canonical_content_projected.*built-in encoder"):
+            _projected_bank()
+    finally:
+        prior_bank_mod._ENCODERS[name] = previous_callable
+        prior_bank_mod._ENCODER_REGISTRATIONS[name] = previous_registration
+    assert prior_bank_mod._ENCODERS[name] is previous_callable
+    assert prior_bank_mod._ENCODER_REGISTRATIONS[name] is previous_registration
+
+
+@pytest.mark.registry_mutation
 @pytest.mark.parametrize("decode_mode", ["full", "full_chunked"])
 @pytest.mark.parametrize("override_kind", ["registration", "callable"])
 def test_projected_construction_rejects_overridden_full_decoder_before_forward(

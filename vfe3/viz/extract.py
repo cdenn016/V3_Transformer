@@ -192,15 +192,16 @@ def _encode_one(model, token_ids: torch.Tensor) -> Tuple[BeliefState, torch.Tens
     ``diagnostics`` do -- the callers' ``mu_p = belief.mu`` handoff then anchors to the refined s,
     so every extracted trajectory/figure describes the model that actually trained."""
     enc = model.prior_bank.encode(token_ids[:1])                  # (1, N, ...)
-    belief = BeliefState(
-        mu=enc.mu[0], sigma=enc.sigma[0], phi=model._apply_pos_phi(enc.phi[0]),
-        omega=enc.omega[0] if enc.omega is not None else None,       # omega-direct GL(K) frame
-        reflection=enc.reflection[0] if enc.reflection is not None else None,   # phi-path sign
-        right_phi=model._pos_phi_right(enc.phi[0]),
+    beliefs = enc._replace(
+        phi=model._apply_pos_phi(enc.phi),
+        right_phi=model._pos_phi_right(enc.phi),
     )
-    model_phi = model._resolve_model_frame(token_ids[:1], belief.phi.unsqueeze(0))
-    n = belief.mu.shape[0]
+    n = beliefs.mu.shape[1]
     rope = model._rope_rotation(n, token_ids.device)
+    if model.cfg.encode_mode == "canonical_content_projected":
+        beliefs, _, _ = model._prepare_projected_canonical_content(beliefs, rope)
+    belief = _snapshot_sequence(beliefs)
+    model_phi = model._resolve_model_frame(token_ids[:1], beliefs.phi)
     s_belief = None
     if model.cfg.s_e_step:
         s_mu1, s_sigma1 = model._refine_s(token_ids[:1], model_phi, rope=rope)

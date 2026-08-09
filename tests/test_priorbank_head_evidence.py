@@ -325,6 +325,67 @@ def test_head_evidence_rejects_invalid_configurations(overrides: dict[str, objec
         _enabled_cfg(**overrides)
 
 
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"use_prior_bank": False}, "use_prior_bank=True"),
+        ({"irrep_dims": [4]}, "at least two"),
+        ({"irrep_dims": [True, 3]}, "plain positive integers"),
+        ({"irrep_dims": [2.0, 2]}, "plain positive integers"),
+        ({"irrep_dims": [1, 1]}, r"sum\(irrep_dims\)==K"),
+        ({"renyi_order": 0.5}, "canonical KL functional"),
+        ({"divergence_family": "squared_hellinger"}, "canonical KL functional"),
+        ({"decode_mode": "family_chunked"}, "supported family/decode contract"),
+        (
+            {"family": "gaussian_full", "decode_mode": "diagonal_chunked"},
+            "supported family/decode contract",
+        ),
+    ],
+)
+def test_direct_head_evidence_construction_rejects_invalid_contract(
+    overrides: dict[str, object],
+    match: str,
+) -> None:
+    """Direct PriorBank construction must enforce the same locally knowable mixer contract."""
+    values = dict(
+        vocab_size=11,
+        K=4,
+        n_gen=8,
+        use_prior_bank=True,
+        family="gaussian_diagonal",
+        divergence_family="renyi",
+        renyi_order=1.0,
+        decode_mode="diagonal_chunked",
+        irrep_dims=[2, 2],
+        use_priorbank_head_evidence_mixer=True,
+    )
+    values.update(overrides)
+    with pytest.raises(ValueError, match=match):
+        PriorBank(**values)
+
+
+def test_direct_head_evidence_accepts_precise_projected_rank_exception() -> None:
+    """Only projected diagonal content may feed the built-in full scorer under this mixer."""
+    bank = PriorBank(
+        vocab_size=11,
+        K=4,
+        n_gen=8,
+        use_prior_bank=True,
+        family="gaussian_diagonal",
+        divergence_family="renyi",
+        renyi_order=1.0,
+        decode_mode="full_chunked",
+        encode_mode="canonical_content_projected",
+        prior_source="token",
+        s_e_step=False,
+        gauge_parameterization="phi",
+        irrep_dims=[2, 2],
+        use_priorbank_head_evidence_mixer=True,
+    )
+    assert tuple(bank.irrep_dims) == (2, 2)
+    assert bank.head_evidence_logits.shape == (2,)
+
+
 def test_optimizer_owns_head_evidence_logits_once_with_mu_hyperparameters():
     cfg = _enabled_cfg(m_p_mu_lr=0.0123)
     model = VFEModel(cfg)
