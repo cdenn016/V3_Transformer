@@ -724,6 +724,10 @@ class VFE3Config:
     m_p_sigma_lr:              float = 0.0025
     m_phi_lr:                  float = 0.015
     m_s_phi_lr:                float = 0.015
+    # Optional absolute M-step rates for the two semantically distinct mixer parameter families.
+    # None preserves the historical behavior by inheriting m_p_mu_lr at optimizer construction.
+    m_head_evidence_lr:        Optional[float] = None
+    m_head_mixer_lr:           Optional[float] = None
     
     
     # Stored phi-factor M-step policy. "adamw" is the default and preserves the established optimizer
@@ -3172,6 +3176,10 @@ class VFE3Config:
             v = getattr(self, name)
             if not math.isfinite(v) or v < 0.0:
                 raise ValueError(f"{name} must be finite and >= 0, got {v}")
+        for name in ("m_head_evidence_lr", "m_head_mixer_lr"):
+            v = getattr(self, name)
+            if v is not None and (not math.isfinite(v) or v < 0.0):
+                raise ValueError(f"{name} must be finite and >= 0 or None, got {v}")
         if self.connection_weight_decay is not None and (
                 not math.isfinite(self.connection_weight_decay)
                 or self.connection_weight_decay < 0.0):

@@ -35,6 +35,29 @@ def test_config_defaults():
     assert cfg.renyi_order == 1.0
 
 
+def test_head_mixer_learning_rates_default_to_inheritance():
+    cfg = VFE3Config()
+
+    assert cfg.m_head_evidence_lr is None
+    assert cfg.m_head_mixer_lr is None
+
+
+@pytest.mark.parametrize("field", ["m_head_evidence_lr", "m_head_mixer_lr"])
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+def test_head_mixer_learning_rates_require_finite_nonnegative_or_none(field, value):
+    with pytest.raises(ValueError, match=field):
+        VFE3Config(**{field: value})
+
+
+def test_head_mixer_learning_rates_roundtrip_serialized_config():
+    cfg = VFE3Config(m_head_evidence_lr=0.0011, m_head_mixer_lr=0.0022)
+
+    restored = migrate_serialized_config(asdict(cfg), source="test").config
+
+    assert restored.m_head_evidence_lr == pytest.approx(0.0011)
+    assert restored.m_head_mixer_lr == pytest.approx(0.0022)
+
+
 def test_phi_update_defaults_and_retired_fields_are_removed():
     cfg = VFE3Config()
     field_names = {field.name for field in fields(VFE3Config)}
