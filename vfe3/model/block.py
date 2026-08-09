@@ -102,6 +102,7 @@ def vfe_block(
     emission:        Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,   # (d, g, z_0) Bohning emission terms (None -> no data term)
 
     prebuilt_transport: Optional[object]       = None,   # share_refine_s_transport: caller-built flat transport (None -> e_step builds its own)
+    prebuilt_transport_authoritative: bool     = False,  # projected canonical frame owns this exact object across truncation
     gauge_parameterization: str                = "phi",  # 'phi' (exp(phi.G) path) | 'omega_direct' (stored GL(K) element, read from belief.omega)
 ) -> BeliefState:
     r"""Run n_e_steps of the E-step from ``belief`` toward the prior, then optional norm.
@@ -154,6 +155,7 @@ def vfe_block(
         e_steps_backprop_last=cfg.e_steps_backprop_last,
         e_step_halt_tol=cfg.e_step_halt_tol,
         prebuilt_transport=prebuilt_transport,
+        prebuilt_transport_authoritative=prebuilt_transport_authoritative,
         gauge_parameterization=gauge_parameterization,
         # The cfg-derived shared knob bag (audit 2026-07-12 N5: single source of truth with the
         # viz extractors). It rides e_step's **kwargs into e_step_iteration AND the diagnostic

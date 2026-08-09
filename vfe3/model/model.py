@@ -1138,6 +1138,10 @@ class VFEModel(nn.Module):
                     transport_mean_per_head=True,
                     congruence_cond_escalation=self.cfg.congruence_cond_escalation,
                     compact_phi_block_transport=self._compact_phi_blocks_enabled(),
+                    # Single-block groups do not enter the ordinary fused-transport heuristic, but
+                    # projected materialization still requires the exact vertex factors. This asks
+                    # the flat builder for that representation without forming pairwise Omega.
+                    require_vertex_factors=projected_content,
                     exp_fp64_mode=self.cfg.exp_fp64_mode,
                     exp_fp64_norm_threshold=self.cfg.exp_fp64_norm_threshold,
                     validity_max_norm=self.cfg.transport_chart_max_norm,
@@ -1227,6 +1231,7 @@ class VFEModel(nn.Module):
                 capture=capture, grad_record=grad_rec,
                 transport_status=self._transport_status,
                 prebuilt_transport=shared_omega,
+                prebuilt_transport_authoritative=projected_content,
                 gauge_parameterization=self.cfg.gauge_parameterization,
                 kappa_beta_override=self.effective_kappa_beta(token_ids.device))
         if estep_grad_out is not None:                           # one host sync, only when requested

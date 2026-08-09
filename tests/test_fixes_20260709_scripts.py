@@ -168,6 +168,7 @@ def test_public_e_step_keyword_signature_follows_repository_order():
         "training",
         "e_step_halt_tol", "grad_record", "state_record", "rope", "log_prior",
         "transport_chart_max_norm", "transport_status", "prebuilt_transport",
+        "prebuilt_transport_authoritative",
         "kwargs",
     ]
     assert names == expected

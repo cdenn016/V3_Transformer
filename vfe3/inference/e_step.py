@@ -315,6 +315,7 @@ def build_belief_transport(
     transport_mean_per_head:     bool                                        = False,    # factored transport_mean contracts per gauge block (fused path only)
     congruence_cond_escalation:  bool                                        = False,    # opt-in conditioning trigger for the fp64 congruence escalation
     compact_phi_block_transport: bool                                        = False,    # packed phi factors for canonical flat block_glk
+    require_vertex_factors:       bool                                        = False,    # exact flat vertex representation even for a single block
     validity_max_norm:           Optional[float]                             = None,     # opt-in fail-closed pre-clamp chart bound
     mu:                          Optional[torch.Tensor]                      = None,     # regime_ii edge connection reads these
     sigma:                       Optional[torch.Tensor]                      = None,     # regime_ii_covariant features read these
@@ -375,7 +376,7 @@ def build_belief_transport(
             omega, group, mean_per_head=transport_mean_per_head)
         if isinstance(built, dict):
             built = built["Omega"]
-    elif right_phi is not None or _can_fuse_flat(transport_mode, group):
+    elif require_vertex_factors or right_phi is not None or _can_fuse_flat(transport_mode, group):
         built = build_factored_transport(phi, group, gauge_mode=gauge_mode, clamp_monitor=clamp_monitor,
                                          exp_fp64_mode=exp_fp64_mode,
                                          exp_fp64_norm_threshold=exp_fp64_norm_threshold,
@@ -1339,6 +1340,7 @@ def e_step(
     transport_status:           Optional[dict]                = None,
 
     prebuilt_transport: 'torch.Tensor | CompactFactoredTransport | DirectLinkTransport | FactoredTransport | RopeTransport | None' = None,   # share_refine_s_transport: caller-built forward transport
+    prebuilt_transport_authoritative: bool = False,   # projected canonical frame: retain caller identity across truncation boundaries
     **kwargs,
 ) -> 'BeliefState | Tuple[BeliefState, List[float]]':
     r"""Iterate ``e_step_iteration`` ``n_iter`` times (parallel mean-field). Optionally
@@ -1532,13 +1534,18 @@ def e_step(
                     sigma=belief.sigma.detach().requires_grad_(True),
                     phi=belief.phi.detach().requires_grad_(True),
                 )
-                # m10: the hoisted flat transport was built from the PRE-boundary phi under grad, so the
+                # m10: an internally hoisted flat transport was built from the PRE-boundary phi under grad, so the
                 # last-k iterations (which consume it via _prebuilt_omega) would leak transport gradient
                 # through the boundary to the encode/pos-phi tables. Rebuild it from the boundary phi
                 # (values unchanged at e_phi_lr==0, so the forward is byte-identical -- only the leaked
-                # graph is severed). Caller-shared transports are attached on unrolled paths and require
-                # the same rebuild as internally hoisted transports.
-                if _hoisted_omega is not None:
+                # graph is severed). Projected canonical materialization instead marks its caller-owned
+                # transport authoritative: q0=p and the canonical context were both materialized from
+                # that exact object, so every layer/suffix must consume its identity without a second
+                # exponentiation. Other prebuilt callers retain the established rebuild semantics.
+                authoritative_prebuilt = (
+                    prebuilt_transport_authoritative and prebuilt_transport is not None
+                )
+                if _hoisted_omega is not None and not authoritative_prebuilt:
                     _hoisted_omega = build_belief_transport(
                         belief.phi, group,
                         transport_mode="flat",

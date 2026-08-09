@@ -183,6 +183,28 @@ def test_pushforward_and_pullback_pass_float64_gradcheck() -> None:
     )
 
 
+def test_coordinate_transforms_preserve_float32_under_bf16_autocast() -> None:
+    """Autocast may not change the public moment/frame coordinate dtype."""
+    generator = torch.Generator().manual_seed(83)
+    mu = torch.randn(2, 3, 4, generator=generator)
+    var = torch.rand(2, 3, 4, generator=generator) + 0.4
+    frame = (
+        torch.eye(4).expand(2, 3, 4, 4).clone()
+        + 0.08 * torch.randn(2, 3, 4, 4, generator=generator)
+    )
+    frame_inv = torch.linalg.inv(frame)
+    expected_push = project_canonical_diagonal(mu, var, frame)
+    expected_pull = pullback_diagonal_query(mu, var, frame_inv)
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        got_push = project_canonical_diagonal(mu, var, frame)
+        got_pull = pullback_diagonal_query(mu, var, frame_inv)
+
+    for got, expected in zip((*got_push, *got_pull), (*expected_push, *expected_pull)):
+        assert got.dtype == torch.float32
+        assert torch.equal(got, expected)
+
+
 @pytest.mark.parametrize(
     ("which", "match"),
     [
@@ -460,6 +482,110 @@ def test_projected_materialize_expands_only_compact_vertex_factors(
         context.inverse,
         CompactBlockElement(transport.inv_blocks, transport.K).to_dense(),
     )
+
+
+def test_projected_truncated_backprop_reuses_one_transport_across_all_layers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The context frame must remain the E-step frame across truncation boundaries."""
+    import vfe3.inference.e_step as e_step_module
+
+    model = VFEModel(_projected_cfg(
+        n_layers=2,
+        n_e_steps=2,
+        e_steps_backprop_last=1,
+        e_step_update="mm_exact",
+    ))
+    token_ids = torch.tensor([[2, 5]])
+    original_builder = e_step_module.build_belief_transport
+    original_iteration = e_step_module.e_step_iteration
+    built: list[object] = []
+    consumed: list[object] = []
+
+    def tracked_builder(*args: object, **kwargs: object) -> object:
+        transport = original_builder(*args, **kwargs)
+        built.append(transport)
+        return transport
+
+    def tracked_iteration(*args: object, **kwargs: object) -> object:
+        consumed.append(kwargs.get("_prebuilt_omega"))
+        return original_iteration(*args, **kwargs)
+
+    monkeypatch.setattr(e_step_module, "build_belief_transport", tracked_builder)
+    monkeypatch.setattr(e_step_module, "e_step_iteration", tracked_iteration)
+    capture: dict = {}
+
+    model.forward_beliefs(token_ids, training=True, capture=capture)
+
+    assert len(built) == 1
+    assert len(consumed) == 4
+    assert all(transport is built[0] for transport in consumed)
+    context = capture["canonical_frame"]
+    if isinstance(built[0], CompactFactoredTransport):
+        assert torch.equal(
+            context.forward,
+            CompactBlockElement(built[0].exp_blocks, built[0].K).to_dense(),
+        )
+    else:
+        assert isinstance(built[0], FactoredTransport)
+        assert context.forward is built[0].exp_phi
+
+
+@pytest.mark.parametrize("gauge_group", ["block_glk", "glk"])
+def test_projected_single_head_groups_request_factored_vertex_transport(
+    gauge_group: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Single-block projected groups still require exact vertex factors, never pairwise Omega."""
+    import vfe3.inference.e_step as e_step_module
+
+    model = VFEModel(_projected_cfg(
+        gauge_group=gauge_group,
+        n_heads=1,
+        pos_phi="none",
+        e_step_update="mm_exact",
+    ))
+    original_builder = e_step_module.build_belief_transport
+    built: list[object] = []
+
+    def tracked_builder(*args: object, **kwargs: object) -> object:
+        transport = original_builder(*args, **kwargs)
+        built.append(transport)
+        return transport
+
+    def pairwise_forbidden(_self: object) -> torch.Tensor:
+        raise AssertionError("projected single-head path materialized pairwise Omega")
+
+    monkeypatch.setattr(e_step_module, "build_belief_transport", tracked_builder)
+    monkeypatch.setattr(FactoredTransport, "to_dense_omega", pairwise_forbidden)
+    capture: dict = {}
+
+    model.forward_beliefs(torch.tensor([[2, 5]]), capture=capture)
+
+    assert len(built) == 1
+    assert isinstance(built[0], FactoredTransport)
+    assert capture["canonical_frame"].forward is built[0].exp_phi
+
+
+def test_projected_model_materialization_preserves_float32_under_bf16_autocast() -> None:
+    """The model's public projected prior remains float32 inside its AMP region."""
+    model = VFEModel(_projected_cfg(
+        amp_dtype="bf16",
+        pos_phi="none",
+        e_step_update="mm_exact",
+    ))
+    capture: dict = {}
+
+    model.forward_beliefs(torch.tensor([[2, 5]]), capture=capture)
+
+    canonical = model.prior_bank.encode(torch.tensor([[2, 5]]))
+    context = capture["canonical_frame"]
+    prior = capture["prior"]
+    assert canonical.mu.dtype == torch.float32
+    assert context.forward.dtype == torch.float32
+    assert context.inverse.dtype == torch.float32
+    assert prior.mu.dtype == torch.float32
+    assert prior.sigma.dtype == torch.float32
 
 
 def test_projected_phi_gradient_reaches_canonical_tables_and_realized_frames() -> None:

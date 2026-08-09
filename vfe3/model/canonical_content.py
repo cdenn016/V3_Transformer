@@ -71,10 +71,15 @@ def project_canonical_diagonal(
 ) -> tuple[Tensor, Tensor]:
     """Push canonical diagonal moments through ``frame`` and retain the output diagonal."""
     _validate_moments_and_frame(mu_c, var_c, frame, frame_name="frame")
-    return (
-        torch.einsum("...ij,...j->...i", frame, mu_c),
-        torch.einsum("...ij,...j->...i", frame.square(), var_c),
-    )
+    # These transforms are a public coordinate boundary: a surrounding model autocast region must
+    # not silently change float32 canonical tables / realized frames into bf16 moments. Disabling
+    # autocast preserves the already-validated common input dtype without introducing any cast or
+    # detaching the canonical/frame graph.
+    with torch.amp.autocast(mu_c.device.type, enabled=False):
+        return (
+            torch.einsum("...ij,...j->...i", frame, mu_c),
+            torch.einsum("...ij,...j->...i", frame.square(), var_c),
+        )
 
 
 def pullback_diagonal_query(
@@ -84,6 +89,7 @@ def pullback_diagonal_query(
 ) -> tuple[Tensor, Tensor]:
     """Pull a realized diagonal query into canonical full-covariance coordinates."""
     _validate_moments_and_frame(mu_q, var_q, frame_inv, frame_name="frame_inv")
-    mu_c = torch.einsum("...ij,...j->...i", frame_inv, mu_q)
-    cov_c = frame_inv @ torch.diag_embed(var_q) @ frame_inv.transpose(-1, -2)
+    with torch.amp.autocast(mu_q.device.type, enabled=False):
+        mu_c = torch.einsum("...ij,...j->...i", frame_inv, mu_q)
+        cov_c = frame_inv @ torch.diag_embed(var_q) @ frame_inv.transpose(-1, -2)
     return mu_c, cov_c

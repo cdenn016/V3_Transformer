@@ -58,6 +58,7 @@ def vfe_stack(
     emission:        Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,   # (d, g, z_0) Bohning emission terms (None -> no data term)
 
     prebuilt_transport: Optional[object]       = None,   # share_refine_s_transport: one flat transport shared across blocks (valid: e_phi_lr==0 + flat, phi loop-invariant)
+    prebuilt_transport_authoritative: bool     = False,  # projected canonical frame owns this exact object across truncation
     gauge_parameterization: str                = "phi",  # 'phi' (exp(phi.G) path) | 'omega_direct' (stored GL(K) element, read from belief.omega)
     kappa_beta_override: 'Optional[float | torch.Tensor]' = None,   # learnable_kappa_beta: live exp(log_kappa_beta) (t5-exception family); None -> cfg.kappa_beta
 ) -> BeliefState:
@@ -144,6 +145,7 @@ def vfe_stack(
                                "e_step_trace", {"sequence_index": 0})
                                          if diagnostic_capture is not None and layer_index == 0 else None),
                            prebuilt_transport=prebuilt_transport,      # phi is loop-invariant when e_phi_lr==0
+                           prebuilt_transport_authoritative=prebuilt_transport_authoritative,
                            gauge_parameterization=gauge_parameterization)
         if diagnostic_capture is not None:
             diagnostic_capture["layer_converged"].append(capture["converged"])
