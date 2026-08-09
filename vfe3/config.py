@@ -1112,6 +1112,40 @@ class VFE3Config:
                         f"{type(value).__name__}: {value!r}"
                     )
 
+        # This named scientific control stores the existing token tables as the canonical,
+        # frame-intrinsic coordinates (a_v, s_v). Its exactness depends on the whole flat-cocycle
+        # contract, so reject every incompatible field before a generic downstream validator can
+        # report only a secondary consequence (for example s_e_step's model-channel prerequisite).
+        if self.encode_mode == "canonical_content_gauge":
+            incompatible = []
+            if self.family != "gaussian_frame_diagonal":
+                incompatible.append(f"family={self.family!r}")
+            if self.transport_mode != "flat":
+                incompatible.append(f"transport_mode={self.transport_mode!r}")
+            if self.gauge_parameterization != "phi":
+                incompatible.append(
+                    f"gauge_parameterization={self.gauge_parameterization!r}")
+            if self.prior_source != "token":
+                incompatible.append(f"prior_source={self.prior_source!r}")
+            if self.s_e_step:
+                incompatible.append("s_e_step=True")
+            if not self.use_prior_bank:
+                incompatible.append("use_prior_bank=False")
+            if self.decode_mode not in ("diagonal", "diagonal_chunked"):
+                incompatible.append(f"decode_mode={self.decode_mode!r}")
+            if self.omega_reflection != "off":
+                incompatible.append(f"omega_reflection={self.omega_reflection!r}")
+            if self.phi_reflection != "off":
+                incompatible.append(f"phi_reflection={self.phi_reflection!r}")
+            if incompatible:
+                raise ValueError(
+                    "encode_mode='canonical_content_gauge' requires "
+                    "family='gaussian_frame_diagonal', transport_mode='flat', "
+                    "gauge_parameterization='phi', prior_source='token', s_e_step=False, "
+                    "use_prior_bank=True, decode_mode='diagonal'/'diagonal_chunked', and both "
+                    "reflection modes off; got " + ", ".join(incompatible)
+                )
+
         # numerics
         if not (math.isfinite(self.eps) and self.eps > 0.0):
             raise ValueError(f"eps must be finite and positive, got {self.eps}")
@@ -2669,6 +2703,15 @@ class VFE3Config:
         # encode_mode validated against the live encoder registry (per_token + the 'gauge_fixed'
         # stub, which the existing NotImplementedError guard below then rejects).
         _require(self.encode_mode, tuple(sorted(_ENCODERS)), "encode_mode")
+        if self.encode_mode == "canonical_content_gauge":
+            import warnings
+            warnings.warn(
+                "encode_mode='canonical_content_gauge' is frame-intrinsic: under the exact flat "
+                "cocycle, token phi cancels from the supervised belief/decode path, so phi_embed "
+                "receives no supervised gradient unless another objective explicitly acts on phi.",
+                UserWarning,
+                stacklevel=2,
+            )
         # use_prior_bank is the SINGLE decode gate. True (the opt-in pure path): the KL-to-prior
         # readout logits = -KL(q_i || pi_v)/tau_eff over the gauge-orbit prior bank, with the
         # covariance structure selected by decode_mode (diagonal | full). False (the linear-decode

@@ -697,6 +697,32 @@ class PriorBank(nn.Module):
         gauge_group_name:       Optional[str]       = None,
     ) -> None:
         super().__init__()
+        if encode_mode == "canonical_content_gauge":
+            incompatible = []
+            if family != "gaussian_frame_diagonal":
+                incompatible.append(f"family={family!r}")
+            if gauge_parameterization != "phi":
+                incompatible.append(f"gauge_parameterization={gauge_parameterization!r}")
+            if prior_source != "token":
+                incompatible.append(f"prior_source={prior_source!r}")
+            if s_e_step:
+                incompatible.append("s_e_step=True")
+            if not use_prior_bank:
+                incompatible.append("use_prior_bank=False")
+            if decode_mode not in ("diagonal", "diagonal_chunked"):
+                incompatible.append(f"decode_mode={decode_mode!r}")
+            if omega_reflection != "off":
+                incompatible.append(f"omega_reflection={omega_reflection!r}")
+            if phi_reflection != "off":
+                incompatible.append(f"phi_reflection={phi_reflection!r}")
+            if incompatible:
+                raise ValueError(
+                    "encode_mode='canonical_content_gauge' requires "
+                    "family='gaussian_frame_diagonal', gauge_parameterization='phi', "
+                    "prior_source='token', s_e_step=False, use_prior_bank=True, "
+                    "decode_mode='diagonal'/'diagonal_chunked', and both reflection modes off; "
+                    "got " + ", ".join(incompatible)
+                )
         if gauge_parameterization == "omega_direct" and encode_mode == "per_token_additive":
             raise ValueError(
                 "gauge_parameterization='omega_direct' is incompatible with "
@@ -2201,6 +2227,15 @@ def _encode_per_token(
     phi = pb.phi_embed[token_ids]                                            # (B, N, n_gen)
     omega = pb._omega_lookup(token_ids) if getattr(pb, "gauge_parameterization", "phi") == "omega_direct" else None
     return BeliefState(mu=mu, sigma=sigma, phi=phi, omega=omega)
+
+
+@register_encode("canonical_content_gauge", can_omit_base_mean=True, can_omit_base_variance=True)
+def _encode_canonical_content_gauge(
+    pb:        PriorBank,
+    token_ids: torch.Tensor,             # (B, N) integer token ids
+) -> BeliefState:
+    r"""Exact frame-intrinsic control: the existing tables are canonical ``(a_v, s_v, phi_v)``."""
+    return _encode_per_token(pb, token_ids)
 
 
 @register_encode("per_token_additive", can_omit_base_mean=True, can_omit_base_variance=True)
