@@ -11,7 +11,7 @@ from vfe3.model.model import VFEModel
 from vfe3.model import prior_bank as prior_bank_mod
 from vfe3.model.prior_bank import PriorBank, set_decode_av_precision
 from vfe3.numerics import bounded_variance_from_log
-from vfe3.train import build_optimizer
+from vfe3.train import _floor_lr_lambdas, build_optimizer
 
 
 _MISSING = object()
@@ -386,7 +386,14 @@ def test_direct_head_evidence_accepts_precise_projected_rank_exception() -> None
     assert bank.head_evidence_logits.shape == (2,)
 
 
-def test_optimizer_owns_head_evidence_logits_once_with_mu_hyperparameters():
+def _group_owning(optimizer, parameter):
+    return next(
+        group for group in optimizer.param_groups
+        if any(candidate is parameter for candidate in group["params"])
+    )
+
+
+def test_optimizer_owns_head_evidence_logits_once_and_inherits_mean_lr():
     cfg = _enabled_cfg(m_p_mu_lr=0.0123)
     model = VFEModel(cfg)
     optimizer = build_optimizer(model, cfg)
@@ -399,6 +406,69 @@ def test_optimizer_owns_head_evidence_logits_once_with_mu_hyperparameters():
     assert group["lr"] == cfg.m_p_mu_lr
     assert group["weight_decay"] == 0.0
     assert group["role"] == "mu"
+
+
+def test_both_mixers_receive_independent_explicit_learning_rates():
+    cfg = _enabled_cfg(
+        use_head_mixer=True,
+        m_p_mu_lr=0.0123,
+        m_head_evidence_lr=0.0011,
+        m_head_mixer_lr=0.0022,
+    )
+    model = VFEModel(cfg)
+    optimizer = build_optimizer(model, cfg)
+
+    evidence = _group_owning(optimizer, model.prior_bank.head_evidence_logits)
+    legacy = _group_owning(optimizer, model.head_mixer.mixer_delta)
+
+    assert evidence["lr"] == pytest.approx(0.0011)
+    assert legacy["lr"] == pytest.approx(0.0022)
+    assert evidence["weight_decay"] == 0.0
+    assert legacy["weight_decay"] == pytest.approx(cfg.weight_decay)
+    assert evidence["lr_aux_role"] == "head_evidence"
+    assert legacy["lr_aux_role"] == "head_mixer"
+
+
+def test_both_mixer_learning_rates_inherit_mean_lr_when_none():
+    cfg = _enabled_cfg(
+        use_head_mixer=True,
+        m_p_mu_lr=0.0123,
+        m_head_evidence_lr=None,
+        m_head_mixer_lr=None,
+    )
+    model = VFEModel(cfg)
+    optimizer = build_optimizer(model, cfg)
+
+    assert _group_owning(
+        optimizer, model.prior_bank.head_evidence_logits)["lr"] == cfg.m_p_mu_lr
+    assert _group_owning(
+        optimizer, model.head_mixer.mixer_delta)["lr"] == cfg.m_p_mu_lr
+
+
+def test_mixer_learning_rate_scheduler_preserves_zero_and_independent_floor():
+    cfg = _enabled_cfg(
+        use_head_mixer=True,
+        m_head_evidence_lr=0.0,
+        m_head_mixer_lr=0.0022,
+        warmup_steps=2,
+        max_steps=10,
+        min_lr=1e-5,
+        min_lr_frac=0.01,
+    )
+    model = VFEModel(cfg)
+    optimizer = build_optimizer(model, cfg)
+    base_lrs = [group["lr"] for group in optimizer.param_groups]
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, _floor_lr_lambdas(base_lrs, cfg))
+
+    for _ in range(cfg.max_steps + 5):
+        optimizer.step()
+        scheduler.step()
+
+    evidence = _group_owning(optimizer, model.prior_bank.head_evidence_logits)
+    legacy = _group_owning(optimizer, model.head_mixer.mixer_delta)
+    assert evidence["lr"] == 0.0
+    assert legacy["lr"] == pytest.approx(max(cfg.min_lr, cfg.min_lr_frac * 0.0022))
 
 
 def test_head_mixer_and_head_evidence_are_legal_and_separately_owned():

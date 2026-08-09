@@ -189,7 +189,9 @@ def build_optimizer(
 
     Optional parameters are grouped only when their toggle is on: the linear decode weight
     ``output_proj_weight`` (use_prior_bank=False) at ``m_p_mu_lr`` (a mean-readout scale); the
-    head-mixer ``mixer_delta`` (use_head_mixer=True) at ``m_p_mu_lr``; the model-channel tables
+    PriorBank ``head_evidence_logits`` at ``m_head_evidence_lr`` and the post-belief head-mixer
+    ``mixer_delta`` (use_head_mixer=True) at ``m_head_mixer_lr`` (each inherits ``m_p_mu_lr`` when
+    its dedicated setting is None); the model-channel tables
     ``s_mu_embed``/``s_sigma_log_embed`` (lambda_h>0, lambda_gamma>0, or
     prior_source='model_channel') and the hyper-prior centroid ``r_mu``/``r_sigma_log``
     (lambda_h>0), each split mean@``m_p_mu_lr`` / log-scale@``m_p_sigma_lr`` like the belief tables.
@@ -272,10 +274,16 @@ def build_optimizer(
         # (the same protection phi/Omega carry).
         groups.append({"params": [pb.output_proj_bias], "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
     if getattr(pb, "head_evidence_logits", None) is not None:
-        groups.append({"params": [pb.head_evidence_logits], "lr": cfg.m_p_mu_lr,
-                       "weight_decay": 0.0, "role": "mu"})
+        head_evidence_lr = (cfg.m_p_mu_lr if cfg.m_head_evidence_lr is None
+                            else cfg.m_head_evidence_lr)
+        groups.append({"params": [pb.head_evidence_logits], "lr": head_evidence_lr,
+                       "weight_decay": 0.0, "role": "mu",
+                       "lr_aux_role": "head_evidence"})
     if getattr(model, "head_mixer", None) is not None:          # use_head_mixer=True Schur mixer
-        groups.append({"params": list(model.head_mixer.parameters()), "lr": cfg.m_p_mu_lr, "role": "mu"})
+        head_mixer_lr = (cfg.m_p_mu_lr if cfg.m_head_mixer_lr is None
+                         else cfg.m_head_mixer_lr)
+        groups.append({"params": list(model.head_mixer.parameters()), "lr": head_mixer_lr,
+                       "role": "mu", "lr_aux_role": "head_mixer"})
     if getattr(model, "cg_coupling", None) is not None:         # use_cg_coupling=True CG path weights
         groups.append({"params": [model.cg_coupling.path_weights], "lr": cfg.m_p_mu_lr, "role": "mu"})
     if getattr(model, "pos_phi_free", None) is not None:        # pos_phi='learned' positional table

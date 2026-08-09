@@ -108,8 +108,10 @@ def test_model_head_mixer_is_noop_at_init_and_trains():
     base = dict(vocab_size=20, embed_dim=4, n_heads=2, max_seq_len=5, n_layers=1,
                 n_e_steps=1, e_q_mu_lr=0.05, e_phi_lr=0.0)
     tok = torch.randint(0, 20, (3, 5))
-    torch.manual_seed(0); m_off = VFEModel(VFE3Config(**base, use_head_mixer=False))
-    torch.manual_seed(0); m_on = VFEModel(VFE3Config(**base, use_head_mixer=True))
+    torch.manual_seed(0)
+    m_off = VFEModel(VFE3Config(**base, use_head_mixer=False))
+    torch.manual_seed(0)
+    m_on = VFEModel(VFE3Config(**base, use_head_mixer=True))
     assert m_off.head_mixer is None and m_on.head_mixer is not None
     assert torch.allclose(m_off(tok), m_on(tok), atol=1e-6)  # identity init -> same logits at step 0
     targets = torch.randint(0, 20, (3, 5))
@@ -119,12 +121,26 @@ def test_model_head_mixer_is_noop_at_init_and_trains():
 
 
 def test_optimizer_covers_head_mixer_params():
-    cfg = VFE3Config(vocab_size=20, embed_dim=4, n_heads=2, use_head_mixer=True)
+    cfg = VFE3Config(
+        vocab_size=20,
+        embed_dim=4,
+        n_heads=2,
+        use_head_mixer=True,
+        m_p_mu_lr=0.0123,
+        m_head_mixer_lr=0.0022,
+    )
     model = VFEModel(cfg)
     opt = build_optimizer(model, cfg)
     grouped = {p for g in opt.param_groups for p in g["params"]}
+    mixer_group = next(
+        group for group in opt.param_groups
+        if any(parameter is model.head_mixer.mixer_delta for parameter in group["params"])
+    )
     assert grouped == set(model.parameters())
     assert model.head_mixer.mixer_delta in grouped
+    assert mixer_group["lr"] == pytest.approx(cfg.m_head_mixer_lr)
+    assert mixer_group["weight_decay"] == pytest.approx(cfg.weight_decay)
+    assert mixer_group["lr_aux_role"] == "head_mixer"
 
 
 def test_head_mixer_equivariant_under_tied_gauge_full_cov():
