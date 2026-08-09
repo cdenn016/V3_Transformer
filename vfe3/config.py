@@ -2596,7 +2596,12 @@ class VFE3Config:
         # / spd_retract_mode above). Local import avoids a config <- prior_bank cycle. decode_mode must
         # NOT accept 'linear': that kernel is reached only through the use_prior_bank=False second-gate
         # (a learned linear readout), never via decode_mode, so it is excluded from the valid set.
-        from vfe3.model.prior_bank import _DECODERS, _ENCODERS, has_builtin_head_evidence_decoder
+        from vfe3.model.prior_bank import (
+            _DECODERS,
+            _ENCODERS,
+            has_builtin_head_evidence_decoder,
+            has_builtin_projected_full_decoder,
+        )
         _require(self.decode_mode, tuple(sorted(set(_DECODERS) - {"linear"})), "decode_mode")
         # decode_mode sets the covariance RANK(s) of the prior-bank decode kernel via its resolved
         # DecodeRegistration.covariance_kinds: 'diagonal'/'diagonal_chunked' -> {'diagonal'};
@@ -2607,6 +2612,15 @@ class VFE3Config:
         # sigma and its own active registration controls dense-vs-fused training; decode_mode does not
         # route that no-prior path, so the cross-check stays gated on use_prior_bank.
         decode_registration = _DECODERS[self.decode_mode]
+        if (
+            self.encode_mode == "canonical_content_projected"
+            and not has_builtin_projected_full_decoder(self.decode_mode)
+        ):
+            raise ValueError(
+                "encode_mode='canonical_content_projected' requires the built-in analytic "
+                "'full'/'full_chunked' decode registration and callable identities; "
+                "registry overrides are not eligible."
+            )
         if self.use_priorbank_head_evidence_mixer:
             canonical_modes = {
                 "gaussian_diagonal": ("diagonal", "diagonal_chunked"),

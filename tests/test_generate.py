@@ -141,11 +141,11 @@ def test_generate_decodes_only_last_position(monkeypatch):
     ]
 
 
-def test_projected_generation_single_token_matches_full_and_decode_last_logits():
-    """Generation must slice the same realized frame as its final-position query."""
+def test_projected_decode_last_matches_full_last_position_for_multitoken_context():
+    """The last query and its frame must be sliced together, never from the first position."""
     model = _projected_tiny_model(seed=17)
     model.eval()
-    prompt = torch.tensor([[2], [5]], device=PROJECTED_DEVICE)
+    prompt = torch.tensor([[2, 7, 4], [5, 1, 9]], device=PROJECTED_DEVICE)
     capture: dict = {}
 
     _, full_logits = model.forward_beliefs(
@@ -159,13 +159,36 @@ def test_projected_generation_single_token_matches_full_and_decode_last_logits()
         decode_last=True,
     )
 
-    assert "canonical_frame" in capture
-    assert full_logits is not None and full_logits.shape == (2, 1, model.cfg.vocab_size)
-    assert last_logits is not None and last_logits.shape == full_logits.shape
-    assert torch.allclose(last_logits, full_logits, atol=1e-6, rtol=1e-6)
-    expected = full_logits[:, -1].argmax(dim=-1)
-    generated = model.generate(prompt, max_new_tokens=1, greedy=True)
-    assert torch.equal(generated[:, -1], expected)
+    context = capture["canonical_frame"]
+    assert full_logits is not None and full_logits.shape == (2, 3, model.cfg.vocab_size)
+    assert last_logits is not None and last_logits.shape == (2, 1, model.cfg.vocab_size)
+    assert not torch.allclose(context.inverse[:, :1], context.inverse[:, -1:])
+    assert torch.allclose(last_logits, full_logits[:, -1:], atol=1e-6, rtol=1e-6)
+    assert not torch.allclose(last_logits, full_logits[:, :1], atol=1e-6, rtol=1e-6)
+
+
+def test_projected_generation_recomputes_context_after_sequence_growth():
+    """Every greedy step must decode the last position of its newly grown same-forward context."""
+    model = _projected_tiny_model(seed=23)
+    model.eval()
+    prompt = torch.tensor([[2, 7, 4], [5, 1, 9]], device=PROJECTED_DEVICE)
+    expected = prompt.clone()
+
+    for _ in range(2):
+        capture: dict = {}
+        _, full_logits = model.forward_beliefs(
+            expected,
+            return_logits=True,
+            capture=capture,
+        )
+        assert full_logits is not None
+        context = capture["canonical_frame"]
+        assert context.inverse.shape[1] == expected.shape[1]
+        next_token = full_logits[:, -1].argmax(dim=-1, keepdim=True)
+        expected = torch.cat([expected, next_token], dim=1)
+
+    generated = model.generate(prompt, max_new_tokens=2, greedy=True)
+    assert torch.equal(generated, expected)
 
 
 def test_generate_rejects_nonfinite_logit_rows(monkeypatch):

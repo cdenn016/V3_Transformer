@@ -320,6 +320,166 @@ def test_projected_config_accepts_full_head_evidence_after_pullback(
     assert cfg.use_priorbank_head_evidence_mixer is True
 
 
+@pytest.mark.registry_mutation
+@pytest.mark.parametrize("decode_mode", ["full", "full_chunked"])
+@pytest.mark.parametrize("override_kind", ["registration", "callable"])
+def test_projected_construction_rejects_overridden_full_decoder_before_forward(
+    decode_mode: str,
+    override_kind: str,
+) -> None:
+    """A projected model must never reach a custom decoder lacking its frame contract."""
+    from vfe3.model import prior_bank as prior_bank_mod
+
+    previous = prior_bank_mod._DECODERS[decode_mode]
+
+    def replacement_decode(pb, mu_q, sigma_q, tau_eff):
+        return previous.callable(pb, mu_q, sigma_q, tau_eff)
+
+    def replacement_fused_ce(
+        pb,
+        mu_q,
+        sigma_q,
+        targets,
+        *,
+        z_loss_weight=0.0,
+        tau=None,
+        chunk_size=None,
+        ignore_index=-100,
+    ):
+        assert previous.fused_ce is not None
+        return previous.fused_ce(
+            pb,
+            mu_q,
+            sigma_q,
+            targets,
+            z_loss_weight=z_loss_weight,
+            tau=tau,
+            chunk_size=chunk_size,
+            ignore_index=ignore_index,
+        )
+
+    decode_callable = previous.callable
+    fused_callable = previous.fused_ce
+    if override_kind == "callable":
+        decode_callable = replacement_decode
+        fused_callable = replacement_fused_ce if previous.supports_chunked else None
+    try:
+        prior_bank_mod.register_decode(
+            decode_mode,
+            supports_full=previous.supports_full,
+            supports_chunked=previous.supports_chunked,
+            fused_ce=fused_callable,
+            family_consistent=previous.family_consistent,
+            covariance_kinds=previous.covariance_kinds,
+            can_omit_base_mean=previous.can_omit_base_mean,
+            can_omit_base_variance=previous.can_omit_base_variance,
+            override=True,
+        )(decode_callable)
+
+        with pytest.raises(
+            ValueError,
+            match=r"canonical_content_projected.*built-in analytic.*full",
+        ):
+            _projected_cfg(
+                decode_mode=decode_mode,
+                use_priorbank_head_evidence_mixer=False,
+            )
+        with pytest.raises(
+            ValueError,
+            match=r"canonical_content_projected.*built-in analytic.*full",
+        ):
+            PriorBank(
+                vocab_size=9,
+                K=4,
+                n_gen=8,
+                family="gaussian_diagonal",
+                encode_mode="canonical_content_projected",
+                decode_mode=decode_mode,
+                use_prior_bank=True,
+                prior_source="token",
+                s_e_step=False,
+                gauge_parameterization="phi",
+                omega_reflection="off",
+                phi_reflection="off",
+            )
+    finally:
+        # Restore the exact import-time object, including its original callable/fused identity.
+        prior_bank_mod._DECODERS[decode_mode] = previous
+    assert prior_bank_mod.get_decode_registration(decode_mode) is previous
+
+
+@pytest.mark.registry_mutation
+def test_ordinary_full_chunked_runtime_preserves_custom_fused_override() -> None:
+    """The projected-only identity gate must not narrow ordinary registry extensibility."""
+    from vfe3.model import prior_bank as prior_bank_mod
+
+    decode_mode = "full_chunked"
+    previous = prior_bank_mod._DECODERS[decode_mode]
+    assert previous.fused_ce is not None
+
+    def replacement_decode(pb, mu_q, sigma_q, tau_eff):
+        return previous.callable(pb, mu_q, sigma_q, tau_eff)
+
+    def replacement_fused_ce(
+        pb,
+        mu_q,
+        sigma_q,
+        targets,
+        *,
+        z_loss_weight=0.0,
+        tau=None,
+        chunk_size=None,
+        ignore_index=-100,
+    ):
+        assert previous.fused_ce is not None
+        return previous.fused_ce(
+            pb,
+            mu_q,
+            sigma_q,
+            targets,
+            z_loss_weight=z_loss_weight,
+            tau=tau,
+            chunk_size=chunk_size,
+            ignore_index=ignore_index,
+        )
+
+    try:
+        prior_bank_mod.register_decode(
+            decode_mode,
+            supports_full=True,
+            supports_chunked=True,
+            fused_ce=replacement_fused_ce,
+            covariance_kinds=frozenset({"full"}),
+            can_omit_base_mean=True,
+            can_omit_base_variance=True,
+            override=True,
+        )(replacement_decode)
+        cfg = VFE3Config(
+            vocab_size=11,
+            embed_dim=4,
+            n_heads=2,
+            max_seq_len=3,
+            batch_size=1,
+            n_layers=1,
+            n_e_steps=1,
+            oracle_unroll_grad=True,
+            family="gaussian_full",
+            use_prior_bank=True,
+            decode_mode=decode_mode,
+            max_steps=1,
+        )
+        model = VFEModel(cfg).to(TASK6_DEVICE)
+        tokens = torch.tensor([[2, 5]], device=TASK6_DEVICE)
+        targets = torch.tensor([[7, 3]], device=TASK6_DEVICE)
+        logits, loss, ce = model(tokens, targets)
+        assert logits is None
+        assert torch.isfinite(loss)
+        assert torch.isfinite(ce)
+    finally:
+        prior_bank_mod._DECODERS[decode_mode] = previous
+    assert prior_bank_mod.get_decode_registration(decode_mode) is previous
+
+
 def test_direct_projected_prior_bank_rejects_locally_incompatible_family() -> None:
     """Direct bank construction must not bypass the projected encoder's family boundary."""
     with pytest.raises(ValueError, match="canonical_content_projected"):

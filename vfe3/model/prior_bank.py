@@ -751,6 +751,12 @@ class PriorBank(nn.Module):
                     "decode_mode='full'/'full_chunked', and both reflection modes off; "
                     "got " + ", ".join(incompatible)
                 )
+            if not has_builtin_projected_full_decoder(decode_mode):
+                raise ValueError(
+                    "encode_mode='canonical_content_projected' requires the built-in analytic "
+                    "'full'/'full_chunked' decode registration and callable identities; "
+                    "registry overrides are not eligible."
+                )
         if gauge_parameterization == "omega_direct" and encode_mode == "per_token_additive":
             raise ValueError(
                 "gauge_parameterization='omega_direct' is incompatible with "
@@ -2279,6 +2285,26 @@ class GeometricFusedCECallable(Protocol):
         ...
 
 
+class FrameAwareGeometricFusedCECallable(Protocol):
+    """Geometric fused CE contract for the projected full-covariance decode boundary."""
+
+    def __call__(
+        self,
+        pb:              PriorBank,
+        mu_q:            torch.Tensor,
+        sigma_q:         torch.Tensor,
+        targets:         torch.Tensor,
+
+        *,
+        z_loss_weight:   float                           = 0.0,
+        tau:             Optional[float]                 = None,
+        chunk_size:      Optional[int]                   = None,
+        ignore_index:    int                             = -100,
+        canonical_frame: Optional[CanonicalFrameContext] = None,
+    ) -> torch.Tensor:
+        ...
+
+
 class LinearFusedCECallable(Protocol):
     """Fused CE contract for the mean-only linear decoder."""
 
@@ -2296,7 +2322,11 @@ class LinearFusedCECallable(Protocol):
         ...
 
 
-FusedCECallable = GeometricFusedCECallable | LinearFusedCECallable
+FusedCECallable = (
+    GeometricFusedCECallable
+    | FrameAwareGeometricFusedCECallable
+    | LinearFusedCECallable
+)
 
 
 def _encode_prior_sigma(
@@ -2811,4 +2841,35 @@ def has_builtin_head_evidence_decoder(name: str) -> bool:
         registration is _HEAD_EVIDENCE_CANONICAL_DECODERS.get(name)
         and registration is not None
         and registration.callable is _HEAD_EVIDENCE_CANONICAL_DECODER_CALLABLES[name]
+    )
+
+
+# Projected canonical content has a stricter boundary than the general registry: its diagonal query
+# is pulled back to full covariance before these exact analytic scorers, and only full_chunked's
+# import-time fused callable accepts the same-forward canonical_frame keyword. Pin the complete
+# registrations plus both callable identities so an override cannot inherit this private contract by
+# copying metadata or reusing only one of the built-in callables.
+_PROJECTED_FULL_DECODERS: Mapping[str, DecodeRegistration] = MappingProxyType({
+    "full": _HEAD_EVIDENCE_CANONICAL_DECODERS["full"],
+    "full_chunked": _HEAD_EVIDENCE_CANONICAL_DECODERS["full_chunked"],
+})
+_PROJECTED_FULL_DECODER_CALLABLES: Mapping[str, DecodeCallable] = MappingProxyType({
+    name: registration.callable
+    for name, registration in _PROJECTED_FULL_DECODERS.items()
+})
+_PROJECTED_FULL_FUSED_CALLABLES: Mapping[str, Optional[FusedCECallable]] = MappingProxyType({
+    name: registration.fused_ce
+    for name, registration in _PROJECTED_FULL_DECODERS.items()
+})
+
+
+def has_builtin_projected_full_decoder(name: str) -> bool:
+    """Whether *name* still owns the import-time projected full decode contract exactly."""
+    registration = _DECODERS.get(name)
+    builtin = _PROJECTED_FULL_DECODERS.get(name)
+    return (
+        registration is builtin
+        and registration is not None
+        and registration.callable is _PROJECTED_FULL_DECODER_CALLABLES[name]
+        and registration.fused_ce is _PROJECTED_FULL_FUSED_CALLABLES[name]
     )
