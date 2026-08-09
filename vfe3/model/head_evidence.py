@@ -14,6 +14,10 @@ class HeadEvidenceWeights:
     head: Tensor
     coordinate: Tensor
 
+    def minus_identity(self) -> "HeadEvidenceWeights":
+        """Return the exact baseline-plus-delta coefficients ``w - 1``."""
+        return HeadEvidenceWeights(head=self.head - 1.0, coordinate=self.coordinate - 1.0)
+
 
 def normalized_head_evidence_weights(
     logits: Tensor,

@@ -284,11 +284,19 @@ def _full_family_workspace_bytes_per_scalar(
 
 
 def _decode_av_lhs(
-    sq:   torch.Tensor,                   # (..., N, K) query variances
-    mc_q: torch.Tensor,                   # (..., N, K) centered query means
+    sq:          torch.Tensor,                   # (..., N, K) query variances
+    mc_q:        torch.Tensor,                   # (..., N, K) centered query means
+    coord_delta: Optional[torch.Tensor] = None,  # (K,) optional head-evidence coefficients w_h - 1
 ) -> torch.Tensor:                        # (..., N, 2K)
     r"""The v-independent left factor, hoisted out of the chunk loop."""
-    return torch.cat([sq + mc_q ** 2, -2.0 * mc_q], dim=-1)
+    quadratic = sq + mc_q ** 2
+    linear = -2.0 * mc_q
+    if coord_delta is None:
+        return torch.cat([quadratic, linear], dim=-1)
+    return torch.cat([
+        quadratic * coord_delta,
+        linear * coord_delta,
+    ], dim=-1)
 
 
 def _decode_av(
@@ -299,7 +307,8 @@ def _decode_av(
     lsum:  torch.Tensor,                  # (Vc,) sum_k log sigma_v
 
     *,
-    lhs:   Optional[torch.Tensor] = None,  # (..., N, 2K) precomputed _decode_av_lhs (fp32 policy only)
+    lhs:         Optional[torch.Tensor] = None,  # (..., N, 2K) precomputed _decode_av_lhs
+    coord_delta: Optional[torch.Tensor] = None,  # (K,) optional head-evidence coefficients w_h - 1
 ) -> torch.Tensor:                        # (..., N, Vc), float64 under the fp64 policy
     r"""``a_v`` under the active working precision -- the ONE place this algebra is written.
 
@@ -311,11 +320,18 @@ def _decode_av(
     """
     if _DECODE_AV_PRECISION == "fp64" and sq.dtype is not torch.float64:
         return _decode_av(
-            sq.double(), mc_q.double(), mc_v.double(), inv_v.double(), lsum.double())
+            sq.double(), mc_q.double(), mc_v.double(), inv_v.double(), lsum.double(),
+            coord_delta=None if coord_delta is None else coord_delta.double())
     if lhs is None or lhs.dtype is not sq.dtype:
-        lhs = _decode_av_lhs(sq, mc_q)
+        lhs = _decode_av_lhs(sq, mc_q, coord_delta)
     rhs = torch.cat([inv_v, mc_v * inv_v], dim=-1)             # (Vc, 2K)
-    return lhs @ rhs.transpose(-1, -2) + (mc_v ** 2 * inv_v).sum(-1) + lsum
+    if coord_delta is None:
+        return lhs @ rhs.transpose(-1, -2) + (mc_v ** 2 * inv_v).sum(-1) + lsum
+    return (
+        lhs @ rhs.transpose(-1, -2)
+        + (mc_v ** 2 * inv_v * coord_delta).sum(-1)
+        + lsum
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -973,6 +989,21 @@ class PriorBank(nn.Module):
         )
         return weights.head, weights.coordinate
 
+    def _head_evidence_deltas(
+        self,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return exact ``w_h - 1`` coefficients for baseline-plus-delta scoring."""
+        weights = normalized_head_evidence_weights(
+            self.head_evidence_logits,
+            self._head_evidence_irrep_dims,
+            dtype=dtype,
+            device=device,
+        ).minus_identity()
+        return weights.head, weights.coordinate
+
     def encode(
         self,
         token_ids: torch.Tensor,         # (B, N) integer token ids
@@ -1507,6 +1538,26 @@ class PriorBank(nn.Module):
         eye = torch.eye(L.shape[-1], device=L.device, dtype=L.dtype)
         logdet_q = _logdet_chol(torch.where(ok[..., None, None], L, eye))   # (B, N)
         return diag_sq, logdet_q, ok
+
+    def _head_evidence_full_marginal_invariants(
+        self,
+        sigma_q: torch.Tensor,           # (B, N, K, K) posterior covariances
+        head_delta: torch.Tensor,        # (H,) exact head-evidence coefficients w_h - 1
+    ) -> Tuple[torch.Tensor, torch.Tensor]:  # weighted (d_h + logdet marginal), all-block-ok
+        """Compute the query-only marginal entropy delta under the safe-Cholesky policy."""
+        per_pos = torch.zeros(sigma_q.shape[:-2], dtype=sigma_q.dtype, device=sigma_q.device)
+        all_ok = torch.ones(sigma_q.shape[:-2], dtype=torch.bool, device=sigma_q.device)
+        start = 0
+        for delta_h, dim in zip(head_delta, self._head_evidence_irrep_dims):
+            stop = start + dim
+            marginal = sigma_q[..., start:stop, start:stop]
+            L_h, ok_h = safe_cholesky(marginal, eps=self.eps, rounds=5)
+            eye_h = torch.eye(dim, dtype=L_h.dtype, device=L_h.device)
+            logdet_h = _logdet_chol(torch.where(ok_h[..., None, None], L_h, eye_h))
+            per_pos = per_pos + delta_h * (dim + logdet_h)
+            all_ok = all_ok & ok_h
+            start = stop
+        return per_pos.unsqueeze(-1), all_ok
 
     def decode_ce_full_chunked(
         self,
@@ -2155,6 +2206,20 @@ def _decode_diagonal(
     # .to() after the clamp keeps the fp64 a_v island open through the subtraction (F32); it is an
     # identity no-op under the default fp32 policy.
     kl_v = (0.5 * (a_v - per_pos)).clamp(min=0.0).to(mu_q.dtype)         # (B, N, V); KL>=0 floor matches
+    if hasattr(pb, "head_evidence_logits"):
+        _, coord_delta = pb._head_evidence_deltas(dtype=mu_q.dtype, device=mu_q.device)
+        delta_a_v = _decode_av(
+            sigma_q,
+            mc_q,
+            mc_v,
+            inv_v,
+            (torch.log(sigma_v) * coord_delta).sum(-1),
+            coord_delta=coord_delta,
+        )
+        delta_per_pos = (
+            coord_delta * (1.0 + torch.log(sigma_q.clamp(min=pb.eps)))
+        ).sum(-1, keepdim=True)
+        kl_v = kl_v + (0.5 * (delta_a_v - delta_per_pos)).to(mu_q.dtype)
     return -kl_v / tau_eff                                               # reference_decode's safe_kl_clamp (r2 id17)
 
 
@@ -2216,11 +2281,30 @@ def _decode_full(
         kl_max=float("inf"),
         eps=pb.eps,
     )                                                                       # (B, N, V)
+    diag_sq, _, spd_ok = pb._full_cov_query_invariants(sigma_q)              # (B,N,K), _, (B,N)
+    if hasattr(pb, "head_evidence_logits"):
+        head_delta, coord_delta = pb._head_evidence_deltas(
+            dtype=mu_q.dtype, device=mu_q.device)
+        delta_per_pos, block_ok = pb._head_evidence_full_marginal_invariants(
+            sigma_q, head_delta)
+        spd_ok = spd_ok & block_ok
+        c = mu_v.mean(dim=0, keepdim=True)
+        mc_v = mu_v - c
+        mc_q = mu_q - c
+        inv_v = 1.0 / torch.diagonal(sigma_v, dim1=-2, dim2=-1)
+        delta_a_v = _decode_av(
+            diag_sq,
+            mc_q,
+            mc_v,
+            inv_v,
+            (torch.log(1.0 / inv_v) * coord_delta).sum(-1),
+            coord_delta=coord_delta,
+        )
+        kl_v = kl_v + (0.5 * (delta_a_v - delta_per_pos)).to(mu_q.dtype)
     # Same exclusion contract as the chunked twin (audit 2026-08-06 F31). Here the -inf arrived
     # indirectly -- the family seam maps a failed Cholesky to NaN and ``kl_max=inf`` maps that to
     # inf -- so the row has to be neutralized after the fact. One extra (B, N) Cholesky against this
     # kernel's own O(B*N*V*K^3) per-pair factorization is not measurable.
-    spd_ok = pb._full_cov_query_invariants(sigma_q)[2]                      # (B, N)
     kl_v = torch.where(spd_ok.unsqueeze(-1), kl_v, torch.zeros_like(kl_v))
     return -kl_v / tau_eff
 
@@ -2263,6 +2347,21 @@ def _decode_full_chunked(
     # .to() after the clamp keeps the fp64 a_v island open through the subtraction (F32); it is an
     # identity no-op under the default fp32 policy.
     kl_v = (0.5 * (a_v - per_pos)).clamp(min=0.0).to(mu_q.dtype)         # (B, N, V); KL>=0 floor matches
+    if hasattr(pb, "head_evidence_logits"):
+        head_delta, coord_delta = pb._head_evidence_deltas(
+            dtype=mu_q.dtype, device=mu_q.device)
+        delta_per_pos, block_ok = pb._head_evidence_full_marginal_invariants(
+            sigma_q, head_delta)
+        spd_ok = spd_ok & block_ok
+        delta_a_v = _decode_av(
+            diag_sq,
+            mc_q,
+            mc_v,
+            inv_v,
+            (torch.log(sigma_v) * coord_delta).sum(-1),
+            coord_delta=coord_delta,
+        )
+        kl_v = kl_v + (0.5 * (delta_a_v - delta_per_pos)).to(mu_q.dtype)
     # A non-PD Sigma_q has no valid likelihood: emit an INFORMATIONLESS uniform row rather than a
     # score built on a placeholder log-det (audit 2026-08-06 F31). log_softmax of a uniform row is
     # -log V, finite; the all--inf row this used to produce maps to NaN. The CE seams exclude the
