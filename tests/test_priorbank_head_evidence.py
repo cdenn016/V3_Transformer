@@ -1,7 +1,10 @@
 """Opt-in PriorBank-native head-evidence mixer state and ownership."""
 
+import math
+
 import pytest
 import torch
+import torch.nn.functional as F
 
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
@@ -435,3 +438,119 @@ def test_initial_identity_is_bitwise_for_outputs_and_legacy_gradients(mode: str)
     for off_grad, on_grad in zip(off_grads, on_grads[:-1]):
         assert torch.equal(on_grad, off_grad)
     assert on_grads[-1].abs().sum() > 0
+
+
+@pytest.mark.parametrize("mode", ["diagonal_chunked", "full_chunked"])
+def test_fused_head_evidence_ce_matches_dense_with_all_reduction_boundaries_and_gradients(
+    mode: str,
+):
+    bank = _reference_bank(mode, (2, 3), enabled=True, unigram=True)
+    bank.decode_ce_checkpoint = "on"
+    with torch.no_grad():
+        bank.decode_log_scale.fill_(0.31)
+    mu_q, sigma_q = _full_query() if mode == "full_chunked" else _diagonal_query()
+    targets = torch.tensor([[0, -100], [4, 2]])
+    z_loss_weight = 0.073
+
+    fused_fn = (
+        bank.decode_ce_full_chunked
+        if mode == "full_chunked"
+        else bank.decode_ce_diagonal_chunked
+    )
+    fused = fused_fn(
+        mu_q,
+        sigma_q,
+        targets,
+        z_loss_weight=z_loss_weight,
+        chunk_size=2,
+        ignore_index=-100,
+    )
+    dense_logits = bank.decode(mu_q, sigma_q)
+    dense = F.cross_entropy(
+        dense_logits.reshape(-1, bank.vocab_size),
+        targets.reshape(-1),
+        ignore_index=-100,
+        reduction="mean",
+    )
+    valid = targets != -100
+    dense = dense + z_loss_weight * (
+        torch.logsumexp(dense_logits, dim=-1).square() * valid
+    ).sum() / valid.sum()
+    torch.testing.assert_close(fused, dense, rtol=4e-11, atol=4e-11)
+
+    leaves = (
+        mu_q,
+        sigma_q,
+        bank.mu_embed,
+        bank.sigma_log_embed,
+        bank.decode_log_scale,
+        bank.head_evidence_logits,
+    )
+    fused_grads = torch.autograd.grad(fused, leaves, retain_graph=True, allow_unused=True)
+    dense_grads = torch.autograd.grad(dense, leaves)
+    for fused_grad, dense_grad in zip(fused_grads, dense_grads):
+        assert fused_grad is not None
+        assert torch.isfinite(fused_grad).all()
+        torch.testing.assert_close(fused_grad, dense_grad, rtol=3e-9, atol=3e-10)
+    assert fused_grads[-2].abs().sum() > 0
+    assert fused_grads[-1].abs().sum() > 0
+
+
+def test_simultaneous_head_mixers_have_separate_gradients_and_diagnostics():
+    torch.manual_seed(812)
+    cfg = _enabled_cfg(use_head_mixer=True, decode_chunk_size=3, z_loss_weight=0.021)
+    model = VFEModel(cfg)
+    with torch.no_grad():
+        model.prior_bank.head_evidence_logits.copy_(torch.tensor([0.7, -0.35]))
+        model.head_mixer.mixer_delta.copy_(torch.tensor([[0.12, -0.04], [0.03, -0.08]]))
+    tokens = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len))
+    targets = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len))
+    targets[0, 2] = -100
+
+    _, loss, _ = model(tokens, targets)
+    loss.backward()
+    evidence_grad = model.prior_bank.head_evidence_logits.grad
+    mixer_grads = [parameter.grad for parameter in model.head_mixer.mixer_deltas]
+    assert evidence_grad is not None and torch.isfinite(evidence_grad).all()
+    assert evidence_grad.abs().sum() > 0
+    assert all(grad is not None and torch.isfinite(grad).all() for grad in mixer_grads)
+    assert sum(grad.abs().sum() for grad in mixer_grads) > 0
+
+    diagnostics = model.diagnostics(tokens)
+    evidence_keys = {
+        "head_evidence_weights",
+        "head_evidence_entropy",
+        "head_evidence_max_abs_drift",
+    }
+    assert evidence_keys <= diagnostics.keys()
+    assert "head_mixer_drift" in diagnostics
+    weights, _ = model.prior_bank.head_evidence_weights(
+        dtype=model.prior_bank.head_evidence_logits.dtype,
+        device=model.prior_bank.head_evidence_logits.device,
+    )
+    probabilities = weights / weights.numel()
+    torch.testing.assert_close(
+        torch.tensor(diagnostics["head_evidence_weights"]), weights.detach().cpu())
+    assert diagnostics["head_evidence_entropy"] == pytest.approx(
+        float(-(probabilities * probabilities.log()).sum().detach()))
+    assert diagnostics["head_evidence_max_abs_drift"] == pytest.approx(
+        float((weights - 1.0).abs().max().detach()))
+
+    old_head_mixer_drift = diagnostics["head_mixer_drift"]
+    with torch.no_grad():
+        model.prior_bank.head_evidence_logits.add_(torch.tensor([-0.2, 0.5]))
+    assert model.diagnostics(tokens)["head_mixer_drift"] == old_head_mixer_drift
+
+    evidence_diagnostics = {
+        key: model.diagnostics(tokens)[key] for key in evidence_keys
+    }
+    with torch.no_grad():
+        model.head_mixer.mixer_delta.add_(0.17)
+    after_mixer = model.diagnostics(tokens)
+    assert {key: after_mixer[key] for key in evidence_keys} == evidence_diagnostics
+
+    with torch.no_grad():
+        model.prior_bank.head_evidence_logits.copy_(torch.tensor([1000.0, -1000.0]))
+    collapsed = model.diagnostics(tokens)
+    assert collapsed["head_evidence_entropy"] == pytest.approx(0.0)
+    assert math.isfinite(collapsed["head_evidence_entropy"])

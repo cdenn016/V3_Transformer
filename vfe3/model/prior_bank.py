@@ -334,6 +334,42 @@ def _decode_av(
     )
 
 
+def _decode_head_evidence_kl_delta(
+    sq:             torch.Tensor,
+    mc_q:           torch.Tensor,
+    mc_v:           torch.Tensor,
+    inv_v:          torch.Tensor,
+    log_sigma_v:    torch.Tensor,
+    coord_delta:    torch.Tensor,
+    delta_per_pos:  torch.Tensor,
+) -> torch.Tensor:
+    r"""Canonical baseline-plus-delta head-evidence KL contribution for one vocab slice."""
+    delta_a_v = _decode_av(
+        sq,
+        mc_q,
+        mc_v,
+        inv_v,
+        (log_sigma_v * coord_delta).sum(-1),
+        coord_delta=coord_delta,
+    )
+    return (0.5 * (delta_a_v - delta_per_pos)).to(mc_q.dtype)
+
+
+def _decode_analytic_kl_logits(
+    a_v:          torch.Tensor,
+    per_pos:      torch.Tensor,
+    tau_eff:      torch.Tensor,
+    output_dtype: torch.dtype,
+    *,
+    evidence_delta: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Apply the shared canonical KL floor, optional block delta, and decode temperature."""
+    kl_v = (0.5 * (a_v - per_pos)).clamp(min=0.0).to(output_dtype)
+    if evidence_delta is not None:
+        kl_v = kl_v + evidence_delta
+    return -kl_v / tau_eff
+
+
 # ---------------------------------------------------------------------------
 # Registries: mode name -> callable. Variants swap by config; add a variant by
 # writing-and-registering it, never by editing call sites.
@@ -1386,14 +1422,24 @@ class PriorBank(nn.Module):
         # Per-position, v-INDEPENDENT term of -KL/tau_eff: it cancels in the CE difference
         # (logsumexp - target_logit) but is carried so each chunk's logits equal _decode_diagonal's.
         per_pos = self.K + torch.log(sigma_q.clamp(min=self.eps)).sum(-1, keepdim=True)  # (B, N, 1)
+        coord_delta = None
+        delta_per_pos = None
+        if hasattr(self, "head_evidence_logits"):
+            _, coord_delta = self._head_evidence_deltas(dtype=mu_q.dtype, device=mu_q.device)
+            delta_per_pos = (
+                coord_delta * (1.0 + torch.log(sigma_q.clamp(min=self.eps)))
+            ).sum(-1, keepdim=True)
 
         def _chunk_summaries(lhs_:    torch.Tensor, per_pos_:        torch.Tensor,
                              mu_v_c:  torch.Tensor, inv_v_c:         torch.Tensor,
-                             lsum_c:  torch.Tensor, in_chunk_f:      torch.Tensor,
+                             log_v_c: torch.Tensor, lsum_c:          torch.Tensor,
+                             in_chunk_f: torch.Tensor,
                              local_idx: torch.Tensor,
                              u_c:     Optional[torch.Tensor],
                              sq_:     torch.Tensor,
-                             mc_q_:   torch.Tensor) -> 'tuple[torch.Tensor, torch.Tensor]':
+                             mc_q_:   torch.Tensor,
+                             coord_delta_: Optional[torch.Tensor],
+                             delta_per_pos_: Optional[torch.Tensor]) -> 'tuple[torch.Tensor, torch.Tensor]':
             r"""Reduce one vocab chunk to (lse_chunk, target_contrib), both (B, N), on the inside.
 
             logit_{i,v} = -0.5(a_v - per_pos)/tau_eff over the chunk (see _decode_diagonal). The
@@ -1405,11 +1451,14 @@ class PriorBank(nn.Module):
             form uses ``lhs_`` and ignores them.
             """
             a_v = _decode_av(sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_)   # (B, N, Vc)
-            # Cast the FINISHED logit, not a_v (audit 2026-08-06 F32): under the fp64 policy a_v
-            # comes back float64 and the subtraction/division stay in the island, so only the O(1)
-            # result is rounded. Under the default fp32 policy every operand is already float32 and
-            # .to() is an identity no-op, so this line is byte-identical.
-            logit_chunk = (-0.5 * (a_v - per_pos_) / tau_eff).to(lhs_.dtype)   # (B, N, Vc)
+            evidence_delta = None
+            if coord_delta_ is not None and delta_per_pos_ is not None:
+                evidence_delta = _decode_head_evidence_kl_delta(
+                    sq_, mc_q_, mu_v_c, inv_v_c, log_v_c,
+                    coord_delta_, delta_per_pos_,
+                )
+            logit_chunk = _decode_analytic_kl_logits(
+                a_v, per_pos_, tau_eff, lhs_.dtype, evidence_delta=evidence_delta)
             if u_c is not None:
                 logit_chunk = logit_chunk + u_c                            # unigram log-prior chunk slice
             lse_chunk = torch.logsumexp(logit_chunk, dim=-1)               # (B, N)
@@ -1428,7 +1477,8 @@ class PriorBank(nn.Module):
             v1 = min(v0 + chunk, V)
             mc_v_c = (mu_v_all[v0:v1] - c)                                  # (Vc, K) centered prior means
             inv_v_c = 1.0 / sigma_v_all[v0:v1]                             # (Vc, K)
-            lsum_c = torch.log(sigma_v_all[v0:v1]).sum(-1)                 # (Vc,)
+            log_v_c = torch.log(sigma_v_all[v0:v1])                        # (Vc, K)
+            lsum_c = log_v_c.sum(-1)                                      # (Vc,)
             u_c = u_all[v0:v1] if u_all is not None else None              # (Vc,) or None
             # Target gather indices: positions whose target lands in [v0, v1). Ignored positions have
             # target < 0 < v0, so they never match -> target_logit stays 0 for them and `valid` excludes
@@ -1440,13 +1490,14 @@ class PriorBank(nn.Module):
             activation_bytes = _decode_ce_chunk_activation_bytes(lhs, v1 - v0)
             if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
                 lse_chunk, contrib = _checkpoint.checkpoint(
-                    _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, lsum_c, in_chunk_f, local_idx,
-                    u_c, sigma_q, mc_q, use_reentrant=False,
+                    _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, log_v_c, lsum_c,
+                    in_chunk_f, local_idx,
+                    u_c, sigma_q, mc_q, coord_delta, delta_per_pos, use_reentrant=False,
                 )
             else:
                 lse_chunk, contrib = _chunk_summaries(
-                    lhs, per_pos, mc_v_c, inv_v_c, lsum_c, in_chunk_f, local_idx, u_c,
-                    sigma_q, mc_q,
+                    lhs, per_pos, mc_v_c, inv_v_c, log_v_c, lsum_c, in_chunk_f, local_idx, u_c,
+                    sigma_q, mc_q, coord_delta, delta_per_pos,
                 )
             lse_chunks.append(lse_chunk)
             target_logit = target_logit + contrib                          # exactly one chunk contributes per valid pos
@@ -1604,14 +1655,25 @@ class PriorBank(nn.Module):
         # v-INDEPENDENT term of -KL/tau_eff (cancels in the CE difference, carried so each chunk's
         # logits equal _decode_full's): K + log|Sigma_q| (the full-cov analogue of K + sum_k log sigma_q).
         per_pos = self.K + logdet_q.unsqueeze(-1)                          # (B, N, 1)
+        coord_delta = None
+        delta_per_pos = None
+        block_ok = torch.ones_like(spd_ok)
+        if hasattr(self, "head_evidence_logits"):
+            head_delta, coord_delta = self._head_evidence_deltas(
+                dtype=mu_q.dtype, device=mu_q.device)
+            delta_per_pos, block_ok = self._head_evidence_full_marginal_invariants(
+                sigma_q, head_delta)
 
         def _chunk_summaries(lhs_:    torch.Tensor, per_pos_:        torch.Tensor,
                              mu_v_c:  torch.Tensor, inv_v_c:         torch.Tensor,
-                             lsum_c:  torch.Tensor, in_chunk_f:      torch.Tensor,
+                             log_v_c: torch.Tensor, lsum_c:          torch.Tensor,
+                             in_chunk_f: torch.Tensor,
                              local_idx: torch.Tensor,
                              u_c:     Optional[torch.Tensor],
                              sq_:     torch.Tensor,
-                             mc_q_:   torch.Tensor) -> 'tuple[torch.Tensor, torch.Tensor]':
+                             mc_q_:   torch.Tensor,
+                             coord_delta_: Optional[torch.Tensor],
+                             delta_per_pos_: Optional[torch.Tensor]) -> 'tuple[torch.Tensor, torch.Tensor]':
             r"""Reduce one vocab chunk to (lse_chunk, target_contrib), both (B, N), on the inside.
 
             a_v = sum_k[(diag(Sigma_q) + (mc_q-mc_v)^2)/sigma_v] + sum_k log sigma_v
@@ -1623,11 +1685,14 @@ class PriorBank(nn.Module):
             a_v form can difference before squaring (audit 2026-08-06 F32).
             """
             a_v = _decode_av(sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_)   # (B, N, Vc)
-            # Cast the FINISHED logit, not a_v (audit 2026-08-06 F32): under the fp64 policy a_v
-            # comes back float64 and the subtraction/division stay in the island, so only the O(1)
-            # result is rounded. Under the default fp32 policy every operand is already float32 and
-            # .to() is an identity no-op, so this line is byte-identical.
-            logit_chunk = (-0.5 * (a_v - per_pos_) / tau_eff).to(lhs_.dtype)   # (B, N, Vc)
+            evidence_delta = None
+            if coord_delta_ is not None and delta_per_pos_ is not None:
+                evidence_delta = _decode_head_evidence_kl_delta(
+                    sq_, mc_q_, mu_v_c, inv_v_c, log_v_c,
+                    coord_delta_, delta_per_pos_,
+                )
+            logit_chunk = _decode_analytic_kl_logits(
+                a_v, per_pos_, tau_eff, lhs_.dtype, evidence_delta=evidence_delta)
             if u_c is not None:
                 logit_chunk = logit_chunk + u_c                            # unigram log-prior chunk slice
             lse_chunk = torch.logsumexp(logit_chunk, dim=-1)               # (B, N)
@@ -1642,7 +1707,7 @@ class PriorBank(nn.Module):
         # than scored (audit 2026-08-06 F31); it leaves both the numerator and the denominator, and
         # _count_decode_logdet_fallback has already recorded it. The dense path drops the same
         # positions via PriorBank.decode_degenerate_positions, so the two stay in parity.
-        valid = (targets != ignore_index) & spd_ok                         # (B, N) bool
+        valid = (targets != ignore_index) & spd_ok & block_ok              # (B, N) bool
         lse_chunks = []
         target_logit = torch.zeros(mu_q.shape[:-1], device=mu_q.device, dtype=mu_q.dtype)  # (B, N)
 
@@ -1650,7 +1715,8 @@ class PriorBank(nn.Module):
             v1 = min(v0 + chunk, V)
             mc_v_c = (mu_v_all[v0:v1] - c)                                  # (Vc, K) centered prior means
             inv_v_c = 1.0 / sigma_v_all[v0:v1]                             # (Vc, K) = 1/sigma_v
-            lsum_c = torch.log(sigma_v_all[v0:v1]).sum(-1)                 # (Vc,) = sum_k log sigma_v
+            log_v_c = torch.log(sigma_v_all[v0:v1])                        # (Vc, K)
+            lsum_c = log_v_c.sum(-1)                                      # (Vc,) = sum_k log sigma_v
             u_c = u_all[v0:v1] if u_all is not None else None              # (Vc,) or None
             in_chunk = (targets >= v0) & (targets < v1)                    # (B, N) bool
             in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
@@ -1659,13 +1725,14 @@ class PriorBank(nn.Module):
             activation_bytes = _decode_ce_chunk_activation_bytes(lhs, v1 - v0)
             if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
                 lse_chunk, contrib = _checkpoint.checkpoint(
-                    _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, lsum_c, in_chunk_f, local_idx,
-                    u_c, diag_sq, mc_q, use_reentrant=False,
+                    _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, log_v_c, lsum_c,
+                    in_chunk_f, local_idx, u_c, diag_sq, mc_q, coord_delta, delta_per_pos,
+                    use_reentrant=False,
                 )
             else:
                 lse_chunk, contrib = _chunk_summaries(
-                    lhs, per_pos, mc_v_c, inv_v_c, lsum_c, in_chunk_f, local_idx, u_c,
-                    diag_sq, mc_q,
+                    lhs, per_pos, mc_v_c, inv_v_c, log_v_c, lsum_c, in_chunk_f, local_idx, u_c,
+                    diag_sq, mc_q, coord_delta, delta_per_pos,
                 )
             lse_chunks.append(lse_chunk)
             target_logit = target_logit + contrib                          # exactly one chunk contributes per valid pos
@@ -2205,22 +2272,16 @@ def _decode_diagonal(
     per_pos = pb.K + torch.log(sigma_q.clamp(min=pb.eps)).sum(-1, keepdim=True)   # (B, N, 1) = K + sum_k log sigma_q
     # .to() after the clamp keeps the fp64 a_v island open through the subtraction (F32); it is an
     # identity no-op under the default fp32 policy.
-    kl_v = (0.5 * (a_v - per_pos)).clamp(min=0.0).to(mu_q.dtype)         # (B, N, V); KL>=0 floor matches
+    evidence_delta = None
     if hasattr(pb, "head_evidence_logits"):
         _, coord_delta = pb._head_evidence_deltas(dtype=mu_q.dtype, device=mu_q.device)
-        delta_a_v = _decode_av(
-            sigma_q,
-            mc_q,
-            mc_v,
-            inv_v,
-            (torch.log(sigma_v) * coord_delta).sum(-1),
-            coord_delta=coord_delta,
-        )
         delta_per_pos = (
             coord_delta * (1.0 + torch.log(sigma_q.clamp(min=pb.eps)))
         ).sum(-1, keepdim=True)
-        kl_v = kl_v + (0.5 * (delta_a_v - delta_per_pos)).to(mu_q.dtype)
-    return -kl_v / tau_eff                                               # reference_decode's safe_kl_clamp (r2 id17)
+        evidence_delta = _decode_head_evidence_kl_delta(
+            sigma_q, mc_q, mc_v, inv_v, torch.log(sigma_v), coord_delta, delta_per_pos)
+    return _decode_analytic_kl_logits(
+        a_v, per_pos, tau_eff, mu_q.dtype, evidence_delta=evidence_delta)
 
 
 @register_decode(
@@ -2292,15 +2353,9 @@ def _decode_full(
         mc_v = mu_v - c
         mc_q = mu_q - c
         inv_v = 1.0 / torch.diagonal(sigma_v, dim1=-2, dim2=-1)
-        delta_a_v = _decode_av(
-            diag_sq,
-            mc_q,
-            mc_v,
-            inv_v,
-            (torch.log(1.0 / inv_v) * coord_delta).sum(-1),
-            coord_delta=coord_delta,
-        )
-        kl_v = kl_v + (0.5 * (delta_a_v - delta_per_pos)).to(mu_q.dtype)
+        kl_v = kl_v + _decode_head_evidence_kl_delta(
+            diag_sq, mc_q, mc_v, inv_v, torch.log(1.0 / inv_v), coord_delta,
+            delta_per_pos)
     # Same exclusion contract as the chunked twin (audit 2026-08-06 F31). Here the -inf arrived
     # indirectly -- the family seam maps a failed Cholesky to NaN and ``kl_max=inf`` maps that to
     # inf -- so the row has to be neutralized after the fact. One extra (B, N) Cholesky against this
@@ -2346,28 +2401,22 @@ def _decode_full_chunked(
     per_pos = pb.K + logdet_q.unsqueeze(-1)                              # (B, N, 1) = K + log|Sigma_q|
     # .to() after the clamp keeps the fp64 a_v island open through the subtraction (F32); it is an
     # identity no-op under the default fp32 policy.
-    kl_v = (0.5 * (a_v - per_pos)).clamp(min=0.0).to(mu_q.dtype)         # (B, N, V); KL>=0 floor matches
+    evidence_delta = None
     if hasattr(pb, "head_evidence_logits"):
         head_delta, coord_delta = pb._head_evidence_deltas(
             dtype=mu_q.dtype, device=mu_q.device)
         delta_per_pos, block_ok = pb._head_evidence_full_marginal_invariants(
             sigma_q, head_delta)
         spd_ok = spd_ok & block_ok
-        delta_a_v = _decode_av(
-            diag_sq,
-            mc_q,
-            mc_v,
-            inv_v,
-            (torch.log(sigma_v) * coord_delta).sum(-1),
-            coord_delta=coord_delta,
-        )
-        kl_v = kl_v + (0.5 * (delta_a_v - delta_per_pos)).to(mu_q.dtype)
+        evidence_delta = _decode_head_evidence_kl_delta(
+            diag_sq, mc_q, mc_v, inv_v, torch.log(sigma_v), coord_delta, delta_per_pos)
+    logits = _decode_analytic_kl_logits(
+        a_v, per_pos, tau_eff, mu_q.dtype, evidence_delta=evidence_delta)
     # A non-PD Sigma_q has no valid likelihood: emit an INFORMATIONLESS uniform row rather than a
     # score built on a placeholder log-det (audit 2026-08-06 F31). log_softmax of a uniform row is
     # -log V, finite; the all--inf row this used to produce maps to NaN. The CE seams exclude the
     # position outright -- see decode_ce_full_chunked and decode_degenerate_positions.
-    kl_v = torch.where(spd_ok.unsqueeze(-1), kl_v, torch.zeros_like(kl_v))
-    return -kl_v / tau_eff                                               # _decode_diagonal (audit 2026-07-05 m5)
+    return torch.where(spd_ok.unsqueeze(-1), logits, torch.zeros_like(logits))
 
 
 def _family_logits(

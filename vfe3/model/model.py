@@ -1188,6 +1188,9 @@ class VFEModel(nn.Module):
 
         belief = BeliefState(mu=mu_final, sigma=sigma_final, phi=out.phi, omega=out.omega,   # carry the GL(K) frame under omega_direct (None on the phi path)
                              reflection=out.reflection, right_phi=out.right_phi)              # carry exact positional right factor / reflection
+        # TODO(frame-conjugated-head-mixer): thread the realized query frame through this boundary
+        # before implementing M_i = U_i (A kron I) U_i^{-1}; do not co-transform q and every
+        # vocabulary prior by the same M, because that is a KL-invariant no-op.
         if capture is not None:
             # M-step out-param enrichment: vfe_stack already wrote capture['converged'] (q*); add the
             # encode-time prior p (post s-refine) and the raw pre-final_norm stack output for callers
@@ -3289,6 +3292,15 @@ class VFEModel(nn.Module):
         if _hm is not None and hasattr(_hm, "mixer_deltas"):        # use_head_mixer=True
             d["head_mixer_drift"] = max(
                 (float(torch.linalg.norm(p.detach())) for p in _hm.mixer_deltas), default=0.0)
+        if hasattr(self.prior_bank, "head_evidence_logits"):
+            weights, _ = self.prior_bank.head_evidence_weights(
+                dtype=self.prior_bank.head_evidence_logits.dtype,
+                device=self.prior_bank.head_evidence_logits.device,
+            )
+            probabilities = weights / weights.numel()
+            d["head_evidence_weights"] = weights.detach().cpu().tolist()
+            d["head_evidence_entropy"] = float(torch.special.entr(probabilities).sum())
+            d["head_evidence_max_abs_drift"] = float((weights - 1.0).abs().max())
         return d
 
     @torch.no_grad()

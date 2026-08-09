@@ -2032,7 +2032,7 @@ def train(
             row["generalization_gap"] = (last_val["ce"] - ce) if do_eval else float("nan")
             # Extended per-eval diagnostics (Tier-1/2): already-reduced gauge / geometry / numerical-
             # health scalars from diagnostics() -- NOT per-token sums, so logged RAW (no /n_tok).
-            # Conditional keys (connection_w_norm, head_mixer_drift) appear only with their toggle; the
+            # Conditional mixer/connection keys appear only with their toggle; the
             # config is fixed per run so the CSV stays rectangular.
             for _dk in ("holonomy_ci_lo", "holonomy_ci_hi", "holonomy_wilson",
                         "gauge_invariant_mean", "gauge_invariant_spread",
@@ -2054,6 +2054,8 @@ def train(
                         "pos_phi_exp_clamp_frac", "pos_phi_exp_scale_min",
                         "connection_w_norm", "connection_m_norm",
                         "connection_l_norm", "connection_l_offdiag_norm", "head_mixer_drift",
+                        "head_evidence_weights", "head_evidence_entropy",
+                        "head_evidence_max_abs_drift",
                         "regime_ii_covariant_feature_exact"):
                 if _dk in d:
                     row[_dk] = d[_dk]

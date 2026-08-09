@@ -10,10 +10,12 @@ are CONDITIONAL columns -- present only when their toggle is on -- so the CSV st
 Device-agnostic (default CPU; VFE3_TEST_DEVICE=cuda for the GPU).
 """
 
+import ast
 import csv
 import math
 import os
 import tempfile
+import warnings
 from pathlib import Path
 
 import torch
@@ -197,6 +199,63 @@ def test_conditional_break_columns_present_only_under_toggle() -> None:
     # head mixer -> head_mixer_drift column appears (zero at identity init, but present)
     d_hm = VFEModel(_cfg(use_head_mixer=True)).to(DEVICE).diagnostics(tok)
     assert "head_mixer_drift" in d_hm and math.isfinite(d_hm["head_mixer_drift"])
+
+    # PriorBank head evidence has its own conditional diagnostics and leaves the legacy mixer key off.
+    d_he = VFEModel(_cfg(
+        gauge_group="block_glk",
+        use_prior_bank=True,
+        use_priorbank_head_evidence_mixer=True,
+        family="gaussian_diagonal",
+        divergence_family="renyi",
+        renyi_order=1.0,
+        decode_mode="diagonal_chunked",
+    )).to(DEVICE).diagnostics(tok)
+    assert "head_mixer_drift" not in d_he
+    assert len(d_he["head_evidence_weights"]) == 2
+    assert math.isfinite(d_he["head_evidence_entropy"])
+    assert math.isfinite(d_he["head_evidence_max_abs_drift"])
+
+
+def test_head_evidence_diagnostics_propagate_to_metrics_csv() -> None:
+    from vfe3.run_artifacts import RunArtifacts
+
+    torch.manual_seed(19)
+    cfg = _cfg(
+        batch_size=2,
+        max_steps=1,
+        log_interval=1,
+        eval_interval=0,
+        gauge_group="block_glk",
+        use_prior_bank=True,
+        use_priorbank_head_evidence_mixer=True,
+        family="gaussian_diagonal",
+        divergence_family="renyi",
+        renyi_order=1.0,
+        decode_mode="diagonal_chunked",
+    )
+    model = VFEModel(cfg).to(DEVICE)
+    loader = _loader(cfg)
+    with tempfile.TemporaryDirectory() as tmp:
+        artifacts = RunArtifacts(tmp, cfg, model, dataset="head-evidence", device=str(DEVICE))
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="parameter motion:.*")
+            train(
+                model,
+                loader,
+                cfg,
+                n_steps=1,
+                log_interval=1,
+                eval_interval=0,
+                artifacts=artifacts,
+                device=DEVICE,
+                generate_samples=False,
+            )
+        with open(Path(tmp) / "metrics.csv", newline="") as handle:
+            row = next(csv.DictReader(handle))
+
+    assert len(ast.literal_eval(row["head_evidence_weights"])) == 2
+    assert math.isfinite(float(row["head_evidence_entropy"]))
+    assert math.isfinite(float(row["head_evidence_max_abs_drift"]))
 
 
 _TIER2A_KEYS = [
