@@ -303,6 +303,7 @@ class VFEModel(nn.Module):
             untie_decode_bank=cfg.untie_decode_bank and cfg.use_prior_bank,
             gauge_parameterization=cfg.gauge_parameterization,
             irrep_dims=list(self.group.irrep_dims),
+            use_priorbank_head_evidence_mixer=cfg.use_priorbank_head_evidence_mixer,
             omega_reflection=cfg.omega_reflection,
             phi_reflection=cfg.phi_reflection,
             # Compact block storage is opt-in (default OFF), and eligibility is a GROUP property decided

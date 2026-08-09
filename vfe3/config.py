@@ -295,6 +295,11 @@ class VFE3Config:
     # validation otherwise.
     use_head_mixer:            bool  = False
 
+    # PriorBank-native per-gauge-block evidence calibration. This is a separate opt-in from the
+    # Schur-commutant post-E-step head mixer: it owns one zero-initialized scalar per block and is
+    # restricted to the built-in canonical KL decode, where its evidence interpretation is fixed.
+    use_priorbank_head_evidence_mixer: bool = False
+
     # CG cross-type coupling (opt-in, default off; so_n/sp_n only): bilinear Clebsch-Gordan
     # between-block update on the means, exactly equivariant for any weights; sigma untouched
     # (means-only phase; see the 2026-06-09 design spec). NEURAL-NETWORK EXCEPTION (sanctioned,
@@ -1439,6 +1444,18 @@ class VFE3Config:
                 f"gauge_group={self.gauge_group!r} is a single-block group. Use "
                 f"block_glk/tied_block_glk with n_heads >= 2, or an so_n/sp_n irrep tower."
             )
+        if self.use_priorbank_head_evidence_mixer:
+            if not self.use_prior_bank:
+                raise ValueError(
+                    "use_priorbank_head_evidence_mixer=True requires use_prior_bank=True."
+                )
+            if ((self.gauge_group in ("block_glk", "tied_block_glk") and self.n_heads < 2)
+                    or self.gauge_group in ("glk", "so_k", "sp")
+                    or (self.gauge_group in ("so_n", "sp_n") and len(_block_dims) < 2)):
+                raise ValueError(
+                    "use_priorbank_head_evidence_mixer=True requires at least two gauge blocks. "
+                    f"gauge_group={self.gauge_group!r} does not provide a multi-block PriorBank."
+                )
         _require(self.gauge_parameterization, _VALID_GAUGE_PARAM, "gauge_parameterization")
         from vfe3.model.model_frame import model_frame_modes
         _require(self.s_frame_mode, model_frame_modes(), "s_frame_mode")
@@ -1720,6 +1737,13 @@ class VFE3Config:
                     "use_head_mixer=True is incompatible with cross_couplings: cross-coupled block_glk "
                     "collapses irrep_dims to a single block [K], and the head mixer needs >= 2 blocks "
                     "to mix. Disable use_head_mixer or remove cross_couplings."
+                )
+            if self.use_priorbank_head_evidence_mixer:
+                raise ValueError(
+                    "use_priorbank_head_evidence_mixer=True is incompatible with cross_couplings: "
+                    "cross-coupled block_glk collapses irrep_dims to a single block [K], but head "
+                    "evidence requires at least two gauge blocks. Disable the mixer or remove "
+                    "cross_couplings."
                 )
             for _name in ("kappa_beta", "kappa_gamma"):
                 if isinstance(getattr(self, _name), (list, tuple)):
@@ -2514,6 +2538,24 @@ class VFE3Config:
         # route that no-prior path, so the cross-check stays gated on use_prior_bank.
         decode_registration = _DECODERS[self.decode_mode]
         family_kind = family_cov_kind(self.family)
+        if self.use_priorbank_head_evidence_mixer:
+            canonical_modes = {
+                "gaussian_diagonal": ("diagonal", "diagonal_chunked"),
+                "gaussian_full": ("full", "full_chunked"),
+            }
+            if self.divergence_family != "renyi" or self.renyi_order != 1.0:
+                raise ValueError(
+                    "use_priorbank_head_evidence_mixer=True requires the built-in canonical KL "
+                    "functional (divergence_family='renyi', renyi_order=1.0)."
+                )
+            allowed_modes = canonical_modes.get(self.family)
+            if allowed_modes is None or self.decode_mode not in allowed_modes:
+                raise ValueError(
+                    "use_priorbank_head_evidence_mixer=True requires a built-in canonical KL decode: "
+                    "family='gaussian_diagonal' with decode_mode='diagonal'/'diagonal_chunked', or "
+                    "family='gaussian_full' with decode_mode='full'/'full_chunked'. "
+                    f"Got family={self.family!r}, decode_mode={self.decode_mode!r}."
+                )
         if self.use_prior_bank and family_kind not in decode_registration.covariance_kinds:
             raise ValueError(
                 f"decode_mode={self.decode_mode!r} is rank-incompatible with family={self.family!r}: "

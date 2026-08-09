@@ -45,6 +45,8 @@ import torch
 import torch.utils.checkpoint as _checkpoint
 from torch import nn
 
+from vfe3.model.head_evidence import normalized_head_evidence_weights
+
 from vfe3.belief import BeliefState
 from vfe3.divergence import family_cov_kind, get_family, get_functional, kl, renyi
 from vfe3.families.base import _logdet_chol
@@ -631,6 +633,7 @@ class PriorBank(nn.Module):
 
         gauge_parameterization: str                 = "phi",
         irrep_dims:             Optional[List[int]] = None,
+        use_priorbank_head_evidence_mixer: bool     = False,
         omega_reflection:       str                 = "off",
         phi_reflection:         str                 = "off",
         omega_compact_storage:  bool                = False,
@@ -709,7 +712,13 @@ class PriorBank(nn.Module):
         self.decode_unigram_prior = decode_unigram_prior
         self.gauge_parameterization = gauge_parameterization
         self.gauge_group_name = gauge_group_name
-        self.irrep_dims = irrep_dims
+        self.irrep_dims = tuple(irrep_dims) if irrep_dims is not None else None
+        if use_priorbank_head_evidence_mixer:
+            if self.irrep_dims is None:
+                raise ValueError("head evidence requires explicit gauge-block dimensions")
+            if len(self.irrep_dims) < 2 or any(int(dim) <= 0 for dim in self.irrep_dims):
+                raise ValueError("head evidence requires at least two positive gauge blocks")
+            self.head_evidence_logits = nn.Parameter(torch.zeros(len(self.irrep_dims)))
         # untie applies to the KL-to-bank decode only (the linear ablation is already untied by
         # construction), so the flag is resolved against use_prior_bank once, here.
         self.untie_decode_bank = untie_decode_bank and use_prior_bank
@@ -943,6 +952,23 @@ class PriorBank(nn.Module):
             if phi_reflection == "init_seed":
                 with torch.no_grad():
                     self.reflection_sign[1::2] = -1.0
+
+    def head_evidence_weights(
+        self,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return normalized gauge-block and coordinate evidence weights when enabled."""
+        if not hasattr(self, "head_evidence_logits"):
+            raise RuntimeError("head evidence weights require use_priorbank_head_evidence_mixer=True")
+        weights = normalized_head_evidence_weights(
+            self.head_evidence_logits,
+            self.irrep_dims,
+            dtype=dtype,
+            device=device,
+        )
+        return weights.head, weights.coordinate
 
     def encode(
         self,

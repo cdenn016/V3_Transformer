@@ -271,6 +271,9 @@ def build_optimizer(
         # weight_decay=0 -- decaying a unigram prior toward zero biases it to a flat distribution
         # (the same protection phi/Omega carry).
         groups.append({"params": [pb.output_proj_bias], "lr": cfg.m_p_mu_lr, "weight_decay": 0.0, "role": "mu"})
+    if getattr(pb, "head_evidence_logits", None) is not None:
+        groups.append({"params": [pb.head_evidence_logits], "lr": cfg.m_p_mu_lr,
+                       "weight_decay": 0.0, "role": "mu"})
     if getattr(model, "head_mixer", None) is not None:          # use_head_mixer=True Schur mixer
         groups.append({"params": list(model.head_mixer.parameters()), "lr": cfg.m_p_mu_lr, "role": "mu"})
     if getattr(model, "cg_coupling", None) is not None:         # use_cg_coupling=True CG path weights
