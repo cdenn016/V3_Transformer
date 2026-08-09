@@ -47,6 +47,8 @@ import torch.utils.checkpoint as _checkpoint
 from torch import nn
 
 from vfe3.model.head_evidence import normalized_head_evidence_weights
+from vfe3.contracts import CanonicalFrameContext
+from vfe3.model.canonical_content import pullback_diagonal_query
 
 from vfe3.belief import BeliefState
 from vfe3.divergence import family_cov_kind, get_family, get_functional, kl, renyi
@@ -1353,13 +1355,79 @@ class PriorBank(nn.Module):
         base_tau = self.decode_tau if tau is None else tau
         return base_tau * torch.exp(-self.decode_log_scale.clamp(-3.0, 3.0))
 
+    def _query_in_decode_frame(
+        self,
+        mu_q:           torch.Tensor,
+        sigma_q:        torch.Tensor,
+        canonical_frame: Optional[CanonicalFrameContext],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        r"""Return the query in the coordinates owned by the active decode bank.
+
+        Ordinary encoders already produce queries in their decode coordinates and reject a frame
+        context so a stale or accidentally threaded frame cannot change their established values.
+        ``canonical_content_projected`` instead materializes a diagonal query in the realized frame;
+        its canonical diagonal vocabulary bank can only score that query after the exact inverse
+        vertex factor from the SAME forward reconstructs a full canonical covariance.
+        """
+        projected = self.encode_mode == "canonical_content_projected"
+        if not projected:
+            if canonical_frame is not None:
+                raise ValueError(
+                    "canonical_frame is only valid for "
+                    "encode_mode='canonical_content_projected'"
+                )
+            return mu_q, sigma_q
+        if canonical_frame is None:
+            raise ValueError(
+                "encode_mode='canonical_content_projected' requires canonical_frame from the "
+                "same forward query at every decode boundary"
+            )
+        if not isinstance(canonical_frame, CanonicalFrameContext):
+            raise ValueError(
+                "canonical_frame must be a CanonicalFrameContext captured from the same forward "
+                f"query, got {type(canonical_frame).__name__}"
+            )
+        if mu_q.shape != sigma_q.shape:
+            raise ValueError(
+                "projected decode requires diagonal query mean/variance with identical shapes, got "
+                f"{tuple(mu_q.shape)} and {tuple(sigma_q.shape)}"
+            )
+        if mu_q.dim() < 1:
+            raise ValueError("projected decode query must have a trailing coordinate axis")
+        expected_frame_shape = (*mu_q.shape[:-1], mu_q.shape[-1], mu_q.shape[-1])
+        if (canonical_frame.forward.shape != expected_frame_shape
+                or canonical_frame.inverse.shape != expected_frame_shape):
+            raise ValueError(
+                "canonical_frame shape must match the projected query exactly, expected "
+                f"{expected_frame_shape}, got forward={tuple(canonical_frame.forward.shape)} and "
+                f"inverse={tuple(canonical_frame.inverse.shape)}"
+            )
+        if (canonical_frame.forward.dtype != mu_q.dtype
+                or canonical_frame.inverse.dtype != mu_q.dtype
+                or sigma_q.dtype != mu_q.dtype):
+            raise ValueError(
+                "canonical_frame dtype must match the projected query exactly, got "
+                f"query={mu_q.dtype}, variance={sigma_q.dtype}, "
+                f"forward={canonical_frame.forward.dtype}, inverse={canonical_frame.inverse.dtype}"
+            )
+        if (canonical_frame.forward.device != mu_q.device
+                or canonical_frame.inverse.device != mu_q.device
+                or sigma_q.device != mu_q.device):
+            raise ValueError(
+                "canonical_frame device must match the projected query exactly, got "
+                f"query={mu_q.device}, variance={sigma_q.device}, "
+                f"forward={canonical_frame.forward.device}, inverse={canonical_frame.inverse.device}"
+            )
+        return pullback_diagonal_query(mu_q, sigma_q, canonical_frame.inverse)
+
     def decode(
         self,
         mu_q:    torch.Tensor,           # (B, N, K) posterior means
         sigma_q: torch.Tensor,           # (B, N, K) posterior variances
 
         *,
-        tau:     Optional[float] = None,  # override decode_tau; None -> self.decode_tau
+        tau:             Optional[float] = None,  # override decode_tau; None -> self.decode_tau
+        canonical_frame: Optional[CanonicalFrameContext] = None,
     ) -> torch.Tensor:                   # (B, N, V) logits
         r"""Decode logits via the selected kernel; ``use_prior_bank`` is the single gate.
 
@@ -1372,6 +1440,7 @@ class PriorBank(nn.Module):
         Under ``decode_unigram_prior=True`` the unigram log-prior bias kappa * log pi_v is added
         HERE, after the registered kernel, so every decode mode (linear included) gets it from
         one seam; toggle off adds nothing (byte-identical)."""
+        mu_q, sigma_q = self._query_in_decode_frame(mu_q, sigma_q, canonical_frame)
         mode = self.decode_mode if self.use_prior_bank else "linear"
         logits = get_decode(mode)(self, mu_q, sigma_q, self._tau_eff(tau))
         if self.decode_unigram_prior:
@@ -1581,6 +1650,9 @@ class PriorBank(nn.Module):
     def decode_degenerate_positions(
         self,
         sigma_q: torch.Tensor,           # (B, N, K) diagonal or (B, N, K, K) full posterior dispersion
+
+        *,
+        canonical_frame: Optional[CanonicalFrameContext] = None,
     ) -> Optional[torch.Tensor]:         # (B, N) True where the decode cannot score, else None
         r"""Positions the full-covariance decode cannot score, for a CE consumer holding its own targets.
 
@@ -1594,6 +1666,12 @@ class PriorBank(nn.Module):
         has no failure mode to report. Does NOT touch the fallback counter -- the decode kernel this
         accompanies has already counted the same event.
         """
+        if self.encode_mode == "canonical_content_projected" or canonical_frame is not None:
+            if sigma_q.dim() < 1:
+                raise ValueError("decode dispersion must have a trailing coordinate axis")
+            mu_placeholder = torch.zeros_like(sigma_q)
+            _, sigma_q = self._query_in_decode_frame(
+                mu_placeholder, sigma_q, canonical_frame)
         if sigma_q.dim() < 4 or sigma_q.shape[-1] != sigma_q.shape[-2]:
             return None                                       # diagonal dispersion: no factorization
         _, ok = safe_cholesky(sigma_q, eps=self.eps, rounds=5)
@@ -1682,6 +1760,7 @@ class PriorBank(nn.Module):
         tau:           Optional[float] = None,   # override decode_tau; None -> self.decode_tau
         chunk_size:    Optional[int]   = None,   # vocab-chunk width; None -> self.decode_chunk_size
         ignore_index:  int             = -100,
+        canonical_frame: Optional[CanonicalFrameContext] = None,
     ) -> torch.Tensor:                   # () scalar mean cross-entropy
         r"""Fused chunked-vocab cross-entropy for the FULL-covariance KL decode WITHOUT the dense
         (B, N, V) logits OR the (B, N, V, K, K) per-pair Cholesky workspace ``_decode_full`` builds.
@@ -1698,6 +1777,7 @@ class PriorBank(nn.Module):
         chunk-slice add and the z_loss_weight term follow ``decode_ce_diagonal_chunked`` exactly
         (see there); both default OFF / byte-identical.
         """
+        mu_q, sigma_q = self._query_in_decode_frame(mu_q, sigma_q, canonical_frame)
         self._validate_fused_ce_targets(targets, ignore_index=ignore_index)
         tau_eff = self._tau_eff(tau)
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size

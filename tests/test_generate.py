@@ -12,11 +12,15 @@ conditions on a longer sequence and has no relation to forward(prompt). Those
 oracles therefore use max_new_tokens=1.
 """
 
+import os
+
 import pytest
 import torch
 
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
+
+PROJECTED_DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 
 def _tiny_model(seed: int = 0, **overrides) -> VFEModel:
@@ -28,6 +32,41 @@ def _tiny_model(seed: int = 0, **overrides) -> VFEModel:
     cfg = VFE3Config(**base)
     torch.manual_seed(seed)
     return VFEModel(cfg)
+
+
+def _projected_tiny_model(seed: int = 0, **overrides) -> VFEModel:
+    """A tiny legal projected-canonical model for decode/generation consumers."""
+    base = dict(
+        vocab_size=16,
+        embed_dim=4,
+        n_heads=2,
+        max_seq_len=8,
+        batch_size=2,
+        n_layers=1,
+        n_e_steps=1,
+        e_step_update="gradient",
+        oracle_unroll_grad=True,
+        e_q_mu_lr=0.05,
+        e_phi_lr=0.0,
+        family="gaussian_diagonal",
+        transport_mode="flat",
+        gauge_parameterization="phi",
+        prior_source="token",
+        s_e_step=False,
+        use_prior_bank=True,
+        decode_mode="full_chunked",
+        encode_mode="canonical_content_projected",
+        omega_reflection="off",
+        phi_reflection="off",
+        lambda_alpha_mode="constant",
+        pos_phi="learned",
+        pos_phi_compose="group_product",
+        seed=seed,
+        max_steps=1,
+    )
+    base.update(overrides)
+    torch.manual_seed(seed)
+    return VFEModel(VFE3Config(**base)).to(PROJECTED_DEVICE)
 
 
 def test_shape_in_vocab_and_prompt_preserved():
@@ -100,6 +139,33 @@ def test_generate_decodes_only_last_position(monkeypatch):
         (True, True, False, (2, 1, V)),
         (True, True, False, (2, 1, V)),
     ]
+
+
+def test_projected_generation_single_token_matches_full_and_decode_last_logits():
+    """Generation must slice the same realized frame as its final-position query."""
+    model = _projected_tiny_model(seed=17)
+    model.eval()
+    prompt = torch.tensor([[2], [5]], device=PROJECTED_DEVICE)
+    capture: dict = {}
+
+    _, full_logits = model.forward_beliefs(
+        prompt,
+        return_logits=True,
+        capture=capture,
+    )
+    _, last_logits = model.forward_beliefs(
+        prompt,
+        return_logits=True,
+        decode_last=True,
+    )
+
+    assert "canonical_frame" in capture
+    assert full_logits is not None and full_logits.shape == (2, 1, model.cfg.vocab_size)
+    assert last_logits is not None and last_logits.shape == full_logits.shape
+    assert torch.allclose(last_logits, full_logits, atol=1e-6, rtol=1e-6)
+    expected = full_logits[:, -1].argmax(dim=-1)
+    generated = model.generate(prompt, max_new_tokens=1, greedy=True)
+    assert torch.equal(generated[:, -1], expected)
 
 
 def test_generate_rejects_nonfinite_logit_rows(monkeypatch):
@@ -217,7 +283,8 @@ def test_generate_is_training_isolated():
     after = model.prior_bank.mu_embed.detach().clone()
     assert torch.equal(before, after)                       # no parameter changed
     # training forward still produces a finite loss after a generate call
-    tokens = torch.randint(0, V, (2, 4)); targets = torch.randint(0, V, (2, 4))
+    tokens = torch.randint(0, V, (2, 4))
+    targets = torch.randint(0, V, (2, 4))
     _, loss, _ = model(tokens, targets)
     assert torch.isfinite(loss)
 

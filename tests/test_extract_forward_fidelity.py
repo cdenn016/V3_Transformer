@@ -26,6 +26,7 @@ import torch
 
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
+from vfe3.model.canonical_content import CanonicalFrameContext
 from vfe3.model.model import VFEModel
 from vfe3.model.stack import vfe_stack
 from vfe3.viz import extract
@@ -293,3 +294,80 @@ def test_model_channel_bank_matches_direct_rope_refine() -> None:
         rtol=1e-6,
     )
     assert not torch.allclose(expected_mu, unrotated_mu, atol=1e-6, rtol=1e-6)
+
+
+def _projected_extract_model() -> VFEModel:
+    cfg = VFE3Config(
+        vocab_size=11,
+        embed_dim=4,
+        n_heads=2,
+        max_seq_len=5,
+        batch_size=1,
+        n_layers=1,
+        n_e_steps=1,
+        e_step_update="gradient",
+        oracle_unroll_grad=True,
+        e_q_mu_lr=0.04,
+        e_phi_lr=0.0,
+        family="gaussian_diagonal",
+        transport_mode="flat",
+        gauge_parameterization="phi",
+        prior_source="token",
+        s_e_step=False,
+        use_prior_bank=True,
+        decode_mode="full_chunked",
+        encode_mode="canonical_content_projected",
+        omega_reflection="off",
+        phi_reflection="off",
+        lambda_alpha_mode="constant",
+        pos_phi="learned",
+        pos_phi_compose="group_product",
+        max_steps=1,
+    )
+    torch.manual_seed(151)
+    return VFEModel(cfg).to(DEVICE)
+
+
+@pytest.mark.parametrize("sequence_length", [1, 3])
+def test_projected_inference_record_reuses_same_forward_frame_for_decode(
+    sequence_length: int,
+) -> None:
+    """A belief-only extraction record must retain its same-forward projected frame."""
+    model = _projected_extract_model()
+    model.eval()
+    tokens = torch.arange(2, 2 + sequence_length, device=DEVICE).unsqueeze(0)
+    targets = torch.arange(7, 7 + sequence_length, device=DEVICE).remainder(
+        model.cfg.vocab_size
+    ).unsqueeze(0)
+
+    records = extract.collect_inference_bank(
+        model,
+        [(tokens, targets)],
+        return_logits=False,
+        max_batches=1,
+        device=DEVICE,
+    )
+    assert len(records) == 1
+    record = records[0]
+    assert record["logits"] is None
+    frame = record["canonical_frame"]
+    assert isinstance(frame, CanonicalFrameContext)
+    assert frame.forward.device.type == "cpu"
+    assert frame.inverse.device.type == "cpu"
+    assert frame.forward.shape == (1, sequence_length, 4, 4)
+
+    decoded = extract._decode_inference_record(model, record, DEVICE)
+    _, direct = model.forward_beliefs(tokens, return_logits=True)
+    assert direct is not None
+    assert decoded.shape == (1, sequence_length, model.cfg.vocab_size)
+    assert torch.allclose(decoded, direct, atol=1e-6, rtol=1e-6)
+
+    ce_bank = extract.belief_ce_bank(
+        model,
+        [],
+        inference_bank=records,
+        max_batches=1,
+        device=DEVICE,
+    )
+    assert ce_bank["ce"].shape == (sequence_length,)
+    assert torch.isfinite(ce_bank["ce"]).all()

@@ -1,11 +1,37 @@
 """Shared type contracts for mutable runtime dictionaries."""
 
+from dataclasses import dataclass
 from typing import Dict, List, NamedTuple, Optional, Tuple, TypedDict
 
 import torch
 
 from vfe3.belief import BeliefState
-from vfe3.model.canonical_content import CanonicalFrameContext
+
+
+@dataclass(frozen=True)
+class CanonicalFrameContext:
+    """The realized per-token vertex frame and its inverse from one transport build."""
+
+    forward: torch.Tensor
+    inverse: torch.Tensor
+
+    def __post_init__(self) -> None:
+        if self.forward.shape != self.inverse.shape:
+            raise ValueError(
+                "canonical forward and inverse factors must have identical shapes, got "
+                f"{tuple(self.forward.shape)} and {tuple(self.inverse.shape)}")
+        if self.forward.dim() < 2 or self.forward.shape[-2] != self.forward.shape[-1]:
+            raise ValueError(
+                "canonical frame factors must have square trailing matrix axes, got "
+                f"{tuple(self.forward.shape)}")
+        if self.forward.dtype != self.inverse.dtype:
+            raise ValueError(
+                "canonical forward and inverse factors must have the same dtype, got "
+                f"{self.forward.dtype} and {self.inverse.dtype}")
+        if self.forward.device != self.inverse.device:
+            raise ValueError(
+                "canonical forward and inverse factors must be on the same device, got "
+                f"{self.forward.device} and {self.inverse.device}")
 
 
 class EffectiveBetaPriorContext(NamedTuple):

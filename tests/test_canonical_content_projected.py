@@ -1,7 +1,10 @@
 """Projected canonical-content materialization and realized-frame contracts."""
 
+import os
+
 import pytest
 import torch
+import torch.nn.functional as F
 
 from vfe3.config import VFE3Config
 from vfe3.geometry.lie_ops import CompactBlockElement
@@ -12,7 +15,9 @@ from vfe3.model.canonical_content import (
     pullback_diagonal_query,
 )
 from vfe3.model.model import VFEModel
-from vfe3.model.prior_bank import PriorBank, get_encode
+from vfe3.model.prior_bank import PriorBank, get_decode_registration, get_encode
+
+TASK6_DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 
 def _projected_cfg(**overrides: object) -> VFE3Config:
@@ -300,6 +305,21 @@ def test_projected_config_accepts_supported_decode_position_and_tie_variants(
     assert cfg.untie_decode_bank is untie_decode_bank
 
 
+@pytest.mark.parametrize("decode_mode", ["full", "full_chunked"])
+def test_projected_config_accepts_full_head_evidence_after_pullback(
+    decode_mode: str,
+) -> None:
+    """The projected rank exception must reach the built-in full evidence decoder only."""
+    cfg = _projected_cfg(
+        decode_mode=decode_mode,
+        use_priorbank_head_evidence_mixer=True,
+    )
+    assert cfg.encode_mode == "canonical_content_projected"
+    assert cfg.family == "gaussian_diagonal"
+    assert cfg.decode_mode == decode_mode
+    assert cfg.use_priorbank_head_evidence_mixer is True
+
+
 def test_direct_projected_prior_bank_rejects_locally_incompatible_family() -> None:
     """Direct bank construction must not bypass the projected encoder's family boundary."""
     with pytest.raises(ValueError, match="canonical_content_projected"):
@@ -327,12 +347,14 @@ def test_projected_tied_and_untied_banks_share_only_the_canonical_initial_values
 
 
 def _set_noncommuting_model_frames(model: VFEModel, token_ids: torch.Tensor) -> None:
+    device = model.prior_bank.phi_embed.device
     token_blocks = torch.tensor(
         [
             [[[0.10, 0.28], [-0.16, 0.05]], [[-0.08, 0.19], [0.07, 0.12]]],
             [[[0.04, -0.21], [0.13, -0.09]], [[0.11, 0.06], [-0.18, 0.03]]],
         ],
         dtype=model.prior_bank.phi_embed.dtype,
+        device=device,
     )
     position_blocks = torch.tensor(
         [
@@ -340,14 +362,19 @@ def _set_noncommuting_model_frames(model: VFEModel, token_ids: torch.Tensor) -> 
             [[[-0.07, 0.14], [0.05, 0.08]], [[0.09, -0.13], [0.04, -0.05]]],
         ],
         dtype=model.prior_bank.phi_embed.dtype,
+        device=device,
     )
     with torch.no_grad():
         model.prior_bank.phi_embed[token_ids[0]] = token_blocks.flatten(start_dim=1)
         model.pos_phi_free[: token_ids.shape[1]] = position_blocks.flatten(start_dim=1)
         model.prior_bank.mu_embed[token_ids[0]] = torch.tensor(
-            [[0.35, -0.25, 0.55, 0.10], [-0.40, 0.65, 0.15, -0.30]])
+            [[0.35, -0.25, 0.55, 0.10], [-0.40, 0.65, 0.15, -0.30]],
+            device=device,
+        )
         model.prior_bank.sigma_log_embed[token_ids[0]] = torch.log(torch.tensor(
-            [[0.7, 1.3, 0.5, 1.1], [1.4, 0.6, 0.9, 1.2]]))
+            [[0.7, 1.3, 0.5, 1.1], [1.4, 0.6, 0.9, 1.2]],
+            device=device,
+        ))
 
 
 def test_projected_materialize_uses_one_shared_factored_frame_and_preserves_q0_equals_p(
@@ -626,3 +653,428 @@ def test_projected_phi_gradient_reaches_canonical_tables_and_realized_frames() -
         assert parameter.grad is not None
         assert torch.isfinite(parameter.grad).all()
         assert torch.count_nonzero(parameter.grad).item() > 0
+
+
+def _manual_canonical_full_logits(
+    bank: PriorBank,
+    mu_c: torch.Tensor,
+    cov_c: torch.Tensor,
+) -> torch.Tensor:
+    """Independent full-Gaussian KL against the bank's canonical diagonal priors."""
+    mu_v = bank.decode_mu_embed if bank.untie_decode_bank else bank.mu_embed
+    log_var_v = (
+        bank.decode_sigma_log_embed if bank.untie_decode_bank else bank.sigma_log_embed
+    )
+    var_v = torch.exp(log_var_v).clamp(min=bank.eps)
+    inv_var_v = var_v.reciprocal()
+    delta = mu_c.unsqueeze(-2) - mu_v
+    trace = torch.diagonal(cov_c, dim1=-2, dim2=-1) @ inv_var_v.transpose(-1, -2)
+    mahalanobis = (delta.square() * inv_var_v).sum(dim=-1)
+    logdet_q = torch.linalg.slogdet(cov_c).logabsdet.unsqueeze(-1)
+    logdet_v = torch.log(var_v).sum(dim=-1)
+    kl_v = 0.5 * (trace + mahalanobis - bank.K + logdet_v - logdet_q)
+    tau_eff = bank.decode_tau * torch.exp(-bank.decode_log_scale.clamp(-3.0, 3.0))
+    logits = -kl_v / tau_eff
+    if bank.decode_unigram_prior:
+        logits = logits + bank.unigram_kappa * bank.unigram_log_prior
+    return logits
+
+
+def _set_decode_oracle_tables(model: VFEModel) -> None:
+    bank = model.prior_bank
+    mu_values = torch.linspace(
+        -0.75, 0.85, steps=bank.vocab_size * bank.K,
+        dtype=bank.mu_embed.dtype,
+        device=bank.mu_embed.device,
+    ).reshape(bank.vocab_size, bank.K)
+    var_values = torch.linspace(
+        0.45, 1.65, steps=bank.vocab_size * bank.K,
+        dtype=bank.sigma_log_embed.dtype,
+        device=bank.sigma_log_embed.device,
+    ).reshape(bank.vocab_size, bank.K)
+    with torch.no_grad():
+        if bank.untie_decode_bank:
+            bank.decode_mu_embed.copy_(mu_values)
+            bank.decode_sigma_log_embed.copy_(var_values.log())
+        else:
+            bank.mu_embed.copy_(mu_values)
+            bank.sigma_log_embed.copy_(var_values.log())
+        bank.decode_log_scale.fill_(0.29)
+    bank.set_unigram_log_prior(
+        torch.tensor([2, 11, 5, 3, 17, 7, 13, 19, 23, 29, 31], dtype=torch.float32)
+    )
+
+
+@pytest.mark.parametrize("decode_mode", ["full", "full_chunked"])
+@pytest.mark.parametrize("untie_decode_bank", [False, True])
+def test_projected_manual_decode_matches_canonical_full_oracle(
+    decode_mode: str,
+    untie_decode_bank: bool,
+) -> None:
+    """Scoring the materialized diagonal query without pullback breaks this hand KL oracle."""
+    torch.manual_seed(101)
+    model = VFEModel(_projected_cfg(
+        decode_mode=decode_mode,
+        untie_decode_bank=untie_decode_bank,
+        decode_unigram_prior=True,
+        unigram_kappa=0.63,
+        pos_phi="learned",
+        pos_phi_compose="group_product",
+        e_step_update="mm_exact",
+    )).to(TASK6_DEVICE)
+    token_ids = torch.tensor([[2, 5]], device=TASK6_DEVICE)
+    _set_decode_oracle_tables(model)
+    _set_noncommuting_model_frames(model, token_ids)
+    capture: dict = {}
+
+    belief, logits = model.forward_beliefs(
+        token_ids,
+        return_logits=True,
+        capture=capture,
+    )
+
+    context = capture["canonical_frame"]
+    mu_c, cov_c = pullback_diagonal_query(
+        belief.mu,
+        belief.sigma,
+        context.inverse,
+    )
+    expected = _manual_canonical_full_logits(model.prior_bank, mu_c, cov_c)
+    token_only = torch.matrix_exp(torch.einsum(
+        "...a,aij->...ij",
+        model.prior_bank.encode(token_ids).phi,
+        model.group.generators,
+    ))
+    assert not torch.allclose(context.forward, token_only, atol=1e-6, rtol=1e-6)
+    assert logits is not None
+    assert torch.allclose(logits, expected, atol=4e-4, rtol=4e-4)
+
+
+def test_projected_missing_frame_fails_closed_at_priorbank_decode() -> None:
+    """A projected query cannot silently be interpreted as already canonical."""
+    bank = _projected_bank()
+    mu_q = torch.zeros(1, 2, bank.K)
+    var_q = torch.ones_like(mu_q)
+
+    with pytest.raises(
+        ValueError,
+        match=r"canonical_content_projected.*requires canonical_frame.*same forward query",
+    ):
+        bank.decode(mu_q, var_q)
+
+
+def test_projected_missing_frame_fails_closed_at_full_fused_ce() -> None:
+    """The registered fused boundary must enforce the same same-forward context contract."""
+    bank = _projected_gradient_bank("full_chunked")
+    mu_q = torch.zeros(1, 2, bank.K, dtype=torch.float64)
+    var_q = torch.ones_like(mu_q)
+    targets = torch.tensor([[0, 8]])
+    fused_ce = get_decode_registration("full_chunked").fused_ce
+    assert fused_ce is not None
+
+    with pytest.raises(
+        ValueError,
+        match=r"canonical_content_projected.*requires canonical_frame.*same forward query",
+    ):
+        fused_ce(bank, mu_q, var_q, targets)
+
+
+@pytest.mark.parametrize("incompatibility", ["shape", "dtype", "device"])
+def test_projected_incompatible_frame_fails_closed_at_priorbank_decode(
+    incompatibility: str,
+) -> None:
+    """Broadcasting, promotion, or cross-device frame reuse would decode the wrong query."""
+    bank = _projected_bank()
+    mu_q = torch.zeros(1, 2, bank.K)
+    var_q = torch.ones_like(mu_q)
+    frame = torch.eye(bank.K).expand(1, 2, bank.K, bank.K).clone()
+    if incompatibility == "shape":
+        frame = frame[:, :1]
+    elif incompatibility == "dtype":
+        frame = frame.double()
+    else:
+        frame = torch.eye(bank.K, device="meta").expand(1, 2, bank.K, bank.K)
+    context = CanonicalFrameContext(forward=frame, inverse=frame.clone())
+
+    with pytest.raises(ValueError):
+        bank.decode(mu_q, var_q, canonical_frame=context)
+
+
+def test_ordinary_decode_rejects_frame_context_and_is_unchanged_without_it() -> None:
+    """The new frame keyword must remain illegal and value-inert for ordinary encoders."""
+    torch.manual_seed(113)
+    bank = PriorBank(vocab_size=7, K=4, n_gen=8, decode_mode="diagonal")
+    mu_q = torch.randn(1, 2, 4)
+    var_q = torch.rand(1, 2, 4) + 0.4
+    context = CanonicalFrameContext(
+        forward=torch.eye(4).expand(1, 2, 4, 4).clone(),
+        inverse=torch.eye(4).expand(1, 2, 4, 4).clone(),
+    )
+
+    baseline = bank.decode(mu_q, var_q)
+    assert torch.isfinite(baseline).all()
+    with pytest.raises(ValueError, match=r"canonical_frame.*canonical_content_projected"):
+        bank.decode(mu_q, var_q, canonical_frame=context)
+
+
+def test_ordinary_full_fused_ce_rejects_supplied_frame_context() -> None:
+    """Only the projected encoder may activate the fused frame keyword."""
+    bank = PriorBank(
+        vocab_size=7,
+        K=4,
+        n_gen=8,
+        family="gaussian_full",
+        diagonal_covariance=False,
+        decode_mode="full_chunked",
+    )
+    mu_q = torch.zeros(1, 2, 4)
+    cov_q = torch.eye(4).expand(1, 2, 4, 4).clone()
+    targets = torch.tensor([[0, 6]])
+    context = CanonicalFrameContext(
+        forward=torch.eye(4).expand(1, 2, 4, 4).clone(),
+        inverse=torch.eye(4).expand(1, 2, 4, 4).clone(),
+    )
+    fused_ce = get_decode_registration("full_chunked").fused_ce
+    assert fused_ce is not None
+
+    with pytest.raises(ValueError, match=r"canonical_frame.*canonical_content_projected"):
+        fused_ce(bank, mu_q, cov_q, targets, canonical_frame=context)
+
+
+def _projected_gradient_bank(decode_mode: str) -> PriorBank:
+    torch.manual_seed(127)
+    bank = PriorBank(
+        vocab_size=9,
+        K=4,
+        n_gen=8,
+        family="gaussian_diagonal",
+        encode_mode="canonical_content_projected",
+        decode_mode=decode_mode,
+        decode_chunk_size=4,
+        decode_ce_checkpoint=("always" if decode_mode == "full_chunked" else "auto"),
+        use_prior_bank=True,
+        prior_source="token",
+        s_e_step=False,
+        gauge_parameterization="phi",
+        irrep_dims=[2, 2],
+        use_priorbank_head_evidence_mixer=True,
+        omega_reflection="off",
+        phi_reflection="off",
+        decode_unigram_prior=True,
+        unigram_kappa=0.57,
+    ).double()
+    with torch.no_grad():
+        bank.mu_embed.copy_(torch.linspace(-0.8, 0.9, 36).reshape(9, 4))
+        bank.sigma_log_embed.copy_(torch.linspace(0.55, 1.45, 36).reshape(9, 4).log())
+        bank.decode_log_scale.fill_(0.31)
+        bank.head_evidence_logits.copy_(torch.tensor([0.37, -0.22], dtype=torch.float64))
+    bank.set_unigram_log_prior(torch.tensor([2, 11, 5, 3, 17, 7, 13, 19, 23]))
+    return bank
+
+
+def _projected_decode_loss_and_grads(
+    bank: PriorBank,
+    *,
+    fused: bool,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    mu_q = torch.tensor(
+        [[
+            [0.2, -0.5, 0.7, 0.1],
+            [-0.3, 0.8, -0.2, 0.4],
+            [0.9, -0.1, 0.3, -0.6],
+            [-0.4, 0.2, 0.5, 0.7],
+        ]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    var_q = torch.tensor(
+        [[
+            [0.8, 1.2, 0.6, 1.1],
+            [1.0, 0.7, 1.3, 0.9],
+            [0.5, 1.4, 0.8, 1.2],
+            [0.9, -0.25, 1.1, 0.7],
+        ]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    frame = (
+        torch.eye(4, dtype=torch.float64).expand(1, 4, 4, 4).clone()
+        + torch.tensor(
+            [[
+                [[0.10, 0.07, 0.00, 0.00], [-0.04, -0.03, 0.00, 0.00],
+                 [0.00, 0.00, 0.06, -0.08], [0.00, 0.00, 0.05, 0.02]],
+                [[-0.05, 0.09, 0.00, 0.00], [0.03, 0.04, 0.00, 0.00],
+                 [0.00, 0.00, -0.07, 0.04], [0.00, 0.00, 0.08, 0.01]],
+                [[0.02, -0.06, 0.00, 0.00], [0.11, -0.02, 0.00, 0.00],
+                 [0.00, 0.00, 0.03, 0.07], [0.00, 0.00, -0.05, -0.04]],
+                [[-0.08, 0.03, 0.00, 0.00], [0.06, 0.05, 0.00, 0.00],
+                 [0.00, 0.00, 0.09, -0.02], [0.00, 0.00, 0.04, -0.06]],
+            ]],
+            dtype=torch.float64,
+        )
+    ).requires_grad_()
+    context = CanonicalFrameContext(forward=frame, inverse=torch.linalg.inv(frame))
+    targets = torch.tensor([[0, -100, 8, 3]])
+    z_loss_weight = 0.071
+
+    if fused:
+        fused_ce = get_decode_registration("full_chunked").fused_ce
+        assert fused_ce is not None
+        loss = fused_ce(
+            bank,
+            mu_q,
+            var_q,
+            targets,
+            z_loss_weight=z_loss_weight,
+            canonical_frame=context,
+        )
+    else:
+        logits = bank.decode(mu_q, var_q, canonical_frame=context)
+        degenerate = bank.decode_degenerate_positions(
+            var_q,
+            canonical_frame=context,
+        )
+        assert degenerate is not None
+        dense_targets = torch.where(degenerate, targets.new_full((), -100), targets)
+        flat_logits = logits.reshape(-1, bank.vocab_size)
+        flat_targets = dense_targets.reshape(-1)
+        valid = flat_targets != -100
+        n_valid = valid.sum().clamp_min(1)
+        loss = F.cross_entropy(
+            flat_logits,
+            flat_targets,
+            ignore_index=-100,
+            reduction="sum",
+        ) / n_valid
+        log_z = torch.logsumexp(flat_logits, dim=-1)
+        loss = loss + z_loss_weight * (
+            log_z.square() * valid.to(log_z.dtype)
+        ).sum() / n_valid
+
+    leaves = {
+        "query_mean": mu_q,
+        "query_variance": var_q,
+        "frame": frame,
+        "prior_mean": bank.mu_embed,
+        "prior_variance": bank.sigma_log_embed,
+        "temperature": bank.decode_log_scale,
+        "evidence_logits": bank.head_evidence_logits,
+    }
+    gradients = torch.autograd.grad(loss, tuple(leaves.values()))
+    return loss.detach(), dict(zip(leaves, gradients))
+
+
+def test_projected_dense_fused_value_gradient_parity_with_invalid_query() -> None:
+    """Skipping pullback in either CE path breaks values, checkpoint grads, or exclusion."""
+    dense = _projected_gradient_bank("full")
+    fused = _projected_gradient_bank("full_chunked")
+    fused.load_state_dict(dense.state_dict())
+
+    dense_loss, dense_grads = _projected_decode_loss_and_grads(dense, fused=False)
+    fused_loss, fused_grads = _projected_decode_loss_and_grads(fused, fused=True)
+
+    assert torch.allclose(fused_loss, dense_loss, atol=2e-9, rtol=2e-9)
+    for name in dense_grads:
+        assert torch.isfinite(dense_grads[name]).all(), name
+        assert torch.isfinite(fused_grads[name]).all(), name
+        assert torch.count_nonzero(dense_grads[name]).item() > 0, name
+        assert torch.count_nonzero(fused_grads[name]).item() > 0, name
+        assert torch.allclose(fused_grads[name], dense_grads[name], atol=2e-8, rtol=2e-7), name
+
+
+def _retain_forward_query(model: VFEModel, holder: dict[str, object]) -> None:
+    original = model.forward_beliefs
+
+    def tracked(*args: object, **kwargs: object):
+        belief, logits = original(*args, **kwargs)
+        belief.mu.retain_grad()
+        belief.sigma.retain_grad()
+        holder["belief"] = belief
+        capture = kwargs.get("capture")
+        if isinstance(capture, dict):
+            holder["canonical_frame"] = capture.get("canonical_frame")
+        return belief, logits
+
+    model.forward_beliefs = tracked  # type: ignore[method-assign]
+
+
+def _projected_training_model(decode_mode: str) -> VFEModel:
+    torch.manual_seed(139)
+    model = VFEModel(_projected_cfg(
+        decode_mode=decode_mode,
+        decode_chunk_size=4,
+        decode_ce_checkpoint=("always" if decode_mode == "full_chunked" else "auto"),
+        decode_unigram_prior=True,
+        unigram_kappa=0.61,
+        z_loss_weight=0.067,
+        use_priorbank_head_evidence_mixer=True,
+        pos_phi="learned",
+        pos_phi_compose="group_product",
+        e_step_update="gradient",
+        e_q_mu_lr=0.03,
+        e_q_sigma_lr=0.02,
+    ))
+    token_ids = torch.tensor([[2, 5]])
+    _set_noncommuting_model_frames(model, token_ids)
+    model.prior_bank.set_unigram_log_prior(
+        torch.tensor([2, 11, 5, 3, 17, 7, 13, 19, 23, 29, 31])
+    )
+    with torch.no_grad():
+        model.prior_bank.decode_log_scale.fill_(0.23)
+        model.prior_bank.head_evidence_logits.copy_(torch.tensor([0.31, -0.19]))
+    return model.to(TASK6_DEVICE)
+
+
+def test_projected_model_dense_fused_training_threads_context_and_gradients() -> None:
+    """Dropping the same-forward frame from model training severs phi or decode gradients."""
+    dense = _projected_training_model("full")
+    fused = _projected_training_model("full_chunked")
+    fused.load_state_dict(dense.state_dict())
+    dense.train()
+    fused.train()
+    tokens = torch.tensor([[2, 5], [4, 7]], device=TASK6_DEVICE)
+    targets = torch.tensor([[10, -100], [3, 1]], device=TASK6_DEVICE)
+    dense_holder: dict[str, object] = {}
+    fused_holder: dict[str, object] = {}
+    _retain_forward_query(dense, dense_holder)
+    _retain_forward_query(fused, fused_holder)
+
+    dense_logits, dense_loss, dense_ce = dense(tokens, targets)
+    fused_logits, fused_loss, fused_ce = fused(tokens, targets)
+    dense_loss.backward()
+    fused_loss.backward()
+
+    assert dense_logits is not None
+    assert fused_logits is None
+    assert isinstance(dense_holder.get("canonical_frame"), CanonicalFrameContext)
+    assert isinstance(fused_holder.get("canonical_frame"), CanonicalFrameContext)
+    assert torch.allclose(fused_ce, dense_ce, atol=7e-4, rtol=7e-4)
+    assert torch.allclose(fused_loss, dense_loss, atol=7e-4, rtol=7e-4)
+
+    dense_belief = dense_holder["belief"]
+    fused_belief = fused_holder["belief"]
+    gradient_pairs = {
+        "query_mean": (dense_belief.mu.grad, fused_belief.mu.grad),
+        "query_variance": (dense_belief.sigma.grad, fused_belief.sigma.grad),
+        "canonical_prior_mean": (dense.prior_bank.mu_embed.grad, fused.prior_bank.mu_embed.grad),
+        "canonical_prior_variance": (
+            dense.prior_bank.sigma_log_embed.grad,
+            fused.prior_bank.sigma_log_embed.grad,
+        ),
+        "token_phi": (dense.prior_bank.phi_embed.grad, fused.prior_bank.phi_embed.grad),
+        "positional_phi": (dense.pos_phi_free.grad, fused.pos_phi_free.grad),
+        "evidence_logits": (
+            dense.prior_bank.head_evidence_logits.grad,
+            fused.prior_bank.head_evidence_logits.grad,
+        ),
+        "temperature": (
+            dense.prior_bank.decode_log_scale.grad,
+            fused.prior_bank.decode_log_scale.grad,
+        ),
+    }
+    for name, (dense_grad, fused_grad) in gradient_pairs.items():
+        assert dense_grad is not None and fused_grad is not None, name
+        assert torch.isfinite(dense_grad).all() and torch.isfinite(fused_grad).all(), name
+        assert torch.count_nonzero(dense_grad).item() > 0, name
+        assert torch.count_nonzero(fused_grad).item() > 0, name
+        assert torch.allclose(fused_grad, dense_grad, atol=2e-3, rtol=6e-3), name

@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from vfe3 import metrics
 from vfe3.alpha_i import self_coupling_alpha
 from vfe3.belief import BeliefState
+from vfe3.contracts import CanonicalFrameContext
 from vfe3.families.base import get_family, kl
 from vfe3.model.block import _as_coeff, e_step_shared_kwargs   # shared cfg->kwargs bag (audit 2026-07-12 N5)
 from vfe3.free_energy import (
@@ -65,6 +66,11 @@ def _cpu_bank_value(value: object) -> object:
     r"""Detach and CPU-host every tensor retained by a bank record or field."""
     if isinstance(value, torch.Tensor):
         return _cpu_bank_tensor(value)
+    if isinstance(value, CanonicalFrameContext):
+        return CanonicalFrameContext(
+            forward=_cpu_bank_tensor(value.forward),
+            inverse=_cpu_bank_tensor(value.inverse),
+        )
     if isinstance(value, CompactBlockElement):
         return CompactBlockElement(
             _cpu_bank_tensor(value.blocks),
@@ -91,6 +97,9 @@ def _inference_bank_tensors(value: object) -> Iterator[torch.Tensor]:
     """Yield tensors nested in the stable list-of-records inference-bank API."""
     if isinstance(value, torch.Tensor):
         yield value
+    elif isinstance(value, CanonicalFrameContext):
+        yield value.forward
+        yield value.inverse
     elif isinstance(value, CompactBlockElement):
         yield value.blocks
     elif isinstance(value, dict):
@@ -250,6 +259,7 @@ def collect_inference_bank(
             )
             out = capture["out"]
             prior = capture["prior"]
+            canonical_frame = capture.get("canonical_frame")
             s_mu = s_sigma = model_phi = None
             if model._model_channel_active:
                 if model.cfg.s_e_step:
@@ -274,12 +284,17 @@ def collect_inference_bank(
                 "s_mu": _cpu_bank_value(s_mu) if s_mu is not None else None,
                 "s_sigma": _cpu_bank_value(s_sigma) if s_sigma is not None else None,
                 "model_phi": _cpu_bank_value(model_phi) if model_phi is not None else None,
+                "canonical_frame": (
+                    _cpu_bank_value(canonical_frame)
+                    if canonical_frame is not None else None
+                ),
             })
             stop = max_batches is not None and i + 1 >= max_batches
             # The record now owns detached CPU copies. Release every accelerator-side inference
             # workset before the next model forward instead of relying on the loop variable overwrite.
             del batch, tokens, targets, capture, beliefs, logits, out, prior
-            del s_mu, s_sigma, model_phi, out_cpu, belief_mu_cpu, belief_cpu
+            del s_mu, s_sigma, model_phi, canonical_frame
+            del out_cpu, belief_mu_cpu, belief_cpu
             if stop:
                 break
     finally:
@@ -304,9 +319,22 @@ def _decode_inference_record(
         )
     mu = belief.mu.to(device)
     sigma = belief.sigma.to(device)
-    with model._amp_off_context(device):
-        logits = model.prior_bank.decode(mu.float(), sigma.float())
-    del mu, sigma
+    canonical_frame = record.get("canonical_frame")
+    if canonical_frame is not None:
+        if not isinstance(canonical_frame, CanonicalFrameContext):
+            raise ValueError(
+                "inference record canonical_frame must be a CanonicalFrameContext"
+            )
+        canonical_frame = CanonicalFrameContext(
+            forward=canonical_frame.forward.to(device),
+            inverse=canonical_frame.inverse.to(device),
+        )
+    logits = model._decode_belief_with_context(
+        mu,
+        sigma,
+        canonical_frame=canonical_frame,
+    )
+    del mu, sigma, canonical_frame
     return logits
 
 

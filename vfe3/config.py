@@ -2618,11 +2618,19 @@ class VFE3Config:
                     "functional (divergence_family='renyi', renyi_order=1.0)."
                 )
             allowed_modes = canonical_modes.get(self.family)
-            if allowed_modes is None or self.decode_mode not in allowed_modes:
+            projected_full_decode = (
+                self.encode_mode == "canonical_content_projected"
+                and self.family == "gaussian_diagonal"
+                and self.decode_mode in ("full", "full_chunked")
+            )
+            if ((allowed_modes is None or self.decode_mode not in allowed_modes)
+                    and not projected_full_decode):
                 raise ValueError(
                     "use_priorbank_head_evidence_mixer=True requires a built-in canonical KL decode: "
                     "family='gaussian_diagonal' with decode_mode='diagonal'/'diagonal_chunked', or "
-                    "family='gaussian_full' with decode_mode='full'/'full_chunked'. "
+                    "family='gaussian_full' with decode_mode='full'/'full_chunked'; the sole rank "
+                    "exception is encode_mode='canonical_content_projected', which pulls its "
+                    "gaussian_diagonal query back to full covariance before full decoding. "
                     f"Got family={self.family!r}, decode_mode={self.decode_mode!r}."
                 )
             from vfe3.families.base import _FAMILIES, _FUNCTIONALS, renyi

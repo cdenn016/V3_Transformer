@@ -32,6 +32,7 @@ from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.emission import bohning_emission_terms
 from vfe3.contracts import (
+    CanonicalFrameContext,
     EffectiveBetaPriorContext,
     EStepGradientOutput,
     EStepGradientRecord,
@@ -52,7 +53,7 @@ from vfe3.geometry.transport import (
     TransportState,
     get_transport_registration,
 )
-from vfe3.model.canonical_content import CanonicalFrameContext, project_canonical_diagonal
+from vfe3.model.canonical_content import project_canonical_diagonal
 from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.block import _as_coeff, vfe_block
 from vfe3.model.model_frame import resolve_model_frame
@@ -816,6 +817,40 @@ class VFEModel(nn.Module):
             "projected canonical content requires FactoredTransport or "
             f"CompactFactoredTransport vertex factors, got {type(base).__name__}")
 
+    @staticmethod
+    def _slice_canonical_frame(
+        canonical_frame: Optional[CanonicalFrameContext],
+        position_slice: slice,
+    ) -> Optional[CanonicalFrameContext]:
+        """Slice only token positions while preserving the captured frame-factor graph."""
+        if canonical_frame is None:
+            return None
+        return CanonicalFrameContext(
+            forward=canonical_frame.forward[:, position_slice],
+            inverse=canonical_frame.inverse[:, position_slice],
+        )
+
+    def _decode_belief_with_context(
+        self,
+        mu_q:            torch.Tensor,
+        sigma_q:         torch.Tensor,
+
+        *,
+        canonical_frame: Optional[CanonicalFrameContext] = None,
+        decode_last:     bool = False,
+    ) -> torch.Tensor:
+        r"""Decode one realized belief through the model-owned frame/context boundary."""
+        if decode_last:
+            mu_q = mu_q[:, -1:]
+            sigma_q = sigma_q[:, -1:]
+            canonical_frame = self._slice_canonical_frame(canonical_frame, slice(-1, None))
+        with self._amp_off_context(mu_q.device):
+            return self.prior_bank.decode(
+                mu_q.float(),
+                sigma_q.float(),
+                canonical_frame=canonical_frame,
+            )
+
     def _resolve_model_frame(
         self,
         token_ids:  torch.Tensor,        # (B, N) integer token ids
@@ -1257,10 +1292,12 @@ class VFEModel(nn.Module):
             capture["out"]   = out
         logits = None
         if return_logits:
-            mu_decode = mu_final[:, -1:] if decode_last else mu_final
-            sigma_decode = sigma_final[:, -1:] if decode_last else sigma_final
-            with self._amp_off_context(token_ids.device):
-                logits = self.prior_bank.decode(mu_decode.float(), sigma_decode.float())
+            logits = self._decode_belief_with_context(
+                mu_final,
+                sigma_final,
+                canonical_frame=canonical_frame,
+                decode_last=decode_last,
+            )
         return belief, logits
 
     # ----------------------------------------------------------------------------------------------
@@ -1625,12 +1662,13 @@ class VFEModel(nn.Module):
             )[1]
         # Training path: produce the converged belief q* (no (B,N,V) logits) via the shared seam, then
         # run the existing decode + cross-entropy + M-step assembly reading belief.mu / sigma / phi.
-        # cap (non-None only when the M-step self-coupling term is on) is filled by forward_beliefs
-        # with the converged q*, the live final-block prior, the encode-time prior, and the raw
+        # Capture regularizer state and, in projected mode, the exact decode frame. Regularizer
+        # captures also retain the converged q*, live final-block prior, encode-time prior, and raw
         # pre-final_norm stack output.
         cap: Optional[MStepCapture] = (
             {} if (self.cfg.mstep_self_coupling_weight > 0.0
-                   or self.cfg.cg_energy_weight > 0.0) else None
+                   or self.cfg.cg_energy_weight > 0.0
+                   or self.cfg.encode_mode == "canonical_content_projected") else None
         )
         if cap is not None and self.cfg.cg_energy_weight > 0.0:
             # Initialize the CG moment-energy lists ONLY when the regularizer is on. A capture
@@ -1646,6 +1684,9 @@ class VFEModel(nn.Module):
             estep_grad_out=estep_grad_out,
         )
         mu_final, sigma_final = belief.mu, belief.sigma          # (B, N, K) post final_norm; sigma = out.sigma
+        canonical_frame = (
+            cap.get("canonical_frame") if cap is not None else None
+        )
 
         # Decode + cross-entropy fp32 island. The decode matmul (_decode_diagonal) reconstructs the
         # Mahalanobis term via a catastrophically-cancelling subtraction pinned at atol-1e-3, and CE
@@ -1668,10 +1709,17 @@ class VFEModel(nn.Module):
         if fused_chunked:
             with self._amp_off_context(token_ids.device):
                 if self.cfg.use_prior_bank:
-                    ce = decode_registration.fused_ce(
-                        self.prior_bank, mu_final.float(), sigma_final.float(), targets,
-                        z_loss_weight=self.cfg.z_loss_weight,
-                    )
+                    if canonical_frame is None:
+                        ce = decode_registration.fused_ce(
+                            self.prior_bank, mu_final.float(), sigma_final.float(), targets,
+                            z_loss_weight=self.cfg.z_loss_weight,
+                        )
+                    else:
+                        ce = decode_registration.fused_ce(
+                            self.prior_bank, mu_final.float(), sigma_final.float(), targets,
+                            z_loss_weight=self.cfg.z_loss_weight,
+                            canonical_frame=canonical_frame,
+                        )
                 else:
                     ce = decode_registration.fused_ce(
                         self.prior_bank, mu_final.float(), targets,
@@ -1679,8 +1727,11 @@ class VFEModel(nn.Module):
                     )
             logits = None                                        # no (B, N, V) tensor on the fused path
         else:
-            with self._amp_off_context(token_ids.device):
-                logits = self.prior_bank.decode(mu_final.float(), sigma_final.float())   # (B, N, V) fp32
+            logits = self._decode_belief_with_context(
+                mu_final,
+                sigma_final,
+                canonical_frame=canonical_frame,
+            )                                                        # (B, N, V) fp32
             # targets is guaranteed not None here (the inference path returned via forward_beliefs above).
             with self._amp_off_context(token_ids.device):
                 # A position whose Sigma_q is not PD has no valid likelihood and is EXCLUDED, exactly
@@ -1691,7 +1742,10 @@ class VFEModel(nn.Module):
                 # every diagonal decode, where there is no factorization to fail.
                 ce_targets = targets
                 if self.cfg.use_prior_bank:
-                    degenerate = self.prior_bank.decode_degenerate_positions(sigma_final.float())
+                    degenerate = self.prior_bank.decode_degenerate_positions(
+                        sigma_final.float(),
+                        canonical_frame=canonical_frame,
+                    )
                     if degenerate is not None:
                         ce_targets = torch.where(
                             degenerate, targets.new_full((), -100), targets)
