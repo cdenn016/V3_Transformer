@@ -321,6 +321,7 @@ def _decode_av(
     if _DECODE_AV_PRECISION == "fp64" and sq.dtype is not torch.float64:
         return _decode_av(
             sq.double(), mc_q.double(), mc_v.double(), inv_v.double(), lsum.double(),
+            lhs=None if lhs is None else lhs.double(),
             coord_delta=None if coord_delta is None else coord_delta.double())
     if lhs is None or lhs.dtype is not sq.dtype:
         lhs = _decode_av_lhs(sq, mc_q, coord_delta)
@@ -342,6 +343,7 @@ def _decode_head_evidence_kl_delta(
     log_sigma_v:    torch.Tensor,
     coord_delta:    torch.Tensor,
     delta_per_pos:  torch.Tensor,
+    evidence_lhs:   Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Canonical baseline-plus-delta head-evidence KL contribution for one vocab slice."""
     delta_a_v = _decode_av(
@@ -350,9 +352,10 @@ def _decode_head_evidence_kl_delta(
         mc_v,
         inv_v,
         (log_sigma_v * coord_delta).sum(-1),
+        lhs=evidence_lhs,
         coord_delta=coord_delta,
     )
-    return (0.5 * (delta_a_v - delta_per_pos)).to(mc_q.dtype)
+    return 0.5 * (delta_a_v - delta_per_pos)
 
 
 def _decode_analytic_kl_logits(
@@ -364,10 +367,10 @@ def _decode_analytic_kl_logits(
     evidence_delta: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Apply the shared canonical KL floor, optional block delta, and decode temperature."""
-    kl_v = (0.5 * (a_v - per_pos)).clamp(min=0.0).to(output_dtype)
+    kl_v = (0.5 * (a_v - per_pos)).clamp(min=0.0)
     if evidence_delta is not None:
         kl_v = kl_v + evidence_delta
-    return -kl_v / tau_eff
+    return (-kl_v / tau_eff).to(output_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -1424,11 +1427,15 @@ class PriorBank(nn.Module):
         per_pos = self.K + torch.log(sigma_q.clamp(min=self.eps)).sum(-1, keepdim=True)  # (B, N, 1)
         coord_delta = None
         delta_per_pos = None
+        evidence_lhs = None
         if hasattr(self, "head_evidence_logits"):
             _, coord_delta = self._head_evidence_deltas(dtype=mu_q.dtype, device=mu_q.device)
             delta_per_pos = (
                 coord_delta * (1.0 + torch.log(sigma_q.clamp(min=self.eps)))
             ).sum(-1, keepdim=True)
+            evidence_lhs = _decode_av_lhs(sigma_q, mc_q, coord_delta)
+            if _DECODE_AV_PRECISION == "fp64" and evidence_lhs.dtype is not torch.float64:
+                evidence_lhs = evidence_lhs.double()
 
         def _chunk_summaries(lhs_:    torch.Tensor, per_pos_:        torch.Tensor,
                              mu_v_c:  torch.Tensor, inv_v_c:         torch.Tensor,
@@ -1439,7 +1446,8 @@ class PriorBank(nn.Module):
                              sq_:     torch.Tensor,
                              mc_q_:   torch.Tensor,
                              coord_delta_: Optional[torch.Tensor],
-                             delta_per_pos_: Optional[torch.Tensor]) -> 'tuple[torch.Tensor, torch.Tensor]':
+                             delta_per_pos_: Optional[torch.Tensor],
+                             evidence_lhs_: Optional[torch.Tensor]) -> 'tuple[torch.Tensor, torch.Tensor]':
             r"""Reduce one vocab chunk to (lse_chunk, target_contrib), both (B, N), on the inside.
 
             logit_{i,v} = -0.5(a_v - per_pos)/tau_eff over the chunk (see _decode_diagonal). The
@@ -1455,7 +1463,7 @@ class PriorBank(nn.Module):
             if coord_delta_ is not None and delta_per_pos_ is not None:
                 evidence_delta = _decode_head_evidence_kl_delta(
                     sq_, mc_q_, mu_v_c, inv_v_c, log_v_c,
-                    coord_delta_, delta_per_pos_,
+                    coord_delta_, delta_per_pos_, evidence_lhs_,
                 )
             logit_chunk = _decode_analytic_kl_logits(
                 a_v, per_pos_, tau_eff, lhs_.dtype, evidence_delta=evidence_delta)
@@ -1492,12 +1500,13 @@ class PriorBank(nn.Module):
                 lse_chunk, contrib = _checkpoint.checkpoint(
                     _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, log_v_c, lsum_c,
                     in_chunk_f, local_idx,
-                    u_c, sigma_q, mc_q, coord_delta, delta_per_pos, use_reentrant=False,
+                    u_c, sigma_q, mc_q, coord_delta, delta_per_pos, evidence_lhs,
+                    use_reentrant=False,
                 )
             else:
                 lse_chunk, contrib = _chunk_summaries(
                     lhs, per_pos, mc_v_c, inv_v_c, log_v_c, lsum_c, in_chunk_f, local_idx, u_c,
-                    sigma_q, mc_q, coord_delta, delta_per_pos,
+                    sigma_q, mc_q, coord_delta, delta_per_pos, evidence_lhs,
                 )
             lse_chunks.append(lse_chunk)
             target_logit = target_logit + contrib                          # exactly one chunk contributes per valid pos
@@ -1657,12 +1666,16 @@ class PriorBank(nn.Module):
         per_pos = self.K + logdet_q.unsqueeze(-1)                          # (B, N, 1)
         coord_delta = None
         delta_per_pos = None
+        evidence_lhs = None
         block_ok = torch.ones_like(spd_ok)
         if hasattr(self, "head_evidence_logits"):
             head_delta, coord_delta = self._head_evidence_deltas(
                 dtype=mu_q.dtype, device=mu_q.device)
             delta_per_pos, block_ok = self._head_evidence_full_marginal_invariants(
                 sigma_q, head_delta)
+            evidence_lhs = _decode_av_lhs(diag_sq, mc_q, coord_delta)
+            if _DECODE_AV_PRECISION == "fp64" and evidence_lhs.dtype is not torch.float64:
+                evidence_lhs = evidence_lhs.double()
 
         def _chunk_summaries(lhs_:    torch.Tensor, per_pos_:        torch.Tensor,
                              mu_v_c:  torch.Tensor, inv_v_c:         torch.Tensor,
@@ -1673,7 +1686,8 @@ class PriorBank(nn.Module):
                              sq_:     torch.Tensor,
                              mc_q_:   torch.Tensor,
                              coord_delta_: Optional[torch.Tensor],
-                             delta_per_pos_: Optional[torch.Tensor]) -> 'tuple[torch.Tensor, torch.Tensor]':
+                             delta_per_pos_: Optional[torch.Tensor],
+                             evidence_lhs_: Optional[torch.Tensor]) -> 'tuple[torch.Tensor, torch.Tensor]':
             r"""Reduce one vocab chunk to (lse_chunk, target_contrib), both (B, N), on the inside.
 
             a_v = sum_k[(diag(Sigma_q) + (mc_q-mc_v)^2)/sigma_v] + sum_k log sigma_v
@@ -1689,7 +1703,7 @@ class PriorBank(nn.Module):
             if coord_delta_ is not None and delta_per_pos_ is not None:
                 evidence_delta = _decode_head_evidence_kl_delta(
                     sq_, mc_q_, mu_v_c, inv_v_c, log_v_c,
-                    coord_delta_, delta_per_pos_,
+                    coord_delta_, delta_per_pos_, evidence_lhs_,
                 )
             logit_chunk = _decode_analytic_kl_logits(
                 a_v, per_pos_, tau_eff, lhs_.dtype, evidence_delta=evidence_delta)
@@ -1727,12 +1741,13 @@ class PriorBank(nn.Module):
                 lse_chunk, contrib = _checkpoint.checkpoint(
                     _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, log_v_c, lsum_c,
                     in_chunk_f, local_idx, u_c, diag_sq, mc_q, coord_delta, delta_per_pos,
+                    evidence_lhs,
                     use_reentrant=False,
                 )
             else:
                 lse_chunk, contrib = _chunk_summaries(
                     lhs, per_pos, mc_v_c, inv_v_c, log_v_c, lsum_c, in_chunk_f, local_idx, u_c,
-                    diag_sq, mc_q, coord_delta, delta_per_pos,
+                    diag_sq, mc_q, coord_delta, delta_per_pos, evidence_lhs,
                 )
             lse_chunks.append(lse_chunk)
             target_logit = target_logit + contrib                          # exactly one chunk contributes per valid pos
@@ -2361,7 +2376,7 @@ def _decode_full(
     # inf -- so the row has to be neutralized after the fact. One extra (B, N) Cholesky against this
     # kernel's own O(B*N*V*K^3) per-pair factorization is not measurable.
     kl_v = torch.where(spd_ok.unsqueeze(-1), kl_v, torch.zeros_like(kl_v))
-    return -kl_v / tau_eff
+    return (-kl_v / tau_eff).to(mu_q.dtype)
 
 
 @register_decode(

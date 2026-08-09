@@ -8,7 +8,8 @@ import torch.nn.functional as F
 
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
-from vfe3.model.prior_bank import PriorBank
+from vfe3.model import prior_bank as prior_bank_mod
+from vfe3.model.prior_bank import PriorBank, set_decode_av_precision
 from vfe3.numerics import bounded_variance_from_log
 from vfe3.train import build_optimizer
 
@@ -554,3 +555,119 @@ def test_simultaneous_head_mixers_have_separate_gradients_and_diagnostics():
     collapsed = model.diagnostics(tokens)
     assert collapsed["head_evidence_entropy"] == pytest.approx(0.0)
     assert math.isfinite(collapsed["head_evidence_entropy"])
+
+
+@pytest.mark.parametrize("mode", ["diagonal_chunked", "full_chunked"])
+def test_fused_head_evidence_builds_weighted_query_lhs_once_across_chunks_and_checkpoint(
+    mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    bank = _reference_bank(mode, (2, 3), enabled=True, unigram=True)
+    bank.decode_ce_checkpoint = "on"
+    mu_q, sigma_q = _full_query() if mode == "full_chunked" else _diagonal_query()
+    targets = torch.tensor([[0, 3], [4, 2]])
+    weighted_lhs_calls = 0
+    real_decode_av_lhs = prior_bank_mod._decode_av_lhs
+
+    def counting_decode_av_lhs(*args, **kwargs):
+        nonlocal weighted_lhs_calls
+        coord_delta = kwargs.get("coord_delta")
+        if coord_delta is None and len(args) >= 3:
+            coord_delta = args[2]
+        if coord_delta is not None:
+            weighted_lhs_calls += 1
+        return real_decode_av_lhs(*args, **kwargs)
+
+    monkeypatch.setattr(prior_bank_mod, "_decode_av_lhs", counting_decode_av_lhs)
+    fused_fn = (
+        bank.decode_ce_full_chunked
+        if mode == "full_chunked"
+        else bank.decode_ce_diagonal_chunked
+    )
+    loss = fused_fn(mu_q, sigma_q, targets, chunk_size=2)
+    loss.backward()
+
+    assert weighted_lhs_calls == 1
+
+
+@pytest.mark.parametrize("mode", ["diagonal_chunked", "full_chunked"])
+def test_fused_fp64_decode_av_island_divides_before_float32_cast_with_gradient_parity(
+    mode: str,
+):
+    bank = _reference_bank(mode, (2, 3), enabled=True, unigram=True).float()
+    bank.decode_ce_checkpoint = "on"
+    with torch.no_grad():
+        bank.decode_log_scale.fill_(0.31)
+    mu_raw, sigma_raw = _full_query() if mode == "full_chunked" else _diagonal_query()
+    mu_q = mu_raw.float().detach().requires_grad_()
+    sigma_q = sigma_raw.float().detach().requires_grad_()
+    targets = torch.tensor([[0, -100], [4, 2]])
+    z_loss_weight = 0.073
+    previous = set_decode_av_precision("fp64")
+    try:
+        fused_fn = (
+            bank.decode_ce_full_chunked
+            if mode == "full_chunked"
+            else bank.decode_ce_diagonal_chunked
+        )
+        fused = fused_fn(
+            mu_q,
+            sigma_q,
+            targets,
+            z_loss_weight=z_loss_weight,
+            chunk_size=2,
+        )
+
+        weights, _ = bank.head_evidence_weights(dtype=torch.float32, device=mu_q.device)
+        mu_v = bank._decode_mu_table().T.double()
+        var_v = bounded_variance_from_log(
+            bank._decode_sigma_log_table(), eps=bank.eps).T.double()
+        if mode == "full_chunked":
+            divergence, _, _ = _full_head_reference(
+                mu_q.double(), sigma_q.double(), mu_v, var_v, weights.double(), (2, 3))
+        else:
+            divergence = diagonal_head_reference(
+                mu_q.double(), sigma_q.double(), mu_v, var_v, weights.double(), (2, 3))
+        oracle_logits = (-divergence / bank._tau_eff().double()).float()
+        oracle_logits = oracle_logits + bank._unigram_bias()
+        dense_logits = bank.decode(mu_q, sigma_q)
+        torch.testing.assert_close(dense_logits, oracle_logits, rtol=0.0, atol=2.5e-7)
+        oracle = F.cross_entropy(
+            oracle_logits.reshape(-1, bank.vocab_size),
+            targets.reshape(-1),
+            ignore_index=-100,
+        )
+        valid = targets != -100
+        oracle = oracle + z_loss_weight * (
+            torch.logsumexp(oracle_logits, dim=-1).square() * valid
+        ).sum() / valid.sum()
+
+        leaves = (
+            mu_q,
+            sigma_q,
+            bank.mu_embed,
+            bank.sigma_log_embed,
+            bank.decode_log_scale,
+            bank.head_evidence_logits,
+        )
+        fused_grads = torch.autograd.grad(fused, leaves, retain_graph=True)
+        oracle_grads = torch.autograd.grad(oracle, leaves)
+        torch.testing.assert_close(fused, oracle, rtol=0.0, atol=0.0)
+        for fused_grad, oracle_grad in zip(fused_grads, oracle_grads):
+            torch.testing.assert_close(fused_grad, oracle_grad, rtol=2e-6, atol=2e-7)
+    finally:
+        set_decode_av_precision(previous)
+
+
+def test_dense_full_fp64_head_evidence_casts_only_completed_logits_to_query_dtype():
+    bank = _reference_bank("full", (2, 3), enabled=True, unigram=True).float()
+    mu_raw, sigma_raw = _full_query()
+    mu_q = mu_raw.float().detach().requires_grad_()
+    sigma_q = sigma_raw.float().detach().requires_grad_()
+    previous = set_decode_av_precision("fp64")
+    try:
+        logits = bank.decode(mu_q, sigma_q)
+        assert logits.dtype == mu_q.dtype
+        assert torch.isfinite(logits).all()
+    finally:
+        set_decode_av_precision(previous)
