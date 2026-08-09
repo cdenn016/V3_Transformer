@@ -107,6 +107,11 @@ Gaussian comparison. The decoder therefore scores the converged intrinsic query 
 the canonical vocabulary content tables. Learned positional frame composition also cancels from
 this exact flat-cocycle comparison.
 
+An optional unigram term does not alter that statement. When enabled, the decoder first converts
+the intrinsic Gaussian divergence to `-D / tau_eff`, then adds the vocabulary-only base rate
+`kappa * log(pi_v)`. The bias is outside the divergence, frame action, and covariance map; exactness
+and phi cancellation apply to the intrinsic Gaussian term rather than to the total biased logit.
+
 ### Fail-closed configuration contract
 
 `canonical_content_gauge` requires:
@@ -118,6 +123,11 @@ this exact flat-cocycle comparison.
 - `use_prior_bank=True`;
 - a diagonal Gaussian KL decoder (`diagonal` or `diagonal_chunked`); and
 - reflection modes off in this first implementation.
+
+The named control additionally requires the import-time `canonical_content_gauge` encoder
+registration/callable and `gaussian_frame_diagonal` family identities. A same-name registry override
+fails at both configuration and direct `PriorBank` construction rather than inheriting the control's
+scientific claim.
 
 The mode supports a tied or untied decode bank; an untied bank is cloned in canonical coordinates.
 It emits a configuration notice that the flat exact construction makes the relative frame cancel
@@ -179,6 +189,12 @@ without the required frame fails closed instead of silently comparing different 
 - `decode_mode='full'` or `'full_chunked'`; and
 - reflection modes off in this first implementation.
 
+The projected mode additionally pins three import-time identities: its
+`canonical_content_projected` encoder, the `gaussian_diagonal` family that owns the canonical table,
+and the `gaussian_full` family plus analytic full/full-chunked decoder used after pullback. Registry
+aliases or replacements fail during configuration/direct construction; ordinary encoders retain the
+general registry extension seam.
+
 Untied decode tables remain canonical tables. Learned M-step phi and learned/frozen positional phi
 are supported because every new forward rematerializes moments from the current composed frame.
 
@@ -211,13 +227,17 @@ are supported because every new forward rematerializes moments from the current 
 - Group `head_evidence_logits` exactly once and retain the optimizer's fail-closed parameter coverage.
 - Add the toggle and realized head weights to run configuration/diagnostics without changing the
   canonical pure-path predicate when the toggle is false.
-- When enabled, mark the run as using a learned decoder evidence metric. Keep the existing vector
-  HeadMixer compatibility metadata independent.
+- In `pure_path_report.json`, record the mixer toggle, `encode_mode`, and the explicit role
+  `decoder_kl_irrep_weights` when enabled (`inactive` otherwise). Enabling the mixer marks the
+  free-energy/decode pure-path axis false. Keep the existing vector HeadMixer compatibility metadata
+  independent.
 
 ## 5. Error behavior and checkpoint compatibility
 
 - All three components are default off and allocate no new state on the established path.
 - Unsupported family/divergence/decode combinations fail during config construction.
+- The two canonical encoder registrations and their required import-time family/decoder identities
+  fail closed at configuration and direct `PriorBank` construction.
 - A projected PriorBank decode without a realized inverse frame raises a descriptive error.
 - A malformed block partition or fewer than two blocks rejects the head-evidence mixer.
 - Old checkpoints load unchanged under default settings. Toggle-on checkpoints contain the new

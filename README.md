@@ -1051,6 +1051,67 @@ $\tau_{\mathrm{decode}}$ (corrected 2026-08-06). Setting `use_prior_bank=False` 
 registered linear boundary instead, whose logits depend only on the refined mean and a learned
 bias; other registered decode modes retain their own stated scoring rules.
 
+### Opt-in canonical PriorBank controls
+
+Three default-off controls provide explicit experimental routes without changing the established
+configuration:
+
+```python
+use_priorbank_head_evidence_mixer = True
+encode_mode = "canonical_content_gauge"      # exact intrinsic control; phi cancels
+encode_mode = "canonical_content_projected"  # projected diagonal state; frame-aware full decode
+```
+
+`use_priorbank_head_evidence_mixer=True` learns one positive, mean-one evidence weight per declared
+gauge block and applies those weights to the intrinsic Gaussian marginal KL terms. Zero logits give
+weights of exactly one, so the initial score recovers the canonical full KL, including its unweighted
+cross-block correlation correction. The mixer requires `use_prior_bank=True`, at least two gauge
+blocks, the built-in order-one Renyi/KL functional, and built-in analytic Gaussian decoders:
+`gaussian_diagonal` with `diagonal`/`diagonal_chunked`, or `gaussian_full` with
+`full`/`full_chunked`. Projected canonical content is the one rank exception because it pulls its
+diagonal query back to full canonical covariance before scoring. Registry substitutions, generic
+families, and unsupported pairings fail at construction. When enabled, diagnostics expose
+`head_evidence_weights`, `head_evidence_entropy`, and `head_evidence_max_abs_drift`; the existing
+post-belief `HeadMixer` remains a separate component with separate parameters and diagnostics.
+
+`encode_mode="canonical_content_gauge"` is the exact scientific control. It interprets the token
+tables as canonical moments $(a_v,s_v)$ for `gaussian_frame_diagonal`. Under the required flat
+cocycle, the realized token frame and any right positional frame cancel from relative transport and
+from the diagonal KL decoder. Therefore `phi_embed` has no supervised belief/decode gradient unless
+another objective explicitly acts on phi. This mode requires token priors, `s_e_step=False`, phi
+parameterization, reflection off, and `diagonal` or `diagonal_chunked` decode.
+
+`encode_mode="canonical_content_projected"` is intentionally approximate. It composes the realized
+token and right positional factors, materializes $\mu_i=U_i a_v$ and
+$\sigma_i=\operatorname{diag}(U_i\operatorname{Diag}(s_v)U_i^\top)$, and remains in the diagonal
+family through later transports, re-diagonalizing after each congruence. At decode it reuses that
+same forward-pass frame to pull the final diagonal query back to a full canonical covariance, then
+scores the unchanged canonical diagonal vocabulary bank with `full` or `full_chunked`. Dense
+training, fused CE, `return_logits`, `decode_last`, generation, and extraction use this frame-aware
+model seam. A missing, stale-shaped, wrong-device, or wrong-dtype frame context fails closed. The
+mode also requires flat phi transport, token priors, `s_e_step=False`, `e_phi_lr=0`, reflection off,
+and the built-in full decoder identities.
+
+Both canonical modes also pin the import-time encoder registration and callable, rather than
+trusting a replacement registered under the same name. The exact mode pins its
+`gaussian_frame_diagonal` family. The projected mode separately pins the `gaussian_diagonal` family
+that owns its canonical table and the `gaussian_full` family plus decoder used after pullback. These
+identity gates apply at both `VFE3Config` and direct `PriorBank` construction; ordinary registry
+extensions outside the named canonical modes remain supported.
+
+For either canonical decoder, optional unigram bias remains a distinct post-divergence vocabulary
+base-rate: logits are `-intrinsic_gaussian_divergence / tau_eff + kappa * log(pi_v)`. It is not part
+of the Gaussian divergence, frame action, or covariance pullback. Thus exact phi cancellation in
+`canonical_content_gauge` describes the intrinsic Gaussian term, not the optional additive base
+rate.
+
+Run artifacts preserve the distinction. `pure_path_report.json` records both
+`use_priorbank_head_evidence_mixer` and `encode_mode`; when the evidence mixer is enabled it marks
+the free-energy/decode purity axis false and records
+`priorbank_head_evidence_role="decoder_kl_irrep_weights"`. When disabled, that role is `"inactive"`.
+This provenance is separate from the existing post-belief `HeadMixer` flags, while periodic
+diagnostics carry the realized head-evidence weights, entropy, and drift named above.
+
 The causal training windows use $x_i=t_i$ and $y_i=t_{i+1}$. At the checked-in values
 `mass_phi=0`, `mstep_self_coupling_weight=0`, and `z_loss_weight=0`, no corresponding outer
 penalty augments cross-entropy. Because `s_e_step=False` (corrected 2026-08-06), there is no
