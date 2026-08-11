@@ -255,6 +255,34 @@ def _count_mu_trust_fallback(ok: torch.Tensor) -> None:
 _DECODE_LOGDET_FALLBACK_COUNTS: Dict[str, torch.Tensor] = {}
 
 
+_MM_CHOLESKY_FALLBACK_COUNTS: Dict[str, torch.Tensor] = {}
+
+
+def _count_mm_cholesky_fallback(ok: torch.Tensor) -> None:
+    r"""Accumulate MM Cholesky fallback rows per device without a host synchronization."""
+    key = str(ok.device)
+    counter = _MM_CHOLESKY_FALLBACK_COUNTS.get(key)
+    if counter is None:
+        counter = torch.zeros((), dtype=torch.int64, device=ok.device)
+        _MM_CHOLESKY_FALLBACK_COUNTS[key] = counter
+    counter += (~ok).sum()
+
+
+def mm_cholesky_fallback_elements() -> int:
+    r"""Return MM rows retained after a failed Cholesky since the last reset.
+
+    Reading the on-device counters synchronizes, so the training loop calls this only when it is
+    already publishing end-of-run artifacts.
+    """
+    return int(sum(int(count) for count in _MM_CHOLESKY_FALLBACK_COUNTS.values()))
+
+
+def reset_mm_cholesky_fallback_elements() -> None:
+    r"""Zero the asynchronous per-device MM Cholesky fallback counters for a new run."""
+    for count in _MM_CHOLESKY_FALLBACK_COUNTS.values():
+        count.zero_()
+
+
 def _count_decode_logdet_fallback(ok: torch.Tensor) -> None:
     r"""Accumulate decode log-det Cholesky failures per device (async add, no host sync)."""
     key = str(ok.device)

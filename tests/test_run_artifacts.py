@@ -645,6 +645,20 @@ def test_train_with_artifacts_writes_files(trained_artifact_evidence):
     )
 
 
+def test_train_publishes_mm_cholesky_fallback_count(tmp_path, monkeypatch):
+    """The numerical MM fallback count belongs in the durable realized-update record."""
+    import vfe3.train as train_module
+
+    monkeypatch.setattr(train_module, "mm_cholesky_fallback_elements", lambda: 3)
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    artifacts = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
+
+    train(model, _loader(n=96), cfg, n_steps=0, artifacts=artifacts)
+
+    assert artifacts.realized_updates["mm_cholesky_fallback_elements"] == 3
+
+
 def test_train_with_artifacts_writes_attention_pngs(tmp_path):
     # Per eval, one LOG-scaled attention/step_<N>_layer<l>_head<h>.png per (layer, head).
     cfg = _cfg(n_layers=2, prior_handoff_rho=0.5)

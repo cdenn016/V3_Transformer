@@ -29,7 +29,7 @@ from vfe3.geometry.transport import (
 from vfe3.gradients.oracle import _transport_to_float, belief_gradients_autograd
 from vfe3.families.gaussian import FullGaussian
 from vfe3.gradients.pairwise_stats import diagonal_kl_pair_stats
-from vfe3.numerics import safe_cholesky
+from vfe3.numerics import _count_mm_cholesky_fallback, safe_cholesky
 
 _KERNELS: Dict[str, Callable] = {}
 _COMPILED_KERNELS: Dict[str, Callable] = {}   # lazy torch.compile cache (compile_pair_kernel toggle)
@@ -884,7 +884,8 @@ def _mm_exact_dense_fusion(
     need_sigma_update: bool,
     emission:          Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     emission_weight:   float,
-) -> Tuple[torch.Tensor, torch.Tensor]:        # (mu_star, sigma_star), each (..., N, d) / (..., N, d, d)
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # (mu_star, sigma_star, Cholesky-success mask), (..., N, d) / (..., N, d, d) / (..., N)
     r"""Dense d x d precision-fusion minimizer, no irrep/head awareness (WAVE4 audit derivation).
 
     The full-covariance analogue of ``mm_exact_update``'s diagonal precision fusion, at the SAME
@@ -946,17 +947,23 @@ def _mm_exact_dense_fusion(
     # near-singular matrix, matching the diagonal path's "stay put" degenerate convention.
     degenerate = mass <= eps
 
-    L_star, _ = safe_cholesky(prec, eps=eps, rounds=5)
-    mu_star = torch.cholesky_solve(numerator.unsqueeze(-1), L_star).squeeze(-1)
-    mu_star = torch.where(degenerate.unsqueeze(-1), mu, mu_star)
+    L_star, ok_star = safe_cholesky(prec, eps=eps, rounds=5)
+    # cholesky_ex leaves a finite PARTIAL factor on failure. Never feed it to a solve/inverse: the
+    # value can look finite while representing no factorization. Identity is a safe temporary only;
+    # the final selection below retains the incoming belief exactly for every failed row.
+    eye = torch.eye(prec.shape[-1], dtype=prec.dtype, device=prec.device)
+    L_star_safe = torch.where(ok_star[..., None, None], L_star, eye.expand_as(L_star))
+    invalid = degenerate | ~ok_star
+    mu_candidate = torch.cholesky_solve(numerator.unsqueeze(-1), L_star_safe).squeeze(-1)
+    mu_star = torch.where(invalid.unsqueeze(-1), mu, mu_candidate)
 
     if not need_sigma_update:
-        return mu_star, sigma
+        return mu_star, sigma, ok_star
 
-    lambda_inv = torch.cholesky_inverse(L_star)                        # (..., N, d, d)  Lambda*^{-1}
+    lambda_inv = torch.cholesky_inverse(L_star_safe)                   # (..., N, d, d)  Lambda*^{-1}
     sigma_star = mass.unsqueeze(-1).unsqueeze(-1) * lambda_inv
-    sigma_star = torch.where(degenerate.unsqueeze(-1).unsqueeze(-1), sigma, sigma_star)
-    return mu_star, sigma_star
+    sigma_star = torch.where(invalid.unsqueeze(-1).unsqueeze(-1), sigma, sigma_star)
+    return mu_star, sigma_star, ok_star
 
 
 _BLOCK_DIAGONAL_RTOL: float = 1e-6   # calibrated against fp32 accumulation noise on a genuinely diagonal input
@@ -1055,11 +1062,13 @@ def _mm_exact_full_covariance(
     check below rather than silently fusing the wrong objective.
     """
     if irrep_dims is None or len(irrep_dims) == 1:
-        return _mm_exact_dense_fusion(
+        mu_star, sigma_star, ok_star = _mm_exact_dense_fusion(
             mu, sigma, mu_p, sigma_p, mu_t, sigma_t, a, w,
             eps=eps, need_sigma_update=need_sigma_update,
             emission=emission, emission_weight=emission_weight,
         )
+        _count_mm_cholesky_fallback(ok_star)
+        return mu_star, sigma_star
     _verify_prior_block_diagonal(sigma_p, irrep_dims)
     if emission is not None and emission_weight != 0.0:
         emission_prec_all, emission_pull_all, emission_z0_all = emission
@@ -1067,6 +1076,7 @@ def _mm_exact_full_covariance(
         emission_prec_all = emission_pull_all = emission_z0_all = None
     mu_parts:    List[torch.Tensor] = []
     sigma_parts: List[torch.Tensor] = []
+    factor_masks: List[torch.Tensor] = []
     start = 0
     for h, d in enumerate(irrep_dims):
         end = start + d
@@ -1077,7 +1087,7 @@ def _mm_exact_full_covariance(
                 emission_pull_all[..., start:end],
                 emission_z0_all[..., start:end],
             )
-        mu_star_h, sigma_star_h = _mm_exact_dense_fusion(
+        mu_star_h, sigma_star_h, ok_star_h = _mm_exact_dense_fusion(
             mu[..., start:end], sigma[..., start:end, start:end],
             mu_p[..., start:end], sigma_p[..., start:end, start:end],
             mu_t[..., start:end], sigma_t[..., start:end, start:end],
@@ -1087,6 +1097,7 @@ def _mm_exact_full_covariance(
         )
         mu_parts.append(mu_star_h)
         sigma_parts.append(sigma_star_h)
+        factor_masks.append(ok_star_h)
         start = end
     mu_star = torch.cat(mu_parts, dim=-1)                               # (..., N, K)
     # Block-diagonal assembly: pad each head's (..., N, d_h, d_h) block with exact zeros on every
@@ -1100,6 +1111,10 @@ def _mm_exact_full_covariance(
         pad = (start, K - end, start, K - end)                          # (left, right, top, bottom)
         sigma_star = sigma_star + torch.nn.functional.pad(sigma_star_h, pad)
         start = end
+    ok_star = torch.stack(factor_masks, dim=0).all(dim=0)
+    _count_mm_cholesky_fallback(ok_star)
+    mu_star = torch.where(ok_star.unsqueeze(-1), mu_star, mu)
+    sigma_star = torch.where(ok_star.unsqueeze(-1).unsqueeze(-1), sigma_star, sigma)
     return mu_star, sigma_star
 
 
@@ -1130,19 +1145,27 @@ def mm_damped_precision_blend_full(
     itself guaranteed to stay there), then hardened with the same public-SPD certificate.
     """
     from vfe3.geometry.retraction import _certify_public_spd, _symmetric_spectral_map
-    L_old, _  = safe_cholesky(sigma_old,  eps=eps, rounds=5)
-    L_star, _ = safe_cholesky(sigma_star, eps=eps, rounds=5)
-    lam_old  = torch.cholesky_inverse(L_old)
-    lam_star = torch.cholesky_inverse(L_star)
+    L_old, ok_old = safe_cholesky(sigma_old, eps=eps, rounds=5)
+    L_star, ok_star = safe_cholesky(sigma_star, eps=eps, rounds=5)
+    eye = torch.eye(sigma_old.shape[-1], dtype=sigma_old.dtype, device=sigma_old.device)
+    L_old_safe = torch.where(ok_old[..., None, None], L_old, eye.expand_as(L_old))
+    L_star_safe = torch.where(ok_star[..., None, None], L_star, eye.expand_as(L_star))
+    lam_old  = torch.cholesky_inverse(L_old_safe)
+    lam_star = torch.cholesky_inverse(L_star_safe)
     lam_new = (1.0 - eta) * lam_old + eta * lam_star
     numerator = ((1.0 - eta) * torch.einsum("...kl,...l->...k", lam_old, mu_old)
                  + eta * torch.einsum("...kl,...l->...k", lam_star, mu_star))
-    L_new, _ = safe_cholesky(lam_new, eps=eps, rounds=5)
-    mu = torch.cholesky_solve(numerator.unsqueeze(-1), L_new).squeeze(-1)
-    sigma = torch.cholesky_inverse(L_new)
-    sigma = 0.5 * (sigma + sigma.transpose(-1, -2))
-    sigma = _symmetric_spectral_map(sigma, "project", lower=eps, upper=sigma_max)
-    sigma = _certify_public_spd(sigma, eps=eps, sigma_max=sigma_max)
+    L_new, ok_new = safe_cholesky(lam_new, eps=eps, rounds=5)
+    L_new_safe = torch.where(ok_new[..., None, None], L_new, eye.expand_as(L_new))
+    ok = ok_old & ok_star & ok_new
+    _count_mm_cholesky_fallback(ok)
+    mu_candidate = torch.cholesky_solve(numerator.unsqueeze(-1), L_new_safe).squeeze(-1)
+    sigma_candidate = torch.cholesky_inverse(L_new_safe)
+    sigma_candidate = 0.5 * (sigma_candidate + sigma_candidate.transpose(-1, -2))
+    sigma_candidate = _symmetric_spectral_map(sigma_candidate, "project", lower=eps, upper=sigma_max)
+    sigma_candidate = _certify_public_spd(sigma_candidate, eps=eps, sigma_max=sigma_max)
+    mu = torch.where(ok.unsqueeze(-1), mu_candidate, mu_old)
+    sigma = torch.where(ok.unsqueeze(-1).unsqueeze(-1), sigma_candidate, sigma_old)
     return mu, sigma
 
 

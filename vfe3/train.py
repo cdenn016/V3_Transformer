@@ -57,8 +57,10 @@ from vfe3.geometry.retraction import (                          # SPD-retraction
 )
 from vfe3.numerics import (                    # non-equivariant / non-PD fallback accounting
     decode_logdet_fallback_elements,
+    mm_cholesky_fallback_elements,
     mu_trust_fallback_elements,
     reset_decode_logdet_fallback_elements,
+    reset_mm_cholesky_fallback_elements,
     reset_mu_trust_fallback_elements,
 )
 
@@ -1682,6 +1684,7 @@ def train(
     reset_nonfinite_tangent_elements()   # per-run accounting for the SPD-retraction guard
     reset_mu_trust_fallback_elements()   # ... the mu-trust-region equivariance fallback
     reset_decode_logdet_fallback_elements()   # ... and the decode log-det non-PD fallback
+    reset_mm_cholesky_fallback_elements()   # ... and failed full-Gaussian MM Cholesky rows
 
     def _step_indices() -> Iterable[int]:
         if not show_bar:
@@ -2251,6 +2254,7 @@ def train(
     if artifacts is not None:
         neutralized = nonfinite_tangent_elements()
         mu_fallbacks = mu_trust_fallback_elements()
+        mm_fallbacks = mm_cholesky_fallback_elements()
         artifacts.realized_updates = {
             "attempted_steps":      attempted,
             "accepted_updates":     int(attempted - skipped_steps),
@@ -2259,16 +2263,18 @@ def train(
                                      if attempted else float("nan")),
             "nonfinite_tangent_elements": int(neutralized),
             "mu_trust_fallback_elements": int(mu_fallbacks),
+            "mm_cholesky_fallback_elements": int(mm_fallbacks),
             "decode_logdet_fallback_elements": int(decode_logdet_fallback_elements()),
         }
-        if skipped_steps or neutralized or mu_fallbacks:
+        if skipped_steps or neutralized or mu_fallbacks or mm_fallbacks:
             logger.warning(
                 " realized budget: %d/%d optimizer updates accepted (%.3f%%); "
                 "%d SPD tangent element(s) neutralized as non-finite; "
-                "%d belief(s) whitened by the non-equivariant mu-trust fallback",
+                "%d belief(s) whitened by the non-equivariant mu-trust fallback; "
+                "%d belief row(s) retained after MM Cholesky fallback",
                 attempted - skipped_steps, attempted,
                 100.0 * (attempted - skipped_steps) / max(attempted, 1),
-                neutralized, mu_fallbacks)
+                neutralized, mu_fallbacks, mm_fallbacks)
     if ema is not None:
         ema.copy_to(model)                               # the trained model IS the averaged weights
     return losses

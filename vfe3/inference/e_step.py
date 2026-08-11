@@ -717,10 +717,14 @@ def free_energy_value(
     if emission is not None and emission_weight != 0.0:
         emission_prec, emission_pull, emission_z0 = emission
         delta = belief.mu - emission_z0                                  # (..., N, K)
+        sigma_diagonal = (
+            belief.sigma.diagonal(dim1=-2, dim2=-1)
+            if belief.sigma.dim() == belief.mu.dim() + 1 else belief.sigma
+        )
         F = F + emission_weight * (
             0.5 * (emission_prec * delta * delta).sum()
             - (delta * emission_pull).sum()
-            + 0.5 * (emission_prec * belief.sigma).sum()
+            + 0.5 * (emission_prec * sigma_diagonal).sum()
         )
     return F
 

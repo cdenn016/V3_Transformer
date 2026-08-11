@@ -326,3 +326,151 @@ def test_oracle_unroll_grad_toggle_changes_prior_gradient():
     g_off, g_on = grad_of(False), grad_of(True)
     assert torch.isfinite(g_off).all() and torch.isfinite(g_on).all()
     assert not torch.allclose(g_off, g_on)     # the unrolled-through-inference signal reaches the prior
+
+
+def test_dense_emission_trace_uses_only_covariance_diagonal_with_zero_off_diagonal_gradient(monkeypatch):
+    """Changing the dense off-diagonal must not change tr(diag(d) Sigma)."""
+    # The surrounding F needs several spectral operations. Replace only that independent scalar with
+    # zero so this regression measures the emission term's covariance derivative exactly.
+    import vfe3.inference.e_step as e_step_module
+
+    monkeypatch.setattr(e_step_module, "free_energy", lambda sd, *args, **kwargs: sd.new_zeros(()))
+    K = 2
+    group = get_group("glk")(K)
+    sigma = torch.tensor([[[1.0, 0.125], [0.125, 2.0]]], requires_grad=True)
+    belief = BeliefState(
+        mu=torch.zeros(1, K),
+        sigma=sigma,
+        phi=torch.zeros(1, group.generators.shape[0]),
+    )
+    emission = (torch.tensor([2.0, 1.0]), torch.zeros(1, K), torch.zeros(1, K))
+    common = dict(mu_p=torch.zeros(1, K), sigma_p=torch.eye(K).unsqueeze(0), group=group,
+                  family="gaussian_full", emission=emission, emission_weight=2.0)
+    contribution = free_energy_value(belief, **common) - free_energy_value(
+        belief, **{**common, "emission": None})
+
+    torch.testing.assert_close(contribution, torch.tensor(4.0))
+    (gradient,) = torch.autograd.grad(contribution, sigma)
+    assert gradient[0, 0, 1].item() == 0.0
+    assert gradient[0, 1, 0].item() == 0.0
+
+
+def test_diagonal_emission_trace_keeps_existing_variance_semantics():
+    """The diagonal-family trace remains the hand-checked value 4.0."""
+    K = 2
+    group = get_group("glk")(K)
+    belief = BeliefState(
+        mu=torch.zeros(1, K),
+        sigma=torch.tensor([[1.0, 2.0]]),
+        phi=torch.zeros(1, group.generators.shape[0]),
+    )
+    emission = (torch.tensor([2.0, 1.0]), torch.zeros(1, K), torch.zeros(1, K))
+    common = dict(mu_p=torch.zeros(1, K), sigma_p=torch.ones(1, K), group=group,
+                  emission=emission, emission_weight=2.0)
+    contribution = free_energy_value(belief, **common) - free_energy_value(
+        belief, **{**common, "emission": None})
+    torch.testing.assert_close(contribution, torch.tensor(4.0))
+
+
+def test_full_mm_failed_sigma_star_retains_the_old_state_and_counts_the_fallback():
+    """A non-PD candidate cannot move a full-Gaussian belief row."""
+    from vfe3.gradients.kernels import mm_damped_precision_blend_full
+    from vfe3.numerics import mm_cholesky_fallback_elements, reset_mm_cholesky_fallback_elements
+
+    mu_old = torch.tensor([[1.5, -2.0]])
+    sigma_old = torch.eye(2).unsqueeze(0)
+    mu_star = torch.tensor([[9.0, 7.0]])
+    sigma_star = torch.tensor([[[1.0, 0.0], [0.0, -1.0]]])
+    reset_mm_cholesky_fallback_elements()
+
+    mu, sigma = mm_damped_precision_blend_full(
+        mu_old, sigma_old, mu_star, sigma_star, 0.75, eps=1e-6, sigma_max=None)
+
+    assert torch.equal(mu, mu_old)
+    assert torch.equal(sigma, sigma_old)
+    assert mm_cholesky_fallback_elements() == 1
+
+
+def test_full_mm_mixed_batch_updates_valid_row_and_retains_invalid_neighbor():
+    """One failed candidate cannot freeze or contaminate its valid batch neighbor."""
+    from vfe3.gradients.kernels import mm_damped_precision_blend_full
+    from vfe3.numerics import mm_cholesky_fallback_elements, reset_mm_cholesky_fallback_elements
+
+    mu_old = torch.tensor([[1.0, 2.0], [-3.0, 4.0]])
+    sigma_old = torch.eye(2).repeat(2, 1, 1)
+    mu_star = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+    sigma_star = torch.stack((2.0 * torch.eye(2), torch.diag(torch.tensor([1.0, -1.0]))))
+    reset_mm_cholesky_fallback_elements()
+
+    mu, sigma = mm_damped_precision_blend_full(
+        mu_old, sigma_old, mu_star, sigma_star, 1.0, eps=1e-6, sigma_max=None)
+
+    torch.testing.assert_close(mu[0], mu_star[0])
+    torch.testing.assert_close(sigma[0], sigma_star[0])
+    assert torch.equal(mu[1], mu_old[1])
+    assert torch.equal(sigma[1], sigma_old[1])
+    assert mm_cholesky_fallback_elements() == 1
+
+
+def test_full_mm_rejects_a_monkeypatched_partial_cholesky_factor(monkeypatch):
+    """A finite partial factor is still a failed factor and must select the old state."""
+    from vfe3.gradients import kernels as kernels_module
+
+    mu_old = torch.tensor([[1.0, -2.0]])
+    sigma_old = torch.eye(2).unsqueeze(0)
+    mu_star = torch.tensor([[8.0, 9.0]])
+    sigma_star = 2.0 * torch.eye(2).unsqueeze(0)
+    real_safe_cholesky = kernels_module.safe_cholesky
+    calls = {"count": 0}
+
+    def partial_factor(matrix, *, eps, rounds):
+        calls["count"] += 1
+        factor, ok = real_safe_cholesky(matrix, eps=eps, rounds=rounds)
+        if calls["count"] == 2:  # sigma_star: supply a finite factor with an explicit failure mask
+            return torch.eye(matrix.shape[-1], dtype=matrix.dtype).expand_as(factor), torch.zeros_like(ok)
+        return factor, ok
+
+    monkeypatch.setattr(kernels_module, "safe_cholesky", partial_factor)
+    mu, sigma = kernels_module.mm_damped_precision_blend_full(
+        mu_old, sigma_old, mu_star, sigma_star, 0.5, eps=1e-6, sigma_max=None)
+
+    assert calls["count"] >= 2
+    assert torch.equal(mu, mu_old)
+    assert torch.equal(sigma, sigma_old)
+
+
+def test_full_mm_multiblock_failure_retains_the_entire_old_row(monkeypatch):
+    """A failed head factor invalidates the full covariance row, not only that block."""
+    from vfe3.gradients import kernels as kernels_module
+    from vfe3.numerics import mm_cholesky_fallback_elements, reset_mm_cholesky_fallback_elements
+
+    mu_old = torch.tensor([[1.0, -2.0]])
+    sigma_old = torch.eye(2).unsqueeze(0)
+    mu_p = torch.tensor([[4.0, 5.0]])
+    sigma_p = torch.eye(2).unsqueeze(0)
+    mu_t = torch.zeros(1, 1, 2)
+    sigma_t = torch.eye(2).reshape(1, 1, 2, 2)
+    a = torch.ones(1, 1)
+    w = torch.ones(2, 1, 1)
+    real_safe_cholesky = kernels_module.safe_cholesky
+    calls = {"count": 0}
+
+    def first_head_fails(matrix, *, eps, rounds):
+        calls["count"] += 1
+        factor, ok = real_safe_cholesky(matrix, eps=eps, rounds=rounds)
+        if calls["count"] == 1:
+            return torch.eye(matrix.shape[-1], dtype=matrix.dtype).expand_as(factor), torch.zeros_like(ok)
+        return factor, ok
+
+    monkeypatch.setattr(kernels_module, "safe_cholesky", first_head_fails)
+    reset_mm_cholesky_fallback_elements()
+    mu, sigma = kernels_module._mm_exact_full_covariance(
+        mu=mu_old, sigma=sigma_old, mu_p=mu_p, sigma_p=sigma_p,
+        mu_t=mu_t, sigma_t=sigma_t, a=a, w=w, eps=1e-6, irrep_dims=[1, 1],
+        need_sigma_update=True, emission=None, emission_weight=0.0,
+    )
+
+    assert calls["count"] == 2
+    assert torch.equal(mu, mu_old)
+    assert torch.equal(sigma, sigma_old)
+    assert mm_cholesky_fallback_elements() == 1
