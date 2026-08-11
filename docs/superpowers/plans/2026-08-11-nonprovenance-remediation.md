@@ -417,7 +417,7 @@ reviewer. Resolve all correctness findings before beginning the next implementat
 Run Ruff on modified Python files, the focused full-Gaussian 231-test lane, the CPU-fast lane in
 bounded partitions, and every task regression into fresh JUnit XML. Derive totals only from XML.
 
-- [ ] **Step 3: Start and adjudicate the closure ledger**
+- [x] **Step 3: Start and adjudicate the closure ledger**
 
 After the final source commit, start a new closure-mode ledger. Record one claim per finding,
 source/config/environment identity, at least two independent views, eligible mechanical evidence,
@@ -429,12 +429,12 @@ verified by inference from CPU tests.
 Dispatch a clean-context reviewer over the complete base-to-head diff, the design, the plan, and
 the ledger. Repair and re-run affected evidence for every accepted finding.
 
-- [ ] **Step 5: Append remediation status and commit**
+- [x] **Step 5: Append remediation status and commit**
 
 Append a dated remediation section to the audit report listing fixed, refuted, and still-open
 claims with exact final revision and JUnit totals. Commit the report and plan checkbox updates.
 
-- [ ] **Step 6: Handoff without publishing**
+- [x] **Step 6: Handoff without publishing**
 
 Report the isolated worktree, branch, commits, test totals, ledger states, and remaining
 obligations. Do not merge or push unless the user asks.
