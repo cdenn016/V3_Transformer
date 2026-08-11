@@ -407,6 +407,37 @@ def test_projected_across_layer_trace_matches_production_snapshot() -> None:
     )
 
 
+def test_across_layer_trace_with_mlp_dropout_is_rng_neutral_and_restores_mode() -> None:
+    cfg = VFE3Config(
+        vocab_size=13,
+        embed_dim=4,
+        n_heads=2,
+        max_seq_len=4,
+        n_layers=3,
+        n_e_steps=1,
+        e_phi_lr=0.0,
+        use_block_mlp=True,
+        block_mlp_dropout=0.5,
+    )
+    model = VFEModel(cfg).to(DEVICE)
+    model.train()
+    tokens = torch.tensor([[1, 2, 3, 4]], dtype=torch.long, device=DEVICE)
+
+    with torch.no_grad():
+        torch.manual_seed(311)
+        expected_next_logits = model(tokens).detach()
+
+        torch.manual_seed(311)
+        cpu_rng_before = torch.get_rng_state().clone()
+        extract.across_layer_belief_trace(model, tokens)
+
+        assert torch.equal(torch.get_rng_state(), cpu_rng_before)
+        assert model.training
+        assert all(module.training for module in model.block_mlps.modules())
+        actual_next_logits = model(tokens).detach()
+        assert torch.equal(actual_next_logits, expected_next_logits)
+
+
 def test_projected_converged_state_matches_production_snapshot() -> None:
     """Converged diagnostics must not silently replay canonical rather than realized moments."""
     model, tokens, snapshot = _projected_parity_case()

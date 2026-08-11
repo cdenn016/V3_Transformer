@@ -19,6 +19,7 @@ from vfe3.belief import BeliefState
 from vfe3.contracts import CanonicalFrameContext
 from vfe3.families.base import get_family, kl
 from vfe3.model.block import _as_coeff, e_step_shared_kwargs   # shared cfg->kwargs bag (audit 2026-07-12 N5)
+from vfe3.model.model import _block_mlp_diagnostic_eval
 from vfe3.free_energy import (
     attention_tau,
     attention_weights,
@@ -912,6 +913,7 @@ def e_step_fixed_point_diagnostics(
 
 
 @torch.no_grad()
+@_block_mlp_diagnostic_eval
 def across_layer_belief_trace(
     model,
     token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
