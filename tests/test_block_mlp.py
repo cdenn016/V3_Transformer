@@ -1,3 +1,4 @@
+import pytest
 import torch
 from torch import nn
 
@@ -23,6 +24,15 @@ def test_block_mlp_known_residual_and_shape():
 
     assert output.shape == mu.shape
     assert torch.equal(output, torch.tensor([[-1.0, 4.0]]))
+
+@pytest.mark.parametrize("activation", ["gelu", "silu", "relu"])
+def test_block_mlp_supported_activations_forward_finite(activation):
+    mlp = BlockMLP(embed_dim=3, expansion=2, activation=activation, dropout=0.0)
+    mu = torch.tensor([[-1.0, 0.0, 2.0]])
+    output = mlp(mu)
+
+    assert output.shape == mu.shape
+    assert torch.isfinite(output).all()
 
 
 def _tiny_cfg(**overrides):
