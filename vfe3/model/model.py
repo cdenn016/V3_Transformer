@@ -66,7 +66,7 @@ from vfe3.model.prior_bank import (
 )
 from vfe3.model.stack import vfe_stack
 from vfe3.families.base import get_family
-from vfe3.families.gaussian import set_full_cov_kl_precision
+from vfe3.families.gaussian import FullGaussian, validate_full_cov_kl_precision
 from vfe3.geometry.transport import set_full_cov_congruence_precision
 from vfe3.numerics import set_mu_trust_cholesky_rounds, set_safe_cholesky_jitter_mode
 from vfe3.runtime import set_fp32_matmul_precision
@@ -239,13 +239,10 @@ class VFEModel(nn.Module):
         # before model + loader are built), NOT here: seeding inside __init__ would clobber a
         # caller-set RNG state (e.g. a test that seeds then constructs several models).
         self.cfg = cfg
-        # Publish the full-covariance KL precision policy (audit 2026-08-05). This is the SINGLE
-        # place the policy is set: `coupling_energy` has 15 call sites, and a per-call-site kwarg
-        # is how `_transport_to_float` silently lost `cond_escalation` -- one path computing the
-        # gradient at a different precision than the path reporting the objective. A process-wide
-        # policy makes that desynchronisation structurally impossible. Default "fp64" keeps every
-        # caller byte-identical to the pre-policy build.
-        set_full_cov_kl_precision(cfg.full_cov_kl_precision)
+        # The full-covariance KL precision policy is immutable model state. The standalone module
+        # default remains available to direct family callers, but constructing another model must
+        # never change this model's transport, divergence, decoder, or workspace behavior.
+        self.full_cov_kl_precision = validate_full_cov_kl_precision(cfg.full_cov_kl_precision)
         # Same one-place-set rule for the congruence that feeds it (audit 2026-08-06 C1).
         set_full_cov_congruence_precision(cfg.full_cov_congruence_precision)
         set_safe_cholesky_jitter_mode(cfg.safe_cholesky_jitter_mode)
@@ -291,6 +288,7 @@ class VFEModel(nn.Module):
             # (decode_mode='family'/'family_chunked'), so the readout scores the SAME divergence the
             # E-step minimized (PB-14). The fast gaussian kernels ignore them.
             divergence_family=cfg.divergence_family, renyi_order=cfg.renyi_order,
+            full_cov_precision_policy=self.full_cov_kl_precision,
             use_prior_bank=cfg.use_prior_bank, decode_bias=cfg.decode_bias,
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
             decode_chunk_size=cfg.decode_chunk_size,
@@ -611,6 +609,24 @@ class VFEModel(nn.Module):
                     f"(detach_e_step=False, e_step_gradient='unroll') to train it.",
                     stacklevel=2,
                 )
+
+    def _coupling_energy(self, family, *args, **kwargs) -> torch.Tensor:
+        """Evaluate a model-owned coupling grid under this model's immutable precision policy."""
+        if family is FullGaussian:
+            kwargs["precision_policy"] = self.full_cov_kl_precision
+        return family.coupling_energy(*args, **kwargs)
+
+    def _family_instance(self, family, *args):
+        """Construct a model-owned full Gaussian with this model's immutable policy."""
+        if family is FullGaussian:
+            return family(*args, _precision_policy=self.full_cov_kl_precision)
+        return family(*args)
+
+    def _transport_dispersion(self, family, dispersion, omega, **kwargs) -> torch.Tensor:
+        """Transport model-owned full covariance under this model's immutable policy."""
+        if family is FullGaussian:
+            kwargs["precision_policy"] = self.full_cov_kl_precision
+        return family.transport_dispersion(dispersion, omega, **kwargs)
 
     def load_state_dict(
         self,
@@ -1843,7 +1859,8 @@ class VFEModel(nn.Module):
             fam = get_family(cfg.family)
             q_conv = cap["converged"]                           # q*: pre-transform converged belief
             self_div = self_divergence_for_alpha(               # (B, N) summed, or (B, N, K) per-coord
-                fam(q_conv.mu, q_conv.sigma), fam(mu_p, sigma_p),
+                self._family_instance(fam, q_conv.mu, q_conv.sigma),
+                self._family_instance(fam, mu_p, sigma_p),
                 alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
             )
@@ -2099,7 +2116,7 @@ class VFEModel(nn.Module):
         # channel does (gradients/kernels.py, oracle.py: diagonal_out=(sigma.dim()==mu.dim())). This is
         # load-bearing for the batch-independent bare link, whose batch-collapsed operator makes the
         # rank-gap heuristic mis-read a batched diagonal sigma as full; harmless (same branch) elsewhere.
-        e_s = fam.coupling_energy(                                   # (B,H,N,N) block_glk; (B,N,N) single-block
+        e_s = self._coupling_energy(fam,                             # (B,H,N,N) block_glk; (B,N,N) single-block
             s_mu, s_sigma, s_mu, s_sigma, omega,
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
@@ -2780,7 +2797,7 @@ class VFEModel(nn.Module):
             effective = omega.unsqueeze(0)
             mu, sigma = belief.mu.unsqueeze(0), belief.sigma.unsqueeze(0)
             batched = True
-        energy = fam.coupling_energy(
+        energy = self._coupling_energy(fam,
             mu, sigma, mu, sigma, effective,
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
@@ -3010,7 +3027,7 @@ class VFEModel(nn.Module):
             effective = omega.unsqueeze(0)
             mu, sigma = out.mu.unsqueeze(0), out.sigma.unsqueeze(0)
             batched = True
-        energy = fam.coupling_energy(                                # (N, N) or (H, N, N)
+        energy = self._coupling_energy(fam,                          # (N, N) or (H, N, N)
             mu, sigma, mu, sigma, effective,
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family,
@@ -3018,7 +3035,7 @@ class VFEModel(nn.Module):
         )
         coupling_energy = None
         if base_omega is not None:
-            coupling_energy = fam.coupling_energy(
+            coupling_energy = self._coupling_energy(fam,
                 mu, sigma, mu, sigma, base_omega,
                 alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family,
@@ -3038,7 +3055,8 @@ class VFEModel(nn.Module):
                 beta = beta[0]
         _q_conv = cap["converged"]                                   # q*: the F self-term reads the
         self_div = self_divergence_for_alpha(                        # pre-transform converged belief
-            fam(_q_conv.mu, _q_conv.sigma), fam(mu_p, sigma_p),      # (matches the M-step term; F19)
+            self._family_instance(fam, _q_conv.mu, _q_conv.sigma),
+            self._family_instance(fam, mu_p, sigma_p),                # (matches the M-step term; F19)
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
         )
@@ -3264,7 +3282,7 @@ class VFEModel(nn.Module):
         # divergence some other way (the backward pull of gaussian_diagonal_exact, the frame-cancelling
         # identity of gaussian_frame_diagonal) never forms Omega Sigma Omega^T, and this diagnostic
         # must still report it.
-        sandwich = fam.transport_dispersion(sigma, effective,
+        sandwich = self._transport_dispersion(fam, sigma, effective,
                                             diagonal_out=(sigma.dim() == mu.dim()))
         d["sandwich_absmax"]  = float(sandwich.abs().max())          # |Omega Sigma Omega^T| overflow vs fp32 ~1e7
         d["transport_asymmetry"]  = float(metrics.transport_asymmetry(omega).mean())
@@ -3552,7 +3570,7 @@ class VFEModel(nn.Module):
                 effective = omega.unsqueeze(0)
                 mu, sigma = state.mu.unsqueeze(0), state.sigma.unsqueeze(0)
                 batched = True
-            energy = fam.coupling_energy(                             # (N, N) or (H, N, N)
+            energy = self._coupling_energy(fam,                       # (N, N) or (H, N, N)
                 mu, sigma, mu, sigma, effective,
                 alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
@@ -3710,14 +3728,14 @@ class VFEModel(nn.Module):
                 effective = omega.unsqueeze(0)
                 mu, sigma = belief.mu.unsqueeze(0), belief.sigma.unsqueeze(0)
                 batched = True
-            energy = fam.coupling_energy(                             # (N, N) or (H, N, N)
+            energy = self._coupling_energy(fam,                       # (N, N) or (H, N, N)
                 mu, sigma, mu, sigma, effective,
                 alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
             )
             coupling_energy = None
             if base_omega is not None:
-                coupling_energy = fam.coupling_energy(
+                coupling_energy = self._coupling_energy(fam,
                     mu, sigma, mu, sigma, base_omega,
                     alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                     divergence_family=cfg.divergence_family,
@@ -3733,7 +3751,8 @@ class VFEModel(nn.Module):
                     beta = beta[0]
             _q = cap["converged"]                                    # self-term reads THIS block's prior (per-layer exact)
             self_div = self_divergence_for_alpha(
-                fam(_q.mu, _q.sigma), fam(mu_p, sigma_p),
+                self._family_instance(fam, _q.mu, _q.sigma),
+                self._family_instance(fam, mu_p, sigma_p),
                 alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
             )

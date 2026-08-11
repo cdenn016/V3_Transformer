@@ -52,6 +52,7 @@ def _bank(*, decode_mode="family_chunked", renyi_order=1.0, divergence_family="r
         n_layers=1,
         gauge_group="block_glk",
         family="gaussian_full",
+        full_cov_kl_precision="fp32_escalate",
         decode_mode=decode_mode,
         decode_chunk_size=5,
         renyi_order=renyi_order,
@@ -62,8 +63,7 @@ def _bank(*, decode_mode="family_chunked", renyi_order=1.0, divergence_family="r
         unigram_kappa=0.7 if decode_unigram_prior else 1.0,
     ).to(DEVICE)
     pb = model.prior_bank
-    # VFEModel construction publishes its configured (historically fp64) policy process-wide.
-    # The dispatch contract deliberately targets the active fp32 analytic configuration.
+    # The dispatch contract deliberately targets the model-owned fp32 analytic configuration.
     set_full_cov_kl_precision("fp32_escalate")
     prior_bank.set_decode_av_precision("fp32")
     if decode_unigram_prior:
@@ -85,7 +85,7 @@ def _spd_inputs():
 
 def _canonical(pb):
     return (
-        full_cov_kl_precision() == "fp32_escalate"
+        pb.full_cov_kl_precision == "fp32_escalate"
         and prior_bank.decode_av_precision() == "fp32"
         and pb.renyi_order == 1.0
     )

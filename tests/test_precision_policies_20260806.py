@@ -20,6 +20,7 @@ import vfe3.families.gaussian as gaussian_mod
 import vfe3.numerics as numerics_mod
 from vfe3.config import VFE3Config
 from vfe3.families.gaussian import FullGaussian, _full_gaussian_kl_terms
+from vfe3.model.model import VFEModel
 from vfe3.numerics import (
     apply_mu_trust_region,
     mu_trust_fallback_elements,
@@ -118,6 +119,35 @@ def test_fp64_policy_is_unaffected_by_the_new_spelling():
     with pytest.raises(ValueError, match="full_cov_kl_precision"):
         VFE3Config(vocab_size=32, embed_dim=K, n_heads=2, max_seq_len=8,
                    full_cov_kl_precision="nonsense")
+
+
+def test_constructing_second_model_does_not_change_first_full_gaussian_policy_or_decode():
+    """A model-owned full-Gaussian decode must retain model A's precision policy.
+
+    Replacing the process-global policy in ``VFEModel.__init__`` makes this fail: model B changes
+    model A's stored policy and its family decode result for this ill-conditioned public query.
+    """
+    common = dict(
+        vocab_size=16,
+        embed_dim=K,
+        n_heads=2,
+        max_seq_len=4,
+        family="gaussian_full",
+        use_prior_bank=True,
+        decode_mode="family",
+        full_cov_congruence_precision="fp64",
+    )
+    model_a = VFEModel(VFE3Config(**common, full_cov_kl_precision="fp64"))
+    mu = torch.zeros(1, 1, K)
+    sigma = _spd(7, seed=17).reshape(1, 1, K, K)
+    before = model_a.prior_bank.reference_decode(mu, sigma)
+
+    model_b = VFEModel(VFE3Config(**common, full_cov_kl_precision="fp32_escalate"))
+    after = model_a.prior_bank.reference_decode(mu, sigma)
+
+    assert model_a.full_cov_kl_precision == "fp64"
+    assert model_b.full_cov_kl_precision == "fp32_escalate"
+    assert torch.equal(before, after)
 
 
 # -- C3: relative jitter -----------------------------------------------------------------------

@@ -27,11 +27,19 @@ from vfe3.geometry.transport import (
     transport_mean,
 )
 from vfe3.gradients.oracle import _transport_to_float, belief_gradients_autograd
+from vfe3.families.gaussian import FullGaussian
 from vfe3.gradients.pairwise_stats import diagonal_kl_pair_stats
 from vfe3.numerics import safe_cholesky
 
 _KERNELS: Dict[str, Callable] = {}
 _COMPILED_KERNELS: Dict[str, Callable] = {}   # lazy torch.compile cache (compile_pair_kernel toggle)
+
+
+def _family_instance(family, mu: torch.Tensor, sigma: torch.Tensor, precision_policy: Optional[str]):
+    """Construct the built-in full family with an explicit model policy when supplied."""
+    if family is FullGaussian and precision_policy is not None:
+        return family(mu, sigma, _precision_policy=precision_policy)
+    return family(mu, sigma)
 
 
 @dataclass(frozen=True)
@@ -450,6 +458,7 @@ def belief_gradients(
     reuse_pairwise_kl_stats:   bool = False,   # reuse graph-live diagonal-KL pair statistics on the canonical route
     gradient_mode:             str  = "filtering",
     family:                    str  = "gaussian_diagonal",
+    full_cov_kl_precision:     Optional[str] = None,
     divergence_family:         str  = "renyi",
     lambda_alpha_mode:         str  = "constant",
     transport_mode:            str  = "flat",  # registry metadata excludes belief-dependent Omega
@@ -491,7 +500,9 @@ def belief_gradients(
             lambda_twohop=lambda_twohop,
             include_attention_entropy=include_attention_entropy, create_graph=create_graph,
             need_sigma_grad=need_sigma_grad,
-            gradient_mode=gradient_mode, family=family, divergence_family=divergence_family,
+            gradient_mode=gradient_mode, family=family,
+            full_cov_kl_precision=full_cov_kl_precision,
+            divergence_family=divergence_family,
             lambda_alpha_mode=lambda_alpha_mode, irrep_dims=irrep_dims, log_prior=log_prior,
             omega_builder=omega_builder,
         )
@@ -526,6 +537,7 @@ def belief_gradients(
                 reuse_pairwise_kl_stats=reuse_pairwise_kl_stats,
                 gradient_mode=gradient_mode,
                 family=family,
+                full_cov_kl_precision=full_cov_kl_precision,
                 divergence_family=divergence_family,
                 lambda_alpha_mode=lambda_alpha_mode,
                 transport_mode=transport_mode,
@@ -630,6 +642,7 @@ def mm_exact_update(
 
     lambda_alpha_mode: str = "constant",
     family:            str = "gaussian_diagonal",
+    full_cov_kl_precision: Optional[str] = None,
     divergence_family: str = "renyi",
 
     need_sigma_update:       bool = True,       # False -> omit sigma fusion and return the input sigma exactly
@@ -689,6 +702,7 @@ def mm_exact_update(
                 value=value,
                 lambda_alpha_mode=lambda_alpha_mode,
                 family=family,
+                full_cov_kl_precision=full_cov_kl_precision,
                 divergence_family=divergence_family,
                 need_sigma_update=need_sigma_update,
                 reuse_pairwise_kl_stats=reuse_pairwise_kl_stats,
@@ -730,7 +744,9 @@ def mm_exact_update(
     mu_t    = transport_mean(omega, mu_k)                        # (..., N, N, K) transported keys
     sigma_t = transport_covariance(omega, sigma_k, diagonal_out=(sigma_k.dim() == mu_k.dim()))
     fam = get_family(family)
-    sd = self_divergence_for_alpha(fam(mu, sigma), fam(mu_p, sigma_p), alpha=1.0, kl_max=kl_max, eps=eps,
+    sd = self_divergence_for_alpha(
+                                   _family_instance(fam, mu, sigma, full_cov_kl_precision),
+                                   _family_instance(fam, mu_p, sigma_p, full_cov_kl_precision), alpha=1.0, kl_max=kl_max, eps=eps,
                                    divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
     pair_stats = None
     decoupled_value = isinstance(omega, RopeTransport) and not omega.on_value
@@ -750,7 +766,10 @@ def mm_exact_update(
             irrep_dims=irrep_dims,
         )
     if pair_stats is None:
-        energy = pairwise_energy(fam(mu, sigma), fam.from_transported(mu_t, sigma_t, sigma_k),
+        key = (fam.from_transported(mu_t, sigma_t, sigma_k, _precision_policy=full_cov_kl_precision)
+               if fam is FullGaussian and full_cov_kl_precision is not None
+               else fam.from_transported(mu_t, sigma_t, sigma_k))
+        energy = pairwise_energy(_family_instance(fam, mu, sigma, full_cov_kl_precision), key,
                                  alpha=1.0, kl_max=kl_max, eps=eps,
                                  divergence_family=divergence_family, irrep_dims=irrep_dims)
     else:

@@ -53,7 +53,11 @@ from vfe3.model.canonical_content import pullback_diagonal_query
 from vfe3.belief import BeliefState
 from vfe3.divergence import family_cov_kind, get_family, get_functional, kl, renyi
 from vfe3.families.base import _logdet_chol
-from vfe3.families.gaussian import FullGaussian, full_cov_kl_precision
+from vfe3.families.gaussian import (
+    FullGaussian,
+    full_cov_kl_precision,
+    validate_full_cov_kl_precision,
+)
 from vfe3.families.covariance_tables import (
     covariance_from_packed,
     packed_from_covariance,
@@ -150,7 +154,7 @@ def _uses_canonical_full_family_decode(
         return False
     if type(pb.renyi_order) not in (int, float) or pb.renyi_order != 1.0:
         return False
-    if full_cov_kl_precision() != "fp32_escalate" or decode_av_precision() != "fp32":
+    if pb.full_cov_kl_precision != "fp32_escalate" or decode_av_precision() != "fp32":
         return False
 
     # Do not call _decode_sigma_log_table() here.  For the model-channel full path it materializes
@@ -269,6 +273,7 @@ def _full_family_workspace_bytes_per_scalar(
     family_cls: type,
     ref: torch.Tensor,
     *public_operands: torch.Tensor,
+    precision_policy: Optional[str] = None,
 ) -> int:
     r"""Return a conservative call-time workspace scalar size for the built-in full Gaussian.
 
@@ -280,9 +285,26 @@ def _full_family_workspace_bytes_per_scalar(
     """
     if family_cls is FullGaussian and (
             any(operand.dtype == torch.float64 for operand in public_operands)
-            or full_cov_kl_precision() in ("fp64", "fp32_escalate", "fp32_escalate_cond")):
+            or (full_cov_kl_precision() if precision_policy is None else precision_policy)
+            in ("fp64", "fp32_escalate", "fp32_escalate_cond")):
         return 8
     return ref.element_size()
+
+
+def _family_with_precision_policy(
+    family_cls: type,
+    mu: torch.Tensor,
+    sigma: torch.Tensor,
+    precision_policy: str,
+):
+    """Construct the built-in full family with its owning PriorBank policy.
+
+    Registry overrides retain their legacy constructor contract; only the built-in family consumes
+    this private model-owned policy marker.
+    """
+    if family_cls is FullGaussian:
+        return family_cls(mu, sigma, _precision_policy=precision_policy)
+    return family_cls(mu, sigma)
 
 
 def _decode_av_lhs(
@@ -671,6 +693,7 @@ class PriorBank(nn.Module):
         family:              str   = "gaussian_diagonal",
         divergence_family:   str   = "renyi",
         renyi_order:         float = 1.0,
+        full_cov_precision_policy: Optional[str] = None,
         use_prior_bank:      bool  = True,
         decode_bias:         bool  = False,
         encode_mode:         str   = "per_token",
@@ -842,6 +865,11 @@ class PriorBank(nn.Module):
         # with a canonical gaussian/renyi/alpha=1 seam. Defaults reproduce the old fixed-KL readout.
         self.divergence_family = divergence_family
         self.renyi_order = renyi_order
+        self.full_cov_kl_precision = (
+            full_cov_kl_precision()
+            if full_cov_precision_policy is None
+            else validate_full_cov_kl_precision(full_cov_precision_policy)
+        )
         self._s_cov_kind = family_cov_kind(family)
         self.use_prior_bank = use_prior_bank
         self.encode_mode = encode_mode
@@ -2154,7 +2182,7 @@ class PriorBank(nn.Module):
         # this route's own units (audit 2026-08-07). Inert for a diagonal family (inner == 1).
         inner = self.K * self.K if is_full else 1
         workspace_bytes_per_scalar = _full_family_workspace_bytes_per_scalar(
-            family_cls, mu_q, mu_q, sigma_q,
+            family_cls, mu_q, mu_q, sigma_q, precision_policy=self.full_cov_kl_precision,
         )
         chunk = _decode_ce_family_effective_chunk(
             mu_q, chunk, inner, workspace_bytes_per_scalar=workspace_bytes_per_scalar,
@@ -2192,8 +2220,10 @@ class PriorBank(nn.Module):
             here so checkpointing frees it after forward; recompute is deterministic (the functional
             has no RNG), so value and gradient match the dense family decode exactly.
             """
-            q = family_cls(q_mu_, q_sigma_)
-            p = family_cls(mu_v_c, sigma_v_c)
+            q = _family_with_precision_policy(
+                family_cls, q_mu_, q_sigma_, self.full_cov_kl_precision)
+            p = _family_with_precision_policy(
+                family_cls, mu_v_c, sigma_v_c, self.full_cov_kl_precision)
             energy = functional(q, p, alpha=self.renyi_order,
                                 kl_max=float("inf"), eps=self.eps)         # (B, N, Vc)
             logit_chunk = -energy / tau_eff                                # (B, N, Vc)
@@ -2678,7 +2708,12 @@ def _family_logits(
         eye = torch.eye(sigma_q.shape[-1], device=sigma_q.device, dtype=sigma_q.dtype)
         sigma_q = torch.where(degenerate[..., None, None], eye.expand_as(sigma_q), sigma_q)
 
-    q = family_cls(mu_q.unsqueeze(-2), sigma_q.unsqueeze(-3 if is_full else -2))
+    q = _family_with_precision_policy(
+        family_cls,
+        mu_q.unsqueeze(-2),
+        sigma_q.unsqueeze(-3 if is_full else -2),
+        pb.full_cov_kl_precision,
+    )
     p_sigma_all = bounded_variance_from_log(
         pb._decode_sigma_log_table(), eps=pb.eps
     )                                                                       # (V, K) diagonal prior variances
@@ -2690,7 +2725,7 @@ def _family_logits(
         requested = max(1, min(int(chunk), V))
         inner = pb.K * pb.K if is_full else 1
         workspace_bytes_per_scalar = _full_family_workspace_bytes_per_scalar(
-            family_cls, mu_q, mu_q, sigma_q,
+            family_cls, mu_q, mu_q, sigma_q, precision_policy=pb.full_cov_kl_precision,
         )
         width = _decode_ce_family_effective_chunk(
             mu_q, requested, inner, workspace_bytes_per_scalar=workspace_bytes_per_scalar,
@@ -2699,8 +2734,12 @@ def _family_logits(
     for v0 in range(0, V, width):
         v1 = min(v0 + width, V)
         p_sigma_c = p_sigma_all[v0:v1]                                      # (Vc, K)
-        p = family_cls(mu_v_all[v0:v1],
-                       torch.diag_embed(p_sigma_c) if is_full else p_sigma_c)
+        p = _family_with_precision_policy(
+            family_cls,
+            mu_v_all[v0:v1],
+            torch.diag_embed(p_sigma_c) if is_full else p_sigma_c,
+            pb.full_cov_kl_precision,
+        )
         energy = functional(q, p, alpha=pb.renyi_order,
                             kl_max=float("inf"), eps=pb.eps)                # (B, N, Vc)
         slices.append(-energy / tau_eff)

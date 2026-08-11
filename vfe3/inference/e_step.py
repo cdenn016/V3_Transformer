@@ -20,6 +20,7 @@ from vfe3.alpha_i import self_coupling_alpha
 from vfe3.belief import BeliefState
 from vfe3.contracts import EStepGradientRecord
 from vfe3.families.base import get_family, kl
+from vfe3.families.gaussian import FullGaussian
 from vfe3.free_energy import attention_weights, free_energy, reduced_free_energy, self_divergence_for_alpha
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.lie_ops import CompactBlockElement
@@ -51,6 +52,20 @@ _E_STEP_UPDATE_ALIASES = {
     "gradient":               "gradient",
     "mm_exact":               "mm_exact",
 }
+
+
+def _coupling_energy(family, *args, precision_policy: Optional[str] = None, **kwargs) -> torch.Tensor:
+    """Call the built-in full family with a model-owned policy; other families stay unchanged."""
+    if family is FullGaussian and precision_policy is not None:
+        kwargs["precision_policy"] = precision_policy
+    return family.coupling_energy(*args, **kwargs)
+
+
+def _family_instance(family, mu: torch.Tensor, sigma: torch.Tensor, precision_policy: Optional[str]):
+    """Construct the built-in full family with an explicit model policy when supplied."""
+    if family is FullGaussian and precision_policy is not None:
+        return family(mu, sigma, _precision_policy=precision_policy)
+    return family(mu, sigma)
 
 
 def canonical_e_step_update(name: str) -> str:
@@ -490,6 +505,7 @@ def free_energy_value(
     rope_on_cov:               bool = False,           # full-gauge: rotate the covariance sandwich too
     rope_on_value:             bool = True,            # False -> value aggregation uses the un-rotated base
     family:                    str  = "gaussian_diagonal",
+    full_cov_kl_precision:     Optional[str] = None,
     divergence_family:         str  = "renyi",
     lambda_alpha_mode:         str  = "constant",
     gradient_mode:             str  = "filtering",     # accepted-and-ignored iteration-only knob
@@ -651,18 +667,22 @@ def free_energy_value(
         k_mu, k_sigma = key_belief.mu.unsqueeze(0), key_belief.sigma.unsqueeze(0)
         batched = True
 
-    sd = self_divergence_for_alpha(fam(belief.mu, belief.sigma), fam(mu_p, sigma_p), alpha=renyi_order, kl_max=kl_max,
+    sd = self_divergence_for_alpha(
+                                   _family_instance(fam, belief.mu, belief.sigma, full_cov_kl_precision),
+                                   _family_instance(fam, mu_p, sigma_p, full_cov_kl_precision), alpha=renyi_order, kl_max=kl_max,
                                    eps=eps, divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
     alpha, reg = self_coupling_alpha(sd, value=value, mode=lambda_alpha_mode, b0=b0, c0=c0)
-    energy = fam.coupling_energy(q_mu, q_sigma, k_mu, k_sigma, effective,
-                                 alpha=renyi_order, kl_max=kl_max, eps=eps,
-                                 divergence_family=divergence_family, irrep_dims=group.irrep_dims)
+    energy = _coupling_energy(fam, q_mu, q_sigma, k_mu, k_sigma, effective,
+                               precision_policy=full_cov_kl_precision,
+                               alpha=renyi_order, kl_max=kl_max, eps=eps,
+                               divergence_family=divergence_family, irrep_dims=group.irrep_dims)
     coupling_energy = None
     if base_omega is not None:
-        coupling_energy = fam.coupling_energy(q_mu, q_sigma, k_mu, k_sigma, base_omega,
-                                              alpha=renyi_order, kl_max=kl_max, eps=eps,
-                                              divergence_family=divergence_family,
-                                              irrep_dims=group.irrep_dims)
+        coupling_energy = _coupling_energy(
+            fam, q_mu, q_sigma, k_mu, k_sigma, base_omega,
+            precision_policy=full_cov_kl_precision,
+            alpha=renyi_order, kl_max=kl_max, eps=eps,
+            divergence_family=divergence_family, irrep_dims=group.irrep_dims)
     if batched:
         energy = energy[0]
     F = free_energy(
@@ -720,6 +740,7 @@ def phi_alignment_loss(
     lambda_beta: 'float | torch.Tensor' = 1.0,        # weight on the belief-coupling block (1.0 = pure)
     lambda_twohop: float = 0.0,                        # weight on the detached two-hop coupling block (0.0 = OFF)
     family:    str   = "gaussian_diagonal",
+    full_cov_kl_precision: Optional[str] = None,
     divergence_family: str = "renyi",
 
     include_attention_entropy: bool  = True,
@@ -808,9 +829,10 @@ def phi_alignment_loss(
     # The family coupling seam owns the whole transport + divergence composition (see
     # BeliefParams.coupling_energy), so the phi step descends the SAME energy the belief step does
     # under any family, including one that evaluates the transported divergence exactly.
-    score_energy = fam.coupling_energy(mu, sigma, mu, sigma, omega, alpha=renyi_order,
-                                       kl_max=kl_max, eps=eps, divergence_family=divergence_family,
-                                       irrep_dims=group.irrep_dims)
+    score_energy = _coupling_energy(
+        fam, mu, sigma, mu, sigma, omega, precision_policy=full_cov_kl_precision,
+        alpha=renyi_order, kl_max=kl_max, eps=eps, divergence_family=divergence_family,
+        irrep_dims=group.irrep_dims)
     mass = 0.5 * mass_phi * (phi ** 2).sum() if mass_phi > 0.0 else 0.0
     # value_energy is the coupling-sum energy grid: the SCORE energy on the coherent default, the
     # UN-rotated base VALUE energy under the decoupled RoPE gauge. Both the base coupling block and
@@ -818,10 +840,10 @@ def phi_alignment_loss(
     value_energy = score_energy
     has_decoupled_value = isinstance(omega, RopeTransport) and not omega.on_value
     if has_decoupled_value:
-        value_energy = fam.coupling_energy(mu, sigma, mu, sigma, omega.base, alpha=renyi_order,
-                                           kl_max=kl_max, eps=eps,
-                                           divergence_family=divergence_family,
-                                           irrep_dims=group.irrep_dims)
+        value_energy = _coupling_energy(
+            fam, mu, sigma, mu, sigma, omega.base, precision_policy=full_cov_kl_precision,
+            alpha=renyi_order, kl_max=kl_max, eps=eps,
+            divergence_family=divergence_family, irrep_dims=group.irrep_dims)
         zero = score_energy.new_zeros(score_energy.shape[:-1])
         base = free_energy(
             zero, score_energy, zero,
@@ -880,6 +902,7 @@ def e_step_iteration(
     reuse_pairwise_kl_stats:   bool = False,             # opt-in P3 statistics reuse
     gradient_mode:             str  = "filtering",
     family:                    str  = "gaussian_diagonal",
+    full_cov_kl_precision:     Optional[str] = None,
     divergence_family:         str  = "renyi",
     lambda_alpha_mode:         str  = "constant",
     phi_precond_mode:          str  = "none",
@@ -1063,7 +1086,9 @@ def e_step_iteration(
             belief.mu, belief.sigma, mu_p, sigma_p, omega,
             tau=tau, b0=b0, c0=c0, lambda_beta=lambda_beta,
             kl_max=kl_max, eps=eps, lambda_twohop=lambda_twohop, value=value,
-            lambda_alpha_mode=lambda_alpha_mode, family=family, divergence_family=divergence_family,
+            lambda_alpha_mode=lambda_alpha_mode, family=family,
+            full_cov_kl_precision=full_cov_kl_precision,
+            divergence_family=divergence_family,
             need_sigma_update=(not skip_belief_sigma_update),
             reuse_pairwise_kl_stats=reuse_pairwise_kl_stats,
             irrep_dims=group.irrep_dims, log_prior=log_prior,
@@ -1113,7 +1138,8 @@ def e_step_iteration(
             lambda_twohop=lambda_twohop,
             kl_max=kl_max, eps=eps,
             include_attention_entropy=include_attention_entropy, gradient_mode=gradient_mode,
-            family=family, divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode,
+            family=family, full_cov_kl_precision=full_cov_kl_precision,
+            divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode,
             transport_mode=transport_mode, omega_builder=omega_builder,
             irrep_dims=group.irrep_dims, log_prior=log_prior,
             # skip_belief_sigma_update: the kernel skips the (B,N,N,K) sigma pair contraction
@@ -1218,6 +1244,7 @@ def e_step_iteration(
                 mu, sigma, phi_g, group, tau=tau, renyi_order=renyi_order, kl_max=kl_max, eps=eps,
                 mass_phi=mass_phi, lambda_beta=lambda_beta, lambda_twohop=lambda_twohop,
                 family=family, divergence_family=divergence_family,
+                full_cov_kl_precision=full_cov_kl_precision,
                 include_attention_entropy=include_attention_entropy, log_prior=log_prior,
                 transport_mode=transport_mode, cocycle_relaxation=cocycle_relaxation,
                 # gauge-RoPE: the phi step must descend the SAME rotated belief-coupling block as the
