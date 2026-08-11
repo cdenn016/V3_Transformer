@@ -1170,14 +1170,14 @@ def _optimizer_populated_slot_manifest(
     }
 
 
-_OPTIMIZER_PARAMETER_MANIFEST_SCHEMA_VERSION = 1
+_OPTIMIZER_PARAMETER_MANIFEST_SCHEMA_VERSION = 2
 
 
-def _optimizer_parameter_manifest_payload(
+def _optimizer_parameter_name_shape_groups(
     model:     torch.nn.Module,
     optimizer: torch.optim.Optimizer,
-) -> Dict[str, object]:
-    """Describe optimizer parameters by canonical model name in exact group order."""
+) -> List[List[Dict[str, object]]]:
+    """Describe live optimizer parameters without comparing checkpoint-local numeric IDs."""
     name_by_identity: Dict[int, str] = {}
     for name, parameter in model.named_parameters(remove_duplicate=False):
         identity = id(parameter)
@@ -1202,6 +1202,37 @@ def _optimizer_parameter_manifest_payload(
             seen.add(identity)
             entries.append({"name": name, "shape": list(parameter.shape)})
         parameter_groups.append(entries)
+    return parameter_groups
+
+
+def _optimizer_parameter_manifest_payload(
+    model:           torch.nn.Module,
+    optimizer:       torch.optim.Optimizer,
+    optimizer_state: Mapping[str, object],
+) -> Dict[str, object]:
+    """Bind checkpoint-local slot IDs to canonical names/shapes in exact group order."""
+    saved_groups = optimizer_state.get("param_groups")
+    if not isinstance(saved_groups, list):
+        raise RuntimeError("optimizer state param_groups must be a list")
+    name_shape_groups = _optimizer_parameter_name_shape_groups(model, optimizer)
+    if len(saved_groups) != len(name_shape_groups):
+        raise RuntimeError("optimizer state parameter-group count mismatch")
+
+    seen_ids: set[int] = set()
+    parameter_groups: List[List[Dict[str, object]]] = []
+    for saved_group, name_shape_group in zip(saved_groups, name_shape_groups):
+        if not isinstance(saved_group, Mapping):
+            raise RuntimeError("optimizer state parameter group must be a mapping")
+        parameter_ids = saved_group.get("params")
+        if not isinstance(parameter_ids, list) or len(parameter_ids) != len(name_shape_group):
+            raise RuntimeError("optimizer state parameter topology mismatch")
+        entries: List[Dict[str, object]] = []
+        for parameter_id, name_shape in zip(parameter_ids, name_shape_group):
+            if type(parameter_id) is not int or parameter_id < 0 or parameter_id in seen_ids:
+                raise RuntimeError("optimizer state parameter ids are invalid")
+            seen_ids.add(parameter_id)
+            entries.append({"parameter_id": parameter_id, **name_shape})
+        parameter_groups.append(entries)
     return {
         "schema_version": _OPTIMIZER_PARAMETER_MANIFEST_SCHEMA_VERSION,
         "parameter_groups": parameter_groups,
@@ -1209,10 +1240,11 @@ def _optimizer_parameter_manifest_payload(
 
 
 def _optimizer_parameter_manifest(
-    model:     torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
+    model:           torch.nn.Module,
+    optimizer:       torch.optim.Optimizer,
+    optimizer_state: Mapping[str, object],
 ) -> Dict[str, object]:
-    payload = _optimizer_parameter_manifest_payload(model, optimizer)
+    payload = _optimizer_parameter_manifest_payload(model, optimizer, optimizer_state)
     encoded = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
     ).encode("ascii")
@@ -1220,11 +1252,12 @@ def _optimizer_parameter_manifest(
 
 
 def _validate_optimizer_parameter_manifest(
-    manifest:  object,
-    model:     torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
+    manifest:        object,
+    optimizer_state: object,
+    model:           torch.nn.Module,
+    optimizer:       torch.optim.Optimizer,
 ) -> Mapping[str, object]:
-    """Verify manifest integrity and exact live parameter name/shape/group ordering."""
+    """Verify digest, serialized ID binding, and live name/shape/group ordering."""
     expected_fields = {"schema_version", "parameter_groups", "sha256"}
     if not isinstance(manifest, Mapping) or set(manifest) != expected_fields:
         raise RuntimeError("checkpoint optimizer parameter manifest has an invalid schema")
@@ -1239,10 +1272,14 @@ def _validate_optimizer_parameter_manifest(
         if not isinstance(group, list):
             raise RuntimeError("checkpoint optimizer parameter manifest group must be a list")
         for entry in group:
-            if not isinstance(entry, Mapping) or set(entry) != {"name", "shape"}:
+            if (not isinstance(entry, Mapping)
+                    or set(entry) != {"parameter_id", "name", "shape"}):
                 raise RuntimeError("checkpoint optimizer parameter manifest entry is invalid")
+            parameter_id = entry["parameter_id"]
             name = entry["name"]
             shape = entry["shape"]
+            if type(parameter_id) is not int or parameter_id < 0:
+                raise RuntimeError("checkpoint optimizer parameter manifest id is invalid")
             if not isinstance(name, str) or not name:
                 raise RuntimeError("checkpoint optimizer parameter manifest name is invalid")
             if (not isinstance(shape, list)
@@ -1256,7 +1293,31 @@ def _validate_optimizer_parameter_manifest(
     ).encode("ascii")
     if digest != hashlib.sha256(encoded).hexdigest():
         raise RuntimeError("checkpoint optimizer parameter manifest digest mismatch")
-    if payload != _optimizer_parameter_manifest_payload(model, optimizer):
+
+    if not isinstance(optimizer_state, Mapping):
+        raise RuntimeError("checkpoint optimizer_state must be a mapping")
+    saved_groups = optimizer_state.get("param_groups")
+    if not isinstance(saved_groups, list) or len(saved_groups) != len(groups):
+        raise RuntimeError(
+            "checkpoint optimizer parameter manifest does not match the serialized optimizer")
+    manifest_ids: List[List[int]] = []
+    saved_ids: List[List[int]] = []
+    for manifest_group, saved_group in zip(groups, saved_groups):
+        if not isinstance(saved_group, Mapping) or not isinstance(saved_group.get("params"), list):
+            raise RuntimeError(
+                "checkpoint optimizer parameter manifest does not match the serialized optimizer")
+        manifest_ids.append([entry["parameter_id"] for entry in manifest_group])
+        saved_ids.append(list(saved_group["params"]))
+    if manifest_ids != saved_ids:
+        raise RuntimeError(
+            "checkpoint optimizer parameter manifest does not match the serialized optimizer "
+            "parameter ID order")
+
+    manifest_name_shapes = [
+        [{"name": entry["name"], "shape": entry["shape"]} for entry in group]
+        for group in groups
+    ]
+    if manifest_name_shapes != _optimizer_parameter_name_shape_groups(model, optimizer):
         raise RuntimeError(
             "checkpoint optimizer parameter manifest does not match the live optimizer")
     return manifest
@@ -1801,7 +1862,9 @@ class RunArtifacts:
             saved_best_step    = None
         optimizer_state = optimizer.state_dict()
         optimizer_slot_manifest = _optimizer_populated_slot_manifest(optimizer_state)
-        optimizer_parameter_manifest = _optimizer_parameter_manifest(model, optimizer)
+        optimizer_parameter_manifest = _optimizer_parameter_manifest(
+            model, optimizer, optimizer_state,
+        )
         with _unique_sibling_temp(path) as tmp:
             torch.save({
                 "step":            step,
@@ -2171,7 +2234,10 @@ def load_checkpoint(
     if optimizer is not None:
         if "optimizer_parameter_manifest" in ckpt:
             _validate_optimizer_parameter_manifest(
-                ckpt.get("optimizer_parameter_manifest"), model, optimizer,
+                ckpt.get("optimizer_parameter_manifest"),
+                ckpt.get("optimizer_state"),
+                model,
+                optimizer,
             )
         else:
             saved_code_identity = ckpt.get("code_identity_sha256")

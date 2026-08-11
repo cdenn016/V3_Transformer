@@ -384,6 +384,39 @@ def test_load_checkpoint_rejects_same_shape_parameter_reordering_by_name_before_
     _assert_nested_equal(target_optimizer.state_dict(), optimizer_before)
 
 
+def test_load_checkpoint_rejects_serialized_parameter_id_permutation_before_mutation(tmp_path):
+    """Checkpoint-local slot IDs must remain bound to their digested parameter names."""
+    cfg = _cfg()
+    source = _SameShapeParameters()
+    source_optimizer = torch.optim.AdamW([source.first, source.second])
+    loss = source.first.sum() + 3.0 * source.second.sum()
+    loss.backward()
+    source_optimizer.step()
+    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
+        1, source, source_optimizer, cfg,
+    )
+    bundle = torch.load(checkpoint, weights_only=True)
+    saved_ids = bundle["optimizer_state"]["param_groups"][0]["params"]
+    assert len(saved_ids) == 2
+    first_moment = bundle["optimizer_state"]["state"][saved_ids[0]]["exp_avg"]
+    second_moment = bundle["optimizer_state"]["state"][saved_ids[1]]["exp_avg"]
+    assert not torch.equal(first_moment, second_moment)
+    bundle["optimizer_state"]["param_groups"][0]["params"] = list(reversed(saved_ids))
+    malformed = tmp_path / "permuted-optimizer-parameter-ids.pt"
+    torch.save(bundle, malformed)
+
+    target = _SameShapeParameters()
+    target_optimizer = torch.optim.AdamW([target.first, target.second])
+    model_before = copy.deepcopy(target.state_dict())
+    optimizer_before = copy.deepcopy(target_optimizer.state_dict())
+
+    with pytest.raises(RuntimeError, match="parameter manifest.*serialized optimizer"):
+        load_checkpoint(malformed, target, target_optimizer, cfg=cfg, restore_rng=False)
+
+    _assert_nested_equal(target.state_dict(), model_before)
+    _assert_nested_equal(target_optimizer.state_dict(), optimizer_before)
+
+
 def test_load_checkpoint_rejects_tampered_optimizer_parameter_manifest_digest(tmp_path):
     cfg, _, checkpoint = _populated_optimizer_checkpoint(tmp_path)
     bundle = torch.load(checkpoint, weights_only=True)
@@ -405,10 +438,16 @@ def test_load_checkpoint_rejects_tampered_optimizer_parameter_manifest_digest(tm
 def test_optimizer_parameter_manifest_uses_first_registration_name_for_tied_parameter():
     model = _TiedParameters()
     optimizer = torch.optim.AdamW([model.alias])
+    optimizer_state = optimizer.state_dict()
+    parameter_id = optimizer_state["param_groups"][0]["params"][0]
 
-    manifest = run_artifacts._optimizer_parameter_manifest(model, optimizer)
+    manifest = run_artifacts._optimizer_parameter_manifest(model, optimizer, optimizer_state)
 
-    assert manifest["parameter_groups"] == [[{"name": "canonical", "shape": [2]}]]
+    assert manifest["parameter_groups"] == [[{
+        "parameter_id": parameter_id,
+        "name": "canonical",
+        "shape": [2],
+    }]]
 
 
 @pytest.mark.parametrize("second_moment", ("exp_avg_sq", "max_exp_avg_sq"))

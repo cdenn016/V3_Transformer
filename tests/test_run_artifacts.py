@@ -412,16 +412,20 @@ def test_save_checkpoint_is_loadable(tmp_path):
     assert "optimizer_populated_slot_manifest" in ckpt
     manifest = ckpt["optimizer_parameter_manifest"]
     assert set(manifest) == {"schema_version", "parameter_groups", "sha256"}
-    assert manifest["schema_version"] == 1
+    assert manifest["schema_version"] == 2
     expected_groups = []
     name_by_parameter = {id(parameter): name for name, parameter in model.named_parameters()}
-    for group in opt.param_groups:
+    for group, saved_group in zip(opt.param_groups, ckpt["optimizer_state"]["param_groups"]):
         expected_groups.append([
-            {"name": name_by_parameter[id(parameter)], "shape": list(parameter.shape)}
-            for parameter in group["params"]
+            {
+                "parameter_id": parameter_id,
+                "name": name_by_parameter[id(parameter)],
+                "shape": list(parameter.shape),
+            }
+            for parameter_id, parameter in zip(saved_group["params"], group["params"])
         ])
     assert manifest["parameter_groups"] == expected_groups
-    payload = {"schema_version": 1, "parameter_groups": expected_groups}
+    payload = {"schema_version": 2, "parameter_groups": expected_groups}
     encoded = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
     ).encode("ascii")
