@@ -2234,9 +2234,12 @@ def test_active_block_mlp_checkpoint_roundtrip_and_topology_mismatch(tmp_path):
 
     inactive_cfg = _cfg(use_block_mlp=False, n_layers=2)
     inactive = VFEModel(inactive_cfg).eval()
+    inactive_optimizer = build_optimizer(inactive, inactive_cfg)
     before = copy.deepcopy(inactive.state_dict())
+    optimizer_before = copy.deepcopy(inactive_optimizer.state_dict())
     with pytest.raises((RuntimeError, ValueError)):
         load_checkpoint(
-            checkpoint, inactive, build_optimizer(inactive, inactive_cfg), cfg=inactive_cfg,
+            checkpoint, inactive, inactive_optimizer, cfg=inactive_cfg,
         )
     _assert_nested_equal(inactive.state_dict(), before)
+    _assert_nested_equal(inactive_optimizer.state_dict(), optimizer_before)

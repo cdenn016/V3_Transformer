@@ -1210,10 +1210,14 @@ def test_cost_model_counts_untied_block_mlp_params_and_flops():
     K, expansion, layers = 6, 3, 2
     model = _cost_model(K=K, n_gen=5, n_blocks=2)
     cfg = _cost_cfg(n_layers=layers, use_block_mlp=True, block_mlp_expansion=expansion)
+    off_cfg = _cost_cfg(n_layers=layers, use_block_mlp=False, block_mlp_expansion=expansion)
     out = _cost_model_fields(model, cfg, n_params=123, tokens_seen=13)
+    off = _cost_model_fields(model, off_cfg, n_params=123, tokens_seen=13)
     per_layer = 2 * expansion * K * K + (expansion + 1) * K
     mlp_flops = 4.0 * layers * expansion * K * K
     base_active = (2 * K + 5) + 11 * K
 
+    assert off["active_params_per_token"] == base_active
+    assert out["active_params_per_token"] - base_active == layers * per_layer
     assert out["block_mlp_params"] == layers * per_layer
     assert out["flops_per_token_block_mlp"] == mlp_flops
