@@ -330,6 +330,10 @@ def test_legacy_optimizer_resume_fails_before_mutating_live_state(tmp_path) -> N
     artifacts = RunArtifacts(tmp_path / "source", cfg, source)
     checkpoint = artifacts.save_checkpoint(0, source, optimizer, cfg)
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    # This fixture models the pre-manifest checkpoint topology that still carried the two dormant
+    # token-prior parameters. Keeping a current manifest while rewriting the optimizer groups would
+    # instead create a corrupt modern bundle, correctly rejected at the earlier manifest gate.
+    payload.pop("optimizer_parameter_manifest")
     payload["model_state"] = _legacy_model_state(source)
     groups = payload["optimizer_state"]["param_groups"]
     parameter_ids = [parameter_id for group in groups for parameter_id in group["params"]]
