@@ -23,6 +23,7 @@ is best-effort (a plotting/dependency error is logged, never fatal) so the numer
 survive a viz problem.
 """
 
+import copy
 import csv
 import hashlib
 import json
@@ -1117,14 +1118,9 @@ def _validate_optimizer_state(
             if keys != expected_keys:
                 raise RuntimeError("checkpoint optimizer_state has an invalid AdamW slot schema")
             step = state["step"]
-            expected_step_device = (
-                parameter.device
-                if bool(group.get("fused", False)) or bool(group.get("capturable", False))
-                else torch.device("cpu")
-            )
             valid_step = (
                 isinstance(step, torch.Tensor)
-                and step.device == expected_step_device
+                and step.device.type == "cpu"
                 and step.dtype == torch.float32
                 and step.layout == torch.strided
                 and step.ndim == 0
@@ -1141,12 +1137,16 @@ def _validate_optimizer_state(
             for name in tensor_slots:
                 value = state[name]
                 if (not isinstance(value, torch.Tensor)
+                        or value.device.type != "cpu"
                         or value.shape != parameter.shape
                         or value.dtype != parameter.dtype
                         or value.layout != parameter.layout
                         or not bool(torch.isfinite(value).all())):
                     raise RuntimeError(
                         f"checkpoint optimizer_state {name} is incompatible with its parameter")
+                if name in {"exp_avg_sq", "max_exp_avg_sq"} and bool((value < 0).any()):
+                    raise RuntimeError(
+                        f"checkpoint optimizer_state {name} must be nonnegative")
         else:
             raise RuntimeError("checkpoint optimizer_state contains unsupported parameter slots")
     return saved_state
@@ -1168,6 +1168,196 @@ def _optimizer_populated_slot_manifest(
         "parameter_ids": parameter_ids,
         "sha256":        hashlib.sha256(encoded).hexdigest(),
     }
+
+
+_OPTIMIZER_PARAMETER_MANIFEST_SCHEMA_VERSION = 1
+
+
+def _optimizer_parameter_manifest_payload(
+    model:     torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> Dict[str, object]:
+    """Describe optimizer parameters by canonical model name in exact group order."""
+    name_by_identity: Dict[int, str] = {}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        identity = id(parameter)
+        # Weight tying can intentionally register one Parameter under multiple module paths.
+        # PyTorch's canonical named_parameters() convention is the first registration name.
+        name_by_identity.setdefault(identity, name)
+
+    seen: set[int] = set()
+    parameter_groups: List[List[Dict[str, object]]] = []
+    for group in optimizer.param_groups:
+        parameters = group.get("params")
+        if not isinstance(parameters, list):
+            raise RuntimeError("optimizer parameter group params must be a list")
+        entries: List[Dict[str, object]] = []
+        for parameter in parameters:
+            identity = id(parameter)
+            name = name_by_identity.get(identity)
+            if name is None:
+                raise RuntimeError("optimizer contains a parameter not owned by the model")
+            if identity in seen:
+                raise RuntimeError("optimizer contains a parameter more than once")
+            seen.add(identity)
+            entries.append({"name": name, "shape": list(parameter.shape)})
+        parameter_groups.append(entries)
+    return {
+        "schema_version": _OPTIMIZER_PARAMETER_MANIFEST_SCHEMA_VERSION,
+        "parameter_groups": parameter_groups,
+    }
+
+
+def _optimizer_parameter_manifest(
+    model:     torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> Dict[str, object]:
+    payload = _optimizer_parameter_manifest_payload(model, optimizer)
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("ascii")
+    return {**payload, "sha256": hashlib.sha256(encoded).hexdigest()}
+
+
+def _validate_optimizer_parameter_manifest(
+    manifest:  object,
+    model:     torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> Mapping[str, object]:
+    """Verify manifest integrity and exact live parameter name/shape/group ordering."""
+    expected_fields = {"schema_version", "parameter_groups", "sha256"}
+    if not isinstance(manifest, Mapping) or set(manifest) != expected_fields:
+        raise RuntimeError("checkpoint optimizer parameter manifest has an invalid schema")
+    version = manifest["schema_version"]
+    groups = manifest["parameter_groups"]
+    digest = manifest["sha256"]
+    if type(version) is not int or version != _OPTIMIZER_PARAMETER_MANIFEST_SCHEMA_VERSION:
+        raise RuntimeError("checkpoint optimizer parameter manifest has an unsupported schema version")
+    if not isinstance(groups, list):
+        raise RuntimeError("checkpoint optimizer parameter manifest parameter_groups must be a list")
+    for group in groups:
+        if not isinstance(group, list):
+            raise RuntimeError("checkpoint optimizer parameter manifest group must be a list")
+        for entry in group:
+            if not isinstance(entry, Mapping) or set(entry) != {"name", "shape"}:
+                raise RuntimeError("checkpoint optimizer parameter manifest entry is invalid")
+            name = entry["name"]
+            shape = entry["shape"]
+            if not isinstance(name, str) or not name:
+                raise RuntimeError("checkpoint optimizer parameter manifest name is invalid")
+            if (not isinstance(shape, list)
+                    or any(type(dimension) is not int or dimension < 0 for dimension in shape)):
+                raise RuntimeError("checkpoint optimizer parameter manifest shape is invalid")
+    if not isinstance(digest, str):
+        raise RuntimeError("checkpoint optimizer parameter manifest digest is invalid")
+    payload = {"schema_version": version, "parameter_groups": groups}
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("ascii")
+    if digest != hashlib.sha256(encoded).hexdigest():
+        raise RuntimeError("checkpoint optimizer parameter manifest digest mismatch")
+    if payload != _optimizer_parameter_manifest_payload(model, optimizer):
+        raise RuntimeError(
+            "checkpoint optimizer parameter manifest does not match the live optimizer")
+    return manifest
+
+
+def _validate_realized_optimizer_state(
+    optimizer:          torch.optim.Optimizer,
+    saved_step:         int,
+    successful_updates: Optional[int],
+) -> None:
+    """Validate optimizer tensors after load placement onto their live parameters."""
+    maximum_slot_step = successful_updates if successful_updates is not None else saved_step
+    owner_by_identity: Dict[int, Tuple[torch.Tensor, Mapping[str, object]]] = {}
+    for group in optimizer.param_groups:
+        parameters = group.get("params")
+        if not isinstance(parameters, list):
+            raise RuntimeError("realized optimizer group params must be a list")
+        for parameter in parameters:
+            identity = id(parameter)
+            if identity in owner_by_identity:
+                raise RuntimeError("realized optimizer contains a duplicate parameter")
+            owner_by_identity[identity] = (parameter, group)
+
+    for parameter, state in optimizer.state.items():
+        owned = owner_by_identity.get(id(parameter))
+        if owned is None:
+            raise RuntimeError("realized optimizer state has an unknown parameter")
+        parameter, group = owned
+        if not isinstance(state, Mapping):
+            raise RuntimeError("realized optimizer parameter slot must be a mapping")
+        if not state:
+            continue
+        keys = set(state)
+        if bool(group.get("pullback_group", False)):
+            raise RuntimeError("realized optimizer has state for a stateless pullback parameter")
+        if bool(group.get("omega", False)):
+            dirty = state.get("omega_dirty")
+            if (keys != {"omega_dirty"} or not isinstance(dirty, torch.Tensor)
+                    or dirty.device != parameter.device or dirty.dtype != torch.bool
+                    or dirty.shape != (parameter.shape[0],)):
+                raise RuntimeError("realized optimizer omega_dirty is incompatible")
+            continue
+        expected_keys = {"step", "exp_avg", "exp_avg_sq"}
+        if bool(group.get("amsgrad", False)):
+            expected_keys.add("max_exp_avg_sq")
+        if keys != expected_keys:
+            raise RuntimeError("realized optimizer has an invalid AdamW slot schema")
+        step = state["step"]
+        expected_step_device = (
+            parameter.device
+            if bool(group.get("fused", False)) or bool(group.get("capturable", False))
+            else torch.device("cpu")
+        )
+        valid_step = (
+            isinstance(step, torch.Tensor)
+            and step.device == expected_step_device
+            and step.dtype == torch.float32
+            and step.layout == torch.strided
+            and step.ndim == 0
+            and bool(torch.isfinite(step))
+            and float(step) >= 0.0
+            and float(step).is_integer()
+            and float(step) <= maximum_slot_step
+        )
+        if not valid_step:
+            raise RuntimeError("realized optimizer AdamW step is invalid")
+        tensor_slots = ["exp_avg", "exp_avg_sq"]
+        if bool(group.get("amsgrad", False)):
+            tensor_slots.append("max_exp_avg_sq")
+        for name in tensor_slots:
+            value = state[name]
+            if (not isinstance(value, torch.Tensor)
+                    or value.device != parameter.device
+                    or value.shape != parameter.shape
+                    or value.dtype != parameter.dtype
+                    or value.layout != parameter.layout
+                    or not bool(torch.isfinite(value).all())):
+                raise RuntimeError(f"realized optimizer {name} is incompatible with its parameter")
+            if name in {"exp_avg_sq", "max_exp_avg_sq"} and bool((value < 0).any()):
+                raise RuntimeError(f"realized optimizer {name} must be nonnegative")
+
+
+def _optimizer_state_with_live_group_metadata(
+    saved_state:        Mapping[str, object],
+    optimizer:          torch.optim.Optimizer,
+    successful_updates: Optional[int],
+) -> Dict[str, object]:
+    """Prepare a private load copy whose placement flags come from the live optimizer."""
+    # Avoid duplicating the potentially multi-gigabyte CPU moment bundle. PyTorch constructs the
+    # realized state mapping during load; only the small group metadata needs an owned copy here.
+    state_to_load = dict(saved_state)
+    saved_groups = saved_state["param_groups"]
+    live_groups: List[Dict[str, object]] = []
+    for saved_group, current_group in zip(saved_groups, optimizer.param_groups):
+        group = copy.deepcopy({key: value for key, value in current_group.items() if key != "params"})
+        group["params"] = list(saved_group["params"])
+        if successful_updates is not None:
+            group["successful_updates"] = successful_updates
+        live_groups.append(group)
+    state_to_load["param_groups"] = live_groups
+    return state_to_load
 
 
 def _validate_scaler_state(
@@ -1611,12 +1801,14 @@ class RunArtifacts:
             saved_best_step    = None
         optimizer_state = optimizer.state_dict()
         optimizer_slot_manifest = _optimizer_populated_slot_manifest(optimizer_state)
+        optimizer_parameter_manifest = _optimizer_parameter_manifest(model, optimizer)
         with _unique_sibling_temp(path) as tmp:
             torch.save({
                 "step":            step,
                 "model_state":     model.state_dict(),
                 "optimizer_state": optimizer_state,
                 "optimizer_populated_slot_manifest": optimizer_slot_manifest,
+                "optimizer_parameter_manifest": optimizer_parameter_manifest,
                 "rng_state":       rng_state,
                 "metropolis_rng_state": (metropolis_generator.get_state()
                                           if metropolis_generator is not None else None),
@@ -1969,9 +2161,28 @@ def load_checkpoint(
                 "phi update runtime; restart from model weights/current config without restoring "
                 "the retired optimizer state"
             )
+    expected_code_identity = (
+        artifacts.code_identity_sha256
+        if artifacts is not None
+        else _verified_process_code_identity()
+    )
     saved_optimizer_state = None
     successful_updates = None
     if optimizer is not None:
+        if "optimizer_parameter_manifest" in ckpt:
+            _validate_optimizer_parameter_manifest(
+                ckpt.get("optimizer_parameter_manifest"), model, optimizer,
+            )
+        else:
+            saved_code_identity = ckpt.get("code_identity_sha256")
+            if (resume_cfg is None or config_drift
+                    or not isinstance(saved_code_identity, str)
+                    or saved_code_identity != expected_code_identity):
+                raise RuntimeError(
+                    "legacy optimizer checkpoint has no parameter manifest and cannot establish an "
+                    "unchanged source/config execution contract; load model weights without an "
+                    "optimizer or restart with a fresh optimizer"
+                )
         saved_optimizer_state = _validate_optimizer_state(
             ckpt.get("optimizer_state"), optimizer, saved_step,
             ckpt.get("optimizer_populated_slot_manifest"),
@@ -2000,11 +2211,6 @@ def load_checkpoint(
         artifacts.cfg if artifacts is not None else None)
     if expected_selection_data_identity is None and artifacts is not None:
         expected_selection_data_identity = artifacts.selection_data_identity
-    expected_code_identity = (
-        artifacts.code_identity_sha256
-        if artifacts is not None
-        else _verified_process_code_identity()
-    )
     validated_selection = _preflight_best_selection(
         ckpt,
         checkpoint_path,
@@ -2015,18 +2221,19 @@ def load_checkpoint(
         expected_code_identity,
         expected_selection_data_identity,
     )
-    model.load_state_dict(saved_model_state)
     if optimizer is not None:
-        fresh = [{k: v for k, v in group.items() if k != "params"}
-                 for group in optimizer.param_groups]
-        optimizer.load_state_dict(saved_optimizer_state)
-        for group, metadata in zip(optimizer.param_groups, fresh):
-            params = group["params"]
-            group.clear()
-            group.update(metadata)
-            group["params"] = params
-            if successful_updates is not None:
-                group["successful_updates"] = successful_updates
+        optimizer_snapshot = copy.deepcopy(optimizer.state_dict())
+        state_to_load = _optimizer_state_with_live_group_metadata(
+            saved_optimizer_state, optimizer, successful_updates,
+        )
+        try:
+            optimizer.load_state_dict(state_to_load)
+            _validate_realized_optimizer_state(optimizer, saved_step, successful_updates)
+        except Exception:
+            optimizer.load_state_dict(optimizer_snapshot)
+            raise
+        del optimizer_snapshot
+    model.load_state_dict(saved_model_state)
     if scaler is not None and scaler.is_enabled():
         scaler.load_state_dict(saved_scaler_state)
     # EMA shadow: restore it so a resumed run continues the SAME running average instead of re-seeding
