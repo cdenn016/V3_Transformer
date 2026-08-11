@@ -107,7 +107,9 @@ git commit -m "fix: stabilize SPD spectral derivatives"
 - Modify: `vfe3/families/base.py`
 - Modify: `vfe3/model/model.py`
 - Modify: `vfe3/model/prior_bank.py`
+- Modify: `vfe3/model/block.py`
 - Modify: `vfe3/inference/e_step.py`
+- Modify: `vfe3/gradients/kernels.py`
 - Modify: `vfe3/gradients/oracle.py`
 - Modify: `vfe3/viz/extract.py`
 - Test: `tests/test_precision_policies_20260806.py`
@@ -156,7 +158,8 @@ Use `rg` to verify every model-owned full-covariance consumer passes the instanc
 
 ```powershell
 git add vfe3/families/gaussian.py vfe3/families/base.py vfe3/model/model.py `
-  vfe3/model/prior_bank.py vfe3/inference/e_step.py vfe3/gradients/oracle.py `
+  vfe3/model/prior_bank.py vfe3/model/block.py vfe3/inference/e_step.py `
+  vfe3/gradients/kernels.py vfe3/gradients/oracle.py `
   vfe3/viz/extract.py tests/test_precision_policies_20260806.py `
   tests/test_family_chunked_canonical_dispatch_20260808.py tests/test_families.py `
   tests/test_fix_numerics_audit.py
