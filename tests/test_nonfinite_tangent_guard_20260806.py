@@ -21,6 +21,7 @@ import vfe3.geometry.retraction as R
 from vfe3.geometry.retraction import (
     nonfinite_tangent_elements,
     reset_nonfinite_tangent_elements,
+    retract_logeuclidean_full,
     retract_spd_diagonal,
     retract_spd_full,
 )
@@ -118,6 +119,25 @@ def test_counter_accumulates_and_resets():
     assert nonfinite_tangent_elements() == 4, "counts accumulate across calls"
     reset_nonfinite_tangent_elements()
     assert nonfinite_tangent_elements() == 0
+
+
+def test_logeuclidean_nonfinite_tangent_freezes_only_its_row_and_counts_once():
+    sigma = _sigma()
+    g = torch.Generator().manual_seed(11)
+    finite_delta = 0.1 * torch.randn(Bn, K, K, generator=g)
+    finite_delta = 0.5 * (finite_delta + finite_delta.transpose(-1, -2))
+    finite_delta[2].zero_()
+    poisoned = finite_delta.clone()
+    poisoned[2, 0, 0] = float("nan")
+    poisoned[2, 1, 1] = float("inf")
+    poisoned[2, 2, 2] = float("-inf")
+
+    expected = retract_logeuclidean_full(sigma, finite_delta, **KW)
+    out = retract_logeuclidean_full(sigma, poisoned, **KW)
+
+    assert torch.allclose(out[2], sigma[2], atol=1e-5)
+    assert torch.equal(out[[0, 1, 3]], expected[[0, 1, 3]])
+    assert nonfinite_tangent_elements() == 1
 
 
 # -- (e) the finite path is untouched -----------------------------------------------------------

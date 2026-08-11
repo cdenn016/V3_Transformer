@@ -436,6 +436,35 @@ def test_retract_logeuclidean_full_finite_backward_at_isotropic_init():
     assert torch.isfinite(sigma.grad).all()
 
 
+def test_near_degenerate_exp_preserves_active_off_diagonal_derivative():
+    """An fp32 output roundoff must not erase an active exponential Fréchet derivative."""
+    from vfe3.geometry import retraction as retraction_module
+
+    active = torch.diag(torch.tensor([0.0, 1.0e-8], dtype=torch.float32)).requires_grad_(True)
+    cotangent = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.float32)
+    active_out = retraction_module._symmetric_spectral_map(
+        active,
+        "exp_bounded",
+        lower=-50.0,
+        upper=50.0,
+    )
+    active_grad = torch.autograd.grad((active_out * cotangent).sum(), active)[0]
+    expected = torch.expm1(torch.tensor(1.0e-8, dtype=torch.float32)) / 1.0e-8
+
+    assert torch.allclose(active_grad[0, 1], expected, rtol=1e-6, atol=1e-6)
+
+    flat = torch.diag(torch.tensor([51.0, 52.0], dtype=torch.float32)).requires_grad_(True)
+    flat_out = retraction_module._symmetric_spectral_map(
+        flat,
+        "exp_bounded",
+        lower=-50.0,
+        upper=50.0,
+    )
+    flat_grad = torch.autograd.grad((flat_out * cotangent).sum(), flat)[0]
+
+    assert flat_grad[0, 1].item() == 0.0
+
+
 def test_full_cov_e_step_isotropic_init_finite_backward():
     """End-to-end reachability: a full-cov E-step at the ISOTROPIC Sigma = I init (the real default
     prior init) gives finite grads on the DEFAULT 'unroll' estimator via spd_affine -> retract_spd_full."""
