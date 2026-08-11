@@ -1186,3 +1186,34 @@ def test_ablation_renderer_dispatches_registered_figures_by_name_and_keeps_legac
         assert (sweep_dir / "sweep_results.csv").exists()
         assert (sweep_dir / "sweep_meta.json").exists()
         assert (fig_dir / f"{name}.png").exists()
+
+
+def test_pure_path_reports_mlp_as_optional_nonintertwiner():
+    """The default route remains pure; a coordinate MLP is explicitly reported as non-pure."""
+    off = _pure_path_report(_pure_ns(use_block_mlp=False), [])
+    assert off["pure_flags"]["no_block_mlp"] is True
+    assert off["on_pure_path"] is True
+    assert off["config_toggles"]["block_mlp_structural_mode"] == "disabled"
+    assert off["config_toggles"]["block_mlp_covariance_contract"] == "not_applicable"
+
+    on = _pure_path_report(_pure_ns(use_block_mlp=True), [])
+    assert on["pure_flags"]["no_block_mlp"] is False
+    assert on["config_toggles"]["block_mlp_structural_mode"] == "coordinate_mean_only_nonintertwiner"
+    assert on["config_toggles"]["block_mlp_covariance_contract"] == "passthrough"
+    assert on["gauge_flags"]["block_mlp_intertwiner_compatible"] is False
+    assert on["on_pure_path"] is False
+    assert on["on_gauge_pure_path"] is False
+
+
+def test_cost_model_counts_untied_block_mlp_params_and_flops():
+    """MLP accounting follows the established multiply-add FLOP convention."""
+    K, expansion, layers = 6, 3, 2
+    model = _cost_model(K=K, n_gen=5, n_blocks=2)
+    cfg = _cost_cfg(n_layers=layers, use_block_mlp=True, block_mlp_expansion=expansion)
+    out = _cost_model_fields(model, cfg, n_params=123, tokens_seen=13)
+    per_layer = 2 * expansion * K * K + (expansion + 1) * K
+    mlp_flops = 4.0 * layers * expansion * K * K
+    base_active = (2 * K + 5) + 11 * K
+
+    assert out["block_mlp_params"] == layers * per_layer
+    assert out["flops_per_token_block_mlp"] == mlp_flops

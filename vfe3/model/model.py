@@ -2409,6 +2409,7 @@ class VFEModel(nn.Module):
         out = vfe_stack(                                             # converged belief gauge frame
             belief, belief.mu, belief.sigma, self.group, self.cfg,
             log_prior=log_prior, block_norm=self.block_norm,
+            block_mlps=self.block_mlps,
             head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
             lambda_beta=self.cfg.lambda_beta,
             transport_state=self.transport_state,
@@ -3019,6 +3020,7 @@ class VFEModel(nn.Module):
             out = vfe_stack(
                 belief, belief.mu, belief.sigma, self.group, cfg,
                 log_prior=log_prior, block_norm=self.block_norm,
+                block_mlps=self.block_mlps,
                 head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
                 lambda_beta=cfg.lambda_beta,
                 transport_state=self.transport_state,
@@ -3623,12 +3625,13 @@ class VFEModel(nn.Module):
             return beta.unsqueeze(0) if beta.dim() == 2 else beta     # single-block group -> H=1
 
         maps = []
-        for _ in range(cfg.n_layers):
+        for layer_index in range(cfg.n_layers):
             if score_at != "converged":
                 maps.append(_score(belief))                           # BEFORE the E-step runs
             belief = vfe_block(                                       # converged belief at this block
                 belief, mu_p, sigma_p, self.group, cfg, log_prior=log_prior,
                 block_norm=self.block_norm,
+                block_mlp=(self.block_mlps[layer_index] if self.block_mlps is not None else None),
                 head_mixer=self.head_mixer,                            # replay the mixer too (audit 2026-06-09 overnight F32)
                 lambda_beta=cfg.lambda_beta,
                 transport_state=self.transport_state,
@@ -3738,6 +3741,7 @@ class VFEModel(nn.Module):
                 belief = vfe_block(
                     belief, mu_p, sigma_p, self.group, cfg, log_prior=log_prior,
                     block_norm=self.block_norm, head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
+                    block_mlp=(self.block_mlps[layer_index] if self.block_mlps is not None else None),
                     lambda_beta=cfg.lambda_beta,
                     transport_state=self.transport_state,
                     rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,

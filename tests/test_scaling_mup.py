@@ -725,3 +725,20 @@ def test_analyze_survives_explicit_null_best_val_ppl_and_skips_validation_figure
     assert not (fig_dir / "pareto_frontier.png").exists()
     null_warnings = [r for r in caplog.records if "explicit-null" in r.getMessage()]
     assert len(null_warnings) == 1
+
+
+def test_scaling_counts_untied_block_mlp_parameters():
+    """The scaling predictor must include one biased K->rK->K MLP per inference layer."""
+    K, expansion, layers = 4, 3, 2
+    common = dict(
+        vocab_size=13, embed_dim=K, n_heads=2, max_seq_len=4,
+        n_layers=layers, n_e_steps=1, e_phi_lr=0.0,
+    )
+    off_cfg = VFE3Config(**common)
+    on_cfg = VFE3Config(**common, use_block_mlp=True, block_mlp_expansion=expansion)
+    off_count, _ = scaling.predict_n_params(off_cfg)
+    on_count, _ = scaling.predict_n_params(on_cfg)
+    per_layer = 2 * expansion * K * K + (expansion + 1) * K
+
+    assert on_count == off_count + layers * per_layer
+    assert on_count == sum(parameter.numel() for parameter in VFEModel(on_cfg).parameters())

@@ -512,3 +512,22 @@ def test_projected_inference_record_reuses_same_forward_frame_for_decode(
     )
     assert ce_bank["ce"].shape == (sequence_length,)
     assert torch.isfinite(ce_bank["ce"]).all()
+
+
+def test_active_mlp_extract_replay_matches_forward() -> None:
+    """Extractor replay must include every trained, untied post-block MLP."""
+    cfg = VFE3Config(
+        vocab_size=11, embed_dim=4, n_heads=2, max_seq_len=4,
+        n_layers=2, n_e_steps=1, e_phi_lr=0.0, use_block_mlp=True,
+    )
+    torch.manual_seed(17)
+    model = VFEModel(cfg).to(DEVICE).eval()
+    with torch.no_grad():
+        for mlp in model.block_mlps:
+            mlp.fc2.bias.fill_(0.25)
+    tokens = torch.tensor([[1, 3, 5, 7]], dtype=torch.long, device=DEVICE)
+
+    reference = _forward_reference(model, tokens)
+    replay = extract.converged_state(model, tokens)
+
+    torch.testing.assert_close(replay["mu"], reference.mu[0], atol=1e-6, rtol=1e-6)

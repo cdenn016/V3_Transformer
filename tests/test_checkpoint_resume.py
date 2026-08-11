@@ -2213,3 +2213,30 @@ def test_full_model_channel_packed_tables_round_trip(tmp_path):
     load_checkpoint(tmp_path / "r" / "checkpoints" / "step_4.pt", fresh)
     assert torch.equal(fresh.prior_bank.s_sigma_lower_embed, saved_s)
     assert torch.equal(fresh.prior_bank.r_sigma_lower, saved_r)
+
+
+def test_active_block_mlp_checkpoint_roundtrip_and_topology_mismatch(tmp_path):
+    """Generic strict state persistence restores active MLPs and rejects an off topology."""
+    active_cfg = _cfg(use_block_mlp=True, n_layers=2)
+    torch.manual_seed(31)
+    source = VFEModel(active_cfg).eval()
+    source_optimizer = build_optimizer(source, active_cfg)
+    artifacts = RunArtifacts(tmp_path / "active", active_cfg, source)
+    checkpoint = artifacts.save_checkpoint(1, source, source_optimizer, active_cfg)
+    tokens = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    with torch.no_grad():
+        expected = source(tokens)
+
+    restored = VFEModel(active_cfg).eval()
+    load_checkpoint(checkpoint, restored, build_optimizer(restored, active_cfg), cfg=active_cfg)
+    with torch.no_grad():
+        torch.testing.assert_close(restored(tokens), expected, atol=0.0, rtol=0.0)
+
+    inactive_cfg = _cfg(use_block_mlp=False, n_layers=2)
+    inactive = VFEModel(inactive_cfg).eval()
+    before = copy.deepcopy(inactive.state_dict())
+    with pytest.raises((RuntimeError, ValueError)):
+        load_checkpoint(
+            checkpoint, inactive, build_optimizer(inactive, inactive_cfg), cfg=inactive_cfg,
+        )
+    _assert_nested_equal(inactive.state_dict(), before)
