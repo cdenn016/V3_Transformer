@@ -620,6 +620,7 @@ _NONFINITE_TANGENT_COUNTS: Dict[str, torch.Tensor] = {}
 def _neutralize_nonfinite_tangent(
     tangent:    torch.Tensor,               # (..., K) diagonal or (..., K, K) full whitened tangent
     event_ndim: int,                        # 1 diagonal, 2 full -- the trailing axes of ONE element
+    valid:      Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Zero any tangent ELEMENT that is not entirely finite, and count it (audit 2026-08-06).
 
@@ -647,6 +648,8 @@ def _neutralize_nonfinite_tangent(
     """
     reduce_axes = tuple(range(-event_ndim, 0))
     finite = torch.isfinite(tangent).all(dim=reduce_axes, keepdim=True)
+    if valid is not None:
+        finite = finite & valid
     key = str(tangent.device)
     counter = _NONFINITE_TANGENT_COUNTS.get(key)
     if counter is None:
@@ -880,10 +883,36 @@ def retract_logeuclidean_full(
         # Reuse this eigendecomposition for the Fréchet chart map (audit 2026-07-12 N9): sigma is
         # already symmetrized above and _frechet_log_spd applies the SAME eps clamp, so passing the
         # pre-clamp pair is byte-identical to its own eigh of the identical matrix.
-        tangent = step_size * _frechet_log_spd(sigma, delta_sigma, eps=eps, eig=(eig_raw, eigenvectors))
+        raw_tangent_finite = torch.isfinite(delta_sigma).all(dim=(-2, -1), keepdim=True)
+        # Evaluate the chart map without an autograd graph before constructing its differentiable
+        # counterpart. This catches both literal NaN/Inf tangents and finite tangents whose chart
+        # image overflows, so an invalid row never enters the Fréchet derivative in the backward
+        # graph. The eigensystem is already available, preserving the three-eigh contract.
+        with torch.no_grad():
+            tangent_preview = _frechet_log_spd(
+                sigma,
+                delta_sigma,
+                eps=eps,
+                eig=(eig_raw, eigenvectors),
+            )
+            chart_tangent_finite = torch.isfinite(tangent_preview).all(dim=(-2, -1), keepdim=True)
+        chart_input_finite = raw_tangent_finite & chart_tangent_finite
+        safe_delta_sigma = torch.where(chart_input_finite, delta_sigma, torch.zeros_like(delta_sigma))
+        tangent = step_size * _frechet_log_spd(
+            sigma,
+            safe_delta_sigma,
+            eps=eps,
+            eig=(eig_raw, eigenvectors),
+        )
         # A non-finite chart tangent must be neutralized before the norm guard: otherwise one
-        # poisoned row yields a NaN scale factor and reaches the eigendecomposition below.
-        tangent = _neutralize_nonfinite_tangent(tangent, event_ndim=2)
+        # poisoned row yields a NaN scale factor and reaches the eigendecomposition below. The
+        # validity mask counts rows excluded by the graph-free preflight; the finiteness check in
+        # the helper remains the postcondition guard for an unexpected generated nonfinite.
+        tangent = _neutralize_nonfinite_tangent(
+            tangent,
+            event_ndim=2,
+            valid=chart_input_finite,
+        )
         if trust_region is not None and trust_region > 0:                # clamp the TANGENT, not the
             t_norm  = torch.linalg.norm(tangent, ord='fro', dim=(-2, -1), keepdim=True)   # base point,
             tangent = tangent * torch.clamp(trust_region / (t_norm + eps), max=1.0)       # so R(S,0)=S.

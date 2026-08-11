@@ -140,6 +140,47 @@ def test_logeuclidean_nonfinite_tangent_freezes_only_its_row_and_counts_once():
     assert nonfinite_tangent_elements() == 1
 
 
+@pytest.mark.parametrize(
+    "bad",
+    [float("nan"), float("inf"), float("-inf"), torch.finfo(torch.float32).max],
+    ids=["nan", "posinf", "neginf", "finite_chart_overflow"],
+)
+def test_logeuclidean_frozen_rows_have_identity_sigma_gradient_and_zero_delta_gradient(bad):
+    sigma_value = _sigma()
+    # This makes the finite largest-fp32 tangent overflow only after the log-chart derivative
+    # multiplies it by Sigma^{-1}; the three literal nonfinites exercise the raw-input path.
+    sigma_value[2] = 0.5 * torch.eye(K)
+    finite_delta = torch.zeros(Bn, K, K)
+    finite_delta[0, 0, 0] = 0.1
+    finite_delta[1, 1, 1] = -0.05
+    finite_delta[3, 2, 2] = 0.08
+    poisoned_delta = finite_delta.clone()
+    poisoned_delta[2, 0, 0] = bad
+    cotangent = torch.eye(K).expand(Bn, K, K).clone()
+
+    reference_sigma = sigma_value.clone().requires_grad_(True)
+    reference_delta = finite_delta.clone().requires_grad_(True)
+    reference = retract_logeuclidean_full(reference_sigma, reference_delta, **KW)
+    reference_sigma_grad, reference_delta_grad = torch.autograd.grad(
+        (reference * cotangent).sum(),
+        (reference_sigma, reference_delta),
+    )
+
+    sigma = sigma_value.clone().requires_grad_(True)
+    delta = poisoned_delta.requires_grad_(True)
+    out = retract_logeuclidean_full(sigma, delta, **KW)
+    sigma_grad, delta_grad = torch.autograd.grad((out * cotangent).sum(), (sigma, delta))
+
+    assert torch.equal(out[[0, 1, 3]], reference[[0, 1, 3]])
+    assert torch.equal(sigma_grad[[0, 1, 3]], reference_sigma_grad[[0, 1, 3]])
+    assert torch.equal(delta_grad[[0, 1, 3]], reference_delta_grad[[0, 1, 3]])
+    assert torch.allclose(out[2], sigma[2], atol=1e-5)
+    assert torch.isfinite(sigma_grad[2]).all()
+    assert torch.equal(sigma_grad[2], cotangent[2])
+    assert torch.equal(delta_grad[2], torch.zeros_like(delta_grad[2]))
+    assert nonfinite_tangent_elements() == 1
+
+
 # -- (e) the finite path is untouched -----------------------------------------------------------
 
 
