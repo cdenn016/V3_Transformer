@@ -221,6 +221,8 @@ def test_optimizer_covers_mlp_parameters_once_at_resolved_lr(block_mlp_lr, expec
         use_block_mlp=True,
         m_p_mu_lr=0.0123,
         m_block_mlp_lr=block_mlp_lr,
+        weight_decay=0.0789,
+        mu_weight_decay=0.0,
     )
     model = VFEModel(cfg)
     optimizer = build_optimizer(model, cfg)
@@ -232,6 +234,7 @@ def test_optimizer_covers_mlp_parameters_once_at_resolved_lr(block_mlp_lr, expec
     assert len(mlp_groups) == 1
     assert mlp_groups[0]["role"] == "mu"
     assert mlp_groups[0]["lr"] == pytest.approx(expected_lr)
+    assert mlp_groups[0]["weight_decay"] == pytest.approx(cfg.weight_decay)
     mlp_parameter_ids = {id(parameter) for parameter in model.block_mlps.parameters()}
     assert {id(parameter) for parameter in mlp_groups[0]["params"]} == mlp_parameter_ids
     all_grouped_ids = [

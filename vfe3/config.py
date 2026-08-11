@@ -3494,6 +3494,12 @@ class VFE3Config:
             return any(name in _defaults and getattr(self, name) != _defaults[name] for name in names)
 
         _inert: List[str] = []
+        if not self.use_block_mlp and _changed(
+                "block_mlp_expansion", "block_mlp_activation", "block_mlp_dropout",
+                "m_block_mlp_lr"):
+            _inert.append(
+                "block MLP settings block_mlp_expansion/block_mlp_activation/"
+                "block_mlp_dropout/m_block_mlp_lr (only read when use_block_mlp=True)")
         if canonical_e_step_update != "mm_exact" and _changed("mm_damping"):
             _inert.append(f"mm_damping={self.mm_damping} (only read by e_step_update='mm_exact')")
         # The REVERSE direction of the rule above (audit 2026-07-27). The mm_exact branch of

@@ -2,7 +2,7 @@ import pytest
 import torch
 from torch import nn
 
-from vfe3.config import VFE3Config
+from vfe3.config import ConfigNotice, VFE3Config
 from vfe3.model.block import vfe_block
 from vfe3.model.block_mlp import BlockMLP
 from vfe3.model.model import VFEModel
@@ -59,6 +59,20 @@ def test_off_mode_registers_no_mlp_state_or_parameters():
     assert model.block_mlps is None
     assert not any("block_mlps" in key for key in model.state_dict())
     assert not any("block_mlps" in name for name, _ in model.named_parameters())
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        {"block_mlp_expansion": 2},
+        {"block_mlp_activation": "relu"},
+        {"block_mlp_dropout": 0.25},
+        {"m_block_mlp_lr": 0.0123},
+    ],
+)
+def test_off_mode_warns_when_mlp_only_setting_is_nondefault(setting):
+    with pytest.warns(ConfigNotice, match="block MLP"):
+        _tiny_cfg(use_block_mlp=False, **setting)
 
 
 def test_active_mlp_is_untied_per_layer():
@@ -134,15 +148,52 @@ def test_coordinate_mlp_preserves_covariance_and_other_belief_fields():
         assert out.right_phi is converged.right_phi
 
 
-def test_active_mlp_gradients_are_finite_for_supported_estimators():
+@pytest.mark.parametrize("estimator", ["unroll", "straight_through"])
+def test_every_active_mlp_layer_receives_finite_gradients(estimator):
     tokens = torch.tensor([[1, 2, 3, 4]])
     targets = torch.tensor([[2, 3, 4, 5]])
-    for estimator in ("unroll", "straight_through"):
-        model = VFEModel(_tiny_cfg(use_block_mlp=True, e_step_gradient=estimator))
+    model = VFEModel(_tiny_cfg(
+        use_block_mlp=True,
+        n_layers=3,
+        e_step_gradient=estimator,
+    ))
 
-        _, loss, _ = model(tokens, targets)
-        loss.backward()
+    _, loss, _ = model(tokens, targets)
+    loss.backward()
 
-        for parameter in model.block_mlps[0].parameters():
+    for layer_index, mlp in enumerate(model.block_mlps):
+        for parameter_name, parameter in mlp.named_parameters():
             assert parameter.grad is not None
-            assert torch.isfinite(parameter.grad).all()
+            assert torch.isfinite(parameter.grad).all(), (
+                f"non-finite gradient in layer {layer_index} parameter {parameter_name}"
+            )
+
+
+def test_diagnostic_snapshot_with_dropout_is_rng_neutral_and_restores_training_mode():
+    model = VFEModel(_tiny_cfg(
+        use_block_mlp=True,
+        block_mlp_dropout=0.5,
+        n_layers=3,
+    ))
+    model.train()
+    tokens = torch.tensor([[1, 2, 3, 4]])
+
+    torch.manual_seed(451)
+    expected_next_logits = model(tokens).detach()
+
+    diagnostic_calls = (
+        ("snapshot", lambda: model.build_diagnostic_snapshot(tokens)),
+        ("summary", lambda: model.diagnostics(tokens)),
+        ("attention", lambda: model.attention_maps(tokens)),
+        ("per_layer", lambda: model.diagnostics_per_layer(tokens)),
+    )
+    for diagnostic_name, diagnostic_call in diagnostic_calls:
+        torch.manual_seed(451)
+        cpu_rng_before = torch.get_rng_state().clone()
+        diagnostic_call()
+
+        assert torch.equal(torch.get_rng_state(), cpu_rng_before), diagnostic_name
+        assert model.training
+        assert all(module.training for module in model.block_mlps.modules())
+        actual_next_logits = model(tokens).detach()
+        assert torch.equal(actual_next_logits, expected_next_logits), diagnostic_name

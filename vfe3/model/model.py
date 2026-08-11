@@ -13,6 +13,7 @@ import inspect
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from functools import wraps
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple, Dict
 
 import torch
@@ -80,6 +81,30 @@ from vfe3.runtime import set_fp32_matmul_precision
 # never by matching literal mode names (the add-by-registering contract).
 _REGIME_NEEDS_MU    = _TRANSPORT_NEEDS_MU
 _REGIME_NEEDS_SIGMA = _TRANSPORT_NEEDS_SIGMA
+
+
+def _block_mlp_diagnostic_eval(method: Callable) -> Callable:
+    r"""Run an MLP-bearing diagnostic without stochastic dropout or mode leakage.
+
+    Diagnostics may be called while the enclosing model remains in training mode. Only the
+    coordinate MLPs need a mode override: putting them in evaluation mode makes their dropout
+    deterministic without changing ordinary training forwards. Every descendant's prior mode is
+    restored exactly, including on exceptions and for callers with mixed per-module modes.
+    """
+    @wraps(method)
+    def guarded(self: "VFEModel", *args: Any, **kwargs: Any) -> Any:
+        block_mlps = self.block_mlps
+        if block_mlps is None:
+            return method(self, *args, **kwargs)
+        prior_modes = tuple((module, module.training) for module in block_mlps.modules())
+        block_mlps.eval()
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            for module, was_training in prior_modes:
+                module.training = was_training
+
+    return guarded
 
 
 def _precision_key_bias(
@@ -2362,6 +2387,7 @@ class VFEModel(nn.Module):
         ).total
 
     @torch.no_grad()
+    @_block_mlp_diagnostic_eval
     def gamma_attention_maps(
         self,
         token_ids: torch.Tensor,             # (B, N) token ids; only sequence 0 is used
@@ -2879,6 +2905,7 @@ class VFEModel(nn.Module):
         return gamma.unsqueeze(0) if gamma.dim() == 2 else gamma
 
     @torch.no_grad()
+    @_block_mlp_diagnostic_eval
     def build_diagnostic_snapshot(
         self,
         token_ids: torch.Tensor,                 # (B, N) integer token ids
@@ -2952,6 +2979,7 @@ class VFEModel(nn.Module):
         )
 
     @torch.no_grad()
+    @_block_mlp_diagnostic_eval
     def diagnostics(
         self,
         token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
@@ -3507,6 +3535,7 @@ class VFEModel(nn.Module):
         return d
 
     @torch.no_grad()
+    @_block_mlp_diagnostic_eval
     def attention_maps(
         self,
         token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
@@ -3652,6 +3681,7 @@ class VFEModel(nn.Module):
         return torch.stack(maps, dim=0)                              # (L, H, N, N)
 
     @torch.no_grad()
+    @_block_mlp_diagnostic_eval
     def diagnostics_per_layer(
         self,
         token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used

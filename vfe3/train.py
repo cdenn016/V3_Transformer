@@ -290,7 +290,8 @@ def build_optimizer(
         block_mlp_lr = (cfg.m_p_mu_lr if cfg.m_block_mlp_lr is None
                         else cfg.m_block_mlp_lr)
         groups.append({"params": list(model.block_mlps.parameters()), "lr": block_mlp_lr,
-                       "role": "mu", "lr_aux_role": "block_mlp", **mu_wd})
+                       "weight_decay": cfg.weight_decay,
+                       "role": "mu", "lr_aux_role": "block_mlp"})
 
     if getattr(model, "cg_coupling", None) is not None:         # use_cg_coupling=True CG path weights
         groups.append({"params": [model.cg_coupling.path_weights], "lr": cfg.m_p_mu_lr, "role": "mu"})
