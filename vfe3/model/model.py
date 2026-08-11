@@ -1,6 +1,6 @@
 r"""The full VFE_3.0 model: encode -> E-step inference -> decode -> cross-entropy.
 
-No neural layers (no nn.Linear/MLP/activation): on the pure default path the parameters are the
+On the pure default path there are no neural layers (no nn.Linear/MLP/activation): the parameters are the
 PriorBank's prior tables, plus the model-owned learned tables their toggles create -- the default
 pos_phi='learned' positional table, and the default-OFF head mixer, CG coupling, regime_ii
 connection, and learnable T5-bias scalar. The E-step
@@ -55,6 +55,7 @@ from vfe3.geometry.transport import (
 )
 from vfe3.model.canonical_content import project_canonical_diagonal
 from vfe3.model.head_mixer import HeadMixer
+from vfe3.model.block_mlp import BlockMLP
 from vfe3.model.block import _as_coeff, vfe_block
 from vfe3.model.model_frame import resolve_model_frame
 from vfe3.model.positional_phi import apply_positional_phi, positional_phi_coords
@@ -232,7 +233,7 @@ def _sequence_belief(belief: BeliefState, index: int = 0) -> BeliefState:
 
 
 class VFEModel(nn.Module):
-    """encode -> E-step stack -> decode -> CE. Parameters live only in the PriorBank."""
+    """encode -> E-step stack -> decode -> CE; the pure default owns only PriorBank parameters."""
 
     def __init__(self, cfg: VFE3Config) -> None:
         super().__init__()
@@ -334,6 +335,15 @@ class VFEModel(nn.Module):
                                                          family=cfg.family,
                                                          affine=cfg.layernorm_affine) \
             if cfg.norm_type_block != "none" else None
+        # One untied coordinate MLP per block is an explicitly non-gauge-pure structural
+        # augmentation. The disabled path owns no module, parameter, or state-dict key.
+        self.block_mlps = (
+            nn.ModuleList([
+                BlockMLP(cfg.embed_dim, cfg.block_mlp_expansion,
+                         cfg.block_mlp_activation, cfg.block_mlp_dropout)
+                for _ in range(cfg.n_layers)
+            ]) if cfg.use_block_mlp else None
+        )
         self.final_norm = get_norm(cfg.norm_type_final)(cfg.embed_dim, eps=cfg.eps,
                                                          family=cfg.family,
                                                          affine=cfg.layernorm_affine) \
@@ -1304,6 +1314,7 @@ class VFEModel(nn.Module):
                 beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
                 emission=emission,
                 log_prior=log_prior, block_norm=self.block_norm,
+                block_mlps=self.block_mlps,
                 head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
                 lambda_beta=lambda_beta,
                 transport_state=transport_state,

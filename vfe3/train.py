@@ -286,6 +286,12 @@ def build_optimizer(
                          else cfg.m_head_mixer_lr)
         groups.append({"params": list(model.head_mixer.parameters()), "lr": head_mixer_lr,
                        "role": "mu", "lr_aux_role": "head_mixer"})
+    if getattr(model, "block_mlps", None) is not None:         # use_block_mlp=True coordinate MLPs
+        block_mlp_lr = (cfg.m_p_mu_lr if cfg.m_block_mlp_lr is None
+                        else cfg.m_block_mlp_lr)
+        groups.append({"params": list(model.block_mlps.parameters()), "lr": block_mlp_lr,
+                       "role": "mu", "lr_aux_role": "block_mlp", **mu_wd})
+
     if getattr(model, "cg_coupling", None) is not None:         # use_cg_coupling=True CG path weights
         groups.append({"params": [model.cg_coupling.path_weights], "lr": cfg.m_p_mu_lr, "role": "mu"})
     if getattr(model, "pos_phi_free", None) is not None:        # pos_phi='learned' positional table
@@ -480,7 +486,7 @@ def _learning_rates_by_aux_role(
     """
     if len(param_groups) != len(lrs):
         raise RuntimeError("optimizer parameter groups and scheduler learning rates differ in length")
-    allowed = {"head_evidence", "head_mixer"}
+    allowed = {"head_evidence", "head_mixer", "block_mlp"}
     resolved = {role: float("nan") for role in allowed}
     seen = set()
     for group, lr in zip(param_groups, lrs):
@@ -2044,6 +2050,7 @@ def train(
                 "train_loss":        losses[-1],
                 "train_ce":          ce,                      # true CE (nats), off the graph
                 "train_ppl":         math.exp(min(ce, 20.0)),  # train perplexity = exp(CE), mirrors the console line
+                "lr_block_mlp":       aux_lrs["block_mlp"],
                 "lr_mu":             lrs["mu"],
                 "lr_sigma":          lrs["sigma"],
                 "lr_phi":            lrs["phi"],

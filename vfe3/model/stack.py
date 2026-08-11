@@ -4,7 +4,7 @@ After each block the updated belief becomes (a blend toward) the next block's pr
 mu_p_next = (1 - rho) mu_p + rho mu_q (rho = prior_handoff_rho); sigma_p frozen at the
 embedding by default; phi flows through the belief, not the prior.
 
-Placement note (audit 2026-06-09 overnight F23): the opt-in head_mixer / cg_coupling
+Placement note (audit 2026-06-09 overnight F23): the opt-in head_mixer / cg_coupling / block MLP
 transforms run INSIDE each block (after its E-step, before its norm), so the belief
 handed off above is the POST-transform belief — at n_layers > 1 the transforms recurse
 into every subsequent block's prior. The manuscript places the mixer in the single
@@ -15,7 +15,7 @@ block stay available via the ``capture`` out-param (the M-step self-coupling rea
 them from there).
 """
 
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Sequence, Tuple
 
 import torch
 
@@ -38,6 +38,7 @@ def vfe_stack(
     *,
     log_prior:       Optional[torch.Tensor]                  = None,
     block_norm:      Optional[Callable[..., torch.Tensor]]   = None,      # cached norm instance (None -> off)
+    block_mlps:      Optional[Sequence[Callable[[torch.Tensor], torch.Tensor]]] = None,  # one coordinate MLP per block
     head_mixer:      Optional[Callable[..., 'tuple']]        = None,      # opt-in Schur head mixer (None -> off)
     cg_coupling:     Optional[Callable[..., 'tuple']]        = None,      # opt-in CG cross-type coupling (None -> off)
     lambda_beta:     'float | torch.Tensor'                  = 1.0,       # belief-coupling weight (cfg.lambda_beta)
@@ -133,6 +134,7 @@ def vfe_stack(
             capture["final_block_tau"] = tau_b
         belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior,
                            block_norm=block_norm, head_mixer=head_mixer, cg_coupling=cg_coupling,
+                           block_mlp=(block_mlps[layer_index] if block_mlps is not None else None),
                            lambda_beta=lambda_beta,
                            transport_state=transport_state,
                            e_step_gradient=e_step_gradient, rope=rope, rope_on_cov=rope_on_cov,

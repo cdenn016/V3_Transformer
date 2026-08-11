@@ -200,12 +200,48 @@ def test_aux_role_learning_rate_reporting_handles_active_and_inactive_mixers():
 
     assert reported["head_evidence"] == pytest.approx(0.0011)
     assert math.isnan(reported["head_mixer"])
+    assert math.isnan(reported["block_mlp"])
 
     with pytest.raises(RuntimeError, match="duplicate optimizer learning-rate auxiliary role"):
         _learning_rates_by_aux_role(
             [{"lr_aux_role": "head_mixer"}, {"lr_aux_role": "head_mixer"}],
             [0.0022, 0.0033],
         )
+
+
+@pytest.mark.parametrize("block_mlp_lr, expected_lr", [(None, 0.0123), (0.0456, 0.0456)])
+def test_optimizer_covers_mlp_parameters_once_at_resolved_lr(block_mlp_lr, expected_lr):
+    cfg = VFE3Config(
+        vocab_size=20,
+        embed_dim=4,
+        n_heads=2,
+        max_seq_len=4,
+        n_layers=2,
+        n_e_steps=1,
+        use_block_mlp=True,
+        m_p_mu_lr=0.0123,
+        m_block_mlp_lr=block_mlp_lr,
+    )
+    model = VFEModel(cfg)
+    optimizer = build_optimizer(model, cfg)
+
+    mlp_groups = [
+        group for group in optimizer.param_groups
+        if group.get("lr_aux_role") == "block_mlp"
+    ]
+    assert len(mlp_groups) == 1
+    assert mlp_groups[0]["role"] == "mu"
+    assert mlp_groups[0]["lr"] == pytest.approx(expected_lr)
+    mlp_parameter_ids = {id(parameter) for parameter in model.block_mlps.parameters()}
+    assert {id(parameter) for parameter in mlp_groups[0]["params"]} == mlp_parameter_ids
+    all_grouped_ids = [
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+        if id(parameter) in mlp_parameter_ids
+    ]
+    assert len(all_grouped_ids) == len(mlp_parameter_ids)
+    assert len(set(all_grouped_ids)) == len(mlp_parameter_ids)
 
 
 # The active alphabet of the period-3 stream is {0,1,2}; a structure-BLIND predictor
