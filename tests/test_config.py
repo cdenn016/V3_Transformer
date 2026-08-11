@@ -35,6 +35,45 @@ def test_config_defaults():
     assert cfg.renyi_order == 1.0
 
 
+def test_block_mlp_defaults_are_inert():
+    cfg = VFE3Config()
+
+    assert cfg.use_block_mlp is False
+    assert cfg.block_mlp_expansion == 4
+    assert cfg.block_mlp_activation == "gelu"
+    assert cfg.block_mlp_dropout == 0.0
+    assert cfg.m_block_mlp_lr is None
+
+
+def test_block_mlp_validation_rejects_invalid_controls():
+    for expansion in (True, 1.0, 0):
+        with pytest.raises(ValueError, match="block_mlp_expansion"):
+            VFE3Config(block_mlp_expansion=expansion)
+
+    with pytest.raises(ValueError, match="block_mlp_activation"):
+        VFE3Config(block_mlp_activation="unknown")
+
+    for dropout in (float("nan"), -0.1, 1.0):
+        with pytest.raises(ValueError, match="block_mlp_dropout"):
+            VFE3Config(block_mlp_dropout=dropout)
+
+    for learning_rate in (float("nan"), -0.001, float("inf")):
+        with pytest.raises(ValueError, match="m_block_mlp_lr"):
+            VFE3Config(m_block_mlp_lr=learning_rate)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"use_block_mlp": True, "e_step_gradient": "detach"},
+        {"use_block_mlp": True, "detach_e_step": True},
+    ),
+)
+def test_active_block_mlp_rejects_effective_detach(overrides):
+    with pytest.raises(ValueError, match="block_mlp"):
+        VFE3Config(**overrides)
+
+
 def test_head_mixer_learning_rates_default_to_inheritance():
     cfg = VFE3Config()
 
