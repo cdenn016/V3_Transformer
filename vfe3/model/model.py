@@ -233,7 +233,7 @@ def _sequence_belief(belief: BeliefState, index: int = 0) -> BeliefState:
 
 
 class VFEModel(nn.Module):
-    """encode -> E-step stack -> decode -> CE; the pure default owns only PriorBank parameters."""
+    """encode -> E-step stack -> decode -> CE; default-off MLP preserves the existing topology."""
 
     def __init__(self, cfg: VFE3Config) -> None:
         super().__init__()
@@ -336,7 +336,7 @@ class VFEModel(nn.Module):
                                                          affine=cfg.layernorm_affine) \
             if cfg.norm_type_block != "none" else None
         # One untied coordinate MLP per block is an explicitly non-gauge-pure structural
-        # augmentation. The disabled path owns no module, parameter, or state-dict key.
+        # augmentation. The disabled path adds no MLP module, parameter, or state-dict key.
         self.block_mlps = (
             nn.ModuleList([
                 BlockMLP(cfg.embed_dim, cfg.block_mlp_expansion,

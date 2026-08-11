@@ -482,7 +482,7 @@ def _learning_rates_by_aux_role(
 
     Unlike the required mean/sigma/phi report roles, an auxiliary role is absent when its
     component is disabled. Missing roles therefore resolve to NaN so every metrics row keeps the
-    same two mixer columns and :class:`RunArtifacts` renders inactive values as blank cells.
+    same auxiliary learning-rate columns and :class:`RunArtifacts` renders inactive values as blank cells.
     """
     if len(param_groups) != len(lrs):
         raise RuntimeError("optimizer parameter groups and scheduler learning rates differ in length")

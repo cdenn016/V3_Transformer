@@ -4,8 +4,9 @@ After each block the updated belief becomes (a blend toward) the next block's pr
 mu_p_next = (1 - rho) mu_p + rho mu_q (rho = prior_handoff_rho); sigma_p frozen at the
 embedding by default; phi flows through the belief, not the prior.
 
-Placement note (audit 2026-06-09 overnight F23): the opt-in head_mixer / cg_coupling / block MLP
-transforms run INSIDE each block (after its E-step, before its norm), so the belief
+Placement note (audit 2026-06-09 overnight F23): the opt-in head_mixer / cg_coupling run
+inside each block after its E-step and before its norm; the opt-in block MLP runs after
+that norm. All three transforms precede handoff, so the belief
 handed off above is the POST-transform belief — at n_layers > 1 the transforms recurse
 into every subsequent block's prior. The manuscript places the mixer in the single
 W_O-readout slot (Manuscripts-Theory/GL(K)_attention.tex) and concedes genuine
