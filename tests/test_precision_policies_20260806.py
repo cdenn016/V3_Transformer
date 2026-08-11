@@ -18,8 +18,11 @@ import torch
 
 import vfe3.families.gaussian as gaussian_mod
 import vfe3.numerics as numerics_mod
+from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
 from vfe3.families.gaussian import FullGaussian, _full_gaussian_kl_terms
+from vfe3.geometry.groups import get_group
+from vfe3.inference import e_step as e_step_mod
 from vfe3.model.model import VFEModel
 from vfe3.numerics import (
     apply_mu_trust_region,
@@ -148,6 +151,209 @@ def test_constructing_second_model_does_not_change_first_full_gaussian_policy_or
     assert model_a.full_cov_kl_precision == "fp64"
     assert model_b.full_cov_kl_precision == "fp32_escalate"
     assert torch.equal(before, after)
+
+
+def test_global_mutation_cannot_change_model_owned_dense_full_decode():
+    """The direct dense decoder must use PriorBank's stored policy, not the module default."""
+    cfg = VFE3Config(
+        vocab_size=16, embed_dim=K, n_heads=2, max_seq_len=4,
+        family="gaussian_full", use_prior_bank=True, decode_mode="full",
+        full_cov_kl_precision="fp64", full_cov_congruence_precision="fp64",
+    )
+    model = VFEModel(cfg)
+    mu = torch.zeros(1, 1, K)
+    sigma = _spd(7, seed=31).reshape(1, 1, K, K)
+    before = model.prior_bank.reference_decode(mu, sigma)
+    gaussian_mod.set_full_cov_kl_precision("fp32_escalate")
+    after = model.prior_bank.reference_decode(mu, sigma)
+    assert torch.equal(before, after)
+
+
+def _full_model(*, lambda_h=0.0) -> VFEModel:
+    return VFEModel(VFE3Config(
+        vocab_size=16, embed_dim=4, n_heads=2, max_seq_len=4,
+        family="gaussian_full", lambda_h=lambda_h,
+        full_cov_kl_precision="fp64", full_cov_congruence_precision="fp64",
+        pos_phi="none", e_phi_lr=0.0,
+    ))
+
+
+def test_hyper_prior_kl_keeps_model_policy_value_and_gradient_after_global_mutation(monkeypatch):
+    """The hyper-prior's actual FullGaussian operands belong to the owning model."""
+    from vfe3 import free_energy
+
+    model = _full_model(lambda_h=0.2)
+    tokens = torch.tensor([[1, 2, 3, 4]])
+    calls = []
+    actual = free_energy.self_divergence
+
+    def observed(q, p, **kwargs):
+        calls.append((q._precision_policy, p._precision_policy))
+        return actual(q, p, **kwargs)
+
+    monkeypatch.setattr(free_energy, "self_divergence", observed)
+
+    def value_and_gradient():
+        value = model._hyper_prior_kl(tokens).sum()
+        gradient, = torch.autograd.grad(value, model.prior_bank.s_mu_embed)
+        return value.detach(), gradient.detach()
+
+    before, before_grad = value_and_gradient()
+    gaussian_mod.set_full_cov_kl_precision("fp32_escalate")
+    after, after_grad = value_and_gradient()
+
+    assert calls and set(calls) == {("fp64", "fp64")}
+    torch.testing.assert_close(after, before, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(after_grad, before_grad, rtol=0.0, atol=0.0)
+
+
+def test_cg_moment_energy_rows_uses_builtin_policy_but_preserves_legacy_constructor(monkeypatch):
+    """The direct CG seam passes the policy only to the exact built-in family."""
+    from vfe3 import free_energy
+    from vfe3.families import base as families_base
+    from vfe3.model.cg_coupling import cg_moment_energy_rows
+
+    pre_mu = torch.zeros(1, 2, 4)
+    pre_sigma = torch.eye(4).reshape(1, 1, 4, 4).expand(1, 2, 4, 4).clone()
+    calls = []
+    actual = free_energy.self_divergence
+
+    def observed(q, p, **kwargs):
+        calls.append((q._precision_policy, p._precision_policy))
+        return actual(q, p, **kwargs)
+
+    monkeypatch.setattr(free_energy, "self_divergence", observed)
+
+    def value_and_gradient():
+        post_mu = (pre_mu + 0.1).detach().requires_grad_()
+        value = cg_moment_energy_rows(
+            pre_mu, pre_sigma, post_mu, pre_sigma,
+            family="gaussian_full", full_cov_kl_precision="fp64",
+            kl_max=float("inf"),
+        ).sum()
+        gradient, = torch.autograd.grad(value, post_mu)
+        return value.detach(), gradient.detach()
+
+    before, before_grad = value_and_gradient()
+    gaussian_mod.set_full_cov_kl_precision("fp32_escalate")
+    after, after_grad = value_and_gradient()
+
+    assert calls and set(calls) == {("fp64", "fp64")}
+    torch.testing.assert_close(after, before, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(after_grad, before_grad, rtol=0.0, atol=0.0)
+
+    class LegacyFullGaussian(FullGaussian):
+        def __init__(self, mu, sigma):
+            super().__init__(mu, sigma)
+
+    monkeypatch.setattr(families_base, "get_family", lambda _name: LegacyFullGaussian)
+    legacy = cg_moment_energy_rows(
+        pre_mu, pre_sigma, pre_mu + 0.1, pre_sigma,
+        family="legacy_full", full_cov_kl_precision="fp64", kl_max=float("inf"),
+    )
+    assert torch.isfinite(legacy).all()
+
+
+def test_e_step_early_halt_constructs_policy_owned_full_gaussians(monkeypatch):
+    """Evaluation halting reaches the explicit factory and actually breaks the iteration loop."""
+    belief = BeliefState(
+        mu=torch.zeros(2, 4),
+        sigma=torch.eye(4).expand(2, 4, 4).clone(),
+        phi=torch.zeros(2, 1),
+    )
+    constructed = []
+    iterations = []
+    actual_factory = e_step_mod._family_instance
+
+    def observed_factory(family, mu, sigma, policy):
+        out = actual_factory(family, mu, sigma, policy)
+        constructed.append(out._precision_policy)
+        return out
+
+    def stationary_iteration(current, *_args, **_kwargs):
+        iterations.append(current)
+        return current
+
+    monkeypatch.setattr(e_step_mod, "_family_instance", observed_factory)
+    monkeypatch.setattr(e_step_mod, "e_step_iteration", stationary_iteration)
+    gaussian_mod.set_full_cov_kl_precision("fp32_escalate")
+
+    result = e_step_mod.e_step(
+        belief, belief.mu, belief.sigma, object(), n_iter=3,
+        e_phi_lr=0.1, e_step_halt_tol=1e-9, training=False,
+        family="gaussian_full", full_cov_kl_precision="fp64",
+    )
+
+    assert result is belief
+    assert len(iterations) == 1
+    assert constructed == ["fp64", "fp64"]
+
+
+def test_fixed_point_diagnostic_uses_model_owned_full_gaussian_after_global_mutation(monkeypatch):
+    """The displayed fixed-point KL is evaluated through VFEModel's owned factory."""
+    from vfe3.viz.extract import e_step_fixed_point_diagnostics
+
+    model = _full_model()
+    model.cfg.n_e_steps = 1
+    tokens = torch.tensor([[1, 2, 3, 4]])
+    calls = []
+    actual_factory = model._family_instance
+
+    def observed_factory(family, *args):
+        out = actual_factory(family, *args)
+        if family is FullGaussian:
+            calls.append(out._precision_policy)
+        return out
+
+    monkeypatch.setattr(model, "_family_instance", observed_factory)
+    before = e_step_fixed_point_diagnostics(model, tokens)["estep_fp_kl"]
+    gaussian_mod.set_full_cov_kl_precision("fp32_escalate")
+    after = e_step_fixed_point_diagnostics(model, tokens)["estep_fp_kl"]
+
+    assert calls and set(calls) == {"fp64"}
+    assert after == before
+
+
+def test_gauge_equivariance_residual_owns_full_policy_through_transport_and_divergence(monkeypatch):
+    """The metric's real transport, factory, and energy calls all receive the explicit policy."""
+    from vfe3 import free_energy
+    from vfe3 import metrics
+
+    group = get_group("block_glk")(4, 2)
+    mu = torch.zeros(2, 4)
+    sigma = torch.eye(4).expand(2, 4, 4).clone()
+    omega = torch.eye(4).reshape(1, 1, 4, 4).expand(2, 2, 4, 4).clone()
+    transport_policies = []
+    energy_policies = []
+    transport = FullGaussian.transport_dispersion.__func__
+    pairwise = free_energy.pairwise_energy
+
+    def observed_transport(cls, dispersion, omega_, *, diagonal_out=None, precision_policy=None):
+        transport_policies.append(precision_policy)
+        return transport(cls, dispersion, omega_, diagonal_out=diagonal_out,
+                         precision_policy=precision_policy)
+
+    def observed_energy(q, p, *args, **kwargs):
+        energy_policies.append((q._precision_policy, p._precision_policy))
+        return pairwise(q, p, *args, **kwargs)
+
+    monkeypatch.setattr(FullGaussian, "transport_dispersion", classmethod(observed_transport))
+    monkeypatch.setattr(free_energy, "pairwise_energy", observed_energy)
+
+    before = metrics.gauge_equivariance_residual(
+        mu, sigma, omega, group, n_samples=1, seed=0,
+        full_cov_kl_precision="fp64",
+    )
+    gaussian_mod.set_full_cov_kl_precision("fp32_escalate")
+    after = metrics.gauge_equivariance_residual(
+        mu, sigma, omega, group, n_samples=1, seed=0,
+        full_cov_kl_precision="fp64",
+    )
+
+    assert transport_policies and set(transport_policies) == {"fp64"}
+    assert energy_policies and set(energy_policies) == {("fp64", "fp64")}
+    for key in before:
+        torch.testing.assert_close(after[key], before[key], rtol=0.0, atol=0.0)
 
 
 # -- C3: relative jitter -----------------------------------------------------------------------

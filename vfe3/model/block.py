@@ -196,7 +196,8 @@ def vfe_block(
                 capture["cg_moment_energy_rows"].append(cg_moment_energy_rows(
                     pre_mu, pre_sigma, res.mu, res.sigma,
                     renyi_order=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
-                    family=cfg.family, divergence_family=cfg.divergence_family))
+                    family=cfg.family, divergence_family=cfg.divergence_family,
+                    full_cov_kl_precision=cfg.full_cov_kl_precision))
                 out = out._replace(mu=res.mu, sigma=res.sigma)
         else:
             mu_cg, sigma_cg = cg_coupling(out.mu, out.sigma)

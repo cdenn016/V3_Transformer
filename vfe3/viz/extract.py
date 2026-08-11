@@ -858,8 +858,8 @@ def e_step_fixed_point_diagnostics(
 
     family = get_family(cfg.family)
     out["estep_fp_kl"] = float(kl(
-        family(q_next.mu, q_next.sigma),
-        family(q_t.mu, q_t.sigma),
+        model._family_instance(family, q_next.mu, q_next.sigma),
+        model._family_instance(family, q_t.mu, q_t.sigma),
         kl_max=cfg.kl_max,
         eps=cfg.eps,
     ).mean())

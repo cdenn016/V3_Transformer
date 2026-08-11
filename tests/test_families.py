@@ -169,6 +169,53 @@ def test_full_stack_round_trips():
         assert torch.equal(stacked.mu[h], part.mu) and torch.equal(stacked.sigma[h], part.sigma)
 
 
+def test_full_gaussian_policy_propagates_and_conflicts_are_explicit():
+    from vfe3.families.gaussian import FullGaussian
+
+    mu = torch.zeros(2, 2)
+    sigma = torch.eye(2).expand(2, 2, 2)
+    q64 = FullGaussian(mu, sigma, _precision_policy="fp64")
+    q32 = FullGaussian(mu, sigma, _precision_policy="fp32_escalate")
+
+    assert q64.block(0, 1)._precision_policy == "fp64"
+    assert q64.broadcast_over_keys()._precision_policy == "fp64"
+    assert FullGaussian.from_transported(mu, sigma, sigma, _precision_policy="fp64")._precision_policy == "fp64"
+    assert FullGaussian.stack([q64, q64])._precision_policy == "fp64"
+    with pytest.raises(ValueError, match="conflicting explicit precision policies"):
+        FullGaussian.stack([q64, q32])
+
+
+def test_full_gaussian_conflicting_operand_policies_require_override():
+    from vfe3.families.gaussian import FullGaussian
+
+    mu = torch.zeros(1, 2)
+    sigma = torch.eye(2).unsqueeze(0)
+    q64 = FullGaussian(mu, sigma, _precision_policy="fp64")
+    q32 = FullGaussian(mu + 0.1, sigma, _precision_policy="fp32_escalate")
+
+    with pytest.raises(ValueError, match="conflicting explicit precision policies"):
+        q64.renyi_closed_form(q32)
+    assert torch.isfinite(q64.renyi_closed_form(q32, precision_policy="fp32_escalate")).all()
+
+
+def test_legacy_full_gaussian_subclass_coupling_keeps_legacy_constructor_api():
+    from vfe3.families.gaussian import FullGaussian
+
+    class LegacyFullGaussian(FullGaussian):
+        def __init__(self, mu, sigma):
+            super().__init__(mu, sigma)
+
+        @classmethod
+        def from_transported(cls, mu, dispersion, source_dispersion):
+            return cls(mu, dispersion)
+
+    mu = torch.zeros(1, 2, 2)
+    sigma = torch.eye(2).expand(1, 2, 2, 2)
+    omega = torch.eye(2).expand(1, 2, 2, 2, 2)
+    out = LegacyFullGaussian.coupling_energy(mu, sigma, mu, sigma, omega)
+    assert torch.isfinite(out).all()
+
+
 @pytest.mark.parametrize(
     ("mu_dtype", "sigma_dtype"),
     [(torch.float32, torch.float64), (torch.float64, torch.float32)],

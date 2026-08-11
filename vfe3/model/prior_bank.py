@@ -2594,8 +2594,8 @@ def _decode_full(
     sigma_q_b = sigma_q.unsqueeze(-3)                                    # (B, N, 1, K, K)
     full = get_family("gaussian_full")
     kl_v = kl(
-        full(mu_q_b, sigma_q_b),
-        full(mu_v, sigma_v),
+        _family_with_precision_policy(full, mu_q_b, sigma_q_b, pb.full_cov_kl_precision),
+        _family_with_precision_policy(full, mu_v, sigma_v, pb.full_cov_kl_precision),
         kl_max=float("inf"),
         eps=pb.eps,
     )                                                                       # (B, N, V)

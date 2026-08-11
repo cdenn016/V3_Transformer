@@ -714,6 +714,20 @@ class FullGaussian(BeliefParams):
         the whole chain. Failing it falls back rather than stacking a spurious broadcast.
         """
         policy = full_cov_kl_precision() if precision_policy is None else validate_full_cov_kl_precision(precision_policy)
+        # Private provenance kwargs are an implementation detail of the exact built-in class.
+        # Registry replacements and downstream subclasses historically implement the two-argument
+        # constructor / three-argument from_transported contract, so preserve that public surface.
+        def _make(mu: torch.Tensor, dispersion: torch.Tensor) -> "FullGaussian":
+            if cls is FullGaussian:
+                return cls(mu, dispersion, _precision_policy=policy)
+            return cls(mu, dispersion)
+
+        def _from_transported(
+            mu: torch.Tensor, dispersion: torch.Tensor, source: torch.Tensor,
+        ) -> "FullGaussian":
+            if cls is FullGaussian:
+                return cls.from_transported(mu, dispersion, source, _precision_policy=policy)
+            return cls.from_transported(mu, dispersion, source)
         blocks = None
         if (irrep_dims is not None and len(irrep_dims) > 1
                 and len(set(irrep_dims)) == 1
@@ -736,9 +750,8 @@ class FullGaussian(BeliefParams):
                 precision_policy=policy,
             )
             return pairwise_energy(
-                cls(mu_q, dispersion_q, _precision_policy=policy),
-                cls.from_transported(
-                    mu_t, dispersion_t, dispersion_k, _precision_policy=policy),
+                _make(mu_q, dispersion_q),
+                _from_transported(mu_t, dispersion_t, dispersion_k),
                 alpha=alpha, kl_max=kl_max, eps=eps,
                 divergence_family=divergence_family, irrep_dims=irrep_dims,
             )
@@ -746,14 +759,13 @@ class FullGaussian(BeliefParams):
         from vfe3.free_energy import head_stacked_energy
         H, d = len(irrep_dims), irrep_dims[0]
         mu_t = cls.transport_location(mu_k, omega)                     # (..., N, N, K)
-        key_stack = cls.from_transported(
+        key_stack = _from_transported(
             mu_t.reshape(*mu_t.shape[:-1], H, d).movedim(-2, 0).contiguous(),   # (H,...,N,N,d)
             blocks.movedim(-3, 0).contiguous(),                                 # (H,...,N,N,d,d)
             dispersion_k,
-            _precision_policy=policy,
         )
         return head_stacked_energy(
-            cls(mu_q, dispersion_q, _precision_policy=policy).broadcast_over_keys(), key_stack,
+            _make(mu_q, dispersion_q).broadcast_over_keys(), key_stack,
             alpha=alpha, kl_max=kl_max, eps=eps,
             divergence_family=divergence_family, irrep_dims=irrep_dims,
         )
@@ -848,13 +860,13 @@ class FullGaussian(BeliefParams):
         # through them invites exactly the desynchronisation that lost `cond_escalation` in
         # `_transport_to_float` -- a gradient computed at one precision against an objective
         # reported at another. One policy, one read site, no way for two paths to disagree.
-        policy = (
-            precision_policy
-            if precision_policy is not None
-            else self._precision_policy
-            if self._precision_policy is not None
-            else other._precision_policy
-        )
+        if precision_policy is not None:
+            policy = validate_full_cov_kl_precision(precision_policy)
+        elif (self._precision_policy is not None and other._precision_policy is not None
+              and self._precision_policy != other._precision_policy):
+            raise ValueError("FullGaussian operands have conflicting explicit precision policies; pass precision_policy explicitly")
+        else:
+            policy = self._precision_policy or other._precision_policy
         compute_dtype = _full_cov_kl_compute_dtype(result_dtype, policy)
         mu_q = self.mu.to(compute_dtype)
         sigma_q = self.sigma.to(compute_dtype)

@@ -21,6 +21,7 @@ import torch
 from torch import nn
 
 from vfe3.geometry.cg import cg_intertwiners, cg_selection
+from vfe3.families.gaussian import FullGaussian
 
 
 class CGMomentResult(NamedTuple):
@@ -48,6 +49,7 @@ def cg_moment_energy_rows(
     eps:               float = 1e-6,
     family:            str   = "gaussian_diagonal",
     divergence_family: str   = "renyi",
+    full_cov_kl_precision: Optional[str] = None,
 ) -> torch.Tensor:                        # (..., N) D(q_post || q_pre)
     r"""Per-token post-CG moment divergence D(q_post || q_pre) via the active-family divergence seam.
 
@@ -59,8 +61,12 @@ def cg_moment_energy_rows(
     from vfe3.families.base import get_family
     from vfe3.free_energy import self_divergence
     fam = get_family(family)
+    def _instance(mu: torch.Tensor, sigma: torch.Tensor):
+        if fam is FullGaussian and full_cov_kl_precision is not None:
+            return fam(mu, sigma, _precision_policy=full_cov_kl_precision)
+        return fam(mu, sigma)
     return self_divergence(
-        fam(post_mu, post_sigma), fam(pre_mu, pre_sigma),
+        _instance(post_mu, post_sigma), _instance(pre_mu, pre_sigma),
         alpha=renyi_order, kl_max=kl_max, eps=eps, divergence_family=divergence_family,
     )
 

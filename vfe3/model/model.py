@@ -1935,7 +1935,8 @@ class VFEModel(nn.Module):
                         per_layer_rows.append(cg_moment_energy_rows(
                             pre_mu, pre_sigma, res.mu, res.sigma,
                             renyi_order=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
-                            family=cfg.family, divergence_family=cfg.divergence_family))
+                            family=cfg.family, divergence_family=cfg.divergence_family,
+                            full_cov_kl_precision=self.full_cov_kl_precision))
             else:
                 per_layer_rows = cap["cg_moment_energy_rows"]
             if (len(per_layer_rows) != cfg.n_layers
@@ -1998,7 +1999,8 @@ class VFEModel(nn.Module):
         r_mu, r_sigma = pb.r_parameters()                           # (K,) / (K,K)
         div = self_divergence_per_coord if per_coord else self_divergence
         return div(
-            family(s_mu, s_sigma), family(r_mu, r_sigma),
+            self._family_instance(family, s_mu, s_sigma),
+            self._family_instance(family, r_mu, r_sigma),
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
             divergence_family=cfg.divergence_family,
         )                                                            # (B, N) summed, or (B, N, K) per-coord

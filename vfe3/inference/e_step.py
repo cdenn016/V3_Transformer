@@ -1614,8 +1614,10 @@ def e_step(
             # a wasted check after the final iteration.
             with torch.no_grad():
                 move = kl(
-                    halt_family(belief.mu, belief.sigma),
-                    halt_family(prev_mu, prev_sigma),
+                    _family_instance(halt_family, belief.mu, belief.sigma,
+                                     kwargs.get("full_cov_kl_precision")),
+                    _family_instance(halt_family, prev_mu, prev_sigma,
+                                     kwargs.get("full_cov_kl_precision")),
                     kl_max=float("inf"),
                     eps=halt_eps,
                 ).mean()
