@@ -288,6 +288,111 @@ def test_seed_dirs_reject_missing_or_unreadable_config(tmp_path, config_text):
         ms._seed_dirs(tmp_path)
 
 
+def test_requested_panel_reports_unexpected_duplicate_runs_and_withholds_publication(
+    tmp_path, monkeypatch,
+):
+    _write_request(tmp_path, [8])
+    for dirname, seed, ppl in (
+        ("requested_s8", 8, 10.0),
+        ("unexpected_s6", 6, 11.0),
+        ("unexpected_retry_s6_2", 6, 12.0),
+    ):
+        _write_full_run(
+            tmp_path / dirname,
+            ppl=ppl,
+            seed=seed,
+            metrics=f"step,train_ce\n1,{ppl}\n",
+            config={"config": {"seed": seed, "embed_dim": 20, "generate_figures": False}},
+        )
+
+    design = ms._requested_seed_design(tmp_path)
+    assert design["requested_seeds"] == [8]
+    assert design["accepted_seeds"] == [8]
+    assert design["observed_seeds"] == [6, 6, 8]
+    assert design["unexpected_seeds"] == [6]
+    assert design["duplicate_seeds"] == [6]
+    assert design["unidentified_runs"] == []
+    assert design["n_accepted_seeds"] == 1
+    assert design["n_observed_runs"] == 3
+    assert design["complete"] is False
+
+    aggregate = ms.aggregate_seed_metric(tmp_path)
+    assert aggregate["n"] == 1
+    assert aggregate["seeds"] == [8]
+    assert aggregate["accepted_seeds"] == [8]
+    assert aggregate["observed_seeds"] == [6, 6, 8]
+    assert aggregate["complete"] is False
+    assert ms.aggregate_seed_curves(tmp_path, columns=["train_ce"]) == {}
+
+    emitted = []
+    monkeypatch.setitem(ms.CONFIG, "run_root", str(tmp_path))
+    monkeypatch.setitem(ms.CONFIG, "key", "test_ppl")
+    monkeypatch.setattr(ms, "SCALAR_KEYS", ["test_ppl"])
+    monkeypatch.setattr(ms, "_emit_figures", lambda *args: emitted.append(args))
+
+    assert ms.main() != 0
+    summary = json.loads((tmp_path / "multiseed_summary.json").read_text(encoding="utf-8"))
+    assert summary["n_seeds"] == 1
+    assert summary["seeds"] == [8]
+    assert summary["n_observed_runs"] == 3
+    assert summary["observed_seeds"] == [6, 6, 8]
+    assert summary["design"]["accepted_seeds"] == [8]
+    assert summary["design"]["unexpected_seeds"] == [6]
+    assert summary["design"]["duplicate_seeds"] == [6]
+    assert summary["design"]["complete"] is False
+    assert summary["scalars"] == {}
+    assert summary["curves_final_step"] == {}
+    assert summary["withheld"] == {
+        "scalars": True,
+        "curves": True,
+        "per_layer": True,
+        "figures": True,
+    }
+    assert emitted == []
+
+
+def test_requested_panel_classifies_unreadable_extra_before_config_homogeneity(tmp_path):
+    _write_request(tmp_path, [8])
+    _write_full_run(
+        tmp_path / "requested_s8",
+        ppl=10.0,
+        seed=8,
+        config={"config": {"seed": 8, "embed_dim": 20}},
+    )
+    unidentified = tmp_path / "unidentified"
+    unidentified.mkdir()
+    (unidentified / "summary.json").write_text(json.dumps({"test_ppl": 99.0}))
+    (unidentified / "config.json").write_text("{ not json")
+
+    design = ms._requested_seed_design(tmp_path)
+
+    assert design["accepted_seeds"] == [8]
+    assert design["observed_seeds"] == [8]
+    assert design["unidentified_runs"] == [str(unidentified)]
+    assert design["n_observed_runs"] == 2
+    assert design["complete"] is False
+
+
+def test_duplicate_observation_for_requested_seed_is_runtime_cohort_invalid(tmp_path):
+    _write_request(tmp_path, [8])
+    for dirname, ppl in (("requested_s8", 10.0), ("requested_retry_s8_2", 11.0)):
+        _write_full_run(
+            tmp_path / dirname,
+            ppl=ppl,
+            seed=8,
+            config={"config": {"seed": 8, "embed_dim": 20}},
+        )
+
+    design = ms._requested_seed_design(tmp_path)
+
+    assert design["request_verified"] is True
+    assert design["accepted_seeds"] == []
+    assert design["observed_seeds"] == [8, 8]
+    assert design["duplicate_seeds"] == [8]
+    assert design["cells"] == [{"seed": 8, "status": "duplicate", "run_dir": None}]
+    assert design["complete"] is False
+
+
 def test_aggregate_scalar_reads_dotted_research_key(tmp_path):
     _write_full_run(tmp_path / "a", ppl=1.0, seed=1, research={"corpus_freq_strata_ce": {"rare": 7.0}})
     _write_full_run(tmp_path / "b", ppl=1.0, seed=2, research={"corpus_freq_strata_ce": {"rare": 9.0}})
