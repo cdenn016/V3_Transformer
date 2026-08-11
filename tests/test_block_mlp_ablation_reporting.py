@@ -43,9 +43,23 @@ def test_ablation_summary_and_figure_disclose_nonpushforward_mlp():
     ]
     summary = ablation._gauge_purity_summary(rows)
     assert summary["contains_coordinate_mean_only_nonintertwiner"] is True
+    assert summary["block_mlp_intertwiner_compatible_by_label"] == {
+        "off": True,
+        "on": False,
+    }
     assert summary["all_rows_on_gauge_pure_path"] is False
     text = ablation._gauge_disclosure_text(summary).lower()
     assert "not gauge-pure" in text
     assert "mean-only" in text
     assert "covariance passthrough" in text
     assert "not a gaussian pushforward" in text
+
+
+def test_cross_sweep_bar_label_includes_active_mlp_classification():
+    label = ablation._sensitivity_gauge_label({
+        "head_mixer_compatibility": "disabled",
+        "block_mlp_structural_mode": "coordinate_mean_only_nonintertwiner",
+    })
+    assert label == (
+        "head_mixer=disabled; block_mlp=coordinate_mean_only_nonintertwiner"
+    )

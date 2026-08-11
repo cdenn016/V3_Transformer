@@ -3742,10 +3742,15 @@ def _gauge_purity_summary(results: List[Dict[str, Any]]) -> Dict[str, object]:
         str(result["label"]): str(result.get("block_mlp_covariance_contract", "unavailable"))
         for result in results
     }
+    mlp_intertwiner_compatible = {
+        str(result["label"]): bool(result.get("block_mlp_intertwiner_compatible", False))
+        for result in results
+    }
     return {
         "classifications_by_label": classifications,
         "block_mlp_structural_modes_by_label": mlp_modes,
         "block_mlp_covariance_contracts_by_label": mlp_covariance,
+        "block_mlp_intertwiner_compatible_by_label": mlp_intertwiner_compatible,
         "contains_independent_head_nonintertwiner": any(
             value == "independent_head_nonintertwiner"
             for value in classifications.values()
@@ -5609,6 +5614,13 @@ def _plot_pos_extrapolation(sweep_dir: Path, fig_dir: Path) -> None:
     print(f"  figure -> {out}")
 
 
+def _sensitivity_gauge_label(row: Mapping[str, object]) -> str:
+    """Return the complete structural gauge label used by cross-sweep bars."""
+    head_mixer = str(row.get("head_mixer_compatibility") or "unavailable")
+    block_mlp = str(row.get("block_mlp_structural_mode") or "unavailable")
+    return f"head_mixer={head_mixer}; block_mlp={block_mlp}"
+
+
 def _plot_sensitivity(
     output_dir: Path,
     fig_dir:    Path,
@@ -5646,7 +5658,7 @@ def _plot_sensitivity(
             d.name,
             max(ppls) - min(ppls),
             best["label"],
-            best.get("head_mixer_compatibility") or "unavailable",
+            _sensitivity_gauge_label(best),
         ))
     if not sensitivity:
         return
