@@ -49,7 +49,7 @@ independent review before the next task begins.
   Loewner adjoint for its backward.
 - Preserve the log-Euclidean three-eigendecomposition contract.
 
-- [ ] **Step 1: Add RED regressions**
+- [x] **Step 1: Add RED regressions**
 
 Add tests that assert:
 
@@ -61,7 +61,7 @@ Add tests that assert:
 3. NaN and both infinities in one log-Euclidean tangent freeze only that batch row, increment the
    nonfinite-tangent counter, leave its neighbor unchanged, and leave finite inputs bitwise inert.
 
-- [ ] **Step 2: Prove RED with machine-readable output**
+- [x] **Step 2: Prove RED with machine-readable output**
 
 ```powershell
 $env:CUDA_VISIBLE_DEVICES='-1'
@@ -75,19 +75,19 @@ $env:VFE3_TEST_DEVICE='cpu'
 
 Expected: the new assertions fail for the audited derivative/fallback behavior.
 
-- [ ] **Step 3: Implement the minimal spectral repairs**
+- [x] **Step 3: Implement the minimal spectral repairs**
 
 Use a stable `expm1` divided difference only for nonzero, active-interval exponential gaps whose
 rounded output gap is zero. Add the floored-log spectral values/derivatives, route log-Euclidean
 reconstructions through the cached spectral-map adjoint, and neutralize the chart tangent before
 the trust-region norm.
 
-- [ ] **Step 4: Prove GREEN and adjacent invariants**
+- [x] **Step 4: Prove GREEN and adjacent invariants**
 
 Run the three files above without `-k`, write `.verification/task-01-green.xml`, and explicitly
 confirm the three-eigendecomposition, float64-island, finite-backward, and affine retraction tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add vfe3/geometry/retraction.py tests/test_retraction.py `
@@ -127,25 +127,25 @@ git commit -m "fix: stabilize SPD spectral derivatives"
 - Preserve the module-level policy only as the default for standalone callers.
 - Make `FullGaussian.natural()` compute in `self._public_dtype`.
 
-- [ ] **Step 1: Add RED regressions**
+- [x] **Step 1: Add RED regressions**
 
 Add a two-model test proving construction of model B cannot change model A's stored policy or an
 actual model-A kernel result. Add `(mu32, sigma64)` and `(mu64, sigma32)` natural-coordinate cases
 against an explicit promoted-dtype solve, retaining the same-dtype bitwise regression.
 
-- [ ] **Step 2: Prove RED**
+- [x] **Step 2: Prove RED**
 
 Run the four test files with a focused expression and `.verification/task-02-red.xml`. Expect the
 cross-model result to change under the global mutation and mixed-dtype solves to fail.
 
-- [ ] **Step 3: Implement explicit ownership**
+- [x] **Step 3: Implement explicit ownership**
 
 Validate and store the policy on `VFEModel` and `PriorBank`; remove model-construction mutation;
 thread the value through all model-owned coupling, self-divergence, transport, decoder dispatch,
 and workspace helpers. Promote `mu`, `sigma`, and the identity to the public compute dtype before
 the unchanged LU solve.
 
-- [ ] **Step 4: Prove GREEN and call-site completeness**
+- [x] **Step 4: Prove GREEN and call-site completeness**
 
 Run the four files without the focused expression plus:
 
@@ -157,7 +157,7 @@ Run the four files without the focused expression plus:
 
 Use `rg` to verify every model-owned full-covariance consumer passes the instance policy.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add vfe3/families/gaussian.py vfe3/families/base.py vfe3/model/model.py `
@@ -193,31 +193,31 @@ git commit -m "fix: isolate full Gaussian precision policy"
 - Add reset/read/increment helpers for an asynchronous per-device MM Cholesky fallback counter and
   publish it beside existing numerical fallback metrics.
 
-- [ ] **Step 1: Add RED regressions**
+- [x] **Step 1: Add RED regressions**
 
 Assert the dense emission fixture contributes `4.0`, has exactly zero off-diagonal covariance
 gradient, and retains diagonal-family behavior. Add MM tests in which failed `sigma_star` and a
 monkeypatched partial factor retain the old mean/covariance exactly, while a mixed valid/invalid
 batch updates only its valid row and increments the new counter.
 
-- [ ] **Step 2: Prove RED**
+- [x] **Step 2: Prove RED**
 
 Run the focused tests with `.verification/task-03-red.xml`; current emission should contribute
 `4.375`, and current MM should consume the failed partial factor.
 
-- [ ] **Step 3: Implement masked MM and reporting**
+- [x] **Step 3: Implement masked MM and reporting**
 
 Use `belief.sigma.diagonal(...)` for the dense emission variance. Retain every Cholesky success
 mask, replace failed factors with identity before solve/inversion, combine masks, certify candidate
 rows, and finally select the old state for failures. Add/reset/publish the counter without a
 per-step device synchronization.
 
-- [ ] **Step 4: Prove GREEN**
+- [x] **Step 4: Prove GREEN**
 
 Run the three listed files and the focused full-Gaussian E-step/MM suites to
 `.verification/task-03-green.xml`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add vfe3/inference/e_step.py vfe3/gradients/kernels.py vfe3/numerics.py `
@@ -250,7 +250,7 @@ git commit -m "fix: reject failed full Gaussian MM rows"
 - Add registration metadata so legacy custom decoders keep their existing signature.
 - Keep default scalar decoder returns, default model tuple, and `evaluate()` result keys unchanged.
 
-- [ ] **Step 1: Add RED regressions**
+- [x] **Step 1: Add RED regressions**
 
 Cover NaN and infinity covariance rows, manual-ignore loss equivalence, exact surviving counts,
 fallback counts, finite backward, and zero excluded-row gradient. Add evaluation batches with
@@ -258,11 +258,11 @@ fallback counts, finite backward, and zero excluded-row gradient. Add evaluation
 two-microbatch gradient objective expecting `(1*1 + 3*3)/4 = 2.5` and a combined ignore/non-PD
 count case.
 
-- [ ] **Step 2: Prove RED**
+- [x] **Step 2: Prove RED**
 
 Run the focused decoder/evaluation/accumulation cases to `.verification/task-04-red.xml`.
 
-- [ ] **Step 3: Implement sanitized decoding and count propagation**
+- [x] **Step 3: Implement sanitized decoding and count propagation**
 
 Sanitize nonfinite rows before all decoder arithmetic, combine finiteness and Cholesky masks, and
 count every exclusion. Return exact int64 counts from built-ins when opted in. Propagate the count
@@ -270,14 +270,14 @@ through model forward, evaluation, and training. Weight accumulated losses by co
 GradScaler unscale, divide gradients by the total scored count. Explicitly skip a zero-count
 training accumulation.
 
-- [ ] **Step 4: Prove GREEN and compatibility**
+- [x] **Step 4: Prove GREEN and compatibility**
 
 Run all four listed files plus dense/diagonal/family decoder tests to
 `.verification/task-04-green.xml`. Assert legacy custom decoder callables and the exact four-key
 evaluation result remain unchanged. Inspect the common `grad_accum_steps=1` path for no new
 unconditional scalar synchronization.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add vfe3/model/prior_bank.py vfe3/model/model.py vfe3/train.py `
@@ -306,7 +306,7 @@ git commit -m "fix: account for decoder-excluded tokens"
 - Split internal optimizer validation into portable snapshot and realized live-device phases.
 - Preserve model-only resume and unchanged-contract legacy optimizer resume.
 
-- [ ] **Step 1: Add RED regressions**
+- [x] **Step 1: Add RED regressions**
 
 Assert a CPU-mapped populated fused optimizer snapshot passes portable preflight, then validates
 after normal load placement. Assert same-shaped parameter reordering is rejected by name, a
@@ -314,25 +314,25 @@ tampered manifest digest is rejected, negative `exp_avg_sq` and `max_exp_avg_sq`
 signed `exp_avg` remains valid. Assert model/optimizer/scaler/scheduler/RNG state is unchanged after
 any pre-mutation failure. Cover legacy unchanged-contract acceptance and drift-enabled rejection.
 
-- [ ] **Step 2: Prove RED**
+- [x] **Step 2: Prove RED**
 
 Run only the new cases to `.verification/task-05-red.xml` with the CPU interpreter.
 
-- [ ] **Step 3: Implement manifest and two-phase validation**
+- [x] **Step 3: Implement manifest and two-phase validation**
 
 Build the manifest from `model.named_parameters()` and exact optimizer group order at save time.
 Validate schema, digest, names, and shapes before mutation. Remove live-device equality from CPU
 preflight; load optimizer state; validate realized moments and fused/capturable step devices; and
 restore the optimizer snapshot if realized validation fails. Require nonnegative second moments.
 
-- [ ] **Step 4: Prove CPU GREEN and record CUDA obligation**
+- [x] **Step 4: Prove CPU GREEN and record CUDA obligation**
 
 Run both full files in bounded groups, writing `.verification/task-05-green-part*.xml`. If the GPU
 is still resident, do not run CUDA tests and leave only the real-device integration claim open. If
 it is idle, verify `C:/anaconda/python.exe` reports CUDA and run the targeted resume test with
 `VFE3_TEST_DEVICE=cuda` into `.verification/task-05-cuda.xml`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add vfe3/run_artifacts.py tests/test_checkpoint_resume.py tests/test_run_artifacts.py
@@ -363,7 +363,7 @@ git commit -m "fix: bind optimizer checkpoints by parameter name"
   fields.
 - Keep the parameter-match target at `30_000_000` and tolerance at `0.02`.
 
-- [ ] **Step 1: Add RED regressions**
+- [x] **Step 1: Add RED regressions**
 
 Create a requested `[8]` fixture with observed `s8,s6,s6`; require the panel to be incomplete,
 aggregates/figures withheld, and all discrepancy categories reported. Create validation/time data
@@ -371,23 +371,23 @@ whose only paired seed has `(bits=6,time=100)` and require both coordinates to u
 Update the existing parameter-grid test to expect grids containing `K=45`, `H=5`, 90 Cartesian
 candidates, and exactly `(45,5,29_452_186)` plus `(60,10,30_200_281)`.
 
-- [ ] **Step 2: Prove RED**
+- [x] **Step 2: Prove RED**
 
 Run the three focused tests to `.verification/task-06-red.xml`.
 
-- [ ] **Step 3: Implement cohort joins and minimal grid expansion**
+- [x] **Step 3: Implement cohort joins and minimal grid expansion**
 
 Classify every observed directory before completeness is decided; expose accepted and observed
 counts separately; withhold publication on extras/duplicates/unidentified runs. Join validation
 and time by seed before means. Add only `45` to `embed_dim` and `5` to `n_heads`; do not relax the
 tolerance.
 
-- [ ] **Step 4: Prove GREEN**
+- [x] **Step 4: Prove GREEN**
 
 Run `tests/test_multiseed.py`, the driver-reliability module, and all sweep-adapter/scaling tests to
 `.verification/task-06-green.xml`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add multiseed_analysis.py vfe3/viz/sweep_adapters.py ablation.py `
@@ -407,12 +407,12 @@ git commit -m "fix: align cross-run analysis cohorts"
 - Modify: `docs/audits/deep-audit-three-wave-2026-08-10.md` only to append remediation status and
   exact evidence links; do not rewrite the historical audit verdict.
 
-- [ ] **Step 1: Review every task commit**
+- [x] **Step 1: Review every task commit**
 
 After each implementation commit, generate an SDD review package and dispatch an independent
 reviewer. Resolve all correctness findings before beginning the next implementation task.
 
-- [ ] **Step 2: Run static and aggregate CPU verification**
+- [x] **Step 2: Run static and aggregate CPU verification**
 
 Run Ruff on modified Python files, the focused full-Gaussian 231-test lane, the CPU-fast lane in
 bounded partitions, and every task regression into fresh JUnit XML. Derive totals only from XML.
@@ -424,7 +424,7 @@ source/config/environment identity, at least two independent views, eligible mec
 and an adjudicator. Mark any unavailable CUDA integration obligation `INCONCLUSIVE`, never
 verified by inference from CPU tests.
 
-- [ ] **Step 4: Perform final code review**
+- [x] **Step 4: Perform final code review**
 
 Dispatch a clean-context reviewer over the complete base-to-head diff, the design, the plan, and
 the ledger. Repair and re-run affected evidence for every accepted finding.
