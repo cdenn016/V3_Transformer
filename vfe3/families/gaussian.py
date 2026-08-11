@@ -743,12 +743,13 @@ class FullGaussian(BeliefParams):
         if blocks is None:
             from vfe3.free_energy import pairwise_energy
             mu_t = cls.transport_location(mu_k, omega)
-            dispersion_t = cls.transport_dispersion(
-                dispersion_k, omega,
+            transport_kwargs = dict(
                 diagonal_out=diagonal_out,
                 marginal_blocks=irrep_dims,
-                precision_policy=policy,
             )
+            if cls is FullGaussian:
+                transport_kwargs["precision_policy"] = policy
+            dispersion_t = cls.transport_dispersion(dispersion_k, omega, **transport_kwargs)
             return pairwise_energy(
                 _make(mu_q, dispersion_q),
                 _from_transported(mu_t, dispersion_t, dispersion_k),

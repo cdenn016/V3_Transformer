@@ -209,6 +209,11 @@ def test_legacy_full_gaussian_subclass_coupling_keeps_legacy_constructor_api():
         def from_transported(cls, mu, dispersion, source_dispersion):
             return cls(mu, dispersion)
 
+        @classmethod
+        def transport_dispersion(cls, dispersion, omega, *, diagonal_out=None, marginal_blocks=None):
+            return super().transport_dispersion(
+                dispersion, omega, diagonal_out=diagonal_out, marginal_blocks=marginal_blocks)
+
     mu = torch.zeros(1, 2, 2)
     sigma = torch.eye(2).expand(1, 2, 2, 2)
     omega = torch.eye(2).expand(1, 2, 2, 2, 2)
