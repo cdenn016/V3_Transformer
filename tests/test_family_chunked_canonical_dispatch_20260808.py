@@ -318,14 +318,7 @@ def test_legacy_custom_fused_decoder_keeps_signature_when_stats_are_requested():
         assert int(stats.scored_tokens) == 5
         assert calls == [model.cfg.z_loss_weight]
     finally:
-        prior_bank.register_decode(
-            "full_chunked",
-            supports_full=original.supports_full,
-            supports_chunked=original.supports_chunked,
-            fused_ce=original.fused_ce,
-            family_consistent=original.family_consistent,
-            covariance_kinds=original.covariance_kinds,
-            can_omit_base_mean=original.can_omit_base_mean,
-            can_omit_base_variance=original.can_omit_base_variance,
-            override=True,
-        )(original.callable)
+        # Canonical projected construction pins the complete import-time registration identity,
+        # not only equal metadata/callables. Restore that exact object so this compatibility probe
+        # cannot poison later registry-identity tests in the same process.
+        prior_bank._DECODERS["full_chunked"] = original

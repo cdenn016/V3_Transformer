@@ -1844,16 +1844,21 @@ class PriorBank(nn.Module):
         if self.encode_mode == "canonical_content_projected" or canonical_frame is not None:
             if sigma_q.dim() < 1:
                 raise ValueError("decode dispersion must have a trailing coordinate axis")
-            mu_placeholder = torch.zeros_like(sigma_q)
-            if sigma_q.dim() < 4 or sigma_q.shape[-1] != sigma_q.shape[-2]:
-                _, _, _, ok = self._query_in_decode_frame_for_full_decode(
-                    mu_placeholder, sigma_q, canonical_frame)
-                return ~ok
-            _, sigma_q = self._query_in_decode_frame(
+            is_full = sigma_q.dim() >= 4 and sigma_q.shape[-1] == sigma_q.shape[-2]
+            mu_placeholder = (
+                torch.zeros_like(sigma_q[..., 0]) if is_full else torch.zeros_like(sigma_q))
+            _, safe_sigma, _, ok = self._query_in_decode_frame_for_full_decode(
                 mu_placeholder, sigma_q, canonical_frame)
-        if sigma_q.dim() < 4 or sigma_q.shape[-1] != sigma_q.shape[-2]:
-            return None                                       # diagonal dispersion: no factorization
-        _, _, ok = self._prepare_full_covariance_for_decode(sigma_q)
+        else:
+            if sigma_q.dim() < 4 or sigma_q.shape[-1] != sigma_q.shape[-2]:
+                return None                                   # diagonal dispersion: no factorization
+            safe_sigma, _, ok = self._prepare_full_covariance_for_decode(sigma_q)
+        if hasattr(self, "head_evidence_logits"):
+            head_delta, _ = self._head_evidence_deltas(
+                dtype=safe_sigma.dtype, device=safe_sigma.device)
+            _, block_ok = self._head_evidence_full_marginal_invariants(
+                safe_sigma, head_delta)
+            ok = ok & block_ok
         return ~ok
 
     def _full_cov_query_invariants(
