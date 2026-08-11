@@ -244,9 +244,15 @@ def test_nonfinite_loss_blocks_enabled_gradscaler_step() -> None:
             _targets:        torch.Tensor,
             *,
             estep_grad_out:  Any = None,
+            return_decode_stats: bool = False,
         ) -> tuple[None, torch.Tensor, None]:
             del estep_grad_out
-            return None, self.weight + float("inf"), None
+            loss = self.weight + float("inf")
+            if return_decode_stats:
+                from vfe3.model.prior_bank import DecodeCEResult
+                count = torch.ones((), dtype=torch.int64, device=loss.device)
+                return None, loss, DecodeCEResult(loss.detach(), count)
+            return None, loss, None
 
     model = FiniteGradientInfiniteLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -283,9 +289,15 @@ def test_gradscaler_overflow_with_nonfinite_loss_backs_off_and_reports_gradient(
             self.weight = torch.nn.Parameter(torch.tensor(1.0))
             self.cfg = SimpleNamespace(learnable_r=False, phi_mstep_max_matrix_norm=None)
 
-        def forward(self, _tokens, _targets, *, estep_grad_out=None):
+        def forward(self, _tokens, _targets, *, estep_grad_out=None,
+                    return_decode_stats=False):
             del estep_grad_out
-            return None, self.weight * float("inf"), None
+            loss = self.weight * float("inf")
+            if return_decode_stats:
+                from vfe3.model.prior_bank import DecodeCEResult
+                count = torch.ones((), dtype=torch.int64, device=loss.device)
+                return None, loss, DecodeCEResult(loss.detach(), count)
+            return None, loss, None
 
     model = InfiniteGradientInfiniteLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
@@ -316,9 +328,15 @@ def test_finite_unlogged_gradscaler_step_does_not_scan_every_parameter_gradient(
             self.weight = torch.nn.Parameter(torch.tensor(1.0))
             self.cfg = SimpleNamespace(learnable_r=False, phi_mstep_max_matrix_norm=None)
 
-        def forward(self, _tokens, _targets, *, estep_grad_out=None):
+        def forward(self, _tokens, _targets, *, estep_grad_out=None,
+                    return_decode_stats=False):
             del estep_grad_out
-            return None, self.weight.square(), None
+            loss = self.weight.square()
+            if return_decode_stats:
+                from vfe3.model.prior_bank import DecodeCEResult
+                count = torch.ones((), dtype=torch.int64, device=loss.device)
+                return None, loss, DecodeCEResult(loss.detach(), count)
+            return None, loss, None
 
     model = ScalarModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)

@@ -455,9 +455,10 @@ def test_same_name_family_chunked_override_keeps_decode_av_precision_inert():
             family_consistent=original.family_consistent,
             fused_ce=original.fused_ce,
             covariance_kinds=original.covariance_kinds,
-            can_omit_base_mean=original.can_omit_base_mean,
-            can_omit_base_variance=original.can_omit_base_variance,
-            override=True,
+                can_omit_base_mean=original.can_omit_base_mean,
+                can_omit_base_variance=original.can_omit_base_variance,
+                fused_ce_supports_stats=original.fused_ce_supports_stats,
+                override=True,
         )(original.callable)
 
     restored = prior_bank.get_decode_registration("family_chunked")

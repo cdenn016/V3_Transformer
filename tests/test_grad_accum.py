@@ -9,6 +9,7 @@ range(B)`` loop), so ``(1/K) * sum_k mean_k == mean_full`` for equal-sized micro
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -117,10 +118,12 @@ def test_estep_grad_metrics_are_microbatch_mean_not_last():
                 {"mu": 3.0},
             ]
 
-        def forward(self, tokens, targets=None, *, estep_grad_out=None):
+        def forward(self, tokens, targets=None, *, estep_grad_out=None,
+                    return_decode_stats=False):
             assert estep_grad_out == {}
             estep_grad_out.update(self.records.pop(0))
-            return self.inner(tokens, targets)
+            return self.inner(
+                tokens, targets, return_decode_stats=return_decode_stats)
 
     torch.manual_seed(0)
     cfg = _cfg()
@@ -263,3 +266,68 @@ def test_train_step_indivisible_batch_raises():
     targets = torch.randint(0, 6, (5, 8))
     with pytest.raises(ValueError):
         train_step(model, opt, sched, tokens, targets, grad_clip=1.0, grad_accum_steps=4)
+
+
+class _ScriptedScoredTokenModel(torch.nn.Module):
+    """A one-parameter objective with CE/count encoded by each microbatch's token value."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor(1.0))
+        self.cfg = SimpleNamespace(
+            grad_clip_per_role=False,
+            learnable_r=False,
+            r_update_mode="gradient",
+            m_phi_update_mode="adamw",
+            phi_mstep_max_matrix_norm=None,
+        )
+
+    def forward(self, tokens, targets=None, *, estep_grad_out=None,
+                return_decode_stats=False):
+        value = tokens[0, 0].to(self.weight.dtype)
+        ce = self.weight * value
+        if return_decode_stats:
+            from vfe3.model.prior_bank import DecodeCEResult
+            count = tokens[0, 1].to(dtype=torch.int64)
+            return None, ce, DecodeCEResult(ce=ce.detach(), scored_tokens=count)
+        return None, ce, ce.detach()
+
+
+def _scripted_optimizer(model):
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    return optimizer, scheduler
+
+
+def test_accumulation_uses_decoder_counts_for_exact_token_level_objective():
+    model = _ScriptedScoredTokenModel()
+    optimizer, scheduler = _scripted_optimizer(model)
+    # Microbatch 1: (CE,count)=(1,1); microbatch 2: (CE,count)=(3,3).
+    tokens = torch.tensor([[1, 1], [3, 3]])
+    targets = torch.zeros_like(tokens)
+
+    loss = train_step(
+        model, optimizer, scheduler, tokens, targets,
+        grad_clip=0.0, grad_accum_steps=2,
+    )
+
+    assert loss == pytest.approx((1.0 * 1 + 3.0 * 3) / 4)
+    assert model.weight.grad.item() == pytest.approx(2.5)
+
+
+def test_zero_scored_accumulation_skips_optimizer_and_scheduler_update():
+    model = _ScriptedScoredTokenModel()
+    optimizer, scheduler = _scripted_optimizer(model)
+    tokens = torch.tensor([[0, 0], [0, 0]])
+    targets = torch.full_like(tokens, -100)
+    status = {}
+
+    loss = train_step(
+        model, optimizer, scheduler, tokens, targets,
+        grad_clip=0.0, grad_accum_steps=2, status_out=status,
+    )
+
+    assert loss == 0.0
+    assert status["did_step"] is False
+    assert scheduler.last_epoch == 0
+    assert optimizer.state == {}

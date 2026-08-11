@@ -286,3 +286,46 @@ def test_same_name_family_override_then_restore_falls_closed_to_generic_logits_a
     ).squeeze(-1)
     expected = expected_per_position[valid].mean()
     torch.testing.assert_close(fused, expected, atol=5e-6, rtol=2e-5)
+
+
+def test_legacy_custom_fused_decoder_keeps_signature_when_stats_are_requested():
+    model, _ = _bank(decode_mode="full_chunked", decode_unigram_prior=False)
+    original = prior_bank.get_decode_registration("full_chunked")
+    calls = []
+
+    def legacy_fused(pb, mu_q, sigma_q, targets, *, z_loss_weight=0.0):
+        calls.append(z_loss_weight)
+        return original.fused_ce(
+            pb, mu_q, sigma_q, targets, z_loss_weight=z_loss_weight)
+
+    prior_bank.register_decode(
+        "full_chunked",
+        supports_full=True,
+        supports_chunked=True,
+        fused_ce=legacy_fused,
+        family_consistent=original.family_consistent,
+        covariance_kinds=original.covariance_kinds,
+        can_omit_base_mean=original.can_omit_base_mean,
+        can_omit_base_variance=original.can_omit_base_variance,
+        override=True,
+    )(original.callable)
+    try:
+        tokens = torch.randint(0, model.cfg.vocab_size, (2, 3), device=DEVICE)
+        targets = torch.randint(0, model.cfg.vocab_size, (2, 3), device=DEVICE)
+        targets[0, 1] = -100
+        _, _, stats = model(tokens, targets, return_decode_stats=True)
+        assert isinstance(stats, prior_bank.DecodeCEResult)
+        assert int(stats.scored_tokens) == 5
+        assert calls == [model.cfg.z_loss_weight]
+    finally:
+        prior_bank.register_decode(
+            "full_chunked",
+            supports_full=original.supports_full,
+            supports_chunked=original.supports_chunked,
+            fused_ce=original.fused_ce,
+            family_consistent=original.family_consistent,
+            covariance_kinds=original.covariance_kinds,
+            can_omit_base_mean=original.can_omit_base_mean,
+            can_omit_base_variance=original.can_omit_base_variance,
+            override=True,
+        )(original.callable)

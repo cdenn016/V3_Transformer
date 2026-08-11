@@ -59,6 +59,7 @@ from vfe3.model.block import _as_coeff, vfe_block
 from vfe3.model.model_frame import resolve_model_frame
 from vfe3.model.positional_phi import apply_positional_phi, positional_phi_coords
 from vfe3.model.prior_bank import (
+    DecodeCEResult,
     PriorBank,
     get_decode_registration,
     normalize_legacy_model_state,
@@ -1687,7 +1688,8 @@ class VFEModel(nn.Module):
 
         *,
         estep_grad_out: Optional[EStepGradientOutput] = None,   # diag out-param: filled with the E-step belief-grad norms
-    ) -> 'torch.Tensor | Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor]':
+        return_decode_stats: bool = False,
+    ) -> 'torch.Tensor | Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor | DecodeCEResult]':
         r"""Forward pass; returns logits, or (logits, loss, ce) when targets are given.
 
         On the fused-chunked training path logits is None (callers discard it there), hence the
@@ -1695,6 +1697,8 @@ class VFEModel(nn.Module):
         is filled with the LAST-block / LAST-iteration raw E-step belief-gradient norms
         ``{'mu','sigma','phi'}`` (||grad_mu/sigma/phi|| of F over the belief tuple) -- the E-step
         analogue of the M-step per-group grad norms; default None is zero-overhead and byte-identical.
+        ``return_decode_stats=True`` replaces only the third training-tuple item with an immutable
+        :class:`DecodeCEResult`; the default three-tuple remains unchanged.
 
         Belief production is factored into :meth:`forward_beliefs` (the shared seam); this method is the
         decode + cross-entropy + M-step assembly on top of it."""
@@ -1753,25 +1757,42 @@ class VFEModel(nn.Module):
             targets is not None
             and decode_registration.supports_chunked
         )
+        scored_tokens = None
         if fused_chunked:
             with self._amp_off_context(token_ids.device):
+                fused_kwargs = {"z_loss_weight": self.cfg.z_loss_weight}
+                if return_decode_stats and decode_registration.fused_ce_supports_stats:
+                    fused_kwargs["return_stats"] = True
                 if self.cfg.use_prior_bank:
                     if canonical_frame is None:
-                        ce = decode_registration.fused_ce(
+                        fused_result = decode_registration.fused_ce(
                             self.prior_bank, mu_final.float(), sigma_final.float(), targets,
-                            z_loss_weight=self.cfg.z_loss_weight,
+                            **fused_kwargs,
                         )
                     else:
-                        ce = decode_registration.fused_ce(
+                        fused_result = decode_registration.fused_ce(
                             self.prior_bank, mu_final.float(), sigma_final.float(), targets,
-                            z_loss_weight=self.cfg.z_loss_weight,
                             canonical_frame=canonical_frame,
+                            **fused_kwargs,
                         )
                 else:
-                    ce = decode_registration.fused_ce(
+                    fused_result = decode_registration.fused_ce(
                         self.prior_bank, mu_final.float(), targets,
-                        z_loss_weight=self.cfg.z_loss_weight,
+                        **fused_kwargs,
                     )
+                if return_decode_stats and decode_registration.fused_ce_supports_stats:
+                    if not isinstance(fused_result, DecodeCEResult):
+                        raise TypeError(
+                            f"decode mode {active_decode_mode!r} declares fused CE stats support "
+                            f"but returned {type(fused_result).__name__}"
+                        )
+                    ce = fused_result.ce
+                    scored_tokens = fused_result.scored_tokens
+                else:
+                    ce = fused_result
+                    if return_decode_stats:
+                        # Legacy custom fused decoders have no exclusion channel beyond ignore_index.
+                        scored_tokens = (targets != -100).sum(dtype=torch.int64)
             logits = None                                        # no (B, N, V) tensor on the fused path
         else:
             logits = self._decode_belief_with_context(
@@ -1802,7 +1823,8 @@ class VFEModel(nn.Module):
                 # non-ignored tokens divided by a device-side clamped count. An all-ignore microbatch
                 # gives 0/1 = a finite grad-connected 0; F.cross_entropy's default mean would be
                 # 0/0 = NaN there, poisoning logging / NaN-guards / grad-accum means.
-                n_valid = (flat_targets != -100).sum().clamp_min(1)
+                scored_tokens = (flat_targets != -100).sum(dtype=torch.int64)
+                n_valid = scored_tokens.clamp_min(1)
                 ce = F.cross_entropy(flat_logits, flat_targets, ignore_index=-100,
                                      reduction="sum") / n_valid
                 # z-loss (m20): the four fused chunked kernels add w * mean(logsumexp^2); the dense
@@ -1959,7 +1981,12 @@ class VFEModel(nn.Module):
         # enabled outer regularizers), so the pullback/group phi step consumes its covector.
         # Add a separately selected fixed-returned-state VFE frame objective, declare whether
         # beta/gamma are frozen or envelope-eliminated, and keep the optimizer objective-agnostic.
-        return logits, loss, ce.detach()
+        ce_detached = ce.detach()
+        if return_decode_stats:
+            if scored_tokens is None:
+                raise RuntimeError("decoder stats requested without a scored-token count")
+            return logits, loss, DecodeCEResult(ce_detached, scored_tokens)
+        return logits, loss, ce_detached
 
     @property
     def _model_channel_active(self) -> bool:

@@ -155,3 +155,65 @@ def test_model_forward_is_finite_and_counts_zero():
     loss = model(torch.randint(0, 20, (2, 5)), torch.randint(0, 20, (2, 5)))[1]
     assert torch.isfinite(loss)
     assert decode_logdet_fallback_elements() == 0
+
+
+def test_nonfinite_rows_are_sanitized_excluded_counted_and_have_zero_gradient():
+    r"""NaN and both infinities must leave the graph before any full-covariance arithmetic."""
+    model, bank = _bank()
+    mu, sigma, targets = _inputs(model)
+    invalid_rows = ((0, 1), (0, 3), (1, 2), (1, 3))
+    sigma[invalid_rows[0]] = float("nan")
+    sigma[invalid_rows[1]] = float("inf")
+    sigma[invalid_rows[2]] = float("-inf")
+    sigma[invalid_rows[3]] = -5.0 * torch.eye(model.cfg.embed_dim)
+    targets[1, 4] = -100
+    mu.requires_grad_(True)
+    sigma.requires_grad_(True)
+
+    result = bank.decode_ce_full_chunked(mu, sigma, targets, return_stats=True)
+    assert isinstance(result, prior_bank.DecodeCEResult)
+    assert result.scored_tokens.dtype is torch.int64
+    assert result.scored_tokens.device == sigma.device
+    assert int(result.scored_tokens) == targets.numel() - len(invalid_rows) - 1
+    assert torch.isfinite(result.ce)
+    result.ce.backward()
+
+    assert decode_logdet_fallback_elements() == len(invalid_rows)
+    assert torch.isfinite(mu.grad).all()
+    assert torch.isfinite(sigma.grad).all()
+    for row in invalid_rows:
+        assert torch.equal(mu.grad[row], torch.zeros_like(mu.grad[row]))
+        assert torch.equal(sigma.grad[row], torch.zeros_like(sigma.grad[row]))
+
+    safe_sigma = sigma.detach().clone()
+    masked_targets = targets.clone()
+    eye = torch.eye(model.cfg.embed_dim)
+    for row in invalid_rows:
+        safe_sigma[row] = eye
+        masked_targets[row] = -100
+    reset_decode_logdet_fallback_elements()
+    reference = bank.decode_ce_full_chunked(mu.detach(), safe_sigma, masked_targets)
+    assert torch.equal(result.ce.detach(), reference)
+    assert decode_logdet_fallback_elements() == 0
+
+
+def test_decoder_and_model_stats_are_opt_in_without_changing_default_returns():
+    model, bank = _bank()
+    mu, sigma, targets = _inputs(model)
+    targets[0, 0] = -100
+
+    scalar = bank.decode_ce_full_chunked(mu, sigma, targets)
+    stats = bank.decode_ce_full_chunked(mu, sigma, targets, return_stats=True)
+    assert isinstance(scalar, torch.Tensor)
+    assert isinstance(stats, prior_bank.DecodeCEResult)
+    assert torch.equal(stats.ce, scalar)
+    assert int(stats.scored_tokens) == targets.numel() - 1
+
+    tokens = torch.randint(0, model.cfg.vocab_size, targets.shape)
+    default_result = model(tokens, targets)
+    stats_result = model(tokens, targets, return_decode_stats=True)
+    assert len(default_result) == len(stats_result) == 3
+    assert isinstance(default_result[2], torch.Tensor)
+    assert isinstance(stats_result[2], prior_bank.DecodeCEResult)
+    assert torch.equal(stats_result[2].ce, default_result[2])
+    assert int(stats_result[2].scored_tokens) == targets.numel() - 1

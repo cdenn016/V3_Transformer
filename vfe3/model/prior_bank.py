@@ -433,8 +433,10 @@ class DecodeRegistration:
     noncanonical divergence under ``use_prior_bank=True``.
 
     Direct construction ``DecodeRegistration(callable, supports_full, supports_chunked, fused_ce)``
-    stays source-compatible: the two new fields default, and ``__post_init__`` derives the legacy
-    singleton ``covariance_kinds`` from ``supports_full`` when it is not supplied.
+    stays source-compatible: later capability fields default, and ``__post_init__`` derives the
+    legacy singleton ``covariance_kinds`` from ``supports_full`` when it is not supplied.
+    ``fused_ce_supports_stats`` is an explicit opt-in: only such registrations receive the new
+    ``return_stats`` keyword, preserving legacy custom fused-callable signatures.
     """
 
     callable:          'DecodeCallable'
@@ -445,6 +447,7 @@ class DecodeRegistration:
     covariance_kinds:  'Optional[FrozenSet[str]]'  = None
     can_omit_base_mean: bool                       = False
     can_omit_base_variance: bool                   = False
+    fused_ce_supports_stats: bool                  = False
 
     def __post_init__(self) -> None:
         # Resolve the covariance-kind set. Omitted -> the legacy singleton derived from
@@ -459,6 +462,25 @@ class DecodeRegistration:
 
 
 _DECODERS: Dict[str, DecodeRegistration] = {}
+
+
+@dataclass(frozen=True)
+class DecodeCEResult:
+    """Opt-in fused-decoder result with the exact, unclamped reduction denominator."""
+
+    ce:            torch.Tensor
+    scored_tokens: torch.Tensor
+
+
+def _decode_ce_result(
+    ce:           torch.Tensor,
+    valid:        torch.Tensor,
+    return_stats: bool,
+) -> 'torch.Tensor | DecodeCEResult':
+    """Keep scalar CE as the default while exposing a device-side int64 count on request."""
+    if not return_stats:
+        return ce
+    return DecodeCEResult(ce=ce, scored_tokens=valid.sum(dtype=torch.int64))
 
 # Once-per-process guard for the decode_unigram_prior=True-with-unset-table warning
 # (the decode then degenerates to the current uniform-prior behavior).
@@ -528,6 +550,7 @@ def register_decode(
     covariance_kinds:  'Optional[FrozenSet[str]]'       = None,
     can_omit_base_mean:     bool                        = False,
     can_omit_base_variance: bool                        = False,
+    fused_ce_supports_stats: bool                       = False,
 ) -> 'Callable[[DecodeCallable], DecodeCallable]':
     """Decorator registering a decode kernel under ``name``.
 
@@ -538,7 +561,9 @@ def register_decode(
     ``register_decode(..., supports_full=True|False)`` call therefore keeps its old behavior.
     ``family_consistent`` marks a decoder that reads logits out through the CONFIGURED family and
     divergence functional. ``supports_chunked`` advertises a fused chunked-CE training path, whose
-    callable is ``fused_ce``. The callable and all capabilities are replaced atomically, so an
+    callable is ``fused_ce``. ``fused_ce_supports_stats=True`` declares that callable's opt-in
+    ``return_stats`` contract; the default is false so existing callables receive exactly their
+    historical keyword set. The callable and all capabilities are replaced atomically, so an
     override cannot retain stale routing metadata from the prior registration.
 
     Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
@@ -569,6 +594,12 @@ def register_decode(
                 f"decode mode {name!r} must declare supports_chunked=True exactly when fused_ce "
                 f"is provided"
             )
+        if type(fused_ce_supports_stats) is not bool:
+            raise TypeError("decoder fused-CE stats declaration must be bool")
+        if fused_ce_supports_stats and fused_ce is None:
+            raise ValueError(
+                f"decode mode {name!r} cannot declare fused-CE stats support without fused_ce"
+            )
         # Capabilities belong only to this registration record. Callable identity, aliases, and
         # functools.wraps attributes cannot confer omission rights on a new registered name.
         if type(can_omit_base_mean) is not bool or type(can_omit_base_variance) is not bool:
@@ -582,6 +613,7 @@ def register_decode(
             covariance_kinds=resolved_kinds,
             can_omit_base_mean=can_omit_base_mean,
             can_omit_base_variance=can_omit_base_variance,
+            fused_ce_supports_stats=fused_ce_supports_stats,
         )
         return fn
     return _wrap
@@ -1421,6 +1453,66 @@ class PriorBank(nn.Module):
         base_tau = self.decode_tau if tau is None else tau
         return base_tau * torch.exp(-self.decode_log_scale.clamp(-3.0, 3.0))
 
+    def _prepare_full_covariance_for_decode(
+        self,
+        sigma_q: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        r"""Sanitize and factor full-covariance rows without recording a fallback.
+
+        Nonfinite rows are replaced before Cholesky, diagonals, matrix products, or divergence
+        kernels can observe them. The returned validity is the conjunction of original finiteness
+        and Cholesky success; failed factors are replaced by identity so downstream log-determinant
+        arithmetic and backward remain finite. Scoring boundaries own the exactly-once counter.
+        """
+        if sigma_q.dim() < 4 or sigma_q.shape[-1] != sigma_q.shape[-2]:
+            raise ValueError(
+                "full-covariance decode requires (..., K, K) covariance rows, got "
+                f"{tuple(sigma_q.shape)}"
+            )
+        finite = torch.isfinite(sigma_q).all(dim=(-2, -1))
+        eye = torch.eye(sigma_q.shape[-1], dtype=sigma_q.dtype, device=sigma_q.device)
+        safe_sigma = torch.where(
+            finite[..., None, None], sigma_q, eye.expand_as(sigma_q))
+        factor, chol_ok = safe_cholesky(safe_sigma, eps=self.eps, rounds=5)
+        ok = finite & chol_ok
+        safe_sigma = torch.where(
+            ok[..., None, None], safe_sigma, eye.expand_as(safe_sigma))
+        safe_factor = torch.where(ok[..., None, None], factor, eye.expand_as(factor))
+        return safe_sigma, safe_factor, ok
+
+    def _query_in_decode_frame_for_full_decode(
+        self,
+        mu_q:            torch.Tensor,
+        sigma_q:         torch.Tensor,
+        canonical_frame: Optional[CanonicalFrameContext],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sanitize before frame arithmetic, then return one prepared full-covariance query."""
+        if sigma_q.dim() >= 4 and sigma_q.shape[-1] == sigma_q.shape[-2]:
+            sigma_q, factor_q, input_ok = self._prepare_full_covariance_for_decode(sigma_q)
+            mu_q, sigma_q = self._query_in_decode_frame(mu_q, sigma_q, canonical_frame)
+            return mu_q, sigma_q, factor_q, input_ok
+        else:
+            input_ok = torch.isfinite(sigma_q).all(dim=-1)
+            sigma_q = torch.where(input_ok[..., None], sigma_q, torch.ones_like(sigma_q))
+        mu_q, sigma_q = self._query_in_decode_frame(mu_q, sigma_q, canonical_frame)
+        sigma_q, factor_q, output_ok = self._prepare_full_covariance_for_decode(sigma_q)
+        ok = input_ok & output_ok
+        eye = torch.eye(sigma_q.shape[-1], dtype=sigma_q.dtype, device=sigma_q.device)
+        sigma_q = torch.where(ok[..., None, None], sigma_q, eye.expand_as(sigma_q))
+        factor_q = torch.where(ok[..., None, None], factor_q, eye.expand_as(factor_q))
+        return mu_q, sigma_q, factor_q, ok
+
+    @staticmethod
+    def _full_cov_query_invariants_from_prepared(
+        safe_sigma: torch.Tensor,
+        safe_factor: torch.Tensor,
+        ok: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Read query-only KL invariants from one already-sanitized factorization."""
+        diag_sq = torch.diagonal(safe_sigma, dim1=-2, dim2=-1)
+        logdet_q = _logdet_chol(safe_factor)
+        return diag_sq, logdet_q, ok
+
     def _query_in_decode_frame(
         self,
         mu_q:           torch.Tensor,
@@ -1506,8 +1598,24 @@ class PriorBank(nn.Module):
         Under ``decode_unigram_prior=True`` the unigram log-prior bias kappa * log pi_v is added
         HERE, after the registered kernel, so every decode mode (linear included) gets it from
         one seam; toggle off adds nothing (byte-identical)."""
-        mu_q, sigma_q = self._query_in_decode_frame(mu_q, sigma_q, canonical_frame)
         mode = self.decode_mode if self.use_prior_bank else "linear"
+        registration = get_decode_registration(mode)
+        projected_full = (
+            self.encode_mode == "canonical_content_projected"
+            and registration.supports_full
+            and family_cov_kind(self.family) == "full"
+        )
+        if projected_full:
+            finite = torch.isfinite(sigma_q).all(dim=-1)
+            safe_sigma = torch.where(finite[..., None], sigma_q, torch.ones_like(sigma_q))
+            mu_q, sigma_q = self._query_in_decode_frame(mu_q, safe_sigma, canonical_frame)
+            # Preserve the pre-frame invalidity for the registered built-in kernel while ensuring
+            # the frame multiplication itself never sees NaN/Inf. Its first operation sanitizes
+            # this marker to identity and records the row exactly once.
+            sigma_q = torch.where(
+                finite[..., None, None], sigma_q, torch.full_like(sigma_q, float("nan")))
+        else:
+            mu_q, sigma_q = self._query_in_decode_frame(mu_q, sigma_q, canonical_frame)
         logits = get_decode(mode)(self, mu_q, sigma_q, self._tau_eff(tau))
         if self.decode_unigram_prior:
             logits = logits + self._unigram_bias()                       # (B, N, V) + (V,)
@@ -1569,7 +1677,8 @@ class PriorBank(nn.Module):
         tau:           Optional[float] = None,   # override decode_tau; None -> self.decode_tau
         chunk_size:    Optional[int]   = None,   # vocab-chunk width; None -> self.decode_chunk_size
         ignore_index:  int             = -100,
-    ) -> torch.Tensor:                   # () scalar mean cross-entropy
+        return_stats:  bool            = False,
+    ) -> 'torch.Tensor | DecodeCEResult':
         r"""Fused chunked-vocab cross-entropy: the ``diagonal`` decode CE WITHOUT a (B, N, V) tensor.
 
         Iterates the vocabulary in chunks ``[v0, v1)``, computing each chunk's logits with the SAME
@@ -1711,7 +1820,7 @@ class PriorBank(nn.Module):
             # streamed full-V logsumexp above -- calibrates log Z ~ 0 so the decode approximates a
             # normalized observation model. The 0.0 guard keeps the default path byte-identical.
             ce = ce + z_loss_weight * (logsumexp_v ** 2 * valid).sum() / valid.sum().clamp_min(1)
-        return ce
+        return _decode_ce_result(ce, valid, return_stats)
 
     def decode_degenerate_positions(
         self,
@@ -1736,11 +1845,15 @@ class PriorBank(nn.Module):
             if sigma_q.dim() < 1:
                 raise ValueError("decode dispersion must have a trailing coordinate axis")
             mu_placeholder = torch.zeros_like(sigma_q)
+            if sigma_q.dim() < 4 or sigma_q.shape[-1] != sigma_q.shape[-2]:
+                _, _, _, ok = self._query_in_decode_frame_for_full_decode(
+                    mu_placeholder, sigma_q, canonical_frame)
+                return ~ok
             _, sigma_q = self._query_in_decode_frame(
                 mu_placeholder, sigma_q, canonical_frame)
         if sigma_q.dim() < 4 or sigma_q.shape[-1] != sigma_q.shape[-2]:
             return None                                       # diagonal dispersion: no factorization
-        _, ok = safe_cholesky(sigma_q, eps=self.eps, rounds=5)
+        _, _, ok = self._prepare_full_covariance_for_decode(sigma_q)
         return ~ok
 
     def _full_cov_query_invariants(
@@ -1759,12 +1872,9 @@ class PriorBank(nn.Module):
         (families/gaussian.py renyi_closed_form), so the diagonal-prior closed form is value-equal
         to ``_decode_full`` (the per-pair Cholesky seam) without ever forming a (B, N, V, K, K)
         workspace. ``safe_cholesky`` (jittered, never raises) yields a finite log-det where its
-        ``ok`` mask is True; a position where every jitter round fails (non-PD Sigma_q) gets
-        logdet_q = -inf, so per_pos = K + logdet_q drives every vocab logit to -inf there --
-        matching the dense ``_decode_full`` path and PINNED as a cross-path parity contract by
-        test_fullcov_alpha_roadmap_2026_06_13::test_full_cov_chunked_matches_dense_on_non_pd
-        (audit 2026-07-01 F6). The SPD retraction keeps Sigma_q PD in training, so ok is all-True
-        and the -inf branch never engages on the pure path.
+        ``ok`` mask is True. Nonfinite or non-PD rows are replaced by identity before these
+        invariants are read; ``ok`` retains their original invalidity so the scoring boundary can
+        exclude them. The SPD retraction is expected to keep ``ok`` all-True on the pure path.
 
         RESOLVED (audit 2026-08-06 F31): a degenerate position is EXCLUDED from the cross-entropy,
         not scored. It used to take ``logdet_q = -inf``, pinned as a cross-path parity contract by
@@ -1780,20 +1890,13 @@ class PriorBank(nn.Module):
         absence is visible in the token count. ``ok`` is therefore returned for the CE seams to fold
         into their ignore mask, and ``logdet_q`` gets a FINITE placeholder so nothing NaNs before the
         exclusion applies (the value is free: ``per_pos`` is v-INDEPENDENT and cancels exactly in
-        every logit difference, so it cannot bias a surviving position). The event stays counted, so
-        a run can tell how many tokens the denominator lost.
+        every logit difference, so it cannot bias a surviving position). This helper does not touch
+        the fallback counter: each scoring boundary combines every validity mask and records the
+        final invalid set exactly once, so a run can tell how many tokens the denominator lost.
         """
-        diag_sq = torch.diagonal(sigma_q, dim1=-2, dim2=-1)                # (B, N, K) = diag(Sigma_q)
-        L, ok = safe_cholesky(sigma_q, eps=self.eps, rounds=5)
-        _count_decode_logdet_fallback(ok)
-        # Mask the FACTOR, not the log-det. A failed cholesky_ex returns a finite PARTIAL factor
-        # whose diagonal can be zero or negative, so ``log(diag L)`` is -inf/NaN and masking
-        # afterwards would leave a ``0 * inf`` NaN in the gradient to L even though the value came
-        # out clean. Substituting the identity makes the value (logdet = 0) and the gradient exactly
-        # zero there. Byte-identical wherever ``ok``, which on the pure path is everywhere.
-        eye = torch.eye(L.shape[-1], device=L.device, dtype=L.dtype)
-        logdet_q = _logdet_chol(torch.where(ok[..., None, None], L, eye))   # (B, N)
-        return diag_sq, logdet_q, ok
+        safe_sigma, safe_factor, ok = self._prepare_full_covariance_for_decode(sigma_q)
+        return self._full_cov_query_invariants_from_prepared(
+            safe_sigma, safe_factor, ok)
 
     def _head_evidence_full_marginal_invariants(
         self,
@@ -1827,7 +1930,8 @@ class PriorBank(nn.Module):
         chunk_size:    Optional[int]   = None,   # vocab-chunk width; None -> self.decode_chunk_size
         ignore_index:  int             = -100,
         canonical_frame: Optional[CanonicalFrameContext] = None,
-    ) -> torch.Tensor:                   # () scalar mean cross-entropy
+        return_stats:  bool            = False,
+    ) -> 'torch.Tensor | DecodeCEResult':
         r"""Fused chunked-vocab cross-entropy for the FULL-covariance KL decode WITHOUT the dense
         (B, N, V) logits OR the (B, N, V, K, K) per-pair Cholesky workspace ``_decode_full`` builds.
 
@@ -1843,7 +1947,8 @@ class PriorBank(nn.Module):
         chunk-slice add and the z_loss_weight term follow ``decode_ce_diagonal_chunked`` exactly
         (see there); both default OFF / byte-identical.
         """
-        mu_q, sigma_q = self._query_in_decode_frame(mu_q, sigma_q, canonical_frame)
+        mu_q, sigma_q, factor_q, spd_ok = self._query_in_decode_frame_for_full_decode(
+            mu_q, sigma_q, canonical_frame)
         self._validate_fused_ce_targets(targets, ignore_index=ignore_index)
         tau_eff = self._tau_eff(tau)
         chunk = self.decode_chunk_size if chunk_size is None else chunk_size
@@ -1856,7 +1961,8 @@ class PriorBank(nn.Module):
         c = mu_v_all.mean(dim=0, keepdim=True)                              # (1, K) global v-independent shift
         u_all = self._unigram_bias() if self.decode_unigram_prior else None  # (V,) kappa*log pi_v or None
 
-        diag_sq, logdet_q, spd_ok = self._full_cov_query_invariants(sigma_q)  # (B,N,K), (B,N), (B,N)
+        diag_sq, logdet_q, spd_ok = self._full_cov_query_invariants_from_prepared(
+            sigma_q, factor_q, spd_ok)
         mc_q = mu_q - c                                                     # (B, N, K) centered query means
         lhs = _decode_av_lhs(diag_sq, mc_q)                                 # (B, N, 2K) expanded-form left factor
         # v-INDEPENDENT term of -KL/tau_eff (cancels in the CE difference, carried so each chunk's
@@ -1874,6 +1980,8 @@ class PriorBank(nn.Module):
             evidence_lhs = _decode_av_lhs(diag_sq, mc_q, coord_delta)
             if _DECODE_AV_PRECISION == "fp64" and evidence_lhs.dtype is not torch.float64:
                 evidence_lhs = evidence_lhs.double()
+        final_ok = spd_ok & block_ok
+        _count_decode_logdet_fallback(final_ok)
 
         def _chunk_summaries(lhs_:    torch.Tensor, per_pos_:        torch.Tensor,
                              mu_v_c:  torch.Tensor, inv_v_c:         torch.Tensor,
@@ -1919,7 +2027,7 @@ class PriorBank(nn.Module):
         # than scored (audit 2026-08-06 F31); it leaves both the numerator and the denominator, and
         # _count_decode_logdet_fallback has already recorded it. The dense path drops the same
         # positions via PriorBank.decode_degenerate_positions, so the two stay in parity.
-        valid = (targets != ignore_index) & spd_ok & block_ok              # (B, N) bool
+        valid = (targets != ignore_index) & final_ok                       # (B, N) bool
         lse_chunks = []
         target_logit = torch.zeros(mu_q.shape[:-1], device=mu_q.device, dtype=mu_q.dtype)  # (B, N)
 
@@ -1958,7 +2066,7 @@ class PriorBank(nn.Module):
         if z_loss_weight > 0.0:
             # z-loss on the streamed log Z (see decode_ce_diagonal_chunked); 0.0 guard = byte-identical.
             ce = ce + z_loss_weight * (logsumexp_v ** 2 * valid).sum() / valid.sum().clamp_min(1)
-        return ce
+        return _decode_ce_result(ce, valid, return_stats)
 
     def decode_ce_linear_chunked(
         self,
@@ -1969,7 +2077,8 @@ class PriorBank(nn.Module):
         z_loss_weight: float                 = 0.0,   # z-loss coefficient on mean(logsumexp^2); 0.0 = OFF
         chunk_size:    Optional[int]         = None,  # vocab-chunk width; None -> self.decode_chunk_size
         ignore_index:  int                   = -100,
-    ) -> torch.Tensor:                   # () scalar mean cross-entropy
+        return_stats:  bool                  = False,
+    ) -> 'torch.Tensor | DecodeCEResult':
         r"""Fused chunked-vocab cross-entropy for the LINEAR decode (``use_prior_bank=False``).
 
         The ``_decode_linear`` CE -- ``logits = x @ W^T (+ b)`` -> ``F.cross_entropy`` -- WITHOUT
@@ -2038,7 +2147,7 @@ class PriorBank(nn.Module):
         if z_loss_weight > 0.0:
             # z-loss on the streamed log Z (see decode_ce_diagonal_chunked); 0.0 guard = byte-identical.
             ce = ce + z_loss_weight * (logsumexp_v ** 2 * valid).sum() / valid.sum().clamp_min(1)
-        return ce
+        return _decode_ce_result(ce, valid, return_stats)
 
     def decode_ce_expected_likelihood_chunked(
         self,
@@ -2051,7 +2160,8 @@ class PriorBank(nn.Module):
         tau:           Optional[float] = None,   # override decode_tau; None -> self.decode_tau
         chunk_size:    Optional[int]   = None,   # vocab-chunk width; None -> self.decode_chunk_size
         ignore_index:  int             = -100,
-    ) -> torch.Tensor:                   # () scalar mean cross-entropy
+        return_stats:  bool            = False,
+    ) -> 'torch.Tensor | DecodeCEResult':
         r"""Fused chunked-vocab cross-entropy for the EXPECTED-LIKELIHOOD decode (diagonal only).
 
         The fused-CE twin of ``decode_mode='expected_likelihood_chunked'`` (see
@@ -2130,7 +2240,7 @@ class PriorBank(nn.Module):
         if z_loss_weight > 0.0:
             # z-loss on the streamed log Z (see decode_ce_diagonal_chunked); 0.0 guard = byte-identical.
             ce = ce + z_loss_weight * (logsumexp_v ** 2 * valid).sum() / valid.sum().clamp_min(1)
-        return ce
+        return _decode_ce_result(ce, valid, return_stats)
 
     def decode_ce_family_chunked(
         self,
@@ -2143,7 +2253,8 @@ class PriorBank(nn.Module):
         tau:           Optional[float] = None,   # override decode_tau; None -> self.decode_tau
         chunk_size:    Optional[int]   = None,   # vocab-chunk width; None -> self.decode_chunk_size
         ignore_index:  int             = -100,
-    ) -> torch.Tensor:                   # () scalar mean cross-entropy
+        return_stats:  bool            = False,
+    ) -> 'torch.Tensor | DecodeCEResult':
         r"""Fused chunked-vocab cross-entropy for the FAMILY-consistent decode (``decode_mode=
         'family_chunked'``) WITHOUT the dense (B, N, V) logits.
 
@@ -2166,6 +2277,7 @@ class PriorBank(nn.Module):
                 tau=tau,
                 chunk_size=chunk_size,
                 ignore_index=ignore_index,
+                return_stats=return_stats,
             )
 
         self._validate_fused_ce_targets(targets, ignore_index=ignore_index)
@@ -2202,10 +2314,11 @@ class PriorBank(nn.Module):
         # that are excluded anyway keeps the whole graph finite and cannot affect the loss, because
         # `valid` drops these from the numerator AND the denominator. None => diagonal dispersion,
         # no factorization, nothing to sanitize (byte-identical for the diagonal family).
-        degenerate = self.decode_degenerate_positions(sigma_q)               # (B, N) bool, or None
-        if degenerate is not None:
-            eye = torch.eye(sigma_q.shape[-1], device=sigma_q.device, dtype=sigma_q.dtype)
-            sigma_q = torch.where(degenerate[..., None, None], eye.expand_as(sigma_q), sigma_q)
+        degenerate = None
+        if is_full:
+            sigma_q, _, full_ok = self._prepare_full_covariance_for_decode(sigma_q)
+            degenerate = ~full_ok
+            _count_decode_logdet_fallback(full_ok)
 
         q_mu = mu_q.unsqueeze(-2)                                            # (B, N, 1, K)
         q_sigma = sigma_q.unsqueeze(-3 if is_full else -2)                   # (B, N, 1, K[, K])
@@ -2318,7 +2431,7 @@ class PriorBank(nn.Module):
         if z_loss_weight > 0.0:
             # z-loss on the streamed log Z (see decode_ce_diagonal_chunked); 0.0 guard = byte-identical.
             ce = ce + z_loss_weight * (logsumexp_v ** 2 * valid).sum() / valid.sum().clamp_min(1)
-        return ce
+        return _decode_ce_result(ce, valid, return_stats)
 
 
 EncodeCallable = Callable[[PriorBank, torch.Tensor], BeliefState]
@@ -2343,7 +2456,8 @@ class GeometricFusedCECallable(Protocol):
         tau:           Optional[float] = None,
         chunk_size:    Optional[int]   = None,
         ignore_index:  int             = -100,
-    ) -> torch.Tensor:
+        return_stats:  bool            = False,
+    ) -> 'torch.Tensor | DecodeCEResult':
         ...
 
 
@@ -2363,7 +2477,8 @@ class FrameAwareGeometricFusedCECallable(Protocol):
         chunk_size:      Optional[int]                   = None,
         ignore_index:    int                             = -100,
         canonical_frame: Optional[CanonicalFrameContext] = None,
-    ) -> torch.Tensor:
+        return_stats:    bool                            = False,
+    ) -> 'torch.Tensor | DecodeCEResult':
         ...
 
 
@@ -2380,7 +2495,8 @@ class LinearFusedCECallable(Protocol):
         z_loss_weight: float         = 0.0,
         chunk_size:    Optional[int] = None,
         ignore_index:  int           = -100,
-    ) -> torch.Tensor:
+        return_stats:  bool          = False,
+    ) -> 'torch.Tensor | DecodeCEResult':
         ...
 
 
@@ -2545,6 +2661,7 @@ def _decode_diagonal(
     "diagonal_chunked",
     supports_chunked=True,
     fused_ce=PriorBank.decode_ce_diagonal_chunked,
+    fused_ce_supports_stats=True,
     can_omit_base_mean=True,
     can_omit_base_variance=True,
 )
@@ -2586,6 +2703,7 @@ def _decode_full(
     saturate distant priors to a single logit). General but O(B*N*V*K^3) (per-pair Cholesky):
     the theoretically pure full-covariance path, not the fast diagonal kernel.
     """
+    sigma_q, factor_q, spd_ok = pb._prepare_full_covariance_for_decode(sigma_q)
     mu_v = pb._decode_mu_table()                                         # (V, K) decode table (untied if set)
     sigma_v = torch.diag_embed(
         bounded_variance_from_log(pb._decode_sigma_log_table(), eps=pb.eps)
@@ -2599,13 +2717,14 @@ def _decode_full(
         kl_max=float("inf"),
         eps=pb.eps,
     )                                                                       # (B, N, V)
-    diag_sq, _, spd_ok = pb._full_cov_query_invariants(sigma_q)              # (B,N,K), _, (B,N)
+    diag_sq, _, spd_ok = pb._full_cov_query_invariants_from_prepared(
+        sigma_q, factor_q, spd_ok)
+    block_ok = torch.ones_like(spd_ok)
     if hasattr(pb, "head_evidence_logits"):
         head_delta, coord_delta = pb._head_evidence_deltas(
             dtype=mu_q.dtype, device=mu_q.device)
         delta_per_pos, block_ok = pb._head_evidence_full_marginal_invariants(
             sigma_q, head_delta)
-        spd_ok = spd_ok & block_ok
         c = mu_v.mean(dim=0, keepdim=True)
         mc_v = mu_v - c
         mc_q = mu_q - c
@@ -2613,11 +2732,13 @@ def _decode_full(
         kl_v = kl_v + _decode_head_evidence_kl_delta(
             diag_sq, mc_q, mc_v, inv_v, torch.log(1.0 / inv_v), coord_delta,
             delta_per_pos)
+    final_ok = spd_ok & block_ok
+    _count_decode_logdet_fallback(final_ok)
     # Same exclusion contract as the chunked twin (audit 2026-08-06 F31). Here the -inf arrived
     # indirectly -- the family seam maps a failed Cholesky to NaN and ``kl_max=inf`` maps that to
     # inf -- so the row has to be neutralized after the fact. One extra (B, N) Cholesky against this
     # kernel's own O(B*N*V*K^3) per-pair factorization is not measurable.
-    kl_v = torch.where(spd_ok.unsqueeze(-1), kl_v, torch.zeros_like(kl_v))
+    kl_v = torch.where(final_ok.unsqueeze(-1), kl_v, torch.zeros_like(kl_v))
     return (-kl_v / tau_eff).to(mu_q.dtype)
 
 
@@ -2626,6 +2747,7 @@ def _decode_full(
     supports_full=True,
     supports_chunked=True,
     fused_ce=PriorBank.decode_ce_full_chunked,
+    fused_ce_supports_stats=True,
     can_omit_base_mean=True,
     can_omit_base_variance=True,
 )
@@ -2644,11 +2766,13 @@ def _decode_full_chunked(
     that ``_decode_full`` builds, by exploiting the diagonal prior (see ``_full_cov_query_invariants``).
     Value-equal to ``decode_mode='full'`` to atol-1e-3 (tests/test_fullcov_alpha_roadmap_2026_06_13.py).
     """
+    sigma_q, factor_q, spd_ok = pb._prepare_full_covariance_for_decode(sigma_q)
     sigma_v = bounded_variance_from_log(pb._decode_sigma_log_table(), eps=pb.eps)  # (V, K) diagonal decode variances
     mu_v = pb._decode_mu_table()                                         # (V, K) decode table (untied if set)
     inv_v = 1.0 / sigma_v                                                # (V, K) = 1/sigma_v
 
-    diag_sq, logdet_q, spd_ok = pb._full_cov_query_invariants(sigma_q)   # (B,N,K), (B,N), (B,N)
+    diag_sq, logdet_q, spd_ok = pb._full_cov_query_invariants_from_prepared(
+        sigma_q, factor_q, spd_ok)
     c = mu_v.mean(dim=0, keepdim=True)                                   # (1, K) v-independent shift
     mc_v = mu_v - c                                                      # (V, K) centered prior means
     mc_q = mu_q - c                                                      # (B, N, K) centered query means
@@ -2659,21 +2783,23 @@ def _decode_full_chunked(
     # .to() after the clamp keeps the fp64 a_v island open through the subtraction (F32); it is an
     # identity no-op under the default fp32 policy.
     evidence_delta = None
+    block_ok = torch.ones_like(spd_ok)
     if hasattr(pb, "head_evidence_logits"):
         head_delta, coord_delta = pb._head_evidence_deltas(
             dtype=mu_q.dtype, device=mu_q.device)
         delta_per_pos, block_ok = pb._head_evidence_full_marginal_invariants(
             sigma_q, head_delta)
-        spd_ok = spd_ok & block_ok
         evidence_delta = _decode_head_evidence_kl_delta(
             diag_sq, mc_q, mc_v, inv_v, torch.log(sigma_v), coord_delta, delta_per_pos)
+    final_ok = spd_ok & block_ok
+    _count_decode_logdet_fallback(final_ok)
     logits = _decode_analytic_kl_logits(
         a_v, per_pos, tau_eff, mu_q.dtype, evidence_delta=evidence_delta)
     # A non-PD Sigma_q has no valid likelihood: emit an INFORMATIONLESS uniform row rather than a
     # score built on a placeholder log-det (audit 2026-08-06 F31). log_softmax of a uniform row is
     # -log V, finite; the all--inf row this used to produce maps to NaN. The CE seams exclude the
     # position outright -- see decode_ce_full_chunked and decode_degenerate_positions.
-    return torch.where(spd_ok.unsqueeze(-1), logits, torch.zeros_like(logits))
+    return torch.where(final_ok.unsqueeze(-1), logits, torch.zeros_like(logits))
 
 
 def _family_logits(
@@ -2703,10 +2829,11 @@ def _family_logits(
     functional = get_functional(pb.divergence_family)
     V = pb.vocab_size
 
-    degenerate = pb.decode_degenerate_positions(sigma_q)                    # (B, N) bool, or None
-    if degenerate is not None:
-        eye = torch.eye(sigma_q.shape[-1], device=sigma_q.device, dtype=sigma_q.dtype)
-        sigma_q = torch.where(degenerate[..., None, None], eye.expand_as(sigma_q), sigma_q)
+    degenerate = None
+    if is_full:
+        sigma_q, _, full_ok = pb._prepare_full_covariance_for_decode(sigma_q)
+        degenerate = ~full_ok
+        _count_decode_logdet_fallback(full_ok)
 
     q = _family_with_precision_policy(
         family_cls,
@@ -2784,6 +2911,7 @@ def _decode_family(
     family_consistent=True,
     supports_chunked=True,
     fused_ce=PriorBank.decode_ce_family_chunked,
+    fused_ce_supports_stats=True,
     can_omit_base_mean=True,
     can_omit_base_variance=True,
 )
@@ -2816,6 +2944,7 @@ def _decode_family_chunked(
     "expected_likelihood_chunked",
     supports_chunked=True,
     fused_ce=PriorBank.decode_ce_expected_likelihood_chunked,
+    fused_ce_supports_stats=True,
     can_omit_base_mean=True,
     can_omit_base_variance=True,
 )
@@ -2865,6 +2994,7 @@ def _decode_expected_likelihood_chunked(
     "linear",
     supports_chunked=True,
     fused_ce=PriorBank.decode_ce_linear_chunked,
+    fused_ce_supports_stats=True,
     can_omit_base_mean=True,
     can_omit_base_variance=True,
 )

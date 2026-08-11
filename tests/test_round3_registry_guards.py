@@ -147,6 +147,7 @@ def _restore_decode(name, registration):
         covariance_kinds=registration.covariance_kinds,
         can_omit_base_mean=registration.can_omit_base_mean,
         can_omit_base_variance=registration.can_omit_base_variance,
+        fused_ce_supports_stats=registration.fused_ce_supports_stats,
         override=True,
     )(registration.callable)
 

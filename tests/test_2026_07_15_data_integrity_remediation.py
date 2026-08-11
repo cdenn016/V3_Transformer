@@ -229,9 +229,15 @@ class _ConstantCEModel(torch.nn.Module):
         self,
         tokens:  torch.Tensor,
         targets: torch.Tensor,
+        *,
+        return_decode_stats: bool = False,
     ) -> Tuple[None, None, torch.Tensor]:
-        del tokens, targets
-        return None, None, self.anchor * 0.0 + self.ce
+        del tokens
+        ce = self.anchor * 0.0 + self.ce
+        if return_decode_stats:
+            from vfe3.model.prior_bank import DecodeCEResult
+            return None, None, DecodeCEResult(ce, (targets != -100).sum())
+        return None, None, ce
 
 
 class _NoncausalContextCEModel(torch.nn.Module):
@@ -249,12 +255,18 @@ class _NoncausalContextCEModel(torch.nn.Module):
         self,
         tokens:  torch.Tensor,
         targets: torch.Tensor,
+        *,
+        return_decode_stats: bool = False,
     ) -> Tuple[None, None, torch.Tensor]:
         self.call_shapes.append(tuple(tokens.shape))
         valid = targets != -100
         context = tokens.to(torch.float32).mean(dim=-1, keepdim=True)
         ce = context.expand_as(targets)[valid].mean()
-        return None, None, self.anchor * 0.0 + ce
+        ce = self.anchor * 0.0 + ce
+        if return_decode_stats:
+            from vfe3.model.prior_bank import DecodeCEResult
+            return None, None, DecodeCEResult(ce, valid.sum())
+        return None, None, ce
 
 
 def test_evaluate_slices_trailing_padding_before_noncausal_model_calls() -> None:
