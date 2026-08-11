@@ -761,6 +761,11 @@ def predict_n_params(cfg: VFE3Config) -> Tuple[int, int]:
         n += int(cfg.max_seq_len) * n_gen                   # pos_phi_free
     if cfg.use_head_mixer:
         n += HeadMixer.parameter_count(group.irrep_dims, group.irrep_labels)
+    if cfg.use_block_mlp:
+        expansion = int(cfg.block_mlp_expansion)
+        n += int(cfg.n_layers) * (
+            2 * expansion * K * K + (expansion + 1) * K
+        )
     return n, n_gen
 
 

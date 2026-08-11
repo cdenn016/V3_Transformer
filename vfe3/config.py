@@ -656,6 +656,12 @@ class VFE3Config:
     norm_type_block:           str   = "none"
     norm_type_final:           str   = "none"
 
+    # Optional residual feed-forward unit applied after each belief block.
+    use_block_mlp:             bool  = False
+    block_mlp_expansion:       int   = 4
+    block_mlp_activation:      str   = "gelu"
+    block_mlp_dropout:         float = 0.0
+
     # SANCTIONED LEARNED-SCALAR EXCEPTION (t5_bias / learnable_kappa family, default OFF): add a
     # learned per-feature affine gamma/beta to any "layernorm" norm seam -> mu_norm = gamma*LN(mu) +
     # beta, exactly torch.nn.LayerNorm(elementwise_affine=True) on the belief mean. gamma inits to 1
@@ -728,6 +734,7 @@ class VFE3Config:
     # None preserves the historical behavior by inheriting m_p_mu_lr at optimizer construction.
     m_head_evidence_lr:        Optional[float] = None
     m_head_mixer_lr:           Optional[float] = None
+    m_block_mlp_lr:             Optional[float] = None
     
     
     # Stored phi-factor M-step policy. "adamw" is the default and preserves the established optimizer
@@ -2937,6 +2944,22 @@ class VFE3Config:
         _require(self.norm_type_block, _valid_norms, "norm_type_block")
         _require(self.norm_type_final, _valid_norms, "norm_type_final")
 
+        if type(self.block_mlp_expansion) is not int or self.block_mlp_expansion < 1:
+            raise ValueError(
+                "block_mlp_expansion must be an integer >= 1, "
+                f"got {self.block_mlp_expansion!r}"
+            )
+        if self.block_mlp_activation not in ("gelu", "silu", "relu"):
+            raise ValueError(f"unknown block_mlp_activation {self.block_mlp_activation!r}")
+        if (isinstance(self.block_mlp_dropout, bool)
+                or not isinstance(self.block_mlp_dropout, Real)
+                or not math.isfinite(float(self.block_mlp_dropout))
+                or not 0.0 <= float(self.block_mlp_dropout) < 1.0):
+            raise ValueError(
+                "block_mlp_dropout must be a finite real value in [0, 1), "
+                f"got {self.block_mlp_dropout!r}"
+            )
+
         # M-step / training
         # e_step_gradient selects the E-step backward estimator (unroll | straight_through |
         # detach). Reconciled with the legacy detach_e_step bool WITHOUT breaking it: the
@@ -2950,6 +2973,11 @@ class VFE3Config:
                 f"{self.e_step_gradient!r}: detach_e_step already forces the effective mode to "
                 f"'detach'. Set detach_e_step=False and use e_step_gradient to select the mode, "
                 f"or leave e_step_gradient='unroll'."
+            )
+        if self.use_block_mlp and self.effective_e_step_gradient == "detach":
+            raise ValueError(
+                "use_block_mlp=True requires a gradient-carrying E-step; "
+                "set e_step_gradient='unroll' and detach_e_step=False."
             )
         if self.s_frame_mode == "phi_tilde":
             if self.effective_e_step_gradient in ("detach", "straight_through"):
@@ -3180,6 +3208,11 @@ class VFE3Config:
             v = getattr(self, name)
             if v is not None and (not math.isfinite(v) or v < 0.0):
                 raise ValueError(f"{name} must be finite and >= 0 or None, got {v}")
+        v = self.m_block_mlp_lr
+        if v is not None and (
+                isinstance(v, bool) or not isinstance(v, Real)
+                or not math.isfinite(v) or v < 0.0):
+            raise ValueError(f"m_block_mlp_lr must be finite and >= 0 or None, got {v}")
         if self.connection_weight_decay is not None and (
                 not math.isfinite(self.connection_weight_decay)
                 or self.connection_weight_decay < 0.0):
@@ -3461,6 +3494,12 @@ class VFE3Config:
             return any(name in _defaults and getattr(self, name) != _defaults[name] for name in names)
 
         _inert: List[str] = []
+        if not self.use_block_mlp and _changed(
+                "block_mlp_expansion", "block_mlp_activation", "block_mlp_dropout",
+                "m_block_mlp_lr"):
+            _inert.append(
+                "block MLP settings block_mlp_expansion/block_mlp_activation/"
+                "block_mlp_dropout/m_block_mlp_lr (only read when use_block_mlp=True)")
         if canonical_e_step_update != "mm_exact" and _changed("mm_damping"):
             _inert.append(f"mm_damping={self.mm_damping} (only read by e_step_update='mm_exact')")
         # The REVERSE direction of the rule above (audit 2026-07-27). The mm_exact branch of

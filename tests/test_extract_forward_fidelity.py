@@ -407,6 +407,37 @@ def test_projected_across_layer_trace_matches_production_snapshot() -> None:
     )
 
 
+def test_across_layer_trace_with_mlp_dropout_is_rng_neutral_and_restores_mode() -> None:
+    cfg = VFE3Config(
+        vocab_size=13,
+        embed_dim=4,
+        n_heads=2,
+        max_seq_len=4,
+        n_layers=3,
+        n_e_steps=1,
+        e_phi_lr=0.0,
+        use_block_mlp=True,
+        block_mlp_dropout=0.5,
+    )
+    model = VFEModel(cfg).to(DEVICE)
+    model.train()
+    tokens = torch.tensor([[1, 2, 3, 4]], dtype=torch.long, device=DEVICE)
+
+    with torch.no_grad():
+        torch.manual_seed(311)
+        expected_next_logits = model(tokens).detach()
+
+        torch.manual_seed(311)
+        cpu_rng_before = torch.get_rng_state().clone()
+        extract.across_layer_belief_trace(model, tokens)
+
+        assert torch.equal(torch.get_rng_state(), cpu_rng_before)
+        assert model.training
+        assert all(module.training for module in model.block_mlps.modules())
+        actual_next_logits = model(tokens).detach()
+        assert torch.equal(actual_next_logits, expected_next_logits)
+
+
 def test_projected_converged_state_matches_production_snapshot() -> None:
     """Converged diagnostics must not silently replay canonical rather than realized moments."""
     model, tokens, snapshot = _projected_parity_case()
@@ -512,3 +543,22 @@ def test_projected_inference_record_reuses_same_forward_frame_for_decode(
     )
     assert ce_bank["ce"].shape == (sequence_length,)
     assert torch.isfinite(ce_bank["ce"]).all()
+
+
+def test_active_mlp_extract_replay_matches_forward() -> None:
+    """Extractor replay must include every trained, untied post-block MLP."""
+    cfg = VFE3Config(
+        vocab_size=11, embed_dim=4, n_heads=2, max_seq_len=4,
+        n_layers=2, n_e_steps=1, e_phi_lr=0.0, use_block_mlp=True,
+    )
+    torch.manual_seed(17)
+    model = VFEModel(cfg).to(DEVICE).eval()
+    with torch.no_grad():
+        for mlp in model.block_mlps:
+            mlp.fc2.bias.fill_(0.25)
+    tokens = torch.tensor([[1, 3, 5, 7]], dtype=torch.long, device=DEVICE)
+
+    reference = _forward_reference(model, tokens)
+    replay = extract.converged_state(model, tokens)
+
+    torch.testing.assert_close(replay["mu"], reference.mu[0], atol=1e-6, rtol=1e-6)

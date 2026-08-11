@@ -3034,6 +3034,12 @@ def _cost_model_fields(
     # coordinates; base token priors and every decode vocabulary prior remain diagonal.
     lower = K * (K - 1) // 2 if not cfg.diagonal_covariance else 0
     token_row = 2 * K + n_gen + (lower if cfg.prior_source == "model_channel" else 0)
+    block_mlp_active = bool(getattr(cfg, "use_block_mlp", False))
+    block_mlp_expansion = int(getattr(cfg, "block_mlp_expansion", 4))
+    block_mlp_params = (
+        int(cfg.n_layers) * (2 * block_mlp_expansion * K * K + (block_mlp_expansion + 1) * K)
+        if block_mlp_active else 0
+    )
     if cfg.use_prior_bank:
         decode_readout = 2 * V * K
     else:
@@ -3043,6 +3049,7 @@ def _cost_model_fields(
         active += 2 * K + lower                                 # independent s-channel token row
     if cfg.lambda_h > 0.0 or cfg.s_e_step:
         active += 2 * K + lower                                 # executable hyper-prior centroid r
+    active += block_mlp_params
     # Transparent analytic FLOP proxy. Per token: decode over all V (2VK), L*T belief E-step
     # iterations, and one T-iteration model-channel refinement when s_e_step is enabled. Each E-step
     # iteration has O(N) attention energy (2NK) plus O(N) transport application (2N*d_head^2).
@@ -3053,7 +3060,8 @@ def _cost_model_fields(
     belief_estep       = L * T * estep_kernel
     model_estep        = T * estep_kernel if cfg.s_e_step else 0.0
     fpt_estep          = belief_estep + model_estep
-    est_flops_analytic = (fpt_decode + fpt_estep) * float(tokens_seen)
+    fpt_block_mlp      = 4.0 * L * block_mlp_expansion * K * K if block_mlp_active else 0.0
+    est_flops_analytic = (fpt_decode + fpt_estep + fpt_block_mlp) * float(tokens_seen)
     out: Dict[str, object] = {
         "embed_dim":               K,
         "n_heads":                 int(cfg.n_heads),
@@ -3073,6 +3081,8 @@ def _cost_model_fields(
         "est_flops_analytic":      est_flops_analytic,
         "flops_per_token_decode":  fpt_decode,
         "flops_per_token_estep":   fpt_estep,
+        "block_mlp_params":         int(block_mlp_params),
+        "flops_per_token_block_mlp": fpt_block_mlp,
         "device_name":             (torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"),
         "amp_dtype":               cfg.amp_dtype,
     }
@@ -4382,6 +4392,10 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
     head_mixer_gauge_compatible = getattr(cfg, "head_mixer_gauge_compatible", None)
     if head_mixer_gauge_compatible is None:
         head_mixer_gauge_compatible = VFE3Config.head_mixer_gauge_compatible.fget(cfg)
+    block_mlp_active = bool(getattr(cfg, "use_block_mlp", False))
+    block_mlp_structural_mode = "coordinate_mean_only_nonintertwiner" if block_mlp_active else "disabled"
+    block_mlp_covariance_contract = "passthrough" if block_mlp_active else "not_applicable"
+    block_mlp_intertwiner_compatible = not block_mlp_active
     covariance_feature_exact = _last("regime_ii_covariant_feature_exact")
     feature_jitter_recovered = covariance_feature_exact is not None and covariance_feature_exact < 0.5
     if cfg.transport_mode != "regime_ii_covariant":
@@ -4422,6 +4436,7 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
         "full_sigma_update":           not cfg.skip_belief_sigma_update,
         "no_twohop_coupling":          cfg.lambda_twohop == 0.0,
         "no_fixed_prior_surrogate":    not fixed_prior_surrogate,
+        "no_block_mlp":                not block_mlp_active,
         # The E-STEP UPDATE RULE axis (audit 2026-07-26 D-03). 'mm_exact' is the closed-form
         # minimizer of the STRICT-PAIR-MASKED surrogate, which excludes the structural E_ii = 0
         # self-pairs and is therefore not a majorizer of the canonical frozen-attention objective
@@ -4442,6 +4457,7 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
         "no_reflection_sampling":    cfg.omega_reflection == "off" and cfg.phi_reflection == "off",
         "family_group_invariant":    family_group_invariant,
         "head_mixer_intertwiner_compatible": head_mixer_gauge_compatible,
+        "block_mlp_intertwiner_compatible": block_mlp_intertwiner_compatible,
     }
     return {
         "on_pure_path":       all(pure_flags.values()),
@@ -4457,6 +4473,15 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             "use_head_mixer":               bool(cfg.use_head_mixer),
             "use_priorbank_head_evidence_mixer": priorbank_head_evidence_mixer,
             "encode_mode":                  getattr(cfg, "encode_mode", "per_token"),
+            "use_block_mlp":                block_mlp_active,
+            "block_mlp_expansion":          int(getattr(cfg, "block_mlp_expansion", 4)),
+            "block_mlp_activation":         getattr(cfg, "block_mlp_activation", "gelu"),
+            "block_mlp_dropout":            float(getattr(cfg, "block_mlp_dropout", 0.0)),
+            "block_mlp_lr_resolved":        float(
+                getattr(cfg, "m_block_mlp_lr", None)
+                if getattr(cfg, "m_block_mlp_lr", None) is not None else getattr(cfg, "m_p_mu_lr", 0.0)),
+            "block_mlp_structural_mode":    block_mlp_structural_mode,
+            "block_mlp_covariance_contract": block_mlp_covariance_contract,
             "priorbank_head_evidence_role": (
                 "decoder_kl_irrep_weights" if priorbank_head_evidence_mixer else "inactive"
             ),

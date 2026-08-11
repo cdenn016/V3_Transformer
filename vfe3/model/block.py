@@ -81,6 +81,7 @@ def vfe_block(
     *,
     log_prior:       Optional[torch.Tensor]                  = None,
     block_norm:      Optional[Callable[..., torch.Tensor]]   = None,      # cached norm instance (None -> off)
+    block_mlp:       Optional[Callable[[torch.Tensor], torch.Tensor]] = None,  # coordinate residual MLP (None -> off)
     head_mixer:      Optional[Callable[..., 'tuple']]        = None,      # opt-in Schur head mixer (None -> off)
     cg_coupling:     Optional[Callable[..., 'tuple']]        = None,      # opt-in CG cross-type coupling (None -> off)
     lambda_beta:     'float | torch.Tensor'                  = 1.0,       # belief-coupling weight (cfg.lambda_beta)
@@ -204,4 +205,6 @@ def vfe_block(
             out = out._replace(mu=mu_cg, sigma=sigma_cg)   # _replace preserves phi/omega/reflection
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)
         out = out._replace(mu=block_norm(out.mu, out.sigma))   # _replace preserves phi/omega/reflection
+    if block_mlp is not None:                # default-off coordinate augmentation, after norm before handoff
+        out = out._replace(mu=block_mlp(out.mu))
     return out

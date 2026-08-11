@@ -1,6 +1,6 @@
 r"""The full VFE_3.0 model: encode -> E-step inference -> decode -> cross-entropy.
 
-No neural layers (no nn.Linear/MLP/activation): on the pure default path the parameters are the
+On the pure default path there are no neural layers (no nn.Linear/MLP/activation): the parameters are the
 PriorBank's prior tables, plus the model-owned learned tables their toggles create -- the default
 pos_phi='learned' positional table, and the default-OFF head mixer, CG coupling, regime_ii
 connection, and learnable T5-bias scalar. The E-step
@@ -13,6 +13,7 @@ import inspect
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from functools import wraps
 from typing import Any, Callable, Mapping, Optional, Sequence, Tuple, Dict
 
 import torch
@@ -55,6 +56,7 @@ from vfe3.geometry.transport import (
 )
 from vfe3.model.canonical_content import project_canonical_diagonal
 from vfe3.model.head_mixer import HeadMixer
+from vfe3.model.block_mlp import BlockMLP
 from vfe3.model.block import _as_coeff, vfe_block
 from vfe3.model.model_frame import resolve_model_frame
 from vfe3.model.positional_phi import apply_positional_phi, positional_phi_coords
@@ -79,6 +81,30 @@ from vfe3.runtime import set_fp32_matmul_precision
 # never by matching literal mode names (the add-by-registering contract).
 _REGIME_NEEDS_MU    = _TRANSPORT_NEEDS_MU
 _REGIME_NEEDS_SIGMA = _TRANSPORT_NEEDS_SIGMA
+
+
+def _block_mlp_diagnostic_eval(method: Callable) -> Callable:
+    r"""Run an MLP-bearing diagnostic without stochastic dropout or mode leakage.
+
+    Diagnostics may be called while the enclosing model remains in training mode. Only the
+    coordinate MLPs need a mode override: putting them in evaluation mode makes their dropout
+    deterministic without changing ordinary training forwards. Every descendant's prior mode is
+    restored exactly, including on exceptions and for callers with mixed per-module modes.
+    """
+    @wraps(method)
+    def guarded(self: "VFEModel", *args: Any, **kwargs: Any) -> Any:
+        block_mlps = self.block_mlps
+        if block_mlps is None:
+            return method(self, *args, **kwargs)
+        prior_modes = tuple((module, module.training) for module in block_mlps.modules())
+        block_mlps.eval()
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            for module, was_training in prior_modes:
+                module.training = was_training
+
+    return guarded
 
 
 def _precision_key_bias(
@@ -232,7 +258,7 @@ def _sequence_belief(belief: BeliefState, index: int = 0) -> BeliefState:
 
 
 class VFEModel(nn.Module):
-    """encode -> E-step stack -> decode -> CE. Parameters live only in the PriorBank."""
+    """encode -> E-step stack -> decode -> CE; default-off MLP preserves the existing topology."""
 
     def __init__(self, cfg: VFE3Config) -> None:
         super().__init__()
@@ -334,6 +360,15 @@ class VFEModel(nn.Module):
                                                          family=cfg.family,
                                                          affine=cfg.layernorm_affine) \
             if cfg.norm_type_block != "none" else None
+        # One untied coordinate MLP per block is an explicitly non-gauge-pure structural
+        # augmentation. The disabled path adds no MLP module, parameter, or state-dict key.
+        self.block_mlps = (
+            nn.ModuleList([
+                BlockMLP(cfg.embed_dim, cfg.block_mlp_expansion,
+                         cfg.block_mlp_activation, cfg.block_mlp_dropout)
+                for _ in range(cfg.n_layers)
+            ]) if cfg.use_block_mlp else None
+        )
         self.final_norm = get_norm(cfg.norm_type_final)(cfg.embed_dim, eps=cfg.eps,
                                                          family=cfg.family,
                                                          affine=cfg.layernorm_affine) \
@@ -1304,6 +1339,7 @@ class VFEModel(nn.Module):
                 beliefs, beliefs.mu, beliefs.sigma, self.group, self.cfg,
                 emission=emission,
                 log_prior=log_prior, block_norm=self.block_norm,
+                block_mlps=self.block_mlps,
                 head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
                 lambda_beta=lambda_beta,
                 transport_state=transport_state,
@@ -2351,6 +2387,7 @@ class VFEModel(nn.Module):
         ).total
 
     @torch.no_grad()
+    @_block_mlp_diagnostic_eval
     def gamma_attention_maps(
         self,
         token_ids: torch.Tensor,             # (B, N) token ids; only sequence 0 is used
@@ -2398,6 +2435,7 @@ class VFEModel(nn.Module):
         out = vfe_stack(                                             # converged belief gauge frame
             belief, belief.mu, belief.sigma, self.group, self.cfg,
             log_prior=log_prior, block_norm=self.block_norm,
+            block_mlps=self.block_mlps,
             head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
             lambda_beta=self.cfg.lambda_beta,
             transport_state=self.transport_state,
@@ -2867,6 +2905,7 @@ class VFEModel(nn.Module):
         return gamma.unsqueeze(0) if gamma.dim() == 2 else gamma
 
     @torch.no_grad()
+    @_block_mlp_diagnostic_eval
     def build_diagnostic_snapshot(
         self,
         token_ids: torch.Tensor,                 # (B, N) integer token ids
@@ -2940,6 +2979,7 @@ class VFEModel(nn.Module):
         )
 
     @torch.no_grad()
+    @_block_mlp_diagnostic_eval
     def diagnostics(
         self,
         token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
@@ -3008,6 +3048,7 @@ class VFEModel(nn.Module):
             out = vfe_stack(
                 belief, belief.mu, belief.sigma, self.group, cfg,
                 log_prior=log_prior, block_norm=self.block_norm,
+                block_mlps=self.block_mlps,
                 head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
                 lambda_beta=cfg.lambda_beta,
                 transport_state=self.transport_state,
@@ -3494,6 +3535,7 @@ class VFEModel(nn.Module):
         return d
 
     @torch.no_grad()
+    @_block_mlp_diagnostic_eval
     def attention_maps(
         self,
         token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
@@ -3612,12 +3654,13 @@ class VFEModel(nn.Module):
             return beta.unsqueeze(0) if beta.dim() == 2 else beta     # single-block group -> H=1
 
         maps = []
-        for _ in range(cfg.n_layers):
+        for layer_index in range(cfg.n_layers):
             if score_at != "converged":
                 maps.append(_score(belief))                           # BEFORE the E-step runs
             belief = vfe_block(                                       # converged belief at this block
                 belief, mu_p, sigma_p, self.group, cfg, log_prior=log_prior,
                 block_norm=self.block_norm,
+                block_mlp=(self.block_mlps[layer_index] if self.block_mlps is not None else None),
                 head_mixer=self.head_mixer,                            # replay the mixer too (audit 2026-06-09 overnight F32)
                 lambda_beta=cfg.lambda_beta,
                 transport_state=self.transport_state,
@@ -3638,6 +3681,7 @@ class VFEModel(nn.Module):
         return torch.stack(maps, dim=0)                              # (L, H, N, N)
 
     @torch.no_grad()
+    @_block_mlp_diagnostic_eval
     def diagnostics_per_layer(
         self,
         token_ids: torch.Tensor,           # (B, N) token ids; only sequence 0 is used
@@ -3727,6 +3771,7 @@ class VFEModel(nn.Module):
                 belief = vfe_block(
                     belief, mu_p, sigma_p, self.group, cfg, log_prior=log_prior,
                     block_norm=self.block_norm, head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
+                    block_mlp=(self.block_mlps[layer_index] if self.block_mlps is not None else None),
                     lambda_beta=cfg.lambda_beta,
                     transport_state=self.transport_state,
                     rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
