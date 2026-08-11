@@ -373,6 +373,65 @@ def test_requested_panel_classifies_unreadable_extra_before_config_homogeneity(t
     assert design["complete"] is False
 
 
+def test_manifest_failed_cell_is_excluded_from_accepted_config_homogeneity(
+    tmp_path, monkeypatch,
+):
+    (tmp_path / "multiseed_request.json").write_text(json.dumps({
+        "schema_version": 1,
+        "status": "incomplete",
+        "seeds": [8, 23],
+        "cells": [
+            {"seed": 8, "status": "complete"},
+            {"seed": 23, "status": "failed"},
+        ],
+    }))
+    _write_full_run(
+        tmp_path / "requested_s8",
+        ppl=10.0,
+        seed=8,
+        config={"config": {"seed": 8, "embed_dim": 20, "generate_figures": False}},
+    )
+    _write_full_run(
+        tmp_path / "failed_s23",
+        ppl=99.0,
+        seed=23,
+        config={"config": {"seed": 23, "embed_dim": 40, "generate_figures": False}},
+    )
+
+    design = ms._requested_seed_design(tmp_path)
+
+    assert design["accepted_seeds"] == [8]
+    assert design["observed_seeds"] == [8, 23]
+    assert design["cells"] == [
+        {"seed": 8, "status": "complete", "run_dir": str(tmp_path / "requested_s8")},
+        {"seed": 23, "status": "failed", "run_dir": None},
+    ]
+    assert design["complete"] is False
+
+    emitted = []
+    monkeypatch.setitem(ms.CONFIG, "run_root", str(tmp_path))
+    monkeypatch.setitem(ms.CONFIG, "key", "test_ppl")
+    monkeypatch.setattr(ms, "SCALAR_KEYS", ["test_ppl"])
+    monkeypatch.setattr(ms, "_emit_figures", lambda *args: emitted.append(args))
+
+    assert ms.main() != 0
+    summary = json.loads((tmp_path / "multiseed_summary.json").read_text(encoding="utf-8"))
+    assert summary["n_seeds"] == 1
+    assert summary["seeds"] == [8]
+    assert summary["n_observed_runs"] == 2
+    assert summary["observed_seeds"] == [8, 23]
+    assert summary["design"]["complete"] is False
+    assert summary["scalars"] == {}
+    assert summary["curves_final_step"] == {}
+    assert summary["withheld"] == {
+        "scalars": True,
+        "curves": True,
+        "per_layer": True,
+        "figures": True,
+    }
+    assert emitted == []
+
+
 def test_duplicate_observation_for_requested_seed_is_runtime_cohort_invalid(tmp_path):
     _write_request(tmp_path, [8])
     for dirname, ppl in (("requested_s8", 10.0), ("requested_retry_s8_2", 11.0)):

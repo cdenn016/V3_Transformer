@@ -451,16 +451,6 @@ def _requested_seed_design(
     unexpected_seeds = sorted(seed for seed in by_seed if seed not in requested_set)
     duplicate_seeds = sorted(seed for seed, dirs in by_seed.items() if len(dirs) > 1)
 
-    # Preserve the historic homogeneity contract for inferred/no-manifest aggregation, but never let
-    # an excluded extra directory determine or abort the accepted requested cohort.
-    comparable_dirs = [
-        by_seed[seed][0]
-        for seed in requested
-        if len(by_seed.get(seed, [])) == 1
-    ]
-    if not manifest["available"] or manifest["request_verified"]:
-        _assert_homogeneous_configs(comparable_dirs)
-
     cells: List[Dict[str, Any]] = []
     provenance_contracts: Dict[int, Dict[str, object]] = {}
     for seed in requested:
@@ -503,10 +493,17 @@ def _requested_seed_design(
         for cell in cells:
             if cell["status"] == "complete":
                 cell["status"] = "unverifiable"
-    accepted_seeds = sorted(
-        cell["seed"]
+    accepted_cells = [
+        cell
         for cell in cells
         if cell["status"] == "complete" and cell.get("run_dir") is not None
+    ]
+    # Configuration homogeneity applies only to the cohort still eligible for aggregation after
+    # manifest and provenance classification. Inferred/no-manifest cells remain ``complete`` here,
+    # preserving their historical fail-loud homogeneity check.
+    _assert_homogeneous_configs([Path(cell["run_dir"]) for cell in accepted_cells])
+    accepted_seeds = sorted(
+        cell["seed"] for cell in accepted_cells
     )
     exact_observed_panel = (
         accepted_seeds == sorted(requested)
