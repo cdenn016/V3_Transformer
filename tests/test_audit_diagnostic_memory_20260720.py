@@ -9,6 +9,7 @@ import torch
 
 from vfe3.config import VFE3Config
 from vfe3.model.model import VFEModel
+from vfe3.model.prior_bank import DecodeCEResult
 import vfe3.train as train_module
 from vfe3.train import ValidationDiagnostics, _val_diagnostics, evaluate, train
 
@@ -127,10 +128,17 @@ class _PopulationEvaluationSpy(torch.nn.Module):
         self,
         token_ids: torch.Tensor,
         targets:   torch.Tensor,
-    ) -> tuple[None, None, torch.Tensor]:
+
+        *,
+        return_decode_stats: bool = False,
+    ) -> tuple[None, None, torch.Tensor | DecodeCEResult]:
         self.shapes.append(tuple(token_ids.shape))
-        self.scored_targets += int((targets != -100).sum())
-        return None, None, torch.tensor(2.0, device=token_ids.device)
+        scored_tokens = (targets != -100).sum(dtype=torch.int64)
+        self.scored_targets += int(scored_tokens)
+        ce = torch.tensor(2.0, device=token_ids.device)
+        if return_decode_stats:
+            return None, None, DecodeCEResult(ce, scored_tokens)
+        return None, None, ce
 
 
 def test_val_diagnostics_slices_first_sequence_before_snapshot_decode(

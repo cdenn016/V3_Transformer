@@ -45,12 +45,11 @@ def _as_float(x: Any) -> float:
 def aggregate_validation_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     r"""Collapse seeds into one point per ``(route, label)``, keyed on persisted ``best_val_ppl``.
 
-    A group is retained iff it carries at least one finite, positive ``best_val_ppl`` across its
-    seeds -- test metrics (``test_ce`` / ``test_ppl`` / ``test_bpc``) are never consulted, so a
-    validation-only row (every test metric null) still survives. ``val_bits_per_token_mean`` is the
-    seed mean of ``log2(best_val_ppl)`` (validation bits/token; NOT the character-corrected BPC that
-    ``scaling_analysis.aggregate_points`` computes from the test split). ``wall_time_mean`` is the
-    seed mean of the persisted ``wall_time_s``.
+    A group is retained iff at least one exact seed carries BOTH a finite, positive
+    ``best_val_ppl`` and a finite ``wall_time_s``. Test metrics (``test_ce`` / ``test_ppl`` /
+    ``test_bpc``) are never consulted, so a validation-only row (every test metric null) still
+    survives. ``val_bits_per_token_mean`` and ``wall_time_mean`` are means over the same paired seed
+    intersection; paired and missing cohorts remain explicit in the returned point.
 
     A row with an EXPLICIT ``best_val_ppl: None`` (the key is present, just null -- not merely
     absent) alongside a sibling seed carrying a finite value in the SAME group is a data-integrity
@@ -63,17 +62,41 @@ def aggregate_validation_points(rows: List[Dict[str, Any]]) -> List[Dict[str, An
 
     points: List[Dict[str, Any]] = []
     for (route, label), grp in sorted(groups.items()):
+        by_seed: Dict[int, Dict[str, Any]] = {}
+        for row in grp:
+            seed = row.get("seed")
+            if type(seed) is not int or seed < 0:
+                raise ValueError(
+                    f"{route}/{label}: expected an exact nonnegative integer seed, got {seed!r}"
+                )
+            if seed in by_seed:
+                raise ValueError(f"{route}/{label}: duplicate seed {seed}")
+            by_seed[seed] = row
+
+        observed_seeds = sorted(by_seed)
         has_explicit_null = any("best_val_ppl" in g and g["best_val_ppl"] is None for g in grp)
-        val_ppl = [v for v in (_as_float(g.get("best_val_ppl")) for g in grp) if np.isfinite(v) and v > 0.0]
-        if has_explicit_null and val_ppl:
+        val_by_seed = {
+            seed: value
+            for seed, row in by_seed.items()
+            if np.isfinite(value := _as_float(row.get("best_val_ppl"))) and value > 0.0
+        }
+        if has_explicit_null and val_by_seed:
             raise ValueError(
-                f"{route}/{label}: explicit-null best_val_ppl alongside {len(val_ppl)} finite "
+                f"{route}/{label}: explicit-null best_val_ppl alongside {len(val_by_seed)} finite "
                 "seed(s) -- refusing to silently drop it or substitute a test metric"
             )
-        if not val_ppl:
+        wall_by_seed = {
+            seed: value
+            for seed, row in by_seed.items()
+            if np.isfinite(value := _as_float(row.get("wall_time_s")))
+        }
+        paired_seeds = sorted(set(val_by_seed).intersection(wall_by_seed))
+        if not paired_seeds:
             continue
-        bits_seeds = [float(np.log2(v)) for v in val_ppl]
-        wall_seeds = [w for w in (_as_float(g.get("wall_time_s")) for g in grp) if np.isfinite(w)]
+        bits_seeds = [float(np.log2(val_by_seed[seed])) for seed in paired_seeds]
+        wall_seeds = [wall_by_seed[seed] for seed in paired_seeds]
+        missing_val_seeds = sorted(set(observed_seeds).difference(val_by_seed))
+        missing_wall_time_seeds = sorted(set(observed_seeds).difference(wall_by_seed))
         npars      = [w for w in (_as_float(g.get("n_params")) for g in grp) if np.isfinite(w)]
         points.append({
             "route": route, "label": label, "scale_knob": grp[0]["scale_knob"],
@@ -82,10 +105,18 @@ def aggregate_validation_points(rows: List[Dict[str, Any]]) -> List[Dict[str, An
             "n_heads":    _as_float(grp[0].get("n_heads")),
             "n_layers":   _as_float(grp[0].get("n_layers")),
             "n_e_steps":  _as_float(grp[0].get("n_e_steps")),
+            "observed_seeds": observed_seeds,
+            "paired_seeds": paired_seeds,
+            "n_paired_seeds": len(paired_seeds),
+            "missing_val_seeds": missing_val_seeds,
+            "n_missing_val_seeds": len(missing_val_seeds),
+            "missing_wall_time_seeds": missing_wall_time_seeds,
+            "n_missing_wall_time_seeds": len(missing_wall_time_seeds),
             "val_bits_per_token_seeds": bits_seeds,
             "val_bits_per_token_mean":  float(np.mean(bits_seeds)),
             "n_val_seeds": len(bits_seeds),
-            "wall_time_mean": float(np.mean(wall_seeds)) if wall_seeds else float("nan"),
+            "wall_time_seeds": wall_seeds,
+            "wall_time_mean": float(np.mean(wall_seeds)),
         })
     return points
 

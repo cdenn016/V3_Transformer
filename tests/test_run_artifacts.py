@@ -409,6 +409,27 @@ def test_save_checkpoint_is_loadable(tmp_path):
     ckpt = torch.load(p, weights_only=False)
     assert ckpt["step"] == 4
     assert "model_state" in ckpt and "optimizer_state" in ckpt
+    assert "optimizer_populated_slot_manifest" in ckpt
+    manifest = ckpt["optimizer_parameter_manifest"]
+    assert set(manifest) == {"schema_version", "parameter_groups", "sha256"}
+    assert manifest["schema_version"] == 2
+    expected_groups = []
+    name_by_parameter = {id(parameter): name for name, parameter in model.named_parameters()}
+    for group, saved_group in zip(opt.param_groups, ckpt["optimizer_state"]["param_groups"]):
+        expected_groups.append([
+            {
+                "parameter_id": parameter_id,
+                "name": name_by_parameter[id(parameter)],
+                "shape": list(parameter.shape),
+            }
+            for parameter_id, parameter in zip(saved_group["params"], group["params"])
+        ])
+    assert manifest["parameter_groups"] == expected_groups
+    payload = {"schema_version": 2, "parameter_groups": expected_groups}
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    ).encode("ascii")
+    assert manifest["sha256"] == hashlib.sha256(encoded).hexdigest()
     # model-selection state is bundled so a resumed run reports the run-wide best (audit 2026-07-01 C2)
     assert "best_val_ppl" in ckpt and "best_step" in ckpt
     assert ckpt["config"]["grad_clip"] == 0.25
@@ -643,6 +664,20 @@ def test_train_with_artifacts_writes_files(trained_artifact_evidence):
         name.startswith("step_") and name.endswith(".pt")
         for name in trained_artifact_evidence.checkpoint_names
     )
+
+
+def test_train_publishes_mm_cholesky_fallback_count(tmp_path, monkeypatch):
+    """The numerical MM fallback count belongs in the durable realized-update record."""
+    import vfe3.train as train_module
+
+    monkeypatch.setattr(train_module, "mm_cholesky_fallback_elements", lambda: 3)
+    cfg = _cfg()
+    model = VFEModel(cfg)
+    artifacts = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
+
+    train(model, _loader(n=96), cfg, n_steps=0, artifacts=artifacts)
+
+    assert artifacts.realized_updates["mm_cholesky_fallback_elements"] == 3
 
 
 def test_train_with_artifacts_writes_attention_pngs(tmp_path):

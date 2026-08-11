@@ -478,9 +478,15 @@ class _EvaluationModel(nn.Module):
         self,
         tokens:  torch.Tensor,
         targets: torch.Tensor,
+        *,
+        return_decode_stats: bool = False,
     ) -> tuple[None, None, torch.Tensor]:
-        del tokens, targets
-        return None, None, self.anchor.new_tensor(next(self._cross_entropies))
+        del tokens
+        ce = self.anchor.new_tensor(next(self._cross_entropies))
+        if return_decode_stats:
+            from vfe3.model.prior_bank import DecodeCEResult
+            return None, None, DecodeCEResult(ce, (targets != -100).sum())
+        return None, None, ce
 
 
 def test_evaluate_transfers_only_padding_buckets_and_aggregate_and_preserves_token_weighting(

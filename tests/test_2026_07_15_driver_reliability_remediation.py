@@ -1494,10 +1494,10 @@ def test_default_parameter_match_grid_retains_two_realized_30m_widths():
     assert ablation.CONFIG["target_n_params"] == 30_000_000
     assert ablation.CONFIG["max_param_relative_deviation"] == 0.02
     assert grid == {
-        "embed_dim": [32, 40, 48, 60, 64, 66, 75, 80, 96],
-        "n_heads": [4, 6, 8, 10, 11, 12, 15, 16],
+        "embed_dim": [32, 40, 45, 48, 60, 64, 66, 75, 80, 96],
+        "n_heads": [4, 5, 6, 8, 10, 11, 12, 15, 16],
     }
-    assert len(ablation._parameter_grid_overrides(sweep)) == 72
+    assert len(ablation._parameter_grid_overrides(sweep)) == 90
 
     selection = ablation._parameter_match_selection("parameter_matched")
 
@@ -1509,7 +1509,17 @@ def test_default_parameter_match_grid_retains_two_realized_30m_widths():
             record["n_params"],
         )
         for record in selection["selected"]
-    ] == [(66, 11, 29_953_857), (75, 15, 30_252_833)]
+    ] == [(45, 5, 29_452_186), (60, 10, 30_200_281)]
+    assert [
+        (
+            record["label"],
+            record["overrides"]["kl_max"],
+        )
+        for record in selection["selected"]
+    ] == [
+        ("embed_dim=45__n_heads=5", 360),
+        ("embed_dim=60__n_heads=10", 480),
+    ]
     assert all(
         record["param_relative_deviation"]
         <= selection["max_param_relative_deviation"]
@@ -1543,10 +1553,12 @@ def test_every_ablation_arm_constructs_with_only_invalid_arm_prerequisites_repai
     assert position["rope"]["e_step_update"] == "gradient"
 
     covariance = dict(ablation.make_run_overrides("covariance"))
+    assert {arm["decode_mode"] for arm in covariance.values()} == {"family_chunked"}
     assert "e_step_update" not in covariance["diagonal"]
     assert covariance["full"]["e_step_update"] == "gradient"
 
     renyi = dict(ablation.make_run_overrides("renyi_order"))
+    assert {arm["decode_mode"] for arm in renyi.values()} == {"family_chunked"}
     assert "e_step_update" not in renyi["renyi_order=1.0"]
     assert all(
         renyi[f"renyi_order={value}"]["e_step_update"] == "gradient"

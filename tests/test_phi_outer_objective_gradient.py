@@ -439,13 +439,22 @@ def test_rejected_training_attempt_preserves_every_phi_factor_and_clock(
     else:
         original_forward = model.forward
 
-        def _nonfinite_forward(self, token_ids, target_ids=None, *, estep_grad_out=None):
-            logits, loss, ce = original_forward(
+        def _nonfinite_forward(
+            self,
+            token_ids,
+            target_ids=None,
+
+            *,
+            estep_grad_out=None,
+            return_decode_stats=False,
+        ):
+            logits, loss, decode_result = original_forward(
                 token_ids,
                 target_ids,
                 estep_grad_out=estep_grad_out,
+                return_decode_stats=return_decode_stats,
             )
-            return logits, loss * 0.0 + loss.new_tensor(float("inf")), ce
+            return logits, loss * 0.0 + loss.new_tensor(float("inf")), decode_result
 
         model.forward = types.MethodType(_nonfinite_forward, model)
 

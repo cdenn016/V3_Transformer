@@ -27,10 +27,14 @@ NaN-free under log_softmax; (c) the fused CE excludes the position from BOTH num
 denominator; (d) the event is counted; (e) the healthy path is untouched.
 """
 
+import types
+
 import pytest
 import torch
+import torch.nn.functional as F
 
 import vfe3.model.prior_bank as prior_bank
+from vfe3.belief import BeliefState
 from vfe3.numerics import (
     decode_logdet_fallback_elements,
     reset_decode_logdet_fallback_elements,
@@ -155,3 +159,135 @@ def test_model_forward_is_finite_and_counts_zero():
     loss = model(torch.randint(0, 20, (2, 5)), torch.randint(0, 20, (2, 5)))[1]
     assert torch.isfinite(loss)
     assert decode_logdet_fallback_elements() == 0
+
+
+def test_nonfinite_rows_are_sanitized_excluded_counted_and_have_zero_gradient():
+    r"""NaN and both infinities must leave the graph before any full-covariance arithmetic."""
+    model, bank = _bank()
+    mu, sigma, targets = _inputs(model)
+    invalid_rows = ((0, 1), (0, 3), (1, 2), (1, 3))
+    sigma[invalid_rows[0]] = float("nan")
+    sigma[invalid_rows[1]] = float("inf")
+    sigma[invalid_rows[2]] = float("-inf")
+    sigma[invalid_rows[3]] = -5.0 * torch.eye(model.cfg.embed_dim)
+    targets[1, 4] = -100
+    mu.requires_grad_(True)
+    sigma.requires_grad_(True)
+
+    result = bank.decode_ce_full_chunked(mu, sigma, targets, return_stats=True)
+    assert isinstance(result, prior_bank.DecodeCEResult)
+    assert result.scored_tokens.dtype is torch.int64
+    assert result.scored_tokens.device == sigma.device
+    assert int(result.scored_tokens) == targets.numel() - len(invalid_rows) - 1
+    assert torch.isfinite(result.ce)
+    result.ce.backward()
+
+    assert decode_logdet_fallback_elements() == len(invalid_rows)
+    assert torch.isfinite(mu.grad).all()
+    assert torch.isfinite(sigma.grad).all()
+    for row in invalid_rows:
+        assert torch.equal(mu.grad[row], torch.zeros_like(mu.grad[row]))
+        assert torch.equal(sigma.grad[row], torch.zeros_like(sigma.grad[row]))
+
+    safe_sigma = sigma.detach().clone()
+    masked_targets = targets.clone()
+    eye = torch.eye(model.cfg.embed_dim)
+    for row in invalid_rows:
+        safe_sigma[row] = eye
+        masked_targets[row] = -100
+    reset_decode_logdet_fallback_elements()
+    reference = bank.decode_ce_full_chunked(mu.detach(), safe_sigma, masked_targets)
+    assert torch.equal(result.ce.detach(), reference)
+    assert decode_logdet_fallback_elements() == 0
+
+
+def test_decoder_and_model_stats_are_opt_in_without_changing_default_returns():
+    model, bank = _bank()
+    mu, sigma, targets = _inputs(model)
+    targets[0, 0] = -100
+
+    scalar = bank.decode_ce_full_chunked(mu, sigma, targets)
+    stats = bank.decode_ce_full_chunked(mu, sigma, targets, return_stats=True)
+    assert isinstance(scalar, torch.Tensor)
+    assert isinstance(stats, prior_bank.DecodeCEResult)
+    assert torch.equal(stats.ce, scalar)
+    assert int(stats.scored_tokens) == targets.numel() - 1
+
+    tokens = torch.randint(0, model.cfg.vocab_size, targets.shape)
+    default_result = model(tokens, targets)
+    stats_result = model(tokens, targets, return_decode_stats=True)
+    assert len(default_result) == len(stats_result) == 3
+    assert isinstance(default_result[2], torch.Tensor)
+    assert isinstance(stats_result[2], prior_bank.DecodeCEResult)
+    assert torch.equal(stats_result[2].ce, default_result[2])
+    assert int(stats_result[2].scored_tokens) == targets.numel() - 1
+
+
+@pytest.mark.parametrize("decode_mode", ("full", "full_chunked"))
+def test_head_block_only_failure_is_excluded_by_dense_full_consumers(decode_mode):
+    r"""A decoder-final head-block failure must remain excluded at the later dense CE boundary.
+
+    Under relative jitter, the whole covariance uses its global diagonal mean while each head block
+    uses its own mean. A large healthy block can therefore repair the whole matrix even though the
+    bad head block still exhausts its smaller retry ladder. This is the real, unmocked case where
+    ``block_ok`` adds information beyond ``spd_ok``.
+    """
+    model = _tiny_model(
+        gauge_group="block_glk",
+        n_heads=2,
+        family="gaussian_full",
+        decode_mode=decode_mode,
+        use_priorbank_head_evidence_mixer=True,
+        safe_cholesky_jitter_mode="relative",
+    )
+    bank = model.prior_bank
+    mu = torch.tensor(
+        [[[0.2, -0.1, 0.3, -0.4], [-0.3, 0.4, -0.2, 0.1]]],
+        requires_grad=True,
+    )
+    failed = torch.diag(torch.tensor([-0.05, -0.05, 1000.0, 1000.0]))
+    sigma = torch.stack((failed, torch.eye(model.cfg.embed_dim))).unsqueeze(0).requires_grad_()
+    targets = torch.tensor([[1, 2]])
+
+    reset_decode_logdet_fallback_elements()
+    inference_logits = bank.decode(mu, sigma)
+    assert torch.equal(inference_logits[0, 0], torch.zeros_like(inference_logits[0, 0]))
+    assert decode_logdet_fallback_elements() == 1
+
+    degenerate = bank.decode_degenerate_positions(sigma)
+    assert degenerate is not None
+    assert torch.equal(degenerate, torch.tensor([[True, False]]))
+    assert decode_logdet_fallback_elements() == 1, "the degeneracy query must remain non-counting"
+
+    manual_targets = targets.clone()
+    manual_targets[0, 0] = -100
+    manual_ce = F.cross_entropy(
+        inference_logits.reshape(-1, model.cfg.vocab_size),
+        manual_targets.reshape(-1),
+        ignore_index=-100,
+        reduction="sum",
+    )
+
+    phi = torch.zeros(1, 2, bank.phi_embed.shape[-1])
+
+    def scripted_beliefs(self, token_ids, **kwargs):
+        return BeliefState(mu=mu, sigma=sigma, phi=phi), None
+
+    model.forward_beliefs = types.MethodType(scripted_beliefs, model)
+    reset_decode_logdet_fallback_elements()
+    logits, loss, stats = model(
+        torch.tensor([[3, 4]]), targets, return_decode_stats=True)
+
+    if logits is not None:
+        assert torch.equal(logits[0, 0], torch.zeros_like(logits[0, 0]))
+    assert stats.scored_tokens.dtype is torch.int64
+    assert int(stats.scored_tokens) == 1
+    torch.testing.assert_close(stats.ce, manual_ce.detach())
+    torch.testing.assert_close(loss, manual_ce)
+    assert decode_logdet_fallback_elements() == 1
+
+    loss.backward()
+    assert torch.equal(mu.grad[0, 0], torch.zeros_like(mu.grad[0, 0]))
+    assert torch.equal(sigma.grad[0, 0], torch.zeros_like(sigma.grad[0, 0]))
+    assert torch.isfinite(mu.grad[0, 1]).all()
+    assert torch.isfinite(sigma.grad[0, 1]).all()

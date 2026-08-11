@@ -228,6 +228,36 @@ def test_generate_figures_reuses_one_same_token_snapshot(tmp_path, monkeypatch):
         assert (tmp_path / "run" / "figures" / f"model_umap_{channel}.png").exists()
 
 
+def test_generate_figures_forwards_model_owned_full_gaussian_policy(tmp_path, monkeypatch):
+    """The report driver forwards the live model policy to its gauge-residual measurement."""
+    from vfe3 import metrics
+    from vfe3.viz import report
+
+    model = _model(
+        family="gaussian_full",
+        full_cov_kl_precision="fp64",
+        full_cov_congruence_precision="fp64",
+        e_phi_lr=0.0,
+        n_e_steps=1,
+    )
+    seen = []
+
+    def observed_residual(*_args, full_cov_kl_precision, **_kwargs):
+        seen.append(full_cov_kl_precision)
+        return {
+            "energy_in_group": torch.tensor([0.0]),
+            "energy_out_group": torch.tensor([1.0]),
+            "beta_in_group": torch.tensor([0.0]),
+            "beta_out_group": torch.tensor([1.0]),
+        }
+
+    monkeypatch.setattr(metrics, "gauge_equivariance_residual", observed_residual)
+    paths = generate_figures(tmp_path / "run", model=model, loader=_loader(), max_sequences=1)
+
+    assert seen == ["fp64"]
+    assert (tmp_path / "run" / "figures" / "gauge_equivariance.png") in paths
+
+
 def test_model_channel_report_extractors_do_not_replay_snapshot_state(monkeypatch):
     from vfe3.viz import extract
 

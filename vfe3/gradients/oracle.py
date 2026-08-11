@@ -20,6 +20,7 @@ import torch
 
 from vfe3.alpha_i import self_coupling_alpha
 from vfe3.families.base import get_family
+from vfe3.families.gaussian import FullGaussian
 from vfe3.free_energy import free_energy, self_divergence_for_alpha
 # Forward transport containers are named in the `omega` forward-ref annotation below; import them
 # at runtime (alongside the transport helpers this module already imports) so
@@ -31,6 +32,20 @@ from vfe3.geometry.transport import (
     FactoredTransport,
     RopeTransport,
 )
+
+
+def _coupling_energy(family, *args, precision_policy: Optional[str] = None, **kwargs) -> torch.Tensor:
+    """Use an explicit policy for the built-in full family without changing custom-family APIs."""
+    if family is FullGaussian and precision_policy is not None:
+        kwargs["precision_policy"] = precision_policy
+    return family.coupling_energy(*args, **kwargs)
+
+
+def _family_instance(family, mu: torch.Tensor, sigma: torch.Tensor, precision_policy: Optional[str]):
+    """Construct the built-in full family with an explicit model policy when supplied."""
+    if family is FullGaussian and precision_policy is not None:
+        return family(mu, sigma, _precision_policy=precision_policy)
+    return family(mu, sigma)
 
 
 def _transport_to_float(
@@ -118,6 +133,7 @@ def belief_gradients_autograd(
     need_sigma_grad:           bool = True,    # False -> return (grad_mu, None)
     gradient_mode:             str  = "filtering",
     family:                    str  = "gaussian_diagonal",
+    full_cov_kl_precision:     Optional[str] = None,
     divergence_family:         str  = "renyi",
     lambda_alpha_mode:         str  = "constant",
 
@@ -170,6 +186,7 @@ def belief_gradients_autograd(
                 need_sigma_grad=need_sigma_grad,
                 gradient_mode=gradient_mode,
                 family=family,
+                full_cov_kl_precision=full_cov_kl_precision,
                 divergence_family=divergence_family,
                 lambda_alpha_mode=lambda_alpha_mode,
                 irrep_dims=irrep_dims,
@@ -210,24 +227,29 @@ def belief_gradients_autograd(
     # (covers laplace_diagonal etc., not just gaussian_diagonal), so the batch-collapsed (N,N,K,K)
     # regime_ii_link omega routes correctly against a batched diagonal sigma (its rank gap vs the omega
     # would otherwise misinfer the full sandwich); behavior-identical for a batched dense omega.
-    sd = self_divergence_for_alpha(fam(mu_q, sigma_q), fam(mu_p, sigma_p), alpha=renyi_order, kl_max=kl_max, eps=eps,
+    sd = self_divergence_for_alpha(
+                                   _family_instance(fam, mu_q, sigma_q, full_cov_kl_precision),
+                                   _family_instance(fam, mu_p, sigma_p, full_cov_kl_precision), alpha=renyi_order, kl_max=kl_max, eps=eps,
                                    divergence_family=divergence_family, lambda_alpha_mode=lambda_alpha_mode)
     alpha, reg = self_coupling_alpha(sd, mode=lambda_alpha_mode, value=value, b0=b0, c0=c0)
-    energy = fam.coupling_energy(mu_q, sigma_q, mu_k, sigma_k, omega,
-                                 alpha=renyi_order, kl_max=kl_max, eps=eps,
-                                 divergence_family=divergence_family, irrep_dims=irrep_dims,
-                                 diagonal_out=(sigma_k.dim() == mu_k.dim()))
+    energy = _coupling_energy(
+        fam, mu_q, sigma_q, mu_k, sigma_k, omega,
+        precision_policy=full_cov_kl_precision,
+        alpha=renyi_order, kl_max=kl_max, eps=eps,
+        divergence_family=divergence_family, irrep_dims=irrep_dims,
+        diagonal_out=(sigma_k.dim() == mu_k.dim()))
     # Value-gauge decoupling (RopeTransport.on_value=False): beta comes from the rotated SCORE energy
     # above, but the coupling sum the belief descends uses the UN-rotated base transport -- RoPE's
     # position-independent value aggregation (GL(K)_attention.tex:1909). None on the coherent default
     # path (byte-identical). Autograd carries the extra d beta/d mu term the broken envelope leaves.
     coupling_energy = None
     if isinstance(omega, RopeTransport) and not omega.on_value:
-        coupling_energy = fam.coupling_energy(mu_q, sigma_q, mu_k, sigma_k, omega.base,
-                                              alpha=renyi_order, kl_max=kl_max, eps=eps,
-                                              divergence_family=divergence_family,
-                                              irrep_dims=irrep_dims,
-                                              diagonal_out=(sigma_k.dim() == mu_k.dim()))
+        coupling_energy = _coupling_energy(
+            fam, mu_q, sigma_q, mu_k, sigma_k, omega.base,
+            precision_policy=full_cov_kl_precision,
+            alpha=renyi_order, kl_max=kl_max, eps=eps,
+            divergence_family=divergence_family, irrep_dims=irrep_dims,
+            diagonal_out=(sigma_k.dim() == mu_k.dim()))
     F = free_energy(
         sd, energy, alpha, tau=tau, lambda_beta=lambda_beta, lambda_twohop=lambda_twohop,
         include_attention_entropy=include_attention_entropy,

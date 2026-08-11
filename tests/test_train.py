@@ -379,6 +379,45 @@ def test_evaluate_returns_finite_ppl_bpc_consistent_with_ce():
     assert m["bpc"] == pytest.approx(m["ce"] / math.log(2.0))
 
 
+class _ScriptedDecodeStatsModel(torch.nn.Module):
+    """Minimal evaluation double whose decoder excludes a scripted number of targets."""
+
+    def __init__(self, batches):
+        super().__init__()
+        self.prior_bank = torch.nn.Module()
+        self.prior_bank.phi_embed = torch.nn.Parameter(torch.zeros(()))
+        self._batches = list(batches)
+
+    def forward(self, tokens, targets=None, *, return_decode_stats=False):
+        assert return_decode_stats, "evaluation must request the decoder-owned denominator"
+        ce_value, scored_tokens = self._batches.pop(0)
+        ce = self.prior_bank.phi_embed * 0.0 + ce_value
+        from vfe3.model.prior_bank import DecodeCEResult
+        stats = DecodeCEResult(
+            ce=ce.detach(),
+            scored_tokens=torch.tensor(scored_tokens, dtype=torch.int64, device=ce.device),
+        )
+        return None, ce, stats
+
+
+def test_evaluate_weights_by_decoder_scored_tokens_and_preserves_result_keys():
+    model = _ScriptedDecodeStatsModel([(2.0, 1), (4.0, 3)])
+    loader = [
+        (torch.zeros(1, 4, dtype=torch.long), torch.zeros(1, 4, dtype=torch.long)),
+        (torch.zeros(1, 4, dtype=torch.long), torch.zeros(1, 4, dtype=torch.long)),
+    ]
+    result = evaluate(model, loader)
+    assert set(result) == {"ce", "ppl", "bits_per_token", "bpc"}
+    assert result["ce"] == pytest.approx(3.5)
+
+
+def test_evaluate_rejects_a_corpus_with_zero_decoder_scored_tokens():
+    model = _ScriptedDecodeStatsModel([(0.0, 0)])
+    loader = [(torch.zeros(1, 2, dtype=torch.long), torch.full((1, 2), -100))]
+    with pytest.raises(ValueError, match="no scored target tokens"):
+        evaluate(model, loader)
+
+
 def test_silent_and_logging_paths_are_bitwise_identical(caplog):
     torch.manual_seed(0)
     cfg_a = _structured_cfg()

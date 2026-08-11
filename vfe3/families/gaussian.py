@@ -35,8 +35,8 @@ def _full_gaussian_public_dtype(*dtypes: torch.dtype) -> torch.dtype:
 # "fp32_escalate": evaluate the pair grid in float32 and recompute in float64 only when a
 #         Cholesky actually fails. Measured 15.7x faster on the live (B,N,N,K,K) grid, with
 #         attention weights moving by at most 4.0e-6 at the trained operating point.
-# Process-global by design: see the note in FullGaussian.renyi_closed_form. It is set in exactly
-# one place (VFEModel.__init__) so no two consumers of coupling_energy can disagree.
+# The module-level value remains the standalone-call default. Model-owned callers pass an immutable
+# instance policy instead, so constructing another model cannot alter an existing model's numerics.
 _FULL_COV_KL_PRECISIONS = ("fp64", "fp32_escalate", "fp32_escalate_cond")
 # Pivot-ratio floor at which "fp32_escalate_cond" promotes the grid to float64.
 #
@@ -64,12 +64,18 @@ _FULL_COV_KL_COND_FLOOR: float = 1e-4
 _FULL_COV_KL_PRECISION: str = "fp64"
 
 
-def set_full_cov_kl_precision(policy: str) -> str:
-    r"""Set the process-wide full-covariance KL precision policy; returns the previous value."""
-    global _FULL_COV_KL_PRECISION
+def validate_full_cov_kl_precision(policy: str) -> str:
+    """Validate and return one supported full-covariance KL precision policy."""
     if policy not in _FULL_COV_KL_PRECISIONS:
         raise ValueError(
             f"full_cov_kl_precision must be one of {_FULL_COV_KL_PRECISIONS}, got {policy!r}")
+    return policy
+
+
+def set_full_cov_kl_precision(policy: str) -> str:
+    r"""Set the process-wide full-covariance KL precision policy; returns the previous value."""
+    global _FULL_COV_KL_PRECISION
+    validate_full_cov_kl_precision(policy)
     previous = _FULL_COV_KL_PRECISION
     _FULL_COV_KL_PRECISION = policy
     return previous
@@ -80,12 +86,16 @@ def full_cov_kl_precision() -> str:
     return _FULL_COV_KL_PRECISION
 
 
-def _full_cov_kl_compute_dtype(result_dtype: torch.dtype) -> torch.dtype:
-    r"""Working dtype for the full-covariance KL under the active policy.
+def _full_cov_kl_compute_dtype(
+    result_dtype: torch.dtype,
+    precision_policy: Optional[str] = None,
+) -> torch.dtype:
+    r"""Working dtype for the full-covariance KL under an explicit or standalone policy.
 
     A float64 PUBLIC family always computes in float64 regardless of policy -- the policy only
     governs whether a float32 family is promoted, which is what the historical island did."""
-    if _FULL_COV_KL_PRECISION == "fp64" or result_dtype == torch.float64:
+    policy = full_cov_kl_precision() if precision_policy is None else validate_full_cov_kl_precision(precision_policy)
+    if policy == "fp64" or result_dtype == torch.float64:
         return torch.float64
     return torch.float32
 
@@ -488,6 +498,7 @@ class FullGaussian(BeliefParams):
 
         *,
         _public_dtype: Optional[torch.dtype] = None,
+        _precision_policy: Optional[str] = None,
     ) -> None:
         self.mu = mu
         self.sigma = sigma
@@ -496,6 +507,9 @@ class FullGaussian(BeliefParams):
             if _public_dtype is not None
             else _full_gaussian_public_dtype(mu.dtype, sigma.dtype)
         )
+        self._precision_policy = (
+            None if _precision_policy is None else validate_full_cov_kl_precision(_precision_policy)
+        )
 
     @classmethod
     def from_transported(
@@ -503,11 +517,14 @@ class FullGaussian(BeliefParams):
         mu:                torch.Tensor,         # transported means
         dispersion:        torch.Tensor,         # retained full covariance
         source_dispersion: torch.Tensor,         # pre-transport covariance and public dtype source
+        *,
+        _precision_policy: Optional[str] = None,
     ) -> "FullGaussian":
         return cls(
             mu,
             dispersion,
             _public_dtype=_full_gaussian_public_dtype(mu.dtype, source_dispersion.dtype),
+            _precision_policy=_precision_policy,
         )
 
     def coordinate_dim(self) -> int:
@@ -518,6 +535,7 @@ class FullGaussian(BeliefParams):
             self.mu[..., start:end],
             self.sigma[..., start:end, start:end],
             _public_dtype=self._public_dtype,
+            _precision_policy=self._precision_policy,
         )
 
     def broadcast_over_keys(self) -> "FullGaussian":
@@ -525,15 +543,22 @@ class FullGaussian(BeliefParams):
             self.mu.unsqueeze(-2),
             self.sigma.unsqueeze(-3),
             _public_dtype=self._public_dtype,
+            _precision_policy=self._precision_policy,
         )
 
     @classmethod
     def stack(cls, parts: List["FullGaussian"], *, dim: int = 0) -> "FullGaussian":
         public_dtype = _full_gaussian_public_dtype(*(part._public_dtype for part in parts))
+        explicit_policies = {part._precision_policy for part in parts if part._precision_policy is not None}
+        if len(explicit_policies) > 1:
+            raise ValueError(
+                "cannot stack FullGaussian values with conflicting explicit precision policies")
+        precision_policy = next(iter(explicit_policies), None)
         return FullGaussian(
             torch.stack([p.mu for p in parts], dim=dim),
             torch.stack([p.sigma for p in parts], dim=dim),
             _public_dtype=public_dtype,
+            _precision_policy=precision_policy,
         )
 
     @classmethod
@@ -612,6 +637,7 @@ class FullGaussian(BeliefParams):
         *,
         diagonal_out:    Optional[bool]      = None,
         marginal_blocks: Optional[List[int]] = None,
+        precision_policy: Optional[str] = None,
     ) -> torch.Tensor:
         r"""Retain the float64 full-covariance congruence through SPD factorization.
 
@@ -636,10 +662,11 @@ class FullGaussian(BeliefParams):
         transported dispersion is a full (K, K) congruence with cross-head blocks to skip.
         """
         from vfe3.geometry.transport import transport_covariance
+        policy = full_cov_kl_precision() if precision_policy is None else validate_full_cov_kl_precision(precision_policy)
         return transport_covariance(
             omega,
             dispersion,
-            retain_full_precision=(_FULL_COV_KL_PRECISION == "fp64"),
+            retain_full_precision=(policy == "fp64"),
             diagonal_out=diagonal_out,
             marginal_blocks=marginal_blocks,
         )
@@ -661,6 +688,7 @@ class FullGaussian(BeliefParams):
 
         irrep_dims:        Optional[List[int]] = None,
         diagonal_out:      Optional[bool]      = None,
+        precision_policy:  Optional[str]       = None,
     ) -> torch.Tensor:                    # (..., N, N) or (..., H, N, N)
         r"""Full-covariance coupling energy, taking the head blocks directly when it can.
 
@@ -685,6 +713,21 @@ class FullGaussian(BeliefParams):
         ``broadcast_over_keys`` adds one to each, so ``sigma.dim() - mu.dim()`` is invariant along
         the whole chain. Failing it falls back rather than stacking a spurious broadcast.
         """
+        policy = full_cov_kl_precision() if precision_policy is None else validate_full_cov_kl_precision(precision_policy)
+        # Private provenance kwargs are an implementation detail of the exact built-in class.
+        # Registry replacements and downstream subclasses historically implement the two-argument
+        # constructor / three-argument from_transported contract, so preserve that public surface.
+        def _make(mu: torch.Tensor, dispersion: torch.Tensor) -> "FullGaussian":
+            if cls is FullGaussian:
+                return cls(mu, dispersion, _precision_policy=policy)
+            return cls(mu, dispersion)
+
+        def _from_transported(
+            mu: torch.Tensor, dispersion: torch.Tensor, source: torch.Tensor,
+        ) -> "FullGaussian":
+            if cls is FullGaussian:
+                return cls.from_transported(mu, dispersion, source, _precision_policy=policy)
+            return cls.from_transported(mu, dispersion, source)
         blocks = None
         if (irrep_dims is not None and len(irrep_dims) > 1
                 and len(set(irrep_dims)) == 1
@@ -693,28 +736,37 @@ class FullGaussian(BeliefParams):
             from vfe3.geometry.transport import transport_covariance_head_blocks
             blocks = transport_covariance_head_blocks(       # None unless the compact route applies
                 omega, dispersion_k,
-                retain_full_precision=(_FULL_COV_KL_PRECISION == "fp64"),
+                retain_full_precision=(policy == "fp64"),
                 diagonal_out=diagonal_out,
                 marginal_blocks=irrep_dims,
             )
         if blocks is None:
-            return super().coupling_energy(
-                mu_q, dispersion_q, mu_k, dispersion_k, omega,
+            from vfe3.free_energy import pairwise_energy
+            mu_t = cls.transport_location(mu_k, omega)
+            transport_kwargs = dict(
+                diagonal_out=diagonal_out,
+                marginal_blocks=irrep_dims,
+            )
+            if cls is FullGaussian:
+                transport_kwargs["precision_policy"] = policy
+            dispersion_t = cls.transport_dispersion(dispersion_k, omega, **transport_kwargs)
+            return pairwise_energy(
+                _make(mu_q, dispersion_q),
+                _from_transported(mu_t, dispersion_t, dispersion_k),
                 alpha=alpha, kl_max=kl_max, eps=eps,
-                divergence_family=divergence_family,
-                irrep_dims=irrep_dims, diagonal_out=diagonal_out,
+                divergence_family=divergence_family, irrep_dims=irrep_dims,
             )
 
         from vfe3.free_energy import head_stacked_energy
         H, d = len(irrep_dims), irrep_dims[0]
         mu_t = cls.transport_location(mu_k, omega)                     # (..., N, N, K)
-        key_stack = cls.from_transported(
+        key_stack = _from_transported(
             mu_t.reshape(*mu_t.shape[:-1], H, d).movedim(-2, 0).contiguous(),   # (H,...,N,N,d)
             blocks.movedim(-3, 0).contiguous(),                                 # (H,...,N,N,d,d)
             dispersion_k,
         )
         return head_stacked_energy(
-            cls(mu_q, dispersion_q).broadcast_over_keys(), key_stack,
+            _make(mu_q, dispersion_q).broadcast_over_keys(), key_stack,
             alpha=alpha, kl_max=kl_max, eps=eps,
             divergence_family=divergence_family, irrep_dims=irrep_dims,
         )
@@ -734,9 +786,11 @@ class FullGaussian(BeliefParams):
         # ~1.5e-4 once cond(Sigma) >= 1e3 (reachable here, eps=1e-6 floor / sigma_max=5 cap give
         # cond up to ~5e6), so centralizing would CHANGE the live result -- pinned by
         # tests/test_fix_numerics_audit.py::test_natural_inverse_not_routed_solve_vs_safe_spd_diverges.
-        eye = torch.eye(self.mu.shape[-1], device=self.mu.device, dtype=self.mu.dtype)
-        prec = torch.linalg.solve(self.sigma + 1e-6 * eye, eye.expand_as(self.sigma))
-        t1 = (prec @ self.mu.unsqueeze(-1)).squeeze(-1)
+        mu = self.mu if self.mu.dtype == self._public_dtype else self.mu.to(self._public_dtype)
+        sigma = self.sigma if self.sigma.dtype == self._public_dtype else self.sigma.to(self._public_dtype)
+        eye = torch.eye(mu.shape[-1], device=mu.device, dtype=self._public_dtype)
+        prec = torch.linalg.solve(sigma + 1e-6 * eye, eye.expand_as(sigma))
+        t1 = (prec @ mu.unsqueeze(-1)).squeeze(-1)
         return (t1, -0.5 * prec)
 
     @classmethod
@@ -782,6 +836,7 @@ class FullGaussian(BeliefParams):
         alpha:   float = 1.0,
         kl_max:  float = 100.0,
         eps:     float = 1e-6,
+        precision_policy: Optional[str] = None,
     ) -> torch.Tensor:
         r"""Closed-form full-covariance Gaussian Renyi/KL (ported verbatim from
         ``divergence._gaussian_full_renyi``; mu_q=self, mu_t=other)."""
@@ -806,7 +861,14 @@ class FullGaussian(BeliefParams):
         # through them invites exactly the desynchronisation that lost `cond_escalation` in
         # `_transport_to_float` -- a gradient computed at one precision against an objective
         # reported at another. One policy, one read site, no way for two paths to disagree.
-        compute_dtype = _full_cov_kl_compute_dtype(result_dtype)
+        if precision_policy is not None:
+            policy = validate_full_cov_kl_precision(precision_policy)
+        elif (self._precision_policy is not None and other._precision_policy is not None
+              and self._precision_policy != other._precision_policy):
+            raise ValueError("FullGaussian operands have conflicting explicit precision policies; pass precision_policy explicitly")
+        else:
+            policy = self._precision_policy or other._precision_policy
+        compute_dtype = _full_cov_kl_compute_dtype(result_dtype, policy)
         mu_q = self.mu.to(compute_dtype)
         sigma_q = self.sigma.to(compute_dtype)
         mu_t = other.mu.to(compute_dtype)
@@ -851,7 +913,7 @@ class FullGaussian(BeliefParams):
             # e_sigma_q_trust=10 makes reachable in ONE step, not a live error.
             if compute_dtype is not torch.float64:
                 escalate = bool((~ok).any())
-                if _FULL_COV_KL_PRECISION == "fp32_escalate_cond":
+                if (full_cov_kl_precision() if policy is None else policy) == "fp32_escalate_cond":
                     escalate = escalate or bool((inv_cond < _FULL_COV_KL_COND_FLOOR).any())
                 if escalate:
                     div_escalated, ok, _ = _full_gaussian_kl_terms(

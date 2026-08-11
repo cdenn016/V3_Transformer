@@ -322,9 +322,14 @@ def _provenance_contract(run_dir: Path) -> Dict[str, object]:
     return contract
 
 
-def _seed_dirs(root: Path) -> List[Path]:
+def _seed_dirs(root: Path, *, validate_configs: bool = True) -> List[Path]:
     r"""The per-seed run dirs directly under ``root`` (those carrying a run artifact), sorted.
-    Skips siblings like ``figures/`` that hold no run JSON."""
+    Skips siblings like ``figures/`` that hold no run JSON.
+
+    ``validate_configs=False`` is the raw observation seam used by requested-panel classification:
+    unexpected, duplicate, and unidentified directories must be classified before accepted-run
+    homogeneity is checked. Direct callers retain the historic fail-loud config validation.
+    """
     root = Path(root)
     if not root.exists():
         return []
@@ -333,7 +338,8 @@ def _seed_dirs(root: Path) -> List[Path]:
         if p.is_dir() and any((p / f).exists()
                               for f in ("summary.json", "provenance.json", "config.json")):
             out.append(p)
-    _assert_homogeneous_configs(out)
+    if validate_configs:
+        _assert_homogeneous_configs(out)
     return out
 
 
@@ -429,14 +435,22 @@ def _requested_seed_design(
     seed_file: str = "config.json",
 ) -> Dict[str, Any]:
     """Join one invocation-owned seed request to exactly one run directory per requested seed."""
-    run_dirs = _seed_dirs(root)
+    run_dirs = _seed_dirs(root, validate_configs=False)
     by_seed: Dict[int, List[Path]] = {}
+    unidentified_runs: List[str] = []
     for run_dir in run_dirs:
         seed = _seed_for(run_dir, config_name=seed_file)
-        if seed is not None:
+        if seed is None:
+            unidentified_runs.append(str(run_dir))
+        else:
             by_seed.setdefault(seed, []).append(run_dir)
-    manifest = _request_manifest(root, list(by_seed))
+    observed_seeds = sorted(seed for seed, dirs in by_seed.items() for _run_dir in dirs)
+    manifest = _request_manifest(root, observed_seeds)
     requested = manifest["requested_seeds"]
+    requested_set = set(requested)
+    unexpected_seeds = sorted(seed for seed in by_seed if seed not in requested_set)
+    duplicate_seeds = sorted(seed for seed, dirs in by_seed.items() if len(dirs) > 1)
+
     cells: List[Dict[str, Any]] = []
     provenance_contracts: Dict[int, Dict[str, object]] = {}
     for seed in requested:
@@ -479,15 +493,41 @@ def _requested_seed_design(
         for cell in cells:
             if cell["status"] == "complete":
                 cell["status"] = "unverifiable"
+    accepted_cells = [
+        cell
+        for cell in cells
+        if cell["status"] == "complete" and cell.get("run_dir") is not None
+    ]
+    # Configuration homogeneity applies only to the cohort still eligible for aggregation after
+    # manifest and provenance classification. Inferred/no-manifest cells remain ``complete`` here,
+    # preserving their historical fail-loud homogeneity check.
+    _assert_homogeneous_configs([Path(cell["run_dir"]) for cell in accepted_cells])
+    accepted_seeds = sorted(
+        cell["seed"] for cell in accepted_cells
+    )
+    exact_observed_panel = (
+        accepted_seeds == sorted(requested)
+        and not unexpected_seeds
+        and not duplicate_seeds
+        and not unidentified_runs
+    )
     complete = (
         manifest["request_verified"]
         and manifest["manifest_status"] in {"complete", "success"}
         and provenance_verified
         and bool(cells)
         and all(cell["status"] == "complete" for cell in cells)
+        and exact_observed_panel
     )
     return {
         "requested_seeds": requested,
+        "accepted_seeds": accepted_seeds,
+        "observed_seeds": observed_seeds,
+        "unexpected_seeds": unexpected_seeds,
+        "duplicate_seeds": duplicate_seeds,
+        "unidentified_runs": sorted(unidentified_runs),
+        "n_accepted_seeds": len(accepted_seeds),
+        "n_observed_runs": len(run_dirs),
         "request_verified": manifest["request_verified"],
         "manifest_status": manifest["manifest_status"],
         "provenance_verified": provenance_verified,
@@ -550,6 +590,13 @@ def _aggregate_requested_metric(
     out.update({
         "seeds": value_seeds,
         "requested_seeds": design["requested_seeds"],
+        "accepted_seeds": design["accepted_seeds"],
+        "observed_seeds": design["observed_seeds"],
+        "unexpected_seeds": design["unexpected_seeds"],
+        "duplicate_seeds": design["duplicate_seeds"],
+        "unidentified_runs": design["unidentified_runs"],
+        "n_accepted_seeds": design["n_accepted_seeds"],
+        "n_observed_runs": design["n_observed_runs"],
         "request_verified": design["request_verified"],
         "manifest_status": design["manifest_status"],
         "cells": cells,
@@ -951,14 +998,19 @@ def _emit_figures(root: Path, scalars, curves, per_layer) -> None:
 
 def main() -> int:
     root = _resolve_run_root(CONFIG["run_root"])
-    seed_dirs = _seed_dirs(root)
+    seed_dirs = _seed_dirs(root, validate_configs=False)
     if not seed_dirs and not (root / "multiseed_request.json").is_file():
         print(f"no per-seed run dirs under {str(root)!r} "
               f"(looked for summary.json / provenance.json / config.json)")
         return 1
-    seeds = [_seed_for(d) for d in seed_dirs]
     request_design = _requested_seed_design(root)
-    print(f"\n=== Multi-seed digest: {root}  ({len(seed_dirs)} seeds: {seeds}) ===\n")
+    seeds = request_design["accepted_seeds"]
+    observed_seeds = request_design["observed_seeds"]
+    print(
+        f"\n=== Multi-seed digest: {root}  "
+        f"({len(seeds)} accepted seeds: {seeds}; "
+        f"{request_design['n_observed_runs']} observed runs: {observed_seeds}) ===\n"
+    )
 
     scalar_candidates = {
         key: aggregate_scalar(root, key)
@@ -1015,15 +1067,31 @@ def main() -> int:
         print("requested multi-seed design is incomplete; aggregate values and figures withheld")
     print(f"\nNOTE: {CAVEAT}\n")
 
+    accepted_config_dirs = [
+        Path(cell["run_dir"])
+        for cell in request_design["cells"]
+        if cell["status"] == "complete" and cell.get("run_dir") is not None
+    ]
     manifest = {
         "run_root": str(root),
         "config_fingerprint": (
-            _config_fingerprint(seed_dirs[0] / "config.json") if seed_dirs else None
+            _config_fingerprint(accepted_config_dirs[0] / "config.json")
+            if accepted_config_dirs else None
         ),
-        "n_seeds": len(seed_dirs),
+        "n_seeds": request_design["n_accepted_seeds"],
         "seeds": seeds,
+        "n_accepted_seeds": request_design["n_accepted_seeds"],
+        "n_observed_runs": request_design["n_observed_runs"],
+        "observed_seeds": observed_seeds,
         "design": {
             "requested_seeds": request_design["requested_seeds"],
+            "accepted_seeds": request_design["accepted_seeds"],
+            "observed_seeds": request_design["observed_seeds"],
+            "unexpected_seeds": request_design["unexpected_seeds"],
+            "duplicate_seeds": request_design["duplicate_seeds"],
+            "unidentified_runs": request_design["unidentified_runs"],
+            "n_accepted_seeds": request_design["n_accepted_seeds"],
+            "n_observed_runs": request_design["n_observed_runs"],
             "request_verified": request_design["request_verified"],
             "manifest_status": request_design["manifest_status"],
             "status": "complete" if publication_complete else "incomplete",

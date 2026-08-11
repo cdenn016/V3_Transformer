@@ -500,6 +500,27 @@ def test_log_euclidean_full_retraction_has_identity_first_derivative() -> None:
     assert torch.allclose(derivative, tangent, rtol=2e-6, atol=2e-7)
 
 
+def test_log_euclidean_repeated_spectrum_has_identity_off_diagonal_backward() -> None:
+    sigma = torch.eye(2, dtype=torch.float64, requires_grad=True)
+    tangent = torch.zeros(2, 2, dtype=torch.float64, requires_grad=True)
+    cotangent = torch.tensor([[0.0, 1.0], [1.0, 0.0]], dtype=torch.float64)
+
+    out = retract_logeuclidean_full(
+        sigma,
+        tangent,
+        trust_region=0.0,
+        eps=1e-12,
+        sigma_max=None,
+    )
+    sigma_gradient, tangent_gradient = torch.autograd.grad(
+        (out * cotangent).sum(),
+        (sigma, tangent),
+    )
+
+    assert torch.allclose(sigma_gradient, cotangent, rtol=1e-12, atol=1e-12)
+    assert torch.allclose(tangent_gradient, cotangent, rtol=1e-12, atol=1e-12)
+
+
 def test_log_euclidean_scalar_uses_h_over_sigma_chart_tangent() -> None:
     sigma = torch.tensor([[2.0]])
     tangent = torch.tensor([[0.6]])

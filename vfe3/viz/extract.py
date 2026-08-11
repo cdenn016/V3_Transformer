@@ -858,8 +858,8 @@ def e_step_fixed_point_diagnostics(
 
     family = get_family(cfg.family)
     out["estep_fp_kl"] = float(kl(
-        family(q_next.mu, q_next.sigma),
-        family(q_t.mu, q_t.sigma),
+        model._family_instance(family, q_next.mu, q_next.sigma),
+        model._family_instance(family, q_t.mu, q_t.sigma),
         kl_max=cfg.kl_max,
         eps=cfg.eps,
     ).mean())
@@ -1013,7 +1013,7 @@ def numerical_health(
         effective = omega.unsqueeze(0)
         mu, sigma = out.mu.unsqueeze(0), out.sigma.unsqueeze(0)
         batched = True
-    energy = fam.coupling_energy(mu, sigma, mu, sigma, effective,
+    energy = model._coupling_energy(fam, mu, sigma, mu, sigma, effective,
                                  alpha=cfg.renyi_order,
                                  kl_max=cfg.kl_max, eps=cfg.eps,
                                  divergence_family=cfg.divergence_family,
@@ -1116,7 +1116,7 @@ def converged_state(
             effective = omega.unsqueeze(0)
             mu, sigma = out.mu.unsqueeze(0), out.sigma.unsqueeze(0)
             batched = True
-        energy = fam.coupling_energy(
+        energy = model._coupling_energy(fam,
             mu, sigma, mu, sigma, effective,
             alpha=cfg.renyi_order,
             kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
@@ -1135,7 +1135,8 @@ def converged_state(
                 beta = beta[0]
         _q_conv = cap["converged"]                           # q*: the F self-term reads the pre-
         self_div = self_divergence_for_alpha(                # transform converged belief (F19,
-            fam(_q_conv.mu, _q_conv.sigma), fam(mu_p, sigma_p), alpha=cfg.renyi_order,   # as diagnostics)
+            model._family_instance(fam, _q_conv.mu, _q_conv.sigma),
+            model._family_instance(fam, mu_p, sigma_p), alpha=cfg.renyi_order,   # as diagnostics)
             kl_max=cfg.kl_max, eps=cfg.eps, divergence_family=cfg.divergence_family,
             lambda_alpha_mode=cfg.lambda_alpha_mode,
         )
@@ -1290,9 +1291,9 @@ def s_channel_refinement(
     r_mu = r_mu.expand_as(s1_mu)
     r_sigma = r_sigma_raw.expand_as(s1_sigma)
     kl = get_functional("renyi")                                  # KL = renyi at alpha=1
-    r  = fam(r_mu, r_sigma)
-    kl_s0_r = kl(fam(s0_mu, s0_sigma), r, alpha=1.0, kl_max=cfg.kl_max, eps=cfg.eps)  # (N,)
-    kl_s1_r = kl(fam(s1_mu, s1_sigma), r, alpha=1.0, kl_max=cfg.kl_max, eps=cfg.eps)  # (N,)
+    r  = model._family_instance(fam, r_mu, r_sigma)
+    kl_s0_r = kl(model._family_instance(fam, s0_mu, s0_sigma), r, alpha=1.0, kl_max=cfg.kl_max, eps=cfg.eps)  # (N,)
+    kl_s1_r = kl(model._family_instance(fam, s1_mu, s1_sigma), r, alpha=1.0, kl_max=cfg.kl_max, eps=cfg.eps)  # (N,)
     return {
         "mu_delta":       (s1_mu - s0_mu).norm(dim=-1).cpu(),
         "logsigma_delta": (s1_sigma.clamp(min=cfg.eps).log()

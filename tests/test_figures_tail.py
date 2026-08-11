@@ -340,6 +340,64 @@ def test_aggregate_validation_points_raises_on_explicit_null_best_val_ppl_in_cap
         aggregate_validation_points(rows)
 
 
+def test_aggregate_validation_points_pairs_quality_and_time_by_exact_seed():
+    rows = [
+        _val_row("grow_K", "embed_dim", "K20", 0, best_val_ppl=16.0,
+                 embed_dim=20, wall_time_s=None),
+        _val_row("grow_K", "embed_dim", "K20", 1, best_val_ppl=64.0,
+                 embed_dim=20, wall_time_s=100.0),
+        _val_row("grow_K", "embed_dim", "K20", 2, best_val_ppl=float("nan"),
+                 embed_dim=20, wall_time_s=10.0),
+    ]
+
+    point = aggregate_validation_points(rows)[0]
+
+    assert point["observed_seeds"] == [0, 1, 2]
+    assert point["paired_seeds"] == [1]
+    assert point["n_paired_seeds"] == 1
+    assert point["missing_val_seeds"] == [2]
+    assert point["n_missing_val_seeds"] == 1
+    assert point["missing_wall_time_seeds"] == [0]
+    assert point["n_missing_wall_time_seeds"] == 1
+    assert point["val_bits_per_token_seeds"] == pytest.approx([6.0])
+    assert point["wall_time_seeds"] == pytest.approx([100.0])
+    assert point["n_val_seeds"] == 1
+    assert point["val_bits_per_token_mean"] == pytest.approx(6.0)
+    assert point["wall_time_mean"] == pytest.approx(100.0)
+
+
+def test_aggregate_validation_points_rejects_duplicate_seed_identity():
+    rows = [
+        _val_row("grow_K", "embed_dim", "K20", 1, best_val_ppl=16.0,
+                 embed_dim=20, wall_time_s=10.0),
+        _val_row("grow_K", "embed_dim", "K20", 1, best_val_ppl=64.0,
+                 embed_dim=20, wall_time_s=100.0),
+    ]
+
+    with pytest.raises(ValueError, match="duplicate seed 1"):
+        aggregate_validation_points(rows)
+
+
+@pytest.mark.parametrize("bad_seed", [True, -1, 1.5, "1"])
+def test_aggregate_validation_points_rejects_nonexact_seed_identity(bad_seed):
+    row = _val_row("grow_K", "embed_dim", "K20", bad_seed, best_val_ppl=16.0,
+                   embed_dim=20, wall_time_s=10.0)
+
+    with pytest.raises(ValueError, match="exact nonnegative integer seed"):
+        aggregate_validation_points([row])
+
+
+def test_aggregate_validation_points_omits_group_without_paired_seed():
+    rows = [
+        _val_row("grow_K", "embed_dim", "K20", 0, best_val_ppl=16.0,
+                 embed_dim=20, wall_time_s=None),
+        _val_row("grow_K", "embed_dim", "K20", 1, best_val_ppl=float("nan"),
+                 embed_dim=20, wall_time_s=10.0),
+    ]
+
+    assert aggregate_validation_points(rows) == []
+
+
 def test_pareto_frontier_kwargs_pins_sorted_points_and_excludes_inference_route():
     rows = _grow_k_capacity_scaling_rows() + _inference_capacity_scaling_rows()
     points = aggregate_validation_points(rows)

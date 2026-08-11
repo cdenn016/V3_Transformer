@@ -57,8 +57,10 @@ from vfe3.geometry.retraction import (                          # SPD-retraction
 )
 from vfe3.numerics import (                    # non-equivariant / non-PD fallback accounting
     decode_logdet_fallback_elements,
+    mm_cholesky_fallback_elements,
     mu_trust_fallback_elements,
     reset_decode_logdet_fallback_elements,
+    reset_mm_cholesky_fallback_elements,
     reset_mu_trust_fallback_elements,
 )
 
@@ -600,20 +602,18 @@ def train_step(
     the same threshold is applied independently to each optimizer-group role
     (mu/sigma/phi) rather than once over all parameters together.
 
-    With ``grad_accum_steps == K > 1`` the batch is split into ``K`` equal chunks along
-    the batch axis; each chunk's loss is divided by ``K`` and ``backward()``-ed,
-    ACCUMULATING into ``.grad``, and the single clip + ``optimizer.step()`` +
-    ``scheduler.step()`` fires once after all ``K`` microbatches. Because the model's CE
-    and the extra F terms are MEANS over the batch axis and there is no cross-sequence
-    dependency, the accumulated ``.grad`` equals (to round-off) the gradient of one
-    backward on the full batch when the microbatches carry EQUAL counted-token counts
-    (i.e. ``B % K == 0`` and no per-position ``ignore_index`` re-weighting); this gives a
-    larger EFFECTIVE batch without the memory of one big forward. A "step" stays an
-    OPTIMIZER step (the scheduler/warmup/max_steps accounting is unchanged). The grad-clip
-    is applied ONCE to the accumulated (already mean-normalized) gradient at the boundary,
-    so the threshold is NOT rescaled by ``K``. The returned loss is the mean over the
-    ``K`` microbatches (the accumulation-boundary loss). ``K == 1`` is byte-identical to
-    the single-backward path (no chunking, no divide). Requires ``B % K == 0``.
+    With ``grad_accum_steps == K > 1`` the batch is split into ``K`` equal-size chunks along
+    the batch axis. Each microbatch mean loss is multiplied by the decoder's exact scored-token
+    count before ``backward()``, producing token-SUM gradients. After the ONE GradScaler unscale,
+    all accumulated gradients are divided by the total scored-token count, then the single clip +
+    ``optimizer.step()`` + ``scheduler.step()`` fires. This is the exact token-level objective even
+    when decoder exclusions make the microbatch counts uneven; the existing non-CE regularizers
+    remain token-weighted in that case and emit a warning because their native reductions differ.
+    A "step" stays an OPTIMIZER step (scheduler/warmup/max_steps accounting is unchanged), and the
+    clip threshold is not rescaled by ``K``. The returned loss is the same scored-token-weighted
+    accumulation-boundary objective. A zero-scored accumulation skips every update-side effect.
+    ``K == 1`` keeps the single-backward path (no chunking or gradient renormalization) and folds
+    the scored count into its existing host transfer. Requires ``B % K == 0``.
 
     ``scaler`` is an optional :class:`torch.amp.GradScaler` for fp16 training (prevents
     gradient underflow through the unrolled E-step). A disabled scaler (``enabled=False``)
@@ -640,7 +640,10 @@ def train_step(
     _egrad_sums: Dict[str, float] = {}
     _egrad_counts: Dict[str, int] = {}
     if grad_accum_steps == 1:                                   # default path: byte-identical to the single-step loop
-        _, loss, ce = model(tokens, targets, estep_grad_out=_egrad)
+        _, loss, decode_stats = model(
+            tokens, targets, estep_grad_out=_egrad, return_decode_stats=True)
+        ce = decode_stats.ce
+        _scored_det = decode_stats.scored_tokens.detach()
         _scaler.scale(loss).backward()
         _loss_det = loss.detach()                               # host read DEFERRED: fused with the grad-finite
         step_loss = None                                        # flag at the gate below (audit 2026-07-01 round-3)
@@ -648,7 +651,7 @@ def train_step(
         # metrics_out['train_ce'] and nothing else); on a silent step the extra D2H copy is skipped.
         step_ce = (float(ce.detach()) if (ce is not None and metrics_out is not None) else float("nan"))
     else:
-        if tokens.shape[0] % grad_accum_steps != 0:            # equal-token microbatches require an even split
+        if tokens.shape[0] % grad_accum_steps != 0:            # equal-size microbatches require an even split
             raise ValueError(
                 f"grad_accum_steps={grad_accum_steps} must divide the batch size "
                 f"{tokens.shape[0]} for equal microbatches; got remainder "
@@ -656,19 +659,38 @@ def train_step(
             )
         tok_chunks = torch.chunk(tokens, grad_accum_steps, dim=0)
         tgt_chunks = torch.chunk(targets, grad_accum_steps, dim=0)
-        # Token-weighted accumulation: weight each microbatch's mean loss by its valid-token fraction
-        # n_mb/n_tot so the accumulated gradient equals the full-batch token-mean even under uneven
-        # ignore-padding across the batch axis. Uniform 1/grad_accum_steps is exact only when the
-        # microbatches carry EQUAL counted-token counts (e.g. the default unpadded loader), where
-        # n_mb/n_tot == 1/grad_accum_steps and this is byte-identical to the prior weighting.
-        _mb_tok[:] = [int((tc != -100).sum()) for tc in tgt_chunks]   # counted tokens per microbatch (spread = bias)
-        n_tot = max(sum(_mb_tok), 1)
-        # Uneven counted-token microbatches (audit 2026-07-01 C8): the n_mb/n_tot weight below is
-        # exact for the token-mean CE but only APPROXIMATE for the non-CE regularizers (mass_phi,
-        # mstep_self_coupling, lambda_h, gamma), which are means over (B, N)/state and do not scale
-        # with target tokens. The default unpadded loader has equal counts (w == 1/K exactly), so
-        # this warning fires only in the regime where the weighting actually diverges.
-        if grad_accum_steps > 1 and _mb_tok and (max(_mb_tok) != min(_mb_tok)):
+        count_tensors = []
+        loss_numerator = torch.zeros((), dtype=torch.float64, device=tokens.device)
+        ce_numerator = torch.zeros((), dtype=torch.float64, device=tokens.device)
+        for tok_mb, tgt_mb in zip(tok_chunks, tgt_chunks):
+            _egrad_mb = {} if metrics_out is not None else None
+            _, loss_mb, decode_stats_mb = model(
+                tok_mb, tgt_mb, estep_grad_out=_egrad_mb, return_decode_stats=True)
+            ce_mb = decode_stats_mb.ce
+            count_mb = decode_stats_mb.scored_tokens.detach()
+            count_tensors.append(count_mb)
+            if _egrad_mb is not None:
+                for _name, _value in _egrad_mb.items():
+                    if isinstance(_value, Real):
+                        _egrad_sums[_name] = _egrad_sums.get(_name, 0.0) + float(_value)
+                        _egrad_counts[_name] = _egrad_counts.get(_name, 0) + 1
+            count_weight = count_mb.to(dtype=loss_mb.dtype)
+            _scaler.scale(loss_mb * count_weight).backward()
+            loss_numerator = loss_numerator + (
+                loss_mb.detach().to(dtype=torch.float64) * count_mb)
+            ce_numerator = ce_numerator + (
+                ce_mb.detach().to(dtype=torch.float64) * count_mb)
+        _counts = torch.stack(count_tensors)
+        _scored_det = _counts.sum(dtype=torch.int64)
+        _denominator = _scored_det.clamp_min(1).to(dtype=torch.float64)
+        _loss_det = loss_numerator / _denominator
+        _ce_det = ce_numerator / _denominator
+        step_loss = None
+        step_ce = float(_ce_det) if metrics_out is not None else float("nan")
+        _mb_tok[:] = [int(value) for value in _counts.cpu().tolist()]
+        # Decoder exclusions, not merely ignore_index, define the CE denominator. Weighting the
+        # non-CE regularizers by that same count remains approximate when microbatch counts differ.
+        if _mb_tok and max(_mb_tok) != min(_mb_tok):
             import warnings
             warnings.warn(
                 "grad_accum_steps>1 with uneven counted-token microbatches: non-CE regularizers "
@@ -678,40 +700,41 @@ def train_step(
                 "exact objective.",
                 RuntimeWarning, stacklevel=2,
             )
-        step_loss = 0.0
-        step_ce = 0.0
-        for tok_mb, tgt_mb, n_mb in zip(tok_chunks, tgt_chunks, _mb_tok):
-            _egrad_mb = {} if metrics_out is not None else None
-            _, loss_mb, ce_mb = model(tok_mb, tgt_mb, estep_grad_out=_egrad_mb)
-            if _egrad_mb is not None:
-                for _name, _value in _egrad_mb.items():
-                    if isinstance(_value, Real):
-                        _egrad_sums[_name] = _egrad_sums.get(_name, 0.0) + float(_value)
-                        _egrad_counts[_name] = _egrad_counts.get(_name, 0) + 1
-            w = n_mb / n_tot                                          # token-mean weight (valid-token fraction)
-            _scaler.scale(loss_mb * w).backward()                     # accumulate the token-weighted microbatch grad
-            step_loss += float(loss_mb.detach()) * w
-            if metrics_out is not None:                               # CE synced only on a logged step (PERF)
-                step_ce += (float(ce_mb.detach()) if ce_mb is not None else float("nan")) * w
     _scaler_enabled = scaler is not None and scaler.is_enabled()
+    scored_tokens_value = None
     # The enabled scaler's ordinary finite-loss path delegates overflow detection to GradScaler.
     # Resolve the scalar loss first so the rare nonfinite-loss branch can explicitly inspect gradients
     # and distinguish scale backoff (nonfinite gradients) from scale hold (finite gradients).
     if _scaler_enabled:
         if step_loss is None:
-            step_loss = float(_loss_det)
+            _loss_count = torch.stack(
+                (_loss_det.to(dtype=torch.float64),
+                 _scored_det.to(dtype=torch.float64))).tolist()
+            step_loss = _loss_count[0]
+            scored_tokens_value = int(_loss_count[1])
         loss_finite = math.isfinite(step_loss)
     else:
         loss_finite = True                                  # resolved with the fused default-path scan below
     # Unscale once when clipping/metrics needs true-unit gradients or the enabled scaler must classify
     # a nonfinite scalar loss. GradScaler remembers that unscale_ ran; its later step does not repeat it.
     need_unscale = (
+        grad_accum_steps > 1
+        or
         (grad_clip is not None and grad_clip > 0)
         or (metrics_out is not None)
         or (_scaler_enabled and not loss_finite)
     )
     if need_unscale:
         _scaler.unscale_(optimizer)
+    if grad_accum_steps > 1:
+        # Accumulate token-SUM gradients above, then normalize exactly once in true gradient units.
+        # This ordering is required for GradScaler: dividing scaled gradients before unscale would
+        # change overflow detection and the realized objective.
+        grad_denominator = _scored_det.clamp_min(1)
+        for group in optimizer.param_groups:
+            for parameter in group["params"]:
+                if parameter.grad is not None:
+                    parameter.grad.div_(grad_denominator.to(dtype=parameter.grad.dtype))
     # Finite-GRADIENT gate (audit 2026-07-01 F1): a FINITE scalar loss can still carry a NaN/Inf
     # parameter gradient through the unrolled E-step on a degenerate batch; stepping AdamW on it
     # would permanently poison the exp_avg/exp_avg_sq moment buffers. Checked on EVERY step on the
@@ -733,13 +756,24 @@ def train_step(
         if explicit_grad_check else []
     )
     if not _scaler_enabled and _flags and step_loss is None:    # fuse default-path loss + grad flag
-        _pair = torch.stack((_loss_det.float(), torch.stack(_flags).all().float())).tolist()
+        _pair = torch.stack((
+            _loss_det.to(dtype=torch.float64),
+            torch.stack(_flags).all().to(dtype=torch.float64),
+            _scored_det.to(dtype=torch.float64),
+        )).tolist()
         step_loss   = _pair[0]
         grad_finite = bool(_pair[1])
+        scored_tokens_value = int(_pair[2])
     elif _flags:
         grad_finite = bool(torch.stack(_flags).all())
     if step_loss is None:                                       # fp16 / no-grads fallback: one plain loss sync
-        step_loss = float(_loss_det)
+        _loss_count = torch.stack(
+            (_loss_det.to(dtype=torch.float64),
+             _scored_det.to(dtype=torch.float64))).tolist()
+        step_loss = _loss_count[0]
+        scored_tokens_value = int(_loss_count[1])
+    elif scored_tokens_value is None:
+        scored_tokens_value = int(_scored_det)
     loss_finite = math.isfinite(step_loss)
     if metrics_out is not None:
         # Pre-clip gradient health -- the global L2 norm clip_grad_norm_ RETURNS-and-discards, plus
@@ -786,7 +820,11 @@ def train_step(
     # A nonfinite scalar loss independently rejects every route. A finite loss does not imply finite
     # gradients, so the disabled-scaler path additionally applies the explicit gradient gate. The
     # enabled scaler performs its own gradient found_inf check inside step().
-    skip_step = (not loss_finite) or (explicit_grad_check and not grad_finite)
+    skip_step = (
+        scored_tokens_value == 0
+        or (not loss_finite)
+        or (explicit_grad_check and not grad_finite)
+    )
     if metrics_out is not None:
         metrics_out["grad_finite"] = float(grad_finite)
     if grad_clip is not None and grad_clip > 0 and not skip_step:
@@ -929,7 +967,7 @@ def evaluate(
         \mathrm{BPT} = \frac{\mathrm{CE}}{\ln 2},\quad
         \mathrm{BPC} = \mathrm{BPT}\,\cdot\,\mathrm{tokens\_per\_char},
 
-    with ``n_b`` the number of non-ignored (``!= -100``) target tokens in batch ``b``.
+    with ``n_b`` the exact decoder-reported number of scored target tokens in batch ``b``.
     Aggregating by token count (not per-batch mean) reproduces one cross-entropy over
     the concatenated corpus, including a partial last batch. ``tokens_per_char`` is the
     bits-per-CHARACTER correction (``n_tokens / n_codepoints`` from
@@ -965,21 +1003,23 @@ def evaluate(
                     rows = valid_lengths == length
                     group_tokens = tokens[rows, :length]
                     group_targets = targets[rows, :length]
-                    _, _, ce = model(group_tokens, group_targets)
-                    n_b = group_targets.numel()
-                    total_nats.add_(ce.detach().to(dtype=torch.float64) * n_b)
+                    _, _, decode_stats = model(
+                        group_tokens, group_targets, return_decode_stats=True)
+                    n_b = decode_stats.scored_tokens
+                    total_nats.add_(decode_stats.ce.to(dtype=torch.float64) * n_b)
                     total_tok.add_(n_b)
             else:
-                _, _, ce = model(tokens, targets)
-                n_b = valid.sum().to(dtype=torch.float64)
-                total_nats.add_(ce.detach().to(dtype=torch.float64) * n_b)
+                _, _, decode_stats = model(tokens, targets, return_decode_stats=True)
+                n_b = decode_stats.scored_tokens
+                total_nats.add_(decode_stats.ce.to(dtype=torch.float64) * n_b)
                 total_tok.add_(n_b)
             if max_batches is not None and i + 1 >= max_batches:
                 break               # draw exactly max_batches (process-then-break; no extra pull)
         total_nats_value, total_tok_value = torch.stack((total_nats, total_tok)).cpu().tolist()
         if total_tok_value == 0.0:
             raise ValueError(
-                "evaluation produced no non-ignored target tokens; metrics are undefined"
+                "evaluation produced no scored target tokens; no non-ignored target tokens "
+                "remain scored, so metrics are undefined"
             )
         ce = total_nats_value / total_tok_value
     finally:
@@ -1682,6 +1722,7 @@ def train(
     reset_nonfinite_tangent_elements()   # per-run accounting for the SPD-retraction guard
     reset_mu_trust_fallback_elements()   # ... the mu-trust-region equivariance fallback
     reset_decode_logdet_fallback_elements()   # ... and the decode log-det non-PD fallback
+    reset_mm_cholesky_fallback_elements()   # ... and failed full-Gaussian MM Cholesky rows
 
     def _step_indices() -> Iterable[int]:
         if not show_bar:
@@ -2251,6 +2292,7 @@ def train(
     if artifacts is not None:
         neutralized = nonfinite_tangent_elements()
         mu_fallbacks = mu_trust_fallback_elements()
+        mm_fallbacks = mm_cholesky_fallback_elements()
         artifacts.realized_updates = {
             "attempted_steps":      attempted,
             "accepted_updates":     int(attempted - skipped_steps),
@@ -2259,16 +2301,18 @@ def train(
                                      if attempted else float("nan")),
             "nonfinite_tangent_elements": int(neutralized),
             "mu_trust_fallback_elements": int(mu_fallbacks),
+            "mm_cholesky_fallback_elements": int(mm_fallbacks),
             "decode_logdet_fallback_elements": int(decode_logdet_fallback_elements()),
         }
-        if skipped_steps or neutralized or mu_fallbacks:
+        if skipped_steps or neutralized or mu_fallbacks or mm_fallbacks:
             logger.warning(
                 " realized budget: %d/%d optimizer updates accepted (%.3f%%); "
                 "%d SPD tangent element(s) neutralized as non-finite; "
-                "%d belief(s) whitened by the non-equivariant mu-trust fallback",
+                "%d belief(s) whitened by the non-equivariant mu-trust fallback; "
+                "%d belief row(s) retained after MM Cholesky fallback",
                 attempted - skipped_steps, attempted,
                 100.0 * (attempted - skipped_steps) / max(attempted, 1),
-                neutralized, mu_fallbacks)
+                neutralized, mu_fallbacks, mm_fallbacks)
     if ema is not None:
         ema.copy_to(model)                               # the trained model IS the averaged weights
     return losses

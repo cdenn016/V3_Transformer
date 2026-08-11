@@ -838,7 +838,8 @@ def generate_figures(
           lambda p: figs.plot_gauge_equivariance(metrics.gauge_equivariance_residual(
               cstate["mu"], cstate["sigma"], cstate["omega"], model.group,
               kappa=cfg.kappa_beta, renyi_order=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
-              diagonal=cfg.diagonal_covariance, divergence_family=cfg.divergence_family), path=p),
+              diagonal=cfg.diagonal_covariance, divergence_family=cfg.divergence_family,
+              full_cov_kl_precision=model.full_cov_kl_precision), path=p),
           "gauge_equivariance.png" in planned_figures)
     _emit("gauge_head_specialization",
           lambda p: figs.plot_gauge_head_specialization(

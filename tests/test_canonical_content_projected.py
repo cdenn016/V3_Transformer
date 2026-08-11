@@ -1227,6 +1227,61 @@ def _projected_decode_loss_and_grads(
     return loss.detach(), dict(zip(leaves, gradients))
 
 
+def test_projected_dense_nonfinite_variance_is_sanitized_before_frame_backward() -> None:
+    """An excluded projected row must not poison its realized-frame gradient."""
+    from vfe3.numerics import (
+        decode_logdet_fallback_elements,
+        reset_decode_logdet_fallback_elements,
+    )
+
+    bank = _projected_gradient_bank("full")
+    mu = torch.tensor(
+        [[[0.2, -0.5, 0.7, 0.1], [-0.3, 0.8, -0.2, 0.4]]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    var = torch.tensor(
+        [[[float("nan"), 1.2, 0.6, 1.1], [1.0, 0.7, 1.3, 0.9]]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    perturb = torch.tensor(
+        [[
+            [[0.10, 0.07, 0.00, 0.00], [-0.04, -0.03, 0.00, 0.00],
+             [0.00, 0.00, 0.06, -0.08], [0.00, 0.00, 0.05, 0.02]],
+            [[-0.05, 0.09, 0.00, 0.00], [0.03, 0.04, 0.00, 0.00],
+             [0.00, 0.00, -0.07, 0.04], [0.00, 0.00, 0.08, 0.01]],
+        ]],
+        dtype=torch.float64,
+    )
+    frame = (
+        torch.eye(4, dtype=torch.float64).expand(1, 2, 4, 4).clone() + perturb
+    ).requires_grad_()
+    context = CanonicalFrameContext(forward=frame, inverse=torch.linalg.inv(frame))
+    targets = torch.tensor([[1, 2]])
+
+    reset_decode_logdet_fallback_elements()
+    logits = bank.decode(mu, var, canonical_frame=context)
+    mask = bank.decode_degenerate_positions(var, canonical_frame=context)
+    assert mask is not None
+    ce_targets = torch.where(mask, targets.new_full((), -100), targets)
+    loss = F.cross_entropy(
+        logits.reshape(-1, bank.vocab_size),
+        ce_targets.reshape(-1),
+        ignore_index=-100,
+        reduction="sum",
+    ) / (ce_targets != -100).sum().clamp_min(1)
+    loss.backward()
+
+    assert torch.equal(mask, torch.tensor([[True, False]]))
+    assert decode_logdet_fallback_elements() == 1
+    assert torch.isfinite(loss)
+    assert torch.equal(mu.grad[0, 0], torch.zeros_like(mu.grad[0, 0]))
+    assert torch.equal(var.grad[0, 0], torch.zeros_like(var.grad[0, 0]))
+    assert torch.isfinite(frame.grad).all()
+    assert torch.equal(frame.grad[0, 0], torch.zeros_like(frame.grad[0, 0]))
+
+
 def test_projected_dense_fused_value_gradient_parity_with_invalid_query() -> None:
     """Skipping pullback in either CE path breaks values, checkpoint grads, or exclusion."""
     dense = _projected_gradient_bank("full")

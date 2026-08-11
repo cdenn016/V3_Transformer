@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from vfe3.families.base import BeliefParams
+from vfe3.families.gaussian import FullGaussian
 
 
 class _ExpFamily(BeliefParams):
@@ -166,6 +167,83 @@ def test_full_stack_round_trips():
     assert stacked.mu.shape == (4, N, 1, d) and stacked.sigma.shape == (4, N, 1, d, d)
     for h, part in enumerate(parts):
         assert torch.equal(stacked.mu[h], part.mu) and torch.equal(stacked.sigma[h], part.sigma)
+
+
+def test_full_gaussian_policy_propagates_and_conflicts_are_explicit():
+    from vfe3.families.gaussian import FullGaussian
+
+    mu = torch.zeros(2, 2)
+    sigma = torch.eye(2).expand(2, 2, 2)
+    q64 = FullGaussian(mu, sigma, _precision_policy="fp64")
+    q32 = FullGaussian(mu, sigma, _precision_policy="fp32_escalate")
+
+    assert q64.block(0, 1)._precision_policy == "fp64"
+    assert q64.broadcast_over_keys()._precision_policy == "fp64"
+    assert FullGaussian.from_transported(mu, sigma, sigma, _precision_policy="fp64")._precision_policy == "fp64"
+    assert FullGaussian.stack([q64, q64])._precision_policy == "fp64"
+    with pytest.raises(ValueError, match="conflicting explicit precision policies"):
+        FullGaussian.stack([q64, q32])
+
+
+def test_full_gaussian_conflicting_operand_policies_require_override():
+    from vfe3.families.gaussian import FullGaussian
+
+    mu = torch.zeros(1, 2)
+    sigma = torch.eye(2).unsqueeze(0)
+    q64 = FullGaussian(mu, sigma, _precision_policy="fp64")
+    q32 = FullGaussian(mu + 0.1, sigma, _precision_policy="fp32_escalate")
+
+    with pytest.raises(ValueError, match="conflicting explicit precision policies"):
+        q64.renyi_closed_form(q32)
+    assert torch.isfinite(q64.renyi_closed_form(q32, precision_policy="fp32_escalate")).all()
+
+
+def test_legacy_full_gaussian_subclass_coupling_keeps_legacy_constructor_api():
+    from vfe3.families.gaussian import FullGaussian
+
+    class LegacyFullGaussian(FullGaussian):
+        def __init__(self, mu, sigma):
+            super().__init__(mu, sigma)
+
+        @classmethod
+        def from_transported(cls, mu, dispersion, source_dispersion):
+            return cls(mu, dispersion)
+
+        @classmethod
+        def transport_dispersion(cls, dispersion, omega, *, diagonal_out=None, marginal_blocks=None):
+            return super().transport_dispersion(
+                dispersion, omega, diagonal_out=diagonal_out, marginal_blocks=marginal_blocks)
+
+    mu = torch.zeros(1, 2, 2)
+    sigma = torch.eye(2).expand(1, 2, 2, 2)
+    omega = torch.eye(2).expand(1, 2, 2, 2, 2)
+    out = LegacyFullGaussian.coupling_energy(mu, sigma, mu, sigma, omega)
+    assert torch.isfinite(out).all()
+
+
+@pytest.mark.parametrize(
+    ("mu_dtype", "sigma_dtype"),
+    [(torch.float32, torch.float64), (torch.float64, torch.float32)],
+)
+def test_full_gaussian_natural_promotes_mixed_public_dtypes_before_lu_solve(mu_dtype, sigma_dtype):
+    """Mixed public Gaussian moments must use the family's promoted public dtype for the LU solve."""
+    mu = torch.tensor([[1.0, -2.0]], dtype=mu_dtype)
+    sigma = torch.tensor([[[2.0, 0.25], [0.25, 3.0]]], dtype=sigma_dtype)
+    public_dtype = torch.float64
+    mu_public = mu.to(public_dtype)
+    sigma_public = sigma.to(public_dtype)
+    eye = torch.eye(2, dtype=public_dtype)
+    precision = torch.linalg.solve(sigma_public + 1e-6 * eye, eye.expand_as(sigma_public))
+    expected = (
+        (precision @ mu_public.unsqueeze(-1)).squeeze(-1),
+        -0.5 * precision,
+    )
+
+    got = FullGaussian(mu, sigma).natural()
+
+    assert got[0].dtype is public_dtype and got[1].dtype is public_dtype
+    assert torch.equal(got[0], expected[0])
+    assert torch.equal(got[1], expected[1])
 
 
 def test_full_gaussian_per_coord_raises():

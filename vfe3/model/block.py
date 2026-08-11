@@ -55,7 +55,8 @@ def e_step_shared_kwargs(
         e_mu_q_trust=cfg.e_mu_q_trust, mu_trust_mode=cfg.mu_trust_mode,
         e_step_mu_precond=cfg.e_step_mu_precond,
         include_attention_entropy=cfg.include_attention_entropy, gradient_mode=cfg.gradient_mode,
-        family=cfg.family, divergence_family=cfg.divergence_family,
+        family=cfg.family, full_cov_kl_precision=cfg.full_cov_kl_precision,
+        divergence_family=cfg.divergence_family,
         lambda_alpha_mode=cfg.lambda_alpha_mode,
         phi_precond_mode=cfg.phi_precond_mode, phi_retract_mode=cfg.phi_retract_mode,
         spd_retract_mode=cfg.spd_retract_mode, transport_mode=cfg.transport_mode,
@@ -195,7 +196,8 @@ def vfe_block(
                 capture["cg_moment_energy_rows"].append(cg_moment_energy_rows(
                     pre_mu, pre_sigma, res.mu, res.sigma,
                     renyi_order=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
-                    family=cfg.family, divergence_family=cfg.divergence_family))
+                    family=cfg.family, divergence_family=cfg.divergence_family,
+                    full_cov_kl_precision=cfg.full_cov_kl_precision))
                 out = out._replace(mu=res.mu, sigma=res.sigma)
         else:
             mu_cg, sigma_cg = cg_coupling(out.mu, out.sigma)

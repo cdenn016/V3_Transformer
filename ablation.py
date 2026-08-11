@@ -718,8 +718,8 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "description": "structural width/head ablation at a matched realized-parameter budget",
         "match_by": "embed_dim",
         "parameter_grid": {
-            "embed_dim": [32, 40, 48, 60, 64, 66, 75, 80, 96],
-            "n_heads": [4, 6, 8, 10, 11, 12, 15, 16],
+            "embed_dim": [32, 40, 45, 48, 60, 64, 66, 75, 80, 96],
+            "n_heads": [4, 5, 6, 8, 10, 11, 12, 15, 16],
         },
     },
     
@@ -1281,6 +1281,10 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # alpha form (diagonal-only), both of which a naive single-field sweep would have rejected.
     "covariance": {
         "description": "belief covariance structure (diagonal vs full Gaussian)",
+        # Use the family-dispatched decoder for both arms. This is equivalent to the baseline's
+        # rank-specific chunked decoder within each family, while remaining valid as the family
+        # itself changes across the sweep.
+        "requires": {"decode_mode": "family_chunked"},
         "configs": [
             {"label": "diagonal", "family": "gaussian_diagonal"},
             {"label": "full",     "family": "gaussian_full", "e_step_update": "gradient",
@@ -1358,7 +1362,9 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "renyi_order=1.5", "renyi_order": 1.5, "e_step_update": "gradient"},
             {"label": "renyi_order=2.0", "renyi_order": 2.0, "e_step_update": "gradient"},
         ],
-        "requires": {"oracle_unroll_grad": True},
+        # Non-unit alpha requires the family-dispatched prior-bank decoder; the unit-alpha arm
+        # shares it so decoder selection is not a sweep confound.
+        "requires": {"oracle_unroll_grad": True, "decode_mode": "family_chunked"},
         "collect_diagnostics": True,
     },
 

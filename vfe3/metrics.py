@@ -1651,6 +1651,7 @@ def gauge_equivariance_residual(
     scale:             float = 0.5,
     seed:              int   = 0,
     divergence_family: str   = "renyi",
+    full_cov_kl_precision: Optional[str] = None,
 ) -> Dict[str, torch.Tensor]:
     r"""Empirical gauge-equivariance certificate of the attention energy and weights.
 
@@ -1692,6 +1693,19 @@ def gauge_equivariance_residual(
         )
 
     full = get_family("gaussian_full")
+    from vfe3.families.gaussian import FullGaussian
+    def _instance(mu_: torch.Tensor, sigma_: torch.Tensor):
+        if full is FullGaussian and full_cov_kl_precision is not None:
+            return full(mu_, sigma_, _precision_policy=full_cov_kl_precision)
+        return full(mu_, sigma_)
+    def _transport(sigma_: torch.Tensor, omega_, **kwargs) -> torch.Tensor:
+        if full is FullGaussian and full_cov_kl_precision is not None:
+            kwargs["precision_policy"] = full_cov_kl_precision
+        return full.transport_dispersion(sigma_, omega_, **kwargs)
+    def _from_transported(mu_: torch.Tensor, sigma_: torch.Tensor, source_: torch.Tensor):
+        if full is FullGaussian and full_cov_kl_precision is not None:
+            return full.from_transported(mu_, sigma_, source_, _precision_policy=full_cov_kl_precision)
+        return full.from_transported(mu_, sigma_, source_)
     is_full = _is_full_cov(sigma, diagonal)
     sigma0 = sigma if is_full else torch.diag_embed(sigma)                    # (N, K, K)
     k = mu.shape[-1]
@@ -1716,7 +1730,7 @@ def gauge_equivariance_residual(
                     omega_row = torch.einsum(
                         "kl,ijlm,mn->ijkn", gauge_left, omega_row, gauge_right)
                 mu_rows.append(transport_mean(omega_row, mu_q)[0])
-                sig_rows.append(full.transport_dispersion(
+                sig_rows.append(_transport(
                     sig_q,
                     omega_row,
                     diagonal_out=sig_q.dim() == mu_q.dim(),
@@ -1725,8 +1739,8 @@ def gauge_equivariance_residual(
             sig_t = torch.stack(sig_rows, dim=0)                            # (N, N, K[, K])
         else:
             mu_t = transport_mean(om.unsqueeze(0), mu_q.unsqueeze(0))[0]          # (N, N, K)
-            sig_t = full.transport_dispersion(sig_q.unsqueeze(0), om.unsqueeze(0))[0]  # (N, N, K, K)
-        e = pairwise_energy(full(mu_q, sig_q), full.from_transported(mu_t, sig_t, sig_q),
+            sig_t = _transport(sig_q.unsqueeze(0), om.unsqueeze(0))[0]  # (N, N, K, K)
+        e = pairwise_energy(_instance(mu_q, sig_q), _from_transported(mu_t, sig_t, sig_q),
                             alpha=renyi_order, kl_max=kl_max, eps=eps,
                             divergence_family=divergence_family, irrep_dims=group.irrep_dims)
         return e, attention_weights(e, tau=tau)

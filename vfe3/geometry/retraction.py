@@ -190,6 +190,14 @@ def _spectral_values_and_derivatives(
         values = torch.exp(bounded)
         active = (eigenvalues >= lower) & (eigenvalues <= upper)
         derivatives = torch.where(active, values, torch.zeros_like(values))
+    elif kind == "log_floor":
+        bounded = eigenvalues.clamp(min=lower)
+        values = torch.log(bounded)
+        derivatives = torch.where(
+            eigenvalues >= lower,
+            bounded.reciprocal(),
+            torch.zeros_like(values),
+        )
     elif kind == "project":
         values = eigenvalues.clamp(min=lower) if upper is None else eigenvalues.clamp(
             min=lower,
@@ -242,6 +250,26 @@ def _loewner_adjoint(
         upper,
     )
     divided_difference = torch.where(repeated, repeated_limit, divided_difference)
+    if kind == "exp_bounded":
+        assert upper is not None
+        # Distinct fp32 eigenvalues can remain resolvable while their exponentials round to the
+        # same value, making the ordinary output divided difference spuriously zero. ``expm1``
+        # retains the active-interval Fréchet derivative without changing any forward value.
+        active = (
+            (lambda_i >= lower)
+            & (lambda_i <= upper)
+            & (lambda_j >= lower)
+            & (lambda_j <= upper)
+        )
+        rounded_gap_zero = value_gap == 0
+        nonzero_gap = gap != 0
+        stable_difference = torch.exp(lambda_j) * torch.expm1(gap) / gap
+        use_stable_difference = active & rounded_gap_zero & nonzero_gap
+        divided_difference = torch.where(
+            use_stable_difference,
+            stable_difference,
+            divided_difference,
+        )
 
     eigenvectors_t = eigenvectors.transpose(-1, -2)
     symmetric_grad = 0.5 * (grad_output + grad_output.transpose(-1, -2))
@@ -282,6 +310,45 @@ class _SymmetricSpectralMap(torch.autograd.Function):
             grad_output,
         )
         return grad_matrix, None, None, None
+
+
+class _CachedSymmetricSpectralMap(torch.autograd.Function):
+    r"""A symmetric spectral map whose forward reuses an already computed eigensystem.
+
+    The explicit Loewner adjoint avoids differentiating through the arbitrary eigenvectors of a
+    repeated spectrum while retaining the log-Euclidean retraction's three-eigendecomposition
+    contract.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        matrix: torch.Tensor,
+        eigenvalues: torch.Tensor,
+        eigenvectors: torch.Tensor,
+        kind: str,
+        lower: float,
+        upper: Optional[float],
+    ) -> torch.Tensor:
+        values, _ = _spectral_values_and_derivatives(eigenvalues, kind, lower, upper)
+        ctx.save_for_backward(eigenvalues, eigenvectors)
+        ctx.kind = kind
+        ctx.lower = lower
+        ctx.upper = upper
+        return eigenvectors * values.unsqueeze(-2) @ eigenvectors.transpose(-1, -2)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        eigenvalues, eigenvectors = ctx.saved_tensors
+        grad_matrix = _loewner_adjoint(
+            eigenvalues,
+            eigenvectors,
+            ctx.kind,
+            ctx.lower,
+            ctx.upper,
+            grad_output,
+        )
+        return grad_matrix, None, None, None, None, None
 
 
 class _SymmetricSpectralMapPair(torch.autograd.Function):
@@ -356,6 +423,25 @@ def _symmetric_spectral_map(
     upper:  Optional[float] = None,
 ) -> torch.Tensor:
     return _SymmetricSpectralMap.apply(matrix, kind, lower, upper)
+
+
+def _cached_symmetric_spectral_map(
+    matrix: torch.Tensor,
+    eigenvalues: torch.Tensor,
+    eigenvectors: torch.Tensor,
+    kind: str,
+    *,
+    lower: float,
+    upper: Optional[float] = None,
+) -> torch.Tensor:
+    return _CachedSymmetricSpectralMap.apply(
+        matrix,
+        eigenvalues,
+        eigenvectors,
+        kind,
+        lower,
+        upper,
+    )
 
 
 def _symmetric_spectral_map_pair(
@@ -534,6 +620,7 @@ _NONFINITE_TANGENT_COUNTS: Dict[str, torch.Tensor] = {}
 def _neutralize_nonfinite_tangent(
     tangent:    torch.Tensor,               # (..., K) diagonal or (..., K, K) full whitened tangent
     event_ndim: int,                        # 1 diagonal, 2 full -- the trailing axes of ONE element
+    valid:      Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Zero any tangent ELEMENT that is not entirely finite, and count it (audit 2026-08-06).
 
@@ -561,6 +648,8 @@ def _neutralize_nonfinite_tangent(
     """
     reduce_axes = tuple(range(-event_ndim, 0))
     finite = torch.isfinite(tangent).all(dim=reduce_axes, keepdim=True)
+    if valid is not None:
+        finite = finite & valid
     key = str(tangent.device)
     counter = _NONFINITE_TANGENT_COUNTS.get(key)
     if counter is None:
@@ -783,28 +872,70 @@ def retract_logeuclidean_full(
         delta_sigma = 0.5 * (delta_sigma + delta_sigma.transpose(-1, -2))
 
         eig_raw, eigenvectors = _eigh_damped(sigma, _rel_gap_eps(sigma))
-        eigenvalues = eig_raw.clamp(min=eps)
-        log_eig = torch.log(eigenvalues)
-        log_sigma = eigenvectors * log_eig.unsqueeze(-2) @ eigenvectors.transpose(-1, -2)
+        log_sigma = _cached_symmetric_spectral_map(
+            sigma,
+            eig_raw,
+            eigenvectors,
+            "log_floor",
+            lower=eps,
+        )
 
         # Reuse this eigendecomposition for the Fréchet chart map (audit 2026-07-12 N9): sigma is
         # already symmetrized above and _frechet_log_spd applies the SAME eps clamp, so passing the
         # pre-clamp pair is byte-identical to its own eigh of the identical matrix.
-        tangent = step_size * _frechet_log_spd(sigma, delta_sigma, eps=eps, eig=(eig_raw, eigenvectors))
+        raw_tangent_finite = torch.isfinite(delta_sigma).all(dim=(-2, -1), keepdim=True)
+        # Evaluate the chart map without an autograd graph before constructing its differentiable
+        # counterpart. This catches both literal NaN/Inf tangents and finite tangents whose chart
+        # image overflows, so an invalid row never enters the Fréchet derivative in the backward
+        # graph. The eigensystem is already available, preserving the three-eigh contract.
+        with torch.no_grad():
+            tangent_preview = _frechet_log_spd(
+                sigma,
+                delta_sigma,
+                eps=eps,
+                eig=(eig_raw, eigenvectors),
+            )
+            chart_tangent_finite = torch.isfinite(tangent_preview).all(dim=(-2, -1), keepdim=True)
+        chart_input_finite = raw_tangent_finite & chart_tangent_finite
+        safe_delta_sigma = torch.where(chart_input_finite, delta_sigma, torch.zeros_like(delta_sigma))
+        tangent = step_size * _frechet_log_spd(
+            sigma,
+            safe_delta_sigma,
+            eps=eps,
+            eig=(eig_raw, eigenvectors),
+        )
+        # A non-finite chart tangent must be neutralized before the norm guard: otherwise one
+        # poisoned row yields a NaN scale factor and reaches the eigendecomposition below. The
+        # validity mask counts rows excluded by the graph-free preflight; the finiteness check in
+        # the helper remains the postcondition guard for an unexpected generated nonfinite.
+        tangent = _neutralize_nonfinite_tangent(
+            tangent,
+            event_ndim=2,
+            valid=chart_input_finite,
+        )
         if trust_region is not None and trust_region > 0:                # clamp the TANGENT, not the
             t_norm  = torch.linalg.norm(tangent, ord='fro', dim=(-2, -1), keepdim=True)   # base point,
             tangent = tangent * torch.clamp(trust_region / (t_norm + eps), max=1.0)       # so R(S,0)=S.
         M = log_sigma + tangent
         M = 0.5 * (M + M.transpose(-1, -2))
 
-        M_eval, M_evec = _eigh_damped(M, _rel_gap_eps(M))
-        M_eval = M_eval.clamp(-50.0, 50.0)
-        sigma_new = M_evec * torch.exp(M_eval).unsqueeze(-2) @ M_evec.transpose(-1, -2)
+        sigma_new = _symmetric_spectral_map(
+            M,
+            "exp_bounded",
+            lower=-50.0,
+            upper=50.0,
+        )
         sigma_new = 0.5 * (sigma_new + sigma_new.transpose(-1, -2))
 
         eig_new, vec_new = _eigh_damped(sigma_new, _rel_gap_eps(sigma_new))
-        eig_new = eig_new.clamp(min=eps) if sigma_max is None else eig_new.clamp(min=eps, max=sigma_max)
-        sigma_new = vec_new * eig_new.unsqueeze(-2) @ vec_new.transpose(-1, -2)
+        sigma_new = _cached_symmetric_spectral_map(
+            sigma_new,
+            eig_new,
+            vec_new,
+            "project",
+            lower=eps,
+            upper=sigma_max,
+        )
 
     sigma_new = _certify_public_spd(
         sigma_new.to(orig_dtype),

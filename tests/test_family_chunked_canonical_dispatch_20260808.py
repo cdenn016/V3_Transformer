@@ -52,6 +52,7 @@ def _bank(*, decode_mode="family_chunked", renyi_order=1.0, divergence_family="r
         n_layers=1,
         gauge_group="block_glk",
         family="gaussian_full",
+        full_cov_kl_precision="fp32_escalate",
         decode_mode=decode_mode,
         decode_chunk_size=5,
         renyi_order=renyi_order,
@@ -62,8 +63,7 @@ def _bank(*, decode_mode="family_chunked", renyi_order=1.0, divergence_family="r
         unigram_kappa=0.7 if decode_unigram_prior else 1.0,
     ).to(DEVICE)
     pb = model.prior_bank
-    # VFEModel construction publishes its configured (historically fp64) policy process-wide.
-    # The dispatch contract deliberately targets the active fp32 analytic configuration.
+    # The dispatch contract deliberately targets the model-owned fp32 analytic configuration.
     set_full_cov_kl_precision("fp32_escalate")
     prior_bank.set_decode_av_precision("fp32")
     if decode_unigram_prior:
@@ -85,7 +85,7 @@ def _spd_inputs():
 
 def _canonical(pb):
     return (
-        full_cov_kl_precision() == "fp32_escalate"
+        pb.full_cov_kl_precision == "fp32_escalate"
         and prior_bank.decode_av_precision() == "fp32"
         and pb.renyi_order == 1.0
     )
@@ -286,3 +286,39 @@ def test_same_name_family_override_then_restore_falls_closed_to_generic_logits_a
     ).squeeze(-1)
     expected = expected_per_position[valid].mean()
     torch.testing.assert_close(fused, expected, atol=5e-6, rtol=2e-5)
+
+
+def test_legacy_custom_fused_decoder_keeps_signature_when_stats_are_requested():
+    model, _ = _bank(decode_mode="full_chunked", decode_unigram_prior=False)
+    original = prior_bank.get_decode_registration("full_chunked")
+    calls = []
+
+    def legacy_fused(pb, mu_q, sigma_q, targets, *, z_loss_weight=0.0):
+        calls.append(z_loss_weight)
+        return original.fused_ce(
+            pb, mu_q, sigma_q, targets, z_loss_weight=z_loss_weight)
+
+    prior_bank.register_decode(
+        "full_chunked",
+        supports_full=True,
+        supports_chunked=True,
+        fused_ce=legacy_fused,
+        family_consistent=original.family_consistent,
+        covariance_kinds=original.covariance_kinds,
+        can_omit_base_mean=original.can_omit_base_mean,
+        can_omit_base_variance=original.can_omit_base_variance,
+        override=True,
+    )(original.callable)
+    try:
+        tokens = torch.randint(0, model.cfg.vocab_size, (2, 3), device=DEVICE)
+        targets = torch.randint(0, model.cfg.vocab_size, (2, 3), device=DEVICE)
+        targets[0, 1] = -100
+        _, _, stats = model(tokens, targets, return_decode_stats=True)
+        assert isinstance(stats, prior_bank.DecodeCEResult)
+        assert int(stats.scored_tokens) == 5
+        assert calls == [model.cfg.z_loss_weight]
+    finally:
+        # Canonical projected construction pins the complete import-time registration identity,
+        # not only equal metadata/callables. Restore that exact object so this compatibility probe
+        # cannot poison later registry-identity tests in the same process.
+        prior_bank._DECODERS["full_chunked"] = original

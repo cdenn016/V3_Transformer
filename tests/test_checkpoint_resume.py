@@ -13,6 +13,7 @@ thing that can make their final weights differ is a missing restore leg -- model
 optimizer momentum (exp_avg/exp_avg_sq), or the scheduler's ``last_epoch``.
 """
 
+import copy
 import json
 import hashlib
 import math
@@ -61,6 +62,52 @@ def _cfg(**kw) -> VFE3Config:
 
 def _params(model: torch.nn.Module):
     return [p.detach().clone() for p in model.parameters()]
+
+
+def _assert_nested_equal(actual, expected):
+    if isinstance(expected, torch.Tensor):
+        assert isinstance(actual, torch.Tensor)
+        assert torch.equal(actual, expected)
+    elif isinstance(expected, dict):
+        assert isinstance(actual, dict)
+        assert set(actual) == set(expected)
+        for key in expected:
+            _assert_nested_equal(actual[key], expected[key])
+    elif isinstance(expected, (list, tuple)):
+        assert isinstance(actual, type(expected))
+        assert len(actual) == len(expected)
+        for actual_item, expected_item in zip(actual, expected):
+            _assert_nested_equal(actual_item, expected_item)
+    else:
+        assert actual == expected
+
+
+class _SameShapeParameters(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.first = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+        self.second = torch.nn.Parameter(torch.tensor([3.0, 4.0]))
+
+
+class _TiedParameters(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.canonical = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+        self.alias = self.canonical
+
+
+class _EnabledScalerStub:
+    def __init__(self, state):
+        self._state = copy.deepcopy(state)
+
+    def is_enabled(self):
+        return True
+
+    def state_dict(self):
+        return copy.deepcopy(self._state)
+
+    def load_state_dict(self, state):
+        self._state = copy.deepcopy(state)
 
 
 def test_config_resume_from_default_none_and_validated():
@@ -293,6 +340,267 @@ def test_load_checkpoint_rejects_deleted_populated_optimizer_slot_before_mutatio
 
     for expected, actual in zip(before, _params(target)):
         assert torch.equal(expected, actual)
+
+
+def test_optimizer_portable_preflight_accepts_cpu_snapshot_for_fused_non_cpu_parameter():
+    parameter = torch.nn.Parameter(torch.empty(2, device="meta"))
+    optimizer = torch.optim.AdamW([{"params": [parameter], "fused": True}])
+    saved_state = optimizer.state_dict()
+    parameter_id = saved_state["param_groups"][0]["params"][0]
+    saved_state["state"][parameter_id] = {
+        "step": torch.tensor(1.0, dtype=torch.float32),
+        "exp_avg": torch.zeros(2),
+        "exp_avg_sq": torch.ones(2),
+    }
+    ids = [parameter_id]
+    encoded = json.dumps(ids, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+    validated = run_artifacts._validate_optimizer_state(
+        saved_state,
+        optimizer,
+        1,
+        {"parameter_ids": ids, "sha256": hashlib.sha256(encoded).hexdigest()},
+    )
+
+    assert validated is saved_state
+
+
+def test_load_checkpoint_rejects_same_shape_parameter_reordering_by_name_before_mutation(tmp_path):
+    cfg = _cfg()
+    source = _SameShapeParameters()
+    source_optimizer = torch.optim.AdamW([source.first, source.second])
+    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
+        0, source, source_optimizer, cfg,
+    )
+    target = _SameShapeParameters()
+    target_optimizer = torch.optim.AdamW([target.second, target.first])
+    model_before = copy.deepcopy(target.state_dict())
+    optimizer_before = copy.deepcopy(target_optimizer.state_dict())
+
+    with pytest.raises(RuntimeError, match="optimizer parameter manifest.*live optimizer"):
+        load_checkpoint(checkpoint, target, target_optimizer, cfg=cfg, restore_rng=False)
+
+    _assert_nested_equal(target.state_dict(), model_before)
+    _assert_nested_equal(target_optimizer.state_dict(), optimizer_before)
+
+
+def test_load_checkpoint_rejects_serialized_parameter_id_permutation_before_mutation(tmp_path):
+    """Checkpoint-local slot IDs must remain bound to their digested parameter names."""
+    cfg = _cfg()
+    source = _SameShapeParameters()
+    source_optimizer = torch.optim.AdamW([source.first, source.second])
+    loss = source.first.sum() + 3.0 * source.second.sum()
+    loss.backward()
+    source_optimizer.step()
+    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
+        1, source, source_optimizer, cfg,
+    )
+    bundle = torch.load(checkpoint, weights_only=True)
+    saved_ids = bundle["optimizer_state"]["param_groups"][0]["params"]
+    assert len(saved_ids) == 2
+    first_moment = bundle["optimizer_state"]["state"][saved_ids[0]]["exp_avg"]
+    second_moment = bundle["optimizer_state"]["state"][saved_ids[1]]["exp_avg"]
+    assert not torch.equal(first_moment, second_moment)
+    bundle["optimizer_state"]["param_groups"][0]["params"] = list(reversed(saved_ids))
+    malformed = tmp_path / "permuted-optimizer-parameter-ids.pt"
+    torch.save(bundle, malformed)
+
+    target = _SameShapeParameters()
+    target_optimizer = torch.optim.AdamW([target.first, target.second])
+    model_before = copy.deepcopy(target.state_dict())
+    optimizer_before = copy.deepcopy(target_optimizer.state_dict())
+
+    with pytest.raises(RuntimeError, match="parameter manifest.*serialized optimizer"):
+        load_checkpoint(malformed, target, target_optimizer, cfg=cfg, restore_rng=False)
+
+    _assert_nested_equal(target.state_dict(), model_before)
+    _assert_nested_equal(target_optimizer.state_dict(), optimizer_before)
+
+
+def test_load_checkpoint_rejects_tampered_optimizer_parameter_manifest_digest(tmp_path):
+    cfg, _, checkpoint = _populated_optimizer_checkpoint(tmp_path)
+    bundle = torch.load(checkpoint, weights_only=True)
+    bundle["optimizer_parameter_manifest"]["sha256"] = "0" * 64
+    malformed = tmp_path / "tampered-parameter-manifest.pt"
+    torch.save(bundle, malformed)
+    target = VFEModel(cfg)
+    optimizer = build_optimizer(target, cfg)
+    model_before = copy.deepcopy(target.state_dict())
+    optimizer_before = copy.deepcopy(optimizer.state_dict())
+
+    with pytest.raises(RuntimeError, match="optimizer parameter manifest.*digest"):
+        load_checkpoint(malformed, target, optimizer, cfg=cfg)
+
+    _assert_nested_equal(target.state_dict(), model_before)
+    _assert_nested_equal(optimizer.state_dict(), optimizer_before)
+
+
+def test_optimizer_parameter_manifest_uses_first_registration_name_for_tied_parameter():
+    model = _TiedParameters()
+    optimizer = torch.optim.AdamW([model.alias])
+    optimizer_state = optimizer.state_dict()
+    parameter_id = optimizer_state["param_groups"][0]["params"][0]
+
+    manifest = run_artifacts._optimizer_parameter_manifest(model, optimizer, optimizer_state)
+
+    assert manifest["parameter_groups"] == [[{
+        "parameter_id": parameter_id,
+        "name": "canonical",
+        "shape": [2],
+    }]]
+
+
+@pytest.mark.parametrize("second_moment", ("exp_avg_sq", "max_exp_avg_sq"))
+def test_load_checkpoint_rejects_negative_adam_second_moments_before_mutation(
+    tmp_path, second_moment,
+):
+    cfg, _, checkpoint = _populated_optimizer_checkpoint(tmp_path)
+    bundle = torch.load(checkpoint, weights_only=True)
+    populated = next(state for state in bundle["optimizer_state"]["state"].values()
+                     if "exp_avg_sq" in state)
+    if second_moment == "max_exp_avg_sq":
+        populated["max_exp_avg_sq"] = populated["exp_avg_sq"].clone()
+        parameter_id = next(parameter_id for parameter_id, state
+                            in bundle["optimizer_state"]["state"].items()
+                            if state is populated)
+        group = next(group for group in bundle["optimizer_state"]["param_groups"]
+                     if parameter_id in group["params"])
+        group["amsgrad"] = True
+    populated[second_moment].view(-1)[0] = -1.0
+    malformed = tmp_path / f"negative-{second_moment}.pt"
+    torch.save(bundle, malformed)
+    target = VFEModel(cfg)
+    optimizer = build_optimizer(target, cfg)
+    if second_moment == "max_exp_avg_sq":
+        next(group for group in optimizer.param_groups
+             if group["params"][0].shape == populated["exp_avg"].shape)["amsgrad"] = True
+    model_before = copy.deepcopy(target.state_dict())
+    optimizer_before = copy.deepcopy(optimizer.state_dict())
+
+    with pytest.raises(RuntimeError, match=f"{second_moment}.*nonnegative"):
+        load_checkpoint(malformed, target, optimizer, cfg=cfg)
+
+    _assert_nested_equal(target.state_dict(), model_before)
+    _assert_nested_equal(optimizer.state_dict(), optimizer_before)
+
+
+def test_realized_optimizer_failure_rolls_back_before_other_state_mutation(tmp_path, monkeypatch):
+    cfg, source, checkpoint = _populated_optimizer_checkpoint(tmp_path)
+    bundle = torch.load(checkpoint, weights_only=True)
+    scaler_state = {
+        "scale": 32.0,
+        "growth_factor": 2.0,
+        "backoff_factor": 0.5,
+        "growth_interval": 100,
+        "_growth_tracker": 3,
+    }
+    bundle["scaler_state"] = scaler_state
+    bundle["ema_state"] = EMA(source, decay=0.9).state_dict()
+    torch.save(bundle, checkpoint)
+
+    target = VFEModel(cfg)
+    optimizer = build_optimizer(target, cfg)
+    sum(parameter.sum() for parameter in target.parameters()).backward()
+    optimizer.step()
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    scaler = _EnabledScalerStub({**scaler_state, "scale": 8.0})
+    ema = EMA(target, decay=0.9)
+    model_before = copy.deepcopy(target.state_dict())
+    optimizer_before = copy.deepcopy(optimizer.state_dict())
+    scheduler_before = copy.deepcopy(scheduler.state_dict())
+    scaler_before = copy.deepcopy(scaler.state_dict())
+    ema_before = copy.deepcopy(ema.state_dict())
+    torch.manual_seed(9876)
+    rng_before = torch.get_rng_state().clone()
+
+    def reject_realized_state(*_args, **_kwargs):
+        raise RuntimeError("injected realized optimizer failure")
+
+    monkeypatch.setattr(
+        run_artifacts, "_validate_realized_optimizer_state", reject_realized_state, raising=False,
+    )
+    with pytest.raises(RuntimeError, match="injected realized optimizer failure"):
+        load_checkpoint(
+            checkpoint,
+            target,
+            optimizer,
+            cfg=cfg,
+            scaler=scaler,
+            ema=ema,
+            restore_rng=True,
+        )
+
+    _assert_nested_equal(target.state_dict(), model_before)
+    _assert_nested_equal(optimizer.state_dict(), optimizer_before)
+    _assert_nested_equal(scheduler.state_dict(), scheduler_before)
+    _assert_nested_equal(scaler.state_dict(), scaler_before)
+    _assert_nested_equal(ema.state_dict(), ema_before)
+    assert torch.equal(torch.get_rng_state(), rng_before)
+
+
+def test_signed_adam_first_moment_remains_loadable(tmp_path):
+    cfg, _, checkpoint = _populated_optimizer_checkpoint(tmp_path)
+    bundle = torch.load(checkpoint, weights_only=True)
+    populated = next(state for state in bundle["optimizer_state"]["state"].values()
+                     if "exp_avg" in state)
+    populated["exp_avg"] = -populated["exp_avg"].abs() - 0.25
+    signed = tmp_path / "signed-first-moment.pt"
+    torch.save(bundle, signed)
+    target = VFEModel(cfg)
+    optimizer = build_optimizer(target, cfg)
+
+    assert load_checkpoint(signed, target, optimizer, cfg=cfg) == 1
+
+
+def test_legacy_optimizer_manifest_loads_under_unchanged_execution_contract(tmp_path):
+    cfg, _, checkpoint = _populated_optimizer_checkpoint(tmp_path)
+    bundle = torch.load(checkpoint, weights_only=True)
+    del bundle["optimizer_parameter_manifest"]
+    legacy = tmp_path / "legacy-unchanged.pt"
+    torch.save(bundle, legacy)
+    target = VFEModel(cfg)
+    optimizer = build_optimizer(target, cfg)
+
+    assert load_checkpoint(legacy, target, optimizer, cfg=cfg) == 1
+    assert optimizer.state
+
+
+def test_legacy_model_only_checkpoint_does_not_require_optimizer_manifest(tmp_path):
+    cfg = _cfg()
+    source = VFEModel(cfg)
+    checkpoint = RunArtifacts(tmp_path / "source", cfg, source).save_checkpoint(
+        0, source, build_optimizer(source, cfg), cfg,
+    )
+    bundle = torch.load(checkpoint, weights_only=True)
+    del bundle["optimizer_parameter_manifest"]
+    del bundle["optimizer_state"]
+    del bundle["optimizer_populated_slot_manifest"]
+    legacy = tmp_path / "legacy-model-only.pt"
+    torch.save(bundle, legacy)
+    target = VFEModel(cfg)
+
+    assert load_checkpoint(legacy, target, cfg=cfg, restore_rng=False) == 0
+    for saved, restored in zip(source.parameters(), target.parameters()):
+        assert torch.equal(saved, restored)
+
+
+@pytest.mark.parametrize("drift", ("config", "source", "missing_live_config"))
+def test_legacy_optimizer_manifest_requires_unchanged_execution_contract(tmp_path, drift):
+    cfg, _, checkpoint = _populated_optimizer_checkpoint(tmp_path)
+    bundle = torch.load(checkpoint, weights_only=True)
+    del bundle["optimizer_parameter_manifest"]
+    if drift == "source":
+        bundle["code_identity_sha256"] = "0" * 64
+    legacy = tmp_path / f"legacy-{drift}.pt"
+    torch.save(bundle, legacy)
+    target = VFEModel(cfg)
+    optimizer = build_optimizer(target, cfg)
+    load_cfg = None if drift == "missing_live_config" else (
+        _cfg(grad_clip=0.125) if drift == "config" else cfg
+    )
+
+    with pytest.raises(RuntimeError, match="legacy optimizer.*manifest"):
+        load_checkpoint(legacy, target, optimizer, cfg=load_cfg)
 
 
 def test_load_checkpoint_rejects_parameter_step_beyond_successful_updates(tmp_path):
