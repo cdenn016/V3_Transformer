@@ -1603,7 +1603,6 @@ class PriorBank(nn.Module):
         projected_full = (
             self.encode_mode == "canonical_content_projected"
             and registration.supports_full
-            and family_cov_kind(self.family) == "full"
         )
         if projected_full:
             finite = torch.isfinite(sigma_q).all(dim=-1)
