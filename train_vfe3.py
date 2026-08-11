@@ -154,6 +154,10 @@ config = dict(
     decode_bias               = True,     # only if use_prior_bank = False
     use_head_mixer            = False,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
                                            # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
+    use_block_mlp             = False,      # opt-in coordinate mean-only residual MLP; not gauge-pure
+    block_mlp_expansion       = 4,
+    block_mlp_activation      = "gelu",
+    block_mlp_dropout         = 0.0,
     
     use_prior_bank            = True,               # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (encode stays on the prior bank)
@@ -357,6 +361,7 @@ config = dict(
     m_p_mu_lr                 = 0.005,     
     m_head_evidence_lr        = 0.001,     # PriorBank-native KL irrep evidence weights
     m_head_mixer_lr           = 0.001,     # post-belief Schur HeadMixer parameters
+    m_block_mlp_lr            = None,      # None inherits m_p_mu_lr when the optional MLP is active
     m_p_sigma_lr              = 0.002,     
     m_phi_lr                  = 0.0025,    #0.0025 pure path
     
@@ -533,8 +538,9 @@ def _banner(model, cfg: VFE3Config, dataset: str, device: str, n_steps: int,
         *dead_line,
         f" M-LRs: mu={cfg.m_p_mu_lr}  sigma={cfg.m_p_sigma_lr}  "
         f"phi={cfg.m_phi_lr}  s_phi={cfg.m_s_phi_lr}",
-        f" mixer-LRs: head_evidence={_fmt_mixer_lr(cfg.m_head_evidence_lr, cfg.m_p_mu_lr)}  "
-        f"head_mixer={_fmt_mixer_lr(cfg.m_head_mixer_lr, cfg.m_p_mu_lr)}",
+        f" auxiliary M-LRs: head_evidence={_fmt_mixer_lr(cfg.m_head_evidence_lr, cfg.m_p_mu_lr)}  "
+        f"head_mixer={_fmt_mixer_lr(cfg.m_head_mixer_lr, cfg.m_p_mu_lr)}  "
+        f"block_mlp={_fmt_mixer_lr(cfg.m_block_mlp_lr, cfg.m_p_mu_lr)}",
         f" VFE: lambda_alpha={cfg.lambda_alpha}  kappa_beta={cfg.kappa_beta}  "
         f"tau={_fmt_tau(cfg, model)}  mass_phi={cfg.mass_phi}",
         f" seed={cfg.seed}",
@@ -585,7 +591,7 @@ def _select_loader(
 
 
 def _run_label(cfg: VFE3Config, dataset: str) -> str:
-    r"""Descriptive run label ``<dataset>_K<embed_dim>_<group>[_linear][_mix][_cross]_s<seed>`` (no
+    r"""Descriptive run label ``<dataset>_K<embed_dim>_<group>[_linear][_mix][_mlp][_cross]_s<seed>`` (no
     timestamp, no PPL).
 
     The stable part of the run-folder name: ``_run_dir`` prefixes it with a timestamp while the run is
@@ -595,6 +601,7 @@ def _run_label(cfg: VFE3Config, dataset: str) -> str:
     _validate_path_component(dataset, "dataset")
     tags = (("_linear" if not cfg.use_prior_bank else "")
             + ("_mix" if cfg.use_head_mixer else "")
+            + ("_mlp" if cfg.use_block_mlp else "")
             + ("_cross" if cfg.cross_couplings else ""))
     return f"{dataset}_K{cfg.embed_dim}_{cfg.gauge_group}{tags}_s{cfg.seed}"
 

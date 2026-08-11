@@ -301,6 +301,10 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     decode_bias               = True,     # only if use_prior_bank = False
     use_head_mixer            = False,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
                                            # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
+    use_block_mlp             = False,      # opt-in coordinate mean-only residual MLP; not gauge-pure
+    block_mlp_expansion       = 4,
+    block_mlp_activation      = "gelu",
+    block_mlp_dropout         = 0.0,
     
     use_prior_bank            = True,               # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (encode stays on the prior bank)
@@ -502,6 +506,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     m_p_mu_lr                 = 0.015,     
     m_head_evidence_lr        = 0.001,     # PriorBank-native KL irrep evidence weights
     m_head_mixer_lr           = 0.001,     # post-belief Schur HeadMixer parameters
+    m_block_mlp_lr            = None,      # None inherits m_p_mu_lr when the optional MLP is active
     m_p_sigma_lr              = 0.001,     
     m_phi_lr                  = 0.0025,
     
@@ -712,6 +717,14 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     "n_heads": {  # n_heads=1 has no >=2 equal blocks -> disable the head mixer for a clean sweep
         "description": "number of gauge-irrep blocks / heads (divisors of embed_dim=20)",
         "param": "n_heads", "values": [1, 2, 4, 5], "requires": {"use_head_mixer": False},
+    },
+
+    "block_mlp": {
+        "description": "optional post-block coordinate mean-only residual MLP",
+        "configs": [
+            {"label": "block_mlp_off", "use_block_mlp": False},
+            {"label": "block_mlp_on", "use_block_mlp": True},
+        ],
     },
 
     "parameter_matched": {
@@ -2600,10 +2613,15 @@ def _cell_cfg_dict(
 def _gauge_reporting_fields(cfg: VFE3Config) -> Dict[str, object]:
     """Return the executable gauge-purity classification carried by every ablation row."""
     report = _pure_path_report(cfg, [])
+    toggles = report["config_toggles"]
+    gauge_flags = report["gauge_flags"]
     return {
-        "head_mixer_compatibility":    cfg.head_mixer_compatibility,
-        "head_mixer_gauge_compatible": bool(cfg.head_mixer_gauge_compatible),
-        "on_gauge_pure_path":          bool(report["on_gauge_pure_path"]),
+        "head_mixer_compatibility":          cfg.head_mixer_compatibility,
+        "head_mixer_gauge_compatible":       bool(cfg.head_mixer_gauge_compatible),
+        "block_mlp_structural_mode":         str(toggles["block_mlp_structural_mode"]),
+        "block_mlp_covariance_contract":     str(toggles["block_mlp_covariance_contract"]),
+        "block_mlp_intertwiner_compatible":  bool(gauge_flags["block_mlp_intertwiner_compatible"]),
+        "on_gauge_pure_path":                bool(report["on_gauge_pure_path"]),
     }
 
 
@@ -2988,7 +3006,8 @@ _CSV_COLUMNS = [
     "final_val_ce", "final_val_bits_per_token", "final_val_bpc", "best_val_ppl", "final_train_loss",
     "n_params", "target_n_params", "param_difference", "param_relative_deviation",
     "head_mixer_compatibility", "head_mixer_gauge_compatible",
-    "on_gauge_pure_path",
+    "block_mlp_structural_mode", "block_mlp_covariance_contract",
+    "block_mlp_intertwiner_compatible", "on_gauge_pure_path",
     # opt-in per-cell converged-state diagnostics (S2; empty unless the sweep sets collect_diagnostics)
     "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in", "gauge_resid_out",
     "rank_resid", "cov_gap", "energy_klmax_frac",
@@ -3715,11 +3734,25 @@ def _gauge_purity_summary(results: List[Dict[str, Any]]) -> Dict[str, object]:
         str(result["label"]): str(result["head_mixer_compatibility"])
         for result in results
     }
+    mlp_modes = {
+        str(result["label"]): str(result.get("block_mlp_structural_mode", "unavailable"))
+        for result in results
+    }
+    mlp_covariance = {
+        str(result["label"]): str(result.get("block_mlp_covariance_contract", "unavailable"))
+        for result in results
+    }
     return {
         "classifications_by_label": classifications,
+        "block_mlp_structural_modes_by_label": mlp_modes,
+        "block_mlp_covariance_contracts_by_label": mlp_covariance,
         "contains_independent_head_nonintertwiner": any(
             value == "independent_head_nonintertwiner"
             for value in classifications.values()
+        ),
+        "contains_coordinate_mean_only_nonintertwiner": any(
+            value == "coordinate_mean_only_nonintertwiner"
+            for value in mlp_modes.values()
         ),
         "all_rows_on_gauge_pure_path": bool(results) and all(
             result.get("on_gauge_pure_path") is True for result in results
@@ -4639,9 +4672,12 @@ def run_sweep(
                 "param_relative_deviation": parameter_record["param_relative_deviation"],
             })
         result.update(expected_gauge_fields or {
-            "head_mixer_compatibility":    "unavailable",
-            "head_mixer_gauge_compatible": False,
-            "on_gauge_pure_path":          False,
+            "head_mixer_compatibility":         "unavailable",
+            "head_mixer_gauge_compatible":      False,
+            "block_mlp_structural_mode":        "unavailable",
+            "block_mlp_covariance_contract":    "unavailable",
+            "block_mlp_intertwiner_compatible": False,
+            "on_gauge_pure_path":               False,
         })
         result["collect_diagnostics"] = diagnostic_flags["collect_diagnostics"]
         result["collect_extrapolation"] = diagnostic_flags["collect_extrapolation"]
@@ -5049,7 +5085,7 @@ def _plt_or_none() -> Any:
 
 
 def _gauge_disclosure_text(gauge_purity: object) -> str:
-    """Return the explicit gauge/head-mixer disclosure printed on every ablation figure."""
+    """Return the explicit gauge/structural disclosure printed on every ablation figure."""
     if not isinstance(gauge_purity, Mapping):
         return "Gauge classification: unavailable"
     classifications = gauge_purity.get("classifications_by_label")
@@ -5058,6 +5094,12 @@ def _gauge_disclosure_text(gauge_purity: object) -> str:
         if isinstance(classifications, Mapping) else []
     )
     value_text = ", ".join(values) if values else "unavailable"
+    if gauge_purity.get("contains_coordinate_mean_only_nonintertwiner") is True:
+        return (
+            "Gauge classification: coordinate_mean_only_nonintertwiner present; "
+            "block MLP is mean-only with covariance passthrough, not a Gaussian pushforward; "
+            "this figure is not gauge-pure"
+        )
     if gauge_purity.get("contains_independent_head_nonintertwiner") is True:
         return (
             "Gauge classification: independent_head_nonintertwiner present; "
@@ -5632,6 +5674,10 @@ def _plot_sensitivity(
         "classifications_by_label": classifications,
         "contains_independent_head_nonintertwiner": any(
             summary.get("contains_independent_head_nonintertwiner") is True
+            for summary in gauge_summaries
+        ),
+        "contains_coordinate_mean_only_nonintertwiner": any(
+            summary.get("contains_coordinate_mean_only_nonintertwiner") is True
             for summary in gauge_summaries
         ),
         "all_rows_on_gauge_pure_path": bool(gauge_summaries) and all(
