@@ -327,7 +327,7 @@ class VFE3Config:
     # axis. The theoretically PURE no-composition path is "none". Validated against the pos_phi
     # registry.
     pos_phi:                   str             = "learned"   # "none" | "learned" | "frozen"
-    pos_phi_compose:           str             = "bch"       # composition chart: bch (default) | euclidean
+    pos_phi_compose:           str             = "group_product"       # composition chart: bch (default) | euclidean
     
     bch_pe_order:              int             = 4           # BCH Dynkin truncation order (compose_phi order) 4 is just as good as 6
     bch_residual_max:          Optional[float] = None        # opt-in fail-closed BCH/group-product relative residual
@@ -340,6 +340,7 @@ class VFE3Config:
     # rope_full_gauge=True also rotates the covariance sandwich and REQUIRES full covariance.
     pos_rotation:              str   = "none"      # "none" | "rope" (the positional-rotation registry)
     rope_base:                 float = 100.0       # rotary frequency base
+    
     # Where the positional rotation sits relative to the learned gauge frame (audit 2026-07-26 R-4).
     # "right" (default, the PURE path): the frame is V_i = U_i R_i^T, so the operator is
     # Omega_ij = U_i R(theta_j - theta_i) U_j^-1 -- the relative rotation sits BETWEEN the query and
@@ -586,7 +587,10 @@ class VFE3Config:
    
     gradient_mode:             str   = "filtering"   #"smoothing"
     
-    phi_precond_mode:          str   = "none"
+    phi_precond_mode:          str   = "none"   # "none" | "clip" | "killing" | "killing_per_block" | "pullback" | "pullback_per_block"
+                                                       # needs e_phi_lr>0
+    
+    
     phi_retract_mode:          str   = "bch"  # Lie-algebra step chart: euclidean (sum) or bch
     spd_retract_mode:          str   = "spd_affine" # SPD covariance retraction geometry (registry key)
                                                       #"log_euclidean"
@@ -607,7 +611,7 @@ class VFE3Config:
     use_prior_bank:            bool  = False
     decode_bias:               bool  = False  # use_prior_bank=False only: learned per-vocab log-unigram bias on logits=mu_q@W^T+b (zero-init, weight-decay-free). Inert (warns) under use_prior_bank=True.
    
-    decode_tau:                float = 1.0
+    decode_tau:                float = 0.01
     decode_mode:               str   = "diagonal_chunked"    #"full_chunked", "diagonal_chunked", "expected_liklihood_chunked", "diagonal_untied", "full"
     
     # decode_chunk_size: vocabulary-chunk width V is iterated over by the fused CE kernels (the
@@ -640,7 +644,7 @@ class VFE3Config:
     # KL-to-vocab path has no chunk loop to checkpoint).
     decode_ce_checkpoint:      str   = "auto"    #"always", "never"
 
-    encode_mode:               str   = "per_token"   #"per_token_additive"
+    encode_mode:               str   = "per_token"   #"per_token_additive", "canonical_content_projected"
 
     # cross-block belief handoff (mu_q -> mu_p)
     prior_handoff_rho:         float = 1.0          # 1.0 = full flow; 0.0 = priors frozen
@@ -780,6 +784,27 @@ class VFE3Config:
 
     weight_decay:              float = 0.05
    
+    
+    # SEPARATE AdamW weight decay for the log-variance tables (sigma_log_embed, s_sigma_log,
+    # decode_log_scale). None = inherit the global weight_decay (the long-standing behavior --
+    # which decays log sigma toward 0, i.e. an unintended lognormal prior pinning sigma to 1
+    # against the configured sigma_init). Set 0.0 to exempt the sigma sector. Mirrors
+    # connection_weight_decay.
+    sigma_weight_decay:        Optional[float] = None
+
+    # SEPARATE AdamW weight decay for the MEAN-role capacity tables (mu_embed, s_mu_embed,
+    # decode_mu_embed, output_proj_weight) -- the exact mirror of sigma_weight_decay above.
+    # None = inherit the global weight_decay (the long-standing behavior). A dead TENSOR escapes
+    # AdamW decay because zero_grad(set_to_none=True) leaves p.grad = None, but a rarely-visited
+    # ROW inside a live tensor does not: the embedding gather produces a dense gradient, so decay
+    # is applied to all V rows on every step whether or not the token appeared. Measured on the
+    # K=300 wikitext-103 run, that drives the zero-count rows of the mean tables to norm 0.000 and
+    # the count-1..15 rows BELOW random initialization (half-life ln2/(lr*wd) = 2310 steps against
+    # an inter-arrival of 57050/count steps). Set 0.0 to exempt the mean sector; the frequent rows
+    # keep their dense likelihood gradient either way.
+    mu_weight_decay:           Optional[float] = None
+    
+   
     # SEPARATE AdamW weight decay for the gauge-frame coordinate tables (phi_embed, learned
     # pos_phi_free), default 0.065. Decoupled decay on phi sets an LR-invariant frame-norm ceiling
     # (|phi*| ~ E[normalized-grad]/wd) that pulls the transport exp(phi.G) toward the identity; this
@@ -831,6 +856,11 @@ class VFE3Config:
     
     generate_figures:                      bool          = True
 
+    # Memory-guard override for full-vocabulary reporting inputs (audit 2026-07-01 F9): the two
+    # extractors that materialize full (B, N, V) logits/probabilities are skipped above the guard,
+    # while lighter figures still run. True opts those large inputs back in.
+    force_large_figures:       bool          = False
+
     # End-of-run mechanism diagnostics (2026-07-25). The CHEAP tier -- E-step character (belief
     # displacement, direction cosine, and the prior/pair split of the fused mm_exact precision) and
     # the beta channel decomposition (positional prior vs content energy) -- runs with the other
@@ -857,10 +887,7 @@ class VFE3Config:
     # zero), so this only has to clear fp32 round-off, not separate "slow" from "stopped".
     parameter_motion_rel_tol:              float         = 1e-6
 
-    # Memory-guard override for full-vocabulary reporting inputs (audit 2026-07-01 F9): the two
-    # extractors that materialize full (B, N, V) logits/probabilities are skipped above the guard,
-    # while lighter figures still run. True opts those large inputs back in.
-    force_large_figures:       bool          = False
+    
 
     # Opt-in mixed precision for CUDA throughput (RTX 5090). None (default) = OFF = the pure fp32
     # path: NO autocast context is entered anywhere in the forward, so the loss/logits are
@@ -877,12 +904,7 @@ class VFE3Config:
     # scope).
     amp_dtype:                 Optional[str] = None
 
-    # ------------------------------------------------------------------
-    # Tier-1/Tier-2 improvement toggles (2026-07-05 ideas doc; docs/2026-07-05-improvement-ideas.md).
-    # EVERY toggle below defaults OFF / byte-identical to the pre-toggle build; the pure path is
-    # the default. See the ideas doc for the math and the mechanism behind each.
-    # ------------------------------------------------------------------
-
+    
     # E-step update rule. 'gradient' (default, pure current path): one natural-gradient step per
     # inner iteration. 'mm_exact': the closed-form coordinate minimizer of the beta-frozen,
     # strict-pair-masked diagonal-KL surrogate F_hat = sum_i a_i KL(q_i||p_i)
@@ -1070,24 +1092,7 @@ class VFE3Config:
     # formally requires). The logsumexp is already materialized in every fused CE path. 0.0 = OFF.
     z_loss_weight:             float = 0.0
     
-    # SEPARATE AdamW weight decay for the log-variance tables (sigma_log_embed, s_sigma_log,
-    # decode_log_scale). None = inherit the global weight_decay (the long-standing behavior --
-    # which decays log sigma toward 0, i.e. an unintended lognormal prior pinning sigma to 1
-    # against the configured sigma_init). Set 0.0 to exempt the sigma sector. Mirrors
-    # connection_weight_decay.
-    sigma_weight_decay:        Optional[float] = None
-
-    # SEPARATE AdamW weight decay for the MEAN-role capacity tables (mu_embed, s_mu_embed,
-    # decode_mu_embed, output_proj_weight) -- the exact mirror of sigma_weight_decay above.
-    # None = inherit the global weight_decay (the long-standing behavior). A dead TENSOR escapes
-    # AdamW decay because zero_grad(set_to_none=True) leaves p.grad = None, but a rarely-visited
-    # ROW inside a live tensor does not: the embedding gather produces a dense gradient, so decay
-    # is applied to all V rows on every step whether or not the token appeared. Measured on the
-    # K=300 wikitext-103 run, that drives the zero-count rows of the mean tables to norm 0.000 and
-    # the count-1..15 rows BELOW random initialization (half-life ln2/(lr*wd) = 2310 steps against
-    # an inter-arrival of 57050/count steps). Set 0.0 to exempt the mean sector; the frequent rows
-    # keep their dense likelihood gradient either way.
-    mu_weight_decay:           Optional[float] = None
+    
 
     # Untied decode bank (use_prior_bank=True only): decode reads its OWN (V,K) mu/sigma tables,
     # cloned from the encode tables at init (step-0 byte-identical) and trained separately. Isolates

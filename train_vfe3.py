@@ -147,25 +147,29 @@ config = dict(
     pos_phi_scale             = 0.02,                # learned-table init scale AND frozen per-position step
     
     
-    e_step_mu_precond         = "fisher",       # "fisher" | "raw"
+    
+    
+    
     #################################
     #        Encode/Decode          #
     #################################
-    decode_bias               = True,     # only if use_prior_bank = False
+    decode_bias               = True,      # only if use_prior_bank = False
     use_head_mixer            = False,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
                                            # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
-    use_block_mlp             = False,      # opt-in coordinate mean-only residual MLP; not gauge-pure
+    use_block_mlp             = True,      # opt-in coordinate mean-only residual MLP; not gauge-pure
     block_mlp_expansion       = 4,
     block_mlp_activation      = "gelu",
-    block_mlp_dropout         = 0.0,
+    block_mlp_dropout         = 0.01,
     
+    
+    use_priorbank_head_evidence_mixer = False,      
     use_prior_bank            = True,               # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (encode stays on the prior bank)
     decode_tau                = 0.01,
-    decode_mode               = 'full_chunked',  #"family_chunked (set chunks to 512 or default/K^2)", "full_chunked", "diagonal_chunked", "expected_likelihood_chunked", "full", "family", "family_chunked" (family/family_chunked: divergence-consistent KL-to-prior decode, use_prior_bank=True)
+    decode_mode               = 'full_chunked',  #"family_chunked", "full_chunked", "diagonal_chunked", "expected_likelihood_chunked", "full", "family", "family_chunked" (family/family_chunked: divergence-consistent KL-to-prior decode, use_prior_bank=True)
     decode_chunk_size         = 8192,
     
-    encode_mode               = "per_token",   #"per_token_additive"
+    encode_mode               = "per_token",  #"canonical_content_gauge", "per_token_additive", "canonical_content_projected"
     
     
     oracle_unroll_grad        = True,
@@ -334,6 +338,8 @@ config = dict(
     #         Learning Rates
     #################################
     
+    e_step_mu_precond         = "fisher",       # "fisher" | "raw"
+    
     e_q_mu_lr                 = 0.3,
     e_q_sigma_lr              = 0.025,
     e_phi_lr                  = 0.00,     
@@ -358,7 +364,7 @@ config = dict(
     #        Learning Rates
     #################################
         
-    m_p_mu_lr                 = 0.005,     
+    m_p_mu_lr                 = 0.004,     
     m_head_evidence_lr        = 0.001,     # PriorBank-native KL irrep evidence weights
     m_head_mixer_lr           = 0.001,     # post-belief Schur HeadMixer parameters
     m_block_mlp_lr            = None,      # None inherits m_p_mu_lr when the optional MLP is active
@@ -412,8 +418,8 @@ config = dict(
     checkpoint_interval       = 15000,     # save a resumable checkpoint every N steps (0 = off)
 
     
-
-
+    pos_phi_project_slk       = True,       # per-block trace projection (det Omega = 1)
+    decode_av_precision       = "fp32",     # "fp32" | "fp64"
 
     # --- E-step update rule ---
     e_step_update             = "gradient",  # "gradient" (pure current path) | "mm_exact" (closed-form MM
