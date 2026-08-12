@@ -240,7 +240,7 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     eval_stride               = None,
     
     batch_size                = 64,
-    max_steps                 = 15000,
+    max_steps                 = 10000,
     
     n_layers                  = 1,                   # L, number of blocks
     n_e_steps                 = 1 ,                   # T, E-step inner iterations
@@ -299,13 +299,14 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #        Encode/Decode          #
     #################################
     decode_bias               = True,     # only if use_prior_bank = False
-    use_head_mixer            = False,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
+    use_head_mixer            = True,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
                                            # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
     use_block_mlp             = False,      # opt-in coordinate mean-only residual MLP; not gauge-pure
     block_mlp_expansion       = 4,
     block_mlp_activation      = "gelu",
     block_mlp_dropout         = 0.0,
     
+    use_priorbank_head_evidence_mixer = False,     
     use_prior_bank            = True,               # True: KL-to-prior decode (pure path). False: linear projection
                                                      # mu->logits ablation (encode stays on the prior bank)
     decode_tau                = 0.01,
@@ -503,11 +504,11 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     #        Learning Rates
     #################################
         
-    m_p_mu_lr                 = 0.015,     
+    m_p_mu_lr                 = 0.004,     
     m_head_evidence_lr        = 0.001,     # PriorBank-native KL irrep evidence weights
     m_head_mixer_lr           = 0.001,     # post-belief Schur HeadMixer parameters
     m_block_mlp_lr            = None,      # None inherits m_p_mu_lr when the optional MLP is active
-    m_p_sigma_lr              = 0.001,     
+    m_p_sigma_lr              = 0.002,     
     m_phi_lr                  = 0.0025,
     
     m_s_phi_lr                = 0.007,         
@@ -727,12 +728,40 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         ],
     },
 
+    "block_mlp_expansion": {
+        "description": "block MLP hidden-width multiplier",
+        "param": "block_mlp_expansion",
+        "values": [1, 2, 4, 8],
+        "requires": {"use_block_mlp": True},
+    },
+
+    "block_mlp_activation": {
+        "description": "block MLP pointwise activation",
+        "param": "block_mlp_activation",
+        "values": ["gelu", "silu", "relu"],
+        "requires": {"use_block_mlp": True},
+    },
+
+    "block_mlp_dropout": {
+        "description": "block MLP residual-branch dropout probability",
+        "param": "block_mlp_dropout",
+        "values": [0.0, 0.01, 0.05, 0.1],
+        "requires": {"use_block_mlp": True},
+    },
+
+    "m_block_mlp_lr": {
+        "description": "M-step LR for the block MLP parameters",
+        "param": "m_block_mlp_lr",
+        "values": [0.001, 0.002, 0.004, 0.008],
+        "requires": {"use_block_mlp": True},
+    },
+
     "parameter_matched": {
         "description": "structural width/head ablation at a matched realized-parameter budget",
         "match_by": "embed_dim",
         "parameter_grid": {
-            "embed_dim": [32, 40, 45, 48, 60, 64, 66, 75, 80, 96],
-            "n_heads": [4, 5, 6, 8, 10, 11, 12, 15, 16],
+            "embed_dim": [32, 40, 48, 60, 64, 66, 75, 80, 96],
+            "n_heads": [4, 6, 8, 10, 11, 12, 15, 16],
         },
     },
     
@@ -1294,10 +1323,6 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # alpha form (diagonal-only), both of which a naive single-field sweep would have rejected.
     "covariance": {
         "description": "belief covariance structure (diagonal vs full Gaussian)",
-        # Use the family-dispatched decoder for both arms. This is equivalent to the baseline's
-        # rank-specific chunked decoder within each family, while remaining valid as the family
-        # itself changes across the sweep.
-        "requires": {"decode_mode": "family_chunked"},
         "configs": [
             {"label": "diagonal", "family": "gaussian_diagonal"},
             {"label": "full",     "family": "gaussian_full", "e_step_update": "gradient",
@@ -1375,9 +1400,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "renyi_order=1.5", "renyi_order": 1.5, "e_step_update": "gradient"},
             {"label": "renyi_order=2.0", "renyi_order": 2.0, "e_step_update": "gradient"},
         ],
-        # Non-unit alpha requires the family-dispatched prior-bank decoder; the unit-alpha arm
-        # shares it so decoder selection is not a sweep confound.
-        "requires": {"oracle_unroll_grad": True, "decode_mode": "family_chunked"},
+        "requires": {"oracle_unroll_grad": True},
         "collect_diagnostics": True,
     },
 
@@ -1470,17 +1493,17 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # === belief-table init scales (PriorBank) ===============================
     "mu_init_std": {
         "description": "init std of the prior mean table mu_embed ~ N(0, std^2)",
-        "param": "mu_init_std", "values": [0.0005, 0.002, 0.003],
+        "param": "mu_init_std", "values": [0.0001, 0.001, 0.01],
     },
     
     "sigma_init": {
         "description": "constant initial coordinate variance of the prior table (>0)",
-        "param": "sigma_init", "values": [0.1, 0.5, 1, 1.5, 2],
+        "param": "sigma_init", "values": [0.1, 0.5, 1, 1.5, 2.5],
     },
     
     "phi_scale": {
         "description": "init std of the gauge-frame table phi_embed ~ N(0, std^2)",
-        "param": "phi_scale", "values": [0.01, 0.03, 0.05, 0.06, 0.07, 0.1],
+        "param": "phi_scale", "values": [0.001, 0.01, 0.06, 0.1],
     },
     
     "pos_phi_scale": {
@@ -1550,7 +1573,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "decode_tau": {
         "description": "KL-to-prior decode temperature",
-        "param": "decode_tau", "values": [0.008, 0.0125 ], "requires": {"use_prior_bank": True},
+        "param": "decode_tau", "values": [0.005, 0.01, 0.05], "requires": {"use_prior_bank": True},
     },
     
     
@@ -1587,7 +1610,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
     "e_q_mu_lr": {
        "description": "E-step natural-gradient step size for mu_q",
-       "param": "e_q_mu_lr", "values": [0.2, 0.3, 0.4],
+       "param": "e_q_mu_lr", "values": [ 0.35],
        "requires": {"e_step_update": "gradient"},   # audit 2026-07-27: unread under mm_exact
     },
    
@@ -1612,12 +1635,12 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
    
     "m_phi_lr": {
         "description": "M-step LR for the gauge-frame parameters (phi)",
-        "param": "m_phi_lr", "values": [0.0015, 0.0025, 0.0035, 0.005, 0.01],
+        "param": "m_phi_lr", "values": [ 0.0025, 0.0035, 0.005],
     },
    
     "m_p_mu_lr": {
         "description": "M-step LR for the prior-bank means",
-        "param": "m_p_mu_lr", "values": [0.002],
+        "param": "m_p_mu_lr", "values": [0.004],
     },
     
     "m_p_sigma_lr": {
@@ -1627,6 +1650,25 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     
    
     
+
+
+
+
+
+
+    "m_head_evidence_lr": {
+        "description": "M-step LR for the prior-bank evidence mixer",
+        "param": "m_head_evidence_lr", "values": [0.0005, 0.001, 0.0025],
+    },
+    
+    
+    "m_head_mixer_lr": {
+        "description": "M-step LR for the head mixer",
+        "param": "m_head_mixer_lr", "values": [0.0001, 0.001, 0.005, 0.01, 0.05],
+    },
+    
+
+
 
 
 
@@ -1686,18 +1728,18 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
 
     "mu_weight_decay": {
         "description": "AdamW weight decay",
-        "param": "mu_weight_decay", "values": [None, 0, 0.001, 0.01, 0.05, 0.075, 0.1, 0.2],
+        "param": "mu_weight_decay", "values": [0, 0.001, 0.005, 0.01, 0.02,  0.05],
     }, 
     
     "phi_weight_decay":{
         "description": "weight decay on phi",
-        "param": "phi_weight_decay", "values": [0, 0.001, 0.01, 0.02, 0.03, 0.04, 0.05],
+        "param": "phi_weight_decay", "values": [0, 0.001, 0.01, 0.05, 0.07],
     },
 
     "sigma_weight_decay": {  # separate AdamW weight decay for the log-variance tables (None = inherit
         # weight_decay). Numeric radii -> LINE plot; the None (inherit) baseline runs via train_vfe3.
         "description": "AdamW weight decay on the log-variance (sigma) tables",
-        "param": "sigma_weight_decay", "values": [0.04, 0.075, 0.1],
+        "param": "sigma_weight_decay", "values": [0, 0.001, 0.01, 0.05],
     },
 
 
@@ -1832,28 +1874,31 @@ NON_SWEPT_FIELDS = (
 SWEEP_ORDER: List[str] = [
   
   
-  #"decode_tau",
-  # "mu_weight_decay",
   
-   #"weight_decay",
-   #"sigma_weight_decay",
+  # "mu_weight_decay",
   # "phi_weight_decay",
+   
+  #"m_head_evidence_lr",     # PriorBank-native KL irrep evidence weights
+  #"m_head_mixer_lr",            
+   #"e_q_mu_lr",
+   "sigma_weight_decay",
+   "decode_tau",
    
   #"mm_damping",
    
-  # "mu_init_std",
+   "mu_init_std",
    
   # "query_tau_c",
    
-  # "phi_scale",
-  # "sigma_init",
+   "phi_scale",
+   "sigma_init",
    
    
-   "m_p_mu_lr",
-   "m_p_sigma_lr",
-   "m_phi_lr",
+   #"m_p_mu_lr",
+   #"m_p_sigma_lr",
+  # "m_phi_lr",
    "e_q_sigma_lr",
-   "e_q_mu_lr",
+   
    
     
    #"pos_phi_scale",
@@ -1861,7 +1906,7 @@ SWEEP_ORDER: List[str] = [
    #"e_s_mu_lr",
    #"e_s_sigma_lr",
    
-   
+   #"weight_decay",
   #"sigma_max",
    #"m_s_phi_lr",
    
