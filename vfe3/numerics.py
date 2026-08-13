@@ -12,6 +12,7 @@ A theoretically pure path is always available (the unregularized op); the fallba
 guards that activate only when the pure path fails, and they are documented as such.
 """
 
+import math
 import weakref
 from collections import OrderedDict
 from typing import Callable, Dict, List, Literal, NamedTuple, Optional, Tuple
@@ -556,6 +557,10 @@ def validated_cholesky_solve(
     residual_tol = dimension_factor * eps if residual_tol is None else float(residual_tol)
     condition_limit = 1.0 / (dimension_factor * eps) \
         if condition_limit is None else float(condition_limit)
+    if not math.isfinite(residual_tol) or not math.isfinite(condition_limit):
+        raise ValueError(
+            "validated_cholesky_solve requires finite residual_tol and condition_limit, "
+            f"got residual_tol={residual_tol!r}, condition_limit={condition_limit!r}")
     if residual_tol < 0.0 or condition_limit < 1.0:
         raise ValueError(
             "validated_cholesky_solve requires residual_tol >= 0 and condition_limit >= 1, "

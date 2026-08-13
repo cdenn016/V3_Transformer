@@ -261,3 +261,32 @@ def test_validated_cholesky_solve_rejects_normalized_residual_bound() -> None:
     assert float(certified.symmetry_residual) == 0.0
     assert float(certified.factor_residual) == 0.0
     assert float(certified.solve_residual) == 0.0
+
+
+@pytest.mark.parametrize(
+    ("keyword", "value"),
+    [
+        ("residual_tol", float("nan")),
+        ("residual_tol", float("inf")),
+        ("residual_tol", float("-inf")),
+        ("condition_limit", float("nan")),
+        ("condition_limit", float("inf")),
+        ("condition_limit", float("-inf")),
+    ],
+)
+def test_validated_cholesky_solve_rejects_nonfinite_custom_bounds(
+    keyword: str,
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        validated_cholesky_solve(torch.eye(2), **{keyword: value})
+
+
+def test_validated_cholesky_solve_rejects_real_normalized_factor_residual_violation() -> None:
+    matrix = torch.tensor([[1.1, 0.3], [0.3, 0.7]], dtype=torch.float32)
+    rhs = torch.tensor([[0.2], [-0.4]], dtype=torch.float32)
+
+    certificate = validated_cholesky_solve(matrix, rhs, residual_tol=0.0)
+
+    assert float(certificate.factor_residual) > 0.0
+    assert not bool(certificate.certified)
