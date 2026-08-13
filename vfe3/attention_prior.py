@@ -16,6 +16,7 @@ register_prior without editing the free-energy call site.
 """
 
 import math
+from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Sequence
 
 import torch
@@ -49,9 +50,29 @@ def _press_slopes(
 
 
 _PRIORS: Dict[str, Callable] = {}
+_PRIOR_CAUSALITY: Dict[str, tuple[Callable, bool, Optional[str]]] = {}
 
 
-def register_prior(name: str, *, override: bool = False) -> Callable:
+@dataclass(frozen=True)
+class AttentionPriorRegistration:
+    """One active prior builder and its next-token causality declaration."""
+
+    callable: Callable
+    causal_for_next_token_scoring: bool
+    noncausal_when_config_true: Optional[str] = None
+
+    def is_causal_for_next_token_scoring(self, cfg: object) -> bool:
+        if not self.causal_for_next_token_scoring:
+            return False
+        if self.noncausal_when_config_true is None:
+            return True
+        return not bool(getattr(cfg, self.noncausal_when_config_true, False))
+
+
+def register_prior(
+    name: str, *, causal_for_next_token_scoring: Optional[bool] = None,
+    noncausal_when_config_true: Optional[str] = None, override: bool = False,
+) -> Callable:
     """Decorator registering an attention-prior builder -> log-prior bias (Nq, Nk).
 
     Duplicate keys fail closed (audit 2026-07-01 F12): a second registration under an
@@ -60,7 +81,22 @@ def register_prior(name: str, *, override: bool = False) -> Callable:
     def _wrap(fn: Callable) -> Callable:
         if name in _PRIORS and not override:
             raise KeyError(f"attention prior {name!r} already registered; pass override=True to replace")
+        causal = (
+            bool(getattr(fn, "_vfe3_causal_for_next_token_scoring", False))
+            if causal_for_next_token_scoring is None else bool(causal_for_next_token_scoring)
+        )
+        config_key = (
+            getattr(fn, "_vfe3_noncausal_when_config_true", None)
+            if noncausal_when_config_true is None else noncausal_when_config_true
+        )
+        if config_key is not None and not causal:
+            raise ValueError(
+                "noncausal_when_config_true requires causal_for_next_token_scoring=True"
+            )
+        setattr(fn, "_vfe3_causal_for_next_token_scoring", causal)
+        setattr(fn, "_vfe3_noncausal_when_config_true", config_key)
         _PRIORS[name] = fn
+        _PRIOR_CAUSALITY[name] = (fn, causal, config_key)
         return fn
     return _wrap
 
@@ -70,6 +106,18 @@ def get_prior(name: str) -> Callable:
     if name not in _PRIORS:
         raise KeyError(f"no attention prior {name!r}; available: {sorted(_PRIORS)}")
     return _PRIORS[name]
+
+
+def get_prior_registration(name: str) -> AttentionPriorRegistration:
+    """Return the callable plus fail-closed causal metadata for ``name``."""
+    fn = get_prior(name)
+    record = _PRIOR_CAUSALITY.get(name)
+    if record is not None and record[0] is fn:
+        _, causal, config_key = record
+    else:
+        causal = bool(getattr(fn, "_vfe3_causal_for_next_token_scoring", False))
+        config_key = getattr(fn, "_vfe3_noncausal_when_config_true", None)
+    return AttentionPriorRegistration(fn, causal, config_key)
 
 
 @register_prior("uniform")
@@ -86,7 +134,7 @@ def prior_uniform(
     return torch.zeros(n_query, n_key, device=device, dtype=dtype)
 
 
-@register_prior("causal")
+@register_prior("causal", causal_for_next_token_scoring=True)
 def prior_causal(
     n_query: int,
     n_key:   int,
@@ -104,7 +152,7 @@ def prior_causal(
     return B.masked_fill(~allowed, float("-inf"))
 
 
-@register_prior("causal_noself")
+@register_prior("causal_noself", causal_for_next_token_scoring=True)
 def prior_causal_noself(
     n_query: int,
     n_key:   int,
@@ -152,7 +200,7 @@ def prior_alibi(
     return (-slopes.view(n_heads, 1, 1) * dist)                     # (H, N_q, N_k)
 
 
-@register_prior("causal_alibi")
+@register_prior("causal_alibi", causal_for_next_token_scoring=True)
 def prior_causal_alibi(
     n_query:     int,
     n_key:       int,
@@ -184,7 +232,7 @@ def prior_causal_alibi(
     return B.masked_fill(~allowed.unsqueeze(0), float("-inf"))      # (H, N_q, N_k)
 
 
-@register_prior("causal_alibi_noself")
+@register_prior("causal_alibi_noself", causal_for_next_token_scoring=True)
 def prior_causal_alibi_noself(
     n_query:     int,
     n_key:       int,
@@ -241,7 +289,7 @@ def prior_windowed(
     return B.masked_fill(~allowed, float("-inf"))
 
 
-@register_prior("causal_windowed")
+@register_prior("causal_windowed", causal_for_next_token_scoring=True)
 def prior_causal_windowed(
     n_query: int,
     n_key:   int,
@@ -307,7 +355,11 @@ def _t5_relative_position_bucket(
     return buckets + torch.where(is_small, n, large)
 
 
-@register_prior("t5_relative_bias")
+@register_prior(
+    "t5_relative_bias",
+    causal_for_next_token_scoring=True,
+    noncausal_when_config_true="t5_bidirectional",
+)
 def prior_t5_relative_bias(
     n_query: int,
     n_key:   int,

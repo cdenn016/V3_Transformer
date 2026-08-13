@@ -504,7 +504,8 @@ def _report_cfg(**over):
                 lambda_gamma=0.0, s_e_step=False,
                 skip_belief_sigma_update=False, lambda_twohop=0.0,
                 gauge_parameterization="phi", omega_reflection="off", phi_reflection="off",
-                gauge_group="glk", family="gaussian_diagonal")
+                gauge_group="glk", family="gaussian_diagonal", sigma_max=None,
+                transport_chart_max_norm=12.0)
     base.update(over)
     return types.SimpleNamespace(**base)
 
@@ -517,7 +518,8 @@ def test_pure_path_report_regime_ii_covariant_exact_flag():
     assert diag["config_toggles"]["regime_ii_covariant_exact"] is False
     full = _pure_path_report(_report_cfg(transport_mode="regime_ii_covariant",
                                          family="gaussian_full"), [])
-    assert full["config_toggles"]["regime_ii_covariant_exact"] is True
+    assert full["config_toggles"]["regime_ii_covariant_exact"] is False
+    assert full["transport_exactness_status"] == "unknown"
     flat = _pure_path_report(_report_cfg(), [])
     assert flat["config_toggles"]["regime_ii_covariant_exact"] is True
 

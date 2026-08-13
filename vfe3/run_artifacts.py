@@ -3368,7 +3368,13 @@ def finalize_run(
     # stress metrics that say whether the numerical guards stayed inert. A REPORT of where the run sits,
     # not a judgment that any toggle is wrong (toggles are changed intentionally). Best-effort.
     try:
-        artifacts.save_json("pure_path_report.json", _pure_path_report(cfg, artifacts.history, executable_build=model.executable_build))
+        artifacts.save_json("pure_path_report.json", _pure_path_report(
+            cfg,
+            artifacts.history,
+            executable_build=model.executable_build,
+            reflection_scope=model.prior_bank.reflection_scope,
+            reflection_group_component_count=len(model.group.irrep_dims),
+        ))
     except Exception as exc:
         logger.warning("pure-path report failed (%s); skipped", exc)
 
@@ -4300,7 +4306,13 @@ def finalize_validation_run(
             data_seed=data_seed, max_tokens=max_tokens, tokenizer_tag=tokenizer_tag,
         )
         try:
-            artifacts.save_json("pure_path_report.json", _pure_path_report(cfg, artifacts.history, executable_build=model.executable_build))
+            artifacts.save_json("pure_path_report.json", _pure_path_report(
+                cfg,
+                artifacts.history,
+                executable_build=model.executable_build,
+                reflection_scope=model.prior_bank.reflection_scope,
+                reflection_group_component_count=len(model.group.irrep_dims),
+            ))
         except Exception as exc:
             logger.warning("pure-path report failed (%s); skipped", exc)
         if bool(getattr(cfg, "generate_figures", True)):
@@ -4378,24 +4390,25 @@ def _pure_path_report(
     history: List[Dict],
     *,
     executable_build: Optional[ExecutableBuildMetadata] = None,
+    reflection_scope: Optional[str] = None,
+    reflection_group_component_count: Optional[int] = None,
 ) -> Dict:
     r"""Where a run sits relative to the theoretically pure path: the toggle states that define it plus
     the converged-state stress metrics that say whether the numerical guards stayed inert.
 
-    A REPORT, not a verdict. The pure path must EXIST under appropriate toggles, but the user changes
-    toggles intentionally, so a non-pure run is recorded (``on_pure_path=False`` with the offending
-    flags), never flagged as wrong. ``pure_flags`` covers the principal gauge / decode / free-energy
-    purity axes (canonical attention entropy, flat transport, constant/static coupling weights,
-    prior-bank decode, full sigma updates, no two-hop/fixed-prior surrogate, no post-belief HeadMixer,
-    no PriorBank decoder head-evidence mixer, unweighted attention); it does NOT enumerate every
-    default-OFF learned-scalar toggle
-    (pos_phi, learnable_r, t5_learnable_bias, use_cg_coupling),
-    so ``on_pure_path`` certifies these axes rather than a full no-learned-parameter audit.
-    ``gauge_flags``/``on_gauge_pure_path`` is a SECOND, independent axis (audit 2026-07-01 F8): the
-    gauge / model-channel path (learned gauge transport, phi parameterization, no reflection or
-    positional rotation, family/group invariance, no model-channel coupling) -- a run can be pure on
-    the free-energy/decode axis while a gauge setting alters the executed belief path, and vice versa.
-    ``converged_stress`` reads the last finite value of each guard / flatness column (None if absent)."""
+    This is a report, not a rejection gate: diagnostic GL-breaking and noncausal configurations
+    remain executable and are labeled by independent certificate facets. ``on_pure_path`` preserves
+    the legacy free-energy/decode schema. ``on_gauge_pure_path`` is the executable gauge facet and
+    includes the active transport, norm, parameterization, clipping, temperature, emission, encoder,
+    HeadMixer, and immutable BlockMLP seams. ``on_causal_lm_path`` comes independently from both
+    active attention-prior registrations. ``transport_exactness_status`` is affirmative only when
+    complete runtime evidence warrants it; absent evidence is ``unknown``. The conjunctive
+    ``on_theory_pure_path`` combines the explicitly enumerated ``theory_flags``. Reflection scope is
+    runtime-owned metadata and records the block-zero-only product subgroup when applicable.
+
+    ``pure_flags`` intentionally retains its historical meaning and does not enumerate every
+    default-off learned-scalar toggle. ``converged_stress`` reads the last finite value of each guard
+    or flatness column (``None`` if absent)."""
     def _last(key: str) -> Optional[float]:
         for r in reversed(history):
             v = r.get(key)
@@ -4403,7 +4416,9 @@ def _pure_path_report(
                 return float(v)
         return None
     from vfe3.geometry.groups import declared_invariant_families
-    from vfe3.geometry.transport import get_transport_registration
+    from vfe3.geometry.norms import get_norm_registration
+    from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM, get_transport_registration
+    from vfe3.attention_prior import get_prior_registration
 
     invariant_families = declared_invariant_families(cfg.gauge_group)
     family_group_invariant = cfg.family in invariant_families
@@ -4451,20 +4466,39 @@ def _pure_path_report(
         block_mlp_intertwiner_compatible = (
             registration.intertwiner_compatible if block_mlp_active else True
         )
-    covariance_feature_exact = _last("regime_ii_covariant_feature_exact")
-    feature_jitter_recovered = covariance_feature_exact is not None and covariance_feature_exact < 0.5
+    runtime_exactness_key = transport_registration.runtime_exactness_key
     if cfg.transport_mode != "regime_ii_covariant":
-        regime_ii_covariant_exact = True
+        regime_ii_covariant_exact = cfg.transport_mode == "flat"
         regime_ii_covariant_exactness = "not_applicable"
     elif not family_group_invariant:
         regime_ii_covariant_exact = False
         regime_ii_covariant_exactness = "diagonal_projection_approximation"
-    elif feature_jitter_recovered:
-        regime_ii_covariant_exact = False
-        regime_ii_covariant_exactness = "jitter_recovered_approximation"
     else:
-        regime_ii_covariant_exact = True
-        regime_ii_covariant_exactness = "exact_valid_spd_factorization"
+        observations = [row.get(runtime_exactness_key) for row in history]
+        finite_observations = [
+            value for value in observations
+            if isinstance(value, (int, float)) and math.isfinite(value)
+        ]
+        complete = bool(observations) and all(
+            isinstance(value, (int, float)) and math.isfinite(value)
+            for value in observations
+        )
+        regime_ii_covariant_exact = complete and all(value >= 0.5 for value in observations)
+        regime_ii_covariant_exactness = (
+            "exact_valid_spd_factorization" if regime_ii_covariant_exact else
+            "jitter_recovered_approximation" if any(value < 0.5 for value in finite_observations) else
+            "unknown_missing_runtime_evidence"
+        )
+    if cfg.transport_mode == "flat":
+        transport_exactness_status = "not_applicable"
+    elif not transport_registration.gauge_equivariant or not family_group_invariant:
+        transport_exactness_status = "approximate"
+    elif runtime_exactness_key is None:
+        transport_exactness_status = "unknown"
+    elif regime_ii_covariant_exactness == "unknown_missing_runtime_evidence":
+        transport_exactness_status = "unknown"
+    else:
+        transport_exactness_status = "exact" if regime_ii_covariant_exact else "approximate"
 
     spd_retract_mode = getattr(cfg, "spd_retract_mode", "spd_affine")
     sigma_max = getattr(cfg, "sigma_max", 10.0)
@@ -4479,6 +4513,68 @@ def _pure_path_report(
             if spd_retraction_exact
             else "log_euclidean_projected_spectral_cap"
         )
+
+    beta_prior = get_prior_registration(getattr(cfg, "beta_attention_prior", "causal"))
+    gamma_prior = get_prior_registration(getattr(cfg, "gamma_attention_prior", "causal"))
+    causal_flags = {
+        "beta_prior_causal": beta_prior.is_causal_for_next_token_scoring(cfg),
+        "gamma_prior_causal": gamma_prior.is_causal_for_next_token_scoring(cfg),
+    }
+    on_causal_lm_path = all(causal_flags.values())
+
+    block_norm_name = getattr(cfg, "norm_type_block", "none")
+    final_norm_name = getattr(cfg, "norm_type_final", "none")
+    block_norm_registration = get_norm_registration(block_norm_name)
+    final_norm_registration = get_norm_registration(final_norm_name)
+    transport_chart_max_norm = getattr(cfg, "transport_chart_max_norm", None)
+    query_adaptive_trace_live = (
+        bool(getattr(cfg, "query_adaptive_tau", False))
+        and float(getattr(cfg, "query_tau_c", 1.0)) != 0.0
+    )
+    emission_live = (
+        getattr(cfg, "emission_mode", "off") != "off"
+        and float(getattr(cfg, "emission_weight", 0.0)) != 0.0
+    )
+
+    reflection_active = (
+        getattr(cfg, "omega_reflection", "off") != "off"
+        or getattr(cfg, "phi_reflection", "off") != "off"
+    )
+    block_count = reflection_group_component_count
+    if reflection_scope == "block_0_probe" and reflection_active:
+        effective_scope = "block_zero_only"
+        effective_subgroup = "GL(d_0) x product_{h>0} GL+(d_h)"
+        accessible_blocks = [0]
+        accessible_component_count = 2
+        total_component_count = 2 ** block_count if block_count is not None else None
+    elif reflection_active and reflection_scope == "full_element":
+        effective_scope = "full_represented_element"
+        effective_subgroup = "full_registered_reflection_extension"
+        accessible_blocks = list(range(block_count)) if block_count is not None else None
+        accessible_component_count = (
+            2 ** block_count if cfg.gauge_group == "block_glk" and block_count is not None else 2
+        )
+        total_component_count = accessible_component_count
+    elif reflection_active:
+        effective_scope = "unknown"
+        effective_subgroup = "unknown"
+        accessible_blocks = None
+        accessible_component_count = None
+        total_component_count = None
+    else:
+        effective_scope = "not_applicable"
+        effective_subgroup = "connected_component_only"
+        accessible_blocks = []
+        accessible_component_count = 1
+        total_component_count = 1
+    reflection_report = {
+        "configured_scope": reflection_scope,
+        "effective_scope": effective_scope,
+        "effective_subgroup": effective_subgroup,
+        "accessible_blocks": accessible_blocks,
+        "accessible_component_count": accessible_component_count,
+        "total_component_count": total_component_count,
+    }
 
     pure_flags = {
         "canonical_attention_entropy": bool(cfg.include_attention_entropy),
@@ -4506,6 +4602,7 @@ def _pure_path_report(
     # which are inert while RoPE is off -- those are reported in config_toggles for transparency.
     gauge_flags = {
         "learned_gauge_transport":   cfg.gauge_transport == "on",
+        "transport_gauge_equivariant": transport_registration.gauge_equivariant,
         "no_positional_rotation":    cfg.pos_rotation == "none",
         "no_model_channel_coupling": cfg.lambda_gamma == 0.0 and not cfg.s_e_step,
         "phi_parameterization":      cfg.gauge_parameterization == "phi",
@@ -4513,12 +4610,37 @@ def _pure_path_report(
         "family_group_invariant":    family_group_invariant,
         "head_mixer_intertwiner_compatible": head_mixer_gauge_compatible,
         "block_mlp_intertwiner_compatible": block_mlp_intertwiner_compatible,
+        "block_norm_gauge_equivariant": block_norm_registration.gauge_equivariant,
+        "final_norm_gauge_equivariant": final_norm_registration.gauge_equivariant,
+        "no_fixed_coordinate_spectral_cap": sigma_max is None,
+        "no_phi_mstep_chart_cap": getattr(cfg, "phi_mstep_max_matrix_norm", None) is None,
+        "no_pullback_trust_region": getattr(cfg, "m_phi_update_mode", "adamw") != "pullback_group",
+        "no_transport_exponential_clipping": (
+            transport_chart_max_norm is not None
+            and float(transport_chart_max_norm) <= float(TRANSPORT_CLAMP_MAX_NORM)
+        ),
+        "no_e_step_phi_retraction_clipping": float(getattr(cfg, "e_phi_lr", 0.0)) == 0.0,
+        "no_query_adaptive_trace_temperature": not query_adaptive_trace_live,
+        "no_fixed_basis_emission": not emission_live,
+        "no_additive_encoder_control": getattr(cfg, "encode_mode", "per_token") != "per_token_additive",
+    }
+    on_gauge_pure_path = all(gauge_flags.values())
+    theory_flags = {
+        "gauge_pure_path": on_gauge_pure_path,
+        "causal_lm_path": on_causal_lm_path,
+        "transport_exact_when_applicable": transport_exactness_status in {"exact", "not_applicable"},
     }
     return {
         "on_pure_path":       all(pure_flags.values()),
         "pure_flags":         pure_flags,
         "gauge_flags":        gauge_flags,
-        "on_gauge_pure_path": all(gauge_flags.values()),
+        "on_gauge_pure_path": on_gauge_pure_path,
+        "causal_flags":       causal_flags,
+        "on_causal_lm_path": on_causal_lm_path,
+        "transport_exactness_status": transport_exactness_status,
+        "theory_flags":       theory_flags,
+        "on_theory_pure_path": all(theory_flags.values()),
+        "reflection":         reflection_report,
         "config_toggles": {
             "include_attention_entropy":    bool(cfg.include_attention_entropy),
             "transport_mode":               cfg.transport_mode,
@@ -4528,6 +4650,9 @@ def _pure_path_report(
             "use_head_mixer":               bool(cfg.use_head_mixer),
             "use_priorbank_head_evidence_mixer": priorbank_head_evidence_mixer,
             "encode_mode":                  getattr(cfg, "encode_mode", "per_token"),
+            "beta_attention_prior":         getattr(cfg, "beta_attention_prior", "causal"),
+            "gamma_attention_prior":        getattr(cfg, "gamma_attention_prior", "causal"),
+            "t5_bidirectional":             bool(getattr(cfg, "t5_bidirectional", False)),
             "use_block_mlp":                block_mlp_active,
             "block_mlp_mode":               block_mlp_mode,
             "block_mlp_covariance":         block_mlp_covariance,
@@ -4592,6 +4717,18 @@ def _pure_path_report(
             "regime_ii_covariant_exactness": regime_ii_covariant_exactness,
             "spd_retraction_route":         spd_retraction_route,
             "spd_retraction_exact":         spd_retraction_exact,
+            "norm_type_block":              block_norm_name,
+            "norm_type_final":              final_norm_name,
+            "layernorm_affine":             bool(getattr(cfg, "layernorm_affine", False)),
+            "m_phi_update_mode":            getattr(cfg, "m_phi_update_mode", "adamw"),
+            "m_phi_group_trust_radius":      float(getattr(cfg, "m_phi_group_trust_radius", 0.1)),
+            "phi_mstep_max_matrix_norm":     getattr(cfg, "phi_mstep_max_matrix_norm", None),
+            "transport_chart_max_norm":      transport_chart_max_norm,
+            "e_phi_lr":                     float(getattr(cfg, "e_phi_lr", 0.0)),
+            "query_adaptive_tau":            bool(getattr(cfg, "query_adaptive_tau", False)),
+            "query_tau_c":                   float(getattr(cfg, "query_tau_c", 1.0)),
+            "emission_mode":                 getattr(cfg, "emission_mode", "off"),
+            "emission_weight":               float(getattr(cfg, "emission_weight", 0.0)),
             # Covariance class of the ACTIVE transport (audit C7), owned by its complete registry
             # record. An unregistered mode fails closed instead of inventing report metadata.
             "transport_covariance_class":   transport_registration.covariance_class,

@@ -2667,9 +2667,18 @@ def _cell_cfg_dict(
     return d
 
 
-def _gauge_reporting_fields(cfg: VFE3Config) -> Dict[str, object]:
+def _gauge_reporting_fields(
+    cfg: VFE3Config,
+    *,
+    executable_build=None,
+    reflection_scope=None,
+    reflection_group_component_count=None,
+) -> Dict[str, object]:
     """Return the executable gauge-purity classification carried by every ablation row."""
-    report = _pure_path_report(cfg, [])
+    report = _pure_path_report(
+        cfg, [], executable_build=executable_build, reflection_scope=reflection_scope,
+        reflection_group_component_count=reflection_group_component_count,
+    )
     toggles = report["config_toggles"]
     gauge_flags = report["gauge_flags"]
     return {
@@ -2679,6 +2688,11 @@ def _gauge_reporting_fields(cfg: VFE3Config) -> Dict[str, object]:
         "block_mlp_covariance_contract":     str(toggles["block_mlp_covariance_contract"]),
         "block_mlp_intertwiner_compatible":  bool(gauge_flags["block_mlp_intertwiner_compatible"]),
         "on_gauge_pure_path":                bool(report["on_gauge_pure_path"]),
+        "on_causal_lm_path":                 bool(report["on_causal_lm_path"]),
+        "transport_exactness_status":         str(report["transport_exactness_status"]),
+        "on_theory_pure_path":                bool(report["on_theory_pure_path"]),
+        "reflection_effective_scope":         str(report["reflection"]["effective_scope"]),
+        "reflection_accessible_component_count": report["reflection"]["accessible_component_count"],
     }
 
 
@@ -2990,7 +3004,11 @@ def run_single(
         "max_tokens":           (int(max_tokens) if max_tokens is not None else None),
         "_loaded_data_sources": loaded_data_sources,
     }
-    result.update(_gauge_reporting_fields(cfg))
+    result.update(_gauge_reporting_fields(
+        cfg, executable_build=model.executable_build,
+        reflection_scope=model.prior_bank.reflection_scope,
+        reflection_group_component_count=len(model.group.irrep_dims),
+    ))
     result.update(terminal_result)                           # primary/final/best/terminal_checkpoint headline
 
     # PB-07 opt-in: publish the per-token validation nats (the paired within-run bootstrap the
@@ -3064,7 +3082,9 @@ _CSV_COLUMNS = [
     "n_params", "target_n_params", "param_difference", "param_relative_deviation",
     "head_mixer_compatibility", "head_mixer_gauge_compatible",
     "block_mlp_structural_mode", "block_mlp_covariance_contract",
-    "block_mlp_intertwiner_compatible", "on_gauge_pure_path",
+    "block_mlp_intertwiner_compatible", "on_gauge_pure_path", "on_causal_lm_path",
+    "transport_exactness_status", "on_theory_pure_path", "reflection_effective_scope",
+    "reflection_accessible_component_count",
     # opt-in per-cell converged-state diagnostics (S2; empty unless the sweep sets collect_diagnostics)
     "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in", "gauge_resid_out",
     "rank_resid", "cov_gap", "energy_klmax_frac",
@@ -4740,6 +4760,11 @@ def run_sweep(
             "block_mlp_covariance_contract":    "unavailable",
             "block_mlp_intertwiner_compatible": False,
             "on_gauge_pure_path":               False,
+            "on_causal_lm_path":                False,
+            "transport_exactness_status":        "unknown",
+            "on_theory_pure_path":               False,
+            "reflection_effective_scope":        "unknown",
+            "reflection_accessible_component_count": None,
         })
         result["collect_diagnostics"] = diagnostic_flags["collect_diagnostics"]
         result["collect_extrapolation"] = diagnostic_flags["collect_extrapolation"]

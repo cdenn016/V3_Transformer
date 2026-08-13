@@ -458,6 +458,8 @@ class TransportRegistration:
     state_builder:              'Optional[TransportStateBuilder]'
     serialization_keys:         Tuple[str, ...]
     offdiag_serialization_keys: Tuple[str, ...]
+    gauge_equivariant:          bool
+    runtime_exactness_key:      Optional[str]
 
     def satisfies(self, requirement: str) -> bool:
         r"""Whether this transport meets a family's ``transport_requirement``."""
@@ -513,6 +515,8 @@ def register_transport(
     state_builder:              'Optional[TransportStateBuilder]' = None,
     serialization_keys:         Tuple[str, ...]                   = (),
     offdiag_serialization_keys: Tuple[str, ...]                   = (),
+    gauge_equivariant:          Optional[bool]                    = None,
+    runtime_exactness_key:      Optional[str]                     = None,
 ) -> Callable:
     """Decorator registering a transport (connection-regime) builder under ``name``.
 
@@ -571,6 +575,14 @@ def register_transport(
         )
     if not set(offdiag_serialization_keys).issubset(serialization_keys):
         raise ValueError("transport offdiag_serialization_keys must be declared serialization_keys")
+    if runtime_exactness_key is not None and (
+        not isinstance(runtime_exactness_key, str) or not runtime_exactness_key
+    ):
+        raise ValueError("transport runtime_exactness_key must be None or a nonempty string")
+    if gauge_equivariant is None:
+        # Compatibility for complete-record restore helpers written before this additive field.
+        # Unknown/custom covariance labels remain fail-closed.
+        gauge_equivariant = covariance_class in {"covariant", "covariant (flat)"}
 
     def _wrap(fn: Callable[..., TransportDict]) -> Callable[..., TransportDict]:
         if name in _TRANSPORTS and not override:
@@ -586,6 +598,8 @@ def register_transport(
             state_builder=state_builder,
             serialization_keys=serialization_keys,
             offdiag_serialization_keys=offdiag_serialization_keys,
+            gauge_equivariant=bool(gauge_equivariant),
+            runtime_exactness_key=runtime_exactness_key,
         )
         _TRANSPORTS[name] = registration
         # Compatibility views for existing hot-path membership checks. Their values are derived only
@@ -790,6 +804,7 @@ def _record_covariant_feature_exactness(
 @register_transport(
     "flat",
     covariance_class="covariant (flat)",
+    gauge_equivariant=True,
     rope_right_foldable=True,
     pair_transport_kind="coboundary",   # builds Omega_ij = U_i U_j^{-1} from ONE vertex table
 )
@@ -1012,6 +1027,8 @@ def _regime_ii_query_chunk(
 @register_transport(
     "regime_ii_covariant",
     covariance_class="covariant",
+    gauge_equivariant=True,
+    runtime_exactness_key="regime_ii_covariant_feature_exact",
     pair_transport_kind="pair_inverse",   # dense (..., N, N, K, K); invertible, not a coboundary
     needs_mu=True,
     needs_sigma=True,
@@ -1310,6 +1327,7 @@ def _build_regime_ii_link(
 @register_transport(
     "regime_ii_link_charted",
     covariance_class="covariant",
+    gauge_equivariant=True,
     rope_right_foldable=True,
     pair_transport_kind="opaque",   # DirectLinkTransport: contracts, never exposes a pairwise Omega
     state_builder=_build_regime_ii_link_state,
