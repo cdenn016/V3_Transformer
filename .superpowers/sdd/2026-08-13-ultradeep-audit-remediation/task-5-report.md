@@ -125,3 +125,121 @@ A broader Task 1/config and legacy decoder-stat consumer lane collected 321 test
 one unrelated scaling fixture failed because its own `scale_knob` test input is integer `1`, which
 reaches `getattr(cfg, name, None)` and raises `TypeError: attribute name must be string, not 'int'`.
 Task 5 does not touch `scaling.py` or that fixture; no out-of-scope repair was made.
+
+## Review remediation addendum (supersedes the original expanded-decoder closure)
+
+Task 5 review identified two Important decoder defects at report revision `d57cf024`: a wholly
+invalid family-decoder chunk contributed `log(Vc)` mass to a partially valid row, and expanded
+decoder promotion was decided from local raw-energy tiles rather than the global final-score
+ranking. The original Task 5 ledger and the earlier expanded-decoder paragraph are superseded by
+this addendum. Both findings are fixed in implementation commit
+`c07f4c1fe2ef36dadfec185cd550358e72cc1716`.
+
+### Review RED evidence
+
+Command:
+
+```powershell
+$env:CUDA_VISIBLE_DEVICES='-1'
+$env:VFE3_TEST_DEVICE='cpu'
+C:/Python314/python.exe -m pytest `
+  tests/test_ultradeep_remediation_domains_20260813.py `
+  -k "partial_invalid_vocab or global_cross_chunk or global_final_ranking" -q `
+  --junitxml=.verification/remediation-2026-08-13/task-05-review-red.xml
+```
+
+Machine-readable result: 10 tests, 10 expected failures, 0 errors, 0 skipped. The four
+partial-invalid cases returned a larger CE than the dense finite-mask oracle under both
+`decode_ce_checkpoint='never'` and `'always'` at chunk widths 2 and 3. The six ranking cases
+remained float32 for cross-chunk competitors at widths 1 and 2 and for final-score cancellations
+introduced by the unigram and head-evidence terms.
+
+### Invalid-chunk semantics
+
+`decode_ce_family_chunked` retains the graph-safe local finite placeholder, computes its local
+`logsumexp`, and then replaces the summary for a wholly invalid chunk with constant negative
+infinity before the cross-chunk reduction. The final row is zeroed only after global validity is
+known. Thus an invalid chunk contributes no vocabulary mass, while a valid target in another chunk
+remains scored. The literal value-and-gradient oracle cases report `scored_tokens=1` and
+`excluded_tokens=0`; parameters belonging only to the invalid chunk receive exactly zero gradient.
+Completely invalid rows retain the original explicit exclusion contract: finite grad-connected
+zero CE with `scored_tokens=0` and `excluded_tokens` incremented.
+
+### Global final-score interval policy
+
+The fp32 expanded matmul begins with the existing absolute bound
+
+`b_a = (2 n + 4) eps * (abs(lhs) @ abs(rhs)^T + abs(bias))`.
+
+The final-score certificate then propagates this interval through every supported transformation:
+the half-difference with the query-only term, the 1-Lipschitz zero clamp, the head-evidence delta,
+division by the effective temperature (including a temperature-rounding allowance), and the
+unigram-bias addition. Each arithmetic seam includes an explicit fp32 roundoff term. Dense
+decoding compares the nominal winner's lower endpoint against every other token's upper endpoint.
+Fused decoding emits four constant-size summaries per chunk: nominal winner score and bound,
+maximum upper endpoint, and maximum upper endpoint excluding the nominal winner. These summaries
+are combined across all chunks, so chunk width 1 cannot bypass the decision and a lower nominal
+candidate with a wider interval cannot be missed.
+
+Endpoint addition/subtraction and the overlap comparison run in float64, preventing the decision
+itself from rounding away uncertainty. If any row overlaps, the complete batch/vocabulary
+expanded decode is recomputed differentiably in float64, reusing the canonical full-covariance
+invariant kernel where applicable. The promoted result retains float64 through CE; query and
+prior-table gradients flow back to the original fp32 leaves and therefore are stored with expected
+fp32 accumulation rounding. If intervals are separated, no promoted decode is performed. A
+monkeypatched sentinel proves this non-overlap fast path for diagonal and full covariance at chunk
+widths 1 and 2; both dense logits and fused CE remain float32.
+
+### Review GREEN and preservation evidence
+
+Focused review command (the final focused artifact includes the four fast-path cases):
+
+```powershell
+C:/Python314/python.exe -m pytest `
+  tests/test_ultradeep_remediation_domains_20260813.py `
+  -k "partial_invalid_vocab or global_cross_chunk or global_final_ranking or global_interval_nonoverlap" -q `
+  --junitxml=.verification/remediation-2026-08-13/task-05-review-green-attempt4.xml
+```
+
+Result: 14 tests, 0 failures, 0 errors, 0 skipped.
+
+Final full Task 5 command:
+
+```powershell
+C:/Python314/python.exe -m pytest tests/test_cg.py tests/test_prior_bank.py `
+  tests/test_families.py tests/test_decode_nonpd_fallback_20260806.py `
+  tests/test_ultradeep_remediation_domains_20260813.py tests/test_tier12_decode.py -q `
+  --junitxml=.verification/remediation-2026-08-13/task-05-review-full-green-final.xml
+```
+
+Result: 116 tests, 0 failures, 0 errors, 0 skipped.
+
+Final Task 4 numerical-preservation command:
+
+```powershell
+C:/Python314/python.exe -m pytest tests/test_precision_policies_20260806.py `
+  tests/test_family_chunked_canonical_dispatch_20260808.py `
+  tests/test_family_chunked_workspace_20260807.py -q `
+  --junitxml=.verification/remediation-2026-08-13/task-05-review-numerical-green-final.xml
+```
+
+Result: 59 tests, 0 failures, 0 errors, 0 skipped. All commands used
+`C:/Python314/python.exe`, `CUDA_VISIBLE_DEVICES=-1`, and `VFE3_TEST_DEVICE=cpu`. The six Task 5
+Python modules plus the review fixture passed `compileall -q`; `git diff --check` was clean.
+
+Warnings were expected and unchanged in kind: the literal Renyi-alpha-1.5 fixtures emit the
+documented convex-regime warning, and adjacent model fixtures emit existing detached-oracle and
+full-covariance/linear-decode configuration warnings. No CUDA path, diagnostic pipeline, training
+run, coverage percentage, or unrelated scaling repair is claimed.
+
+### Self-review
+
+- The partial-invalid fix changes only the inter-chunk summary sentinel; local graph construction,
+  target gathering, global validity, and scored/excluded accounting remain unchanged.
+- The ranking gate uses final logits after clamp, temperature, head evidence, and unigram bias; it
+  is global across chunks and conservative for candidates whose upper bound is large.
+- The promoted branch is conditional, differentiable, mask/count identical, and shares the
+  canonical covariance invariant algebra rather than introducing a parallel full-KL policy.
+- The non-overlap sentinel tests rule out unconditional float64 recomputation.
+- No files outside `vfe3/model/prior_bank.py`, the Task 5 fixture, this report, and ignored
+  revision-bound verification artifacts were changed by the review remediation.
