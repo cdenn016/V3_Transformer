@@ -389,3 +389,98 @@ def test_global_interval_nonoverlap_keeps_fp32_fast_path(
     assert logits.dtype is torch.float32
     assert fused.ce.dtype is torch.float32
     assert int(fused.scored_tokens) == 1 and int(fused.excluded_tokens) == 0
+
+
+def _separated_expanded_bank(*, full):
+    bank = PriorBank(
+        7, 4, 1, mu_init_std=0.0,
+        family="gaussian_full" if full else "gaussian_diagonal",
+        decode_mode="full_chunked" if full else "diagonal_chunked",
+        decode_ce_checkpoint="never",
+    )
+    with torch.no_grad():
+        bank.mu_embed.copy_(torch.tensor([
+            [0.0, 0.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0, 0.0],
+            [6.0, 0.0, 0.0, 0.0],
+            [9.0, 0.0, 0.0, 0.0],
+            [12.0, 0.0, 0.0, 0.0],
+            [15.0, 0.0, 0.0, 0.0],
+            [18.0, 0.0, 0.0, 0.0],
+        ]))
+        bank.sigma_log_embed.zero_()
+    mu = torch.zeros(3, 5, 4, requires_grad=True)
+    diagonal = torch.ones(3, 5, 4, requires_grad=True)
+    sigma = torch.diag_embed(diagonal) if full else diagonal
+    return bank, mu, sigma
+
+
+@pytest.mark.parametrize("fused", [False, True])
+@pytest.mark.parametrize("full", [False, True])
+def test_nonoverlap_interval_scan_never_casts_vocab_or_chunk_tensor_to_float64(
+    monkeypatch, fused, full,
+):
+    bank, mu, sigma = _separated_expanded_bank(full=full)
+    vocab = bank.vocab_size
+    chunk = 2
+    real_double = torch.Tensor.double
+    real_to = torch.Tensor.to
+
+    def _reject_vocab_double(tensor, *args, **kwargs):
+        forbidden = {vocab, chunk}
+        if any(int(width) in forbidden for width in tensor.shape):
+            raise AssertionError(
+                f"non-overlap scan cast vocabulary/chunk tensor {tuple(tensor.shape)}")
+        return real_double(tensor, *args, **kwargs)
+
+    def _reject_vocab_to(tensor, *args, **kwargs):
+        requested_dtype = kwargs.get("dtype")
+        if args and isinstance(args[0], torch.dtype):
+            requested_dtype = args[0]
+        forbidden = {vocab, chunk}
+        if requested_dtype is torch.float64 and any(
+            int(width) in forbidden for width in tensor.shape
+        ):
+            raise AssertionError(
+                f"non-overlap scan cast vocabulary/chunk tensor {tuple(tensor.shape)}")
+        return real_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "double", _reject_vocab_double)
+    monkeypatch.setattr(torch.Tensor, "to", _reject_vocab_to)
+    if fused:
+        targets = torch.zeros(3, 5, dtype=torch.long)
+        result = (
+            bank.decode_ce_full_chunked
+            if full else bank.decode_ce_diagonal_chunked
+        )(mu, sigma, targets, chunk_size=chunk, return_stats=True)
+        result.ce.backward()
+        assert result.ce.dtype is torch.float32
+        assert int(result.scored_tokens) == 15
+    else:
+        logits = bank.decode(mu, sigma)
+        logits.sum().backward()
+        assert logits.dtype is torch.float32
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_expanded_bound_matmul_is_included_in_each_chunk_workspace_budget(
+    monkeypatch, full,
+):
+    bank, mu, sigma = _separated_expanded_bank(full=full)
+    captured = []
+
+    def _capture_gate(mode, grad_active, activation_bytes):
+        captured.append((grad_active, activation_bytes))
+        return False
+
+    monkeypatch.setattr(
+        prior_bank_module, "_decode_ce_should_checkpoint", _capture_gate)
+    targets = torch.zeros(3, 5, dtype=torch.long)
+    (bank.decode_ce_full_chunked if full else bank.decode_ce_diagonal_chunked)(
+        mu, sigma, targets, chunk_size=2)
+
+    # Each expanded chunk retains both the score and its absolute-error-bound matmul.
+    widths = [2, 2, 2, 1]
+    expected = [(True, 3 * 5 * width * 2 * 4) for width in widths]
+    assert captured == expected
+    assert max(size for _, size in captured) == 3 * 5 * 2 * 2 * 4

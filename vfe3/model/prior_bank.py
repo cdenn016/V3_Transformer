@@ -439,7 +439,23 @@ def _decode_analytic_kl_logits(
         ranking_logits = logits + bias
         bias_bound = eps * (bias.abs() + 1.0)
         bound = bound + bias_bound + eps * (logits.abs() + bias.abs())
-    return ranking_logits, bound
+    positive_inf = torch.full(
+        (), float("inf"), dtype=bound.dtype, device=bound.device)
+    return ranking_logits, torch.nextafter(bound, positive_inf)
+
+
+def _outward_lower(logits: torch.Tensor, bounds: torch.Tensor) -> torch.Tensor:
+    r"""Lower interval endpoint with one explicit outward ulp."""
+    negative_inf = torch.full(
+        (), float("-inf"), dtype=logits.dtype, device=logits.device)
+    return torch.nextafter(logits - bounds, negative_inf)
+
+
+def _outward_upper(logits: torch.Tensor, bounds: torch.Tensor) -> torch.Tensor:
+    r"""Upper interval endpoint with one explicit outward ulp."""
+    positive_inf = torch.full(
+        (), float("inf"), dtype=logits.dtype, device=logits.device)
+    return torch.nextafter(logits + bounds, positive_inf)
 
 
 def _final_ranking_uncertain(logits: torch.Tensor, bounds: torch.Tensor) -> bool:
@@ -447,15 +463,15 @@ def _final_ranking_uncertain(logits: torch.Tensor, bounds: torch.Tensor) -> bool
     if logits.shape[-1] < 2 or logits.dtype is torch.float64:
         return False
     winner = logits.argmax(dim=-1, keepdim=True)
-    winner_lower = (
-        logits.gather(-1, winner).double()
-        - bounds.gather(-1, winner).double()
-    ).squeeze(-1)
-    upper64 = logits.double() + bounds.double()
-    competitor_upper = upper64.scatter(
-        -1, winner, torch.full_like(winner, float("-inf"), dtype=torch.float64)
+    winner_score = logits.gather(-1, winner).squeeze(-1)
+    winner_bound = bounds.gather(-1, winner).squeeze(-1)
+    winner_lower = _outward_lower(winner_score, winner_bound)
+    upper = _outward_upper(logits, bounds)
+    competitor_upper = upper.scatter(
+        -1, winner, torch.full_like(winner, float("-inf"), dtype=upper.dtype)
     ).amax(dim=-1)
-    return bool((winner_lower <= competitor_upper).any())
+    # Only constant-size (B,N) summaries promote; no vocabulary-sized fp64 scan.
+    return bool((winner_lower.double() <= competitor_upper.double()).any())
 
 
 def _chunk_ranking_summary(
@@ -465,10 +481,10 @@ def _chunk_ranking_summary(
     winner = logits.argmax(dim=-1, keepdim=True)
     winner_score = logits.gather(-1, winner).squeeze(-1)
     winner_bound = bounds.gather(-1, winner).squeeze(-1)
-    upper64 = logits.double() + bounds.double()
-    max_upper = upper64.amax(dim=-1)
-    runner_upper = upper64.scatter(
-        -1, winner, torch.full_like(winner, float("-inf"), dtype=torch.float64)
+    upper = _outward_upper(logits, bounds)
+    max_upper = upper.amax(dim=-1)
+    runner_upper = upper.scatter(
+        -1, winner, torch.full_like(winner, float("-inf"), dtype=upper.dtype)
     ).amax(dim=-1)
     return winner_score, winner_bound, max_upper, runner_upper
 
@@ -485,18 +501,18 @@ def _streamed_final_ranking_uncertain(
     if vocab_size < 2 or winner_scores.dtype is torch.float64:
         return False
     winner_chunk = winner_scores.argmax(dim=-1, keepdim=True)
-    winner_lower = (
-        winner_scores.gather(-1, winner_chunk).double()
-        - winner_bounds.gather(-1, winner_chunk).double()
-    ).squeeze(-1)
+    winner_score = winner_scores.gather(-1, winner_chunk).squeeze(-1)
+    winner_bound = winner_bounds.gather(-1, winner_chunk).squeeze(-1)
+    winner_lower = _outward_lower(winner_score, winner_bound)
     chunk_ids = torch.arange(
         winner_scores.shape[-1], device=winner_scores.device)
     winning_chunk_mask = chunk_ids.view(
         *((1,) * (winner_scores.dim() - 1)), -1
     ) == winner_chunk
-    competitor_uppers = torch.where(
-        winning_chunk_mask, runner_uppers, max_uppers)
-    return bool((winner_lower <= competitor_uppers.amax(dim=-1)).any())
+    competitor_upper = torch.where(
+        winning_chunk_mask, runner_uppers, max_uppers).amax(dim=-1)
+    # Reductions happen in fp32; only the two (B,N) summaries promote for comparison.
+    return bool((winner_lower.double() <= competitor_upper.double()).any())
 
 
 # ---------------------------------------------------------------------------
@@ -2026,7 +2042,7 @@ class PriorBank(nn.Module):
             in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
             local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
             grad_active = torch.is_grad_enabled() and lhs.requires_grad
-            activation_bytes = _decode_ce_chunk_activation_bytes(lhs, v1 - v0)
+            activation_bytes = _decode_ce_chunk_activation_bytes(lhs, v1 - v0, inner=2)
             if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
                 (lse_chunk, contrib, ranking_chunk, bound_chunk,
                  max_upper, runner_upper) = _checkpoint.checkpoint(
@@ -2328,7 +2344,7 @@ class PriorBank(nn.Module):
             in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
             local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
             grad_active = torch.is_grad_enabled() and lhs.requires_grad
-            activation_bytes = _decode_ce_chunk_activation_bytes(lhs, v1 - v0)
+            activation_bytes = _decode_ce_chunk_activation_bytes(lhs, v1 - v0, inner=2)
             if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
                 (lse_chunk, contrib, ranking_chunk, bound_chunk,
                  max_upper, runner_upper) = _checkpoint.checkpoint(
