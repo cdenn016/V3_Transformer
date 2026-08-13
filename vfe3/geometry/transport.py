@@ -18,7 +18,7 @@ from torch import nn
 from vfe3.families.base import _logdet_chol
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.lie_ops import CompactBlockElement, _equal_diag_blocks
-from vfe3.numerics import safe_cholesky
+from vfe3.numerics import safe_cholesky, validated_cholesky_solve
 
 if TYPE_CHECKING:
     from vfe3.config import VFE3Config
@@ -1453,24 +1453,33 @@ def full_cov_congruence_precision() -> str:
     return _FULL_COV_CONGRUENCE_PRECISION
 
 
-def _escalate_congruence_if_nonfinite(
+def _validate_and_escalate_congruence(
     out:     torch.Tensor,               # contraction result at the working dtype
     work:    torch.dtype,                # the dtype it was contracted in
     recompute: "Callable[[torch.dtype], torch.Tensor]",
-) -> torch.Tensor:
-    r"""Redo a float32 congruence in float64 when it lost finiteness; inert on the float64 policy.
+) -> 'tuple[torch.Tensor, bool]':
+    r"""Accept only certified SPD congruences; otherwise recompute and retain float64.
 
-    The congruence SQUARES cond(Omega), so a float32 contraction can overflow where a float64 one
-    would not. Non-PD-ness is deliberately NOT the trigger: the downstream KL's ``safe_cholesky``
-    already owns that, and an SPD test here would need a Cholesky over the whole (B*N*N, K, K) grid
-    -- more expensive than the contraction it guards. On the default "fp64" policy this returns
-    immediately without a sync, so the historical path is untouched.
+    Certification is zero-jitter: finiteness alone cannot accept a symmetric-but-indefinite or
+    accuracy-uncertain covariance. ``bool`` reports whether the result was escalated, so callers
+    retain float64 only after a failed fast representation while preserving the historical cast for
+    a deliberately selected unconditional-fp64 policy.
     """
+    certificate = validated_cholesky_solve(out)
+    if bool(certificate.certified.all()):
+        return out, False
     if work is torch.float64:
-        return out
-    if bool(torch.isfinite(out).all()):
-        return out
-    return recompute(torch.float64).to(work)
+        raise FloatingPointError(
+            "float64 congruence could not be certified as finite, symmetric, zero-jitter SPD "
+            "within the residual and conditioning bounds")
+    high_precision = recompute(torch.float64)
+    high_certificate = validated_cholesky_solve(high_precision)
+    if not bool(high_certificate.certified.all()):
+        raise FloatingPointError(
+            "congruence failed fast validation and its float64 recomputation could not be "
+            "certified as finite, symmetric, zero-jitter SPD within the residual and "
+            "conditioning bounds")
+    return high_precision, True
 
 
 def _congruence_compute_dtype(source_dtype: torch.dtype) -> torch.dtype:
@@ -2538,11 +2547,11 @@ def transport_covariance(
     work = _congruence_compute_dtype(sigma.dtype)          # fp64 by default; see the policy above
     out = torch.einsum("...ijkl,...jlm,...ijnm->...ijkn",
                        omega.to(work), sigma.to(work), omega.to(work))
-    out = _escalate_congruence_if_nonfinite(
+    out, escalated = _validate_and_escalate_congruence(
         out, work,
         lambda hi: torch.einsum("...ijkl,...jlm,...ijnm->...ijkn",
                                 omega.to(hi), sigma.to(hi), omega.to(hi)))
-    return out if retain_full_precision else out.to(sigma.dtype)
+    return out if retain_full_precision or escalated else out.to(sigma.dtype)
 
 
 def transport_scale(
@@ -2832,11 +2841,11 @@ def _compact_head_block_congruence(
     out = torch.einsum(                                            # (..., Ni, Nj, H, d, d)
         "...ijhkl,...jhlm,...ijhnm->...ijhkn",
         omega_blocks, sigma_diag.to(work), omega_blocks)
-    out = _escalate_congruence_if_nonfinite(
+    out, escalated = _validate_and_escalate_congruence(
         out, work,
         lambda hi: torch.einsum("...ijhkl,...jhlm,...ijhnm->...ijhkn",
                                 omega_blocks.to(hi), sigma_diag.to(hi), omega_blocks.to(hi)))
-    return out.to(sigma.dtype)
+    return out if escalated else out.to(sigma.dtype)
 
 
 def _resolve_compact_for_head_blocks(
@@ -2964,11 +2973,14 @@ def _compact_factored_full_covariance(
     out = torch.einsum(
         "...ijhkl,...jhlgm,...ijgnm->...ijhkgn",
         omega_blocks, sigma_blocks.to(work), omega_blocks)
-    out = _escalate_congruence_if_nonfinite(
+    out = out.reshape(*out.shape[:-4], factored.K, factored.K)
+    out, escalated = _validate_and_escalate_congruence(
         out, work,
-        lambda hi: torch.einsum("...ijhkl,...jhlgm,...ijgnm->...ijhkgn",
-                                omega_blocks.to(hi), sigma_blocks.to(hi), omega_blocks.to(hi)))
-    return out.reshape(*out.shape[:-4], factored.K, factored.K).to(sigma.dtype)
+        lambda hi: torch.einsum(
+            "...ijhkl,...jhlgm,...ijgnm->...ijhkgn",
+            omega_blocks.to(hi), sigma_blocks.to(hi), omega_blocks.to(hi),
+        ).reshape(*out.shape))
+    return out if escalated else out.to(sigma.dtype)
 
 
 def _factored_per_head_mean(

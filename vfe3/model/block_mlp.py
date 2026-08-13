@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from vfe3.contracts import BlockMLPBuildMetadata, CanonicalFrameContext
+from vfe3.numerics import validated_cholesky_solve
 
 
 _ACTIVATIONS = {
@@ -185,10 +186,28 @@ class GaugeGateBlockMLP(nn.Module):
             stop = start + dim
             mu_h = mu[..., start:stop]
             sigma_hh = sigma[..., start:stop, start:stop]
-            solved = torch.linalg.solve(sigma_hh, mu_h.unsqueeze(-1)).squeeze(-1)
+            rhs = mu_h.unsqueeze(-1)
+            checked = validated_cholesky_solve(sigma_hh, rhs)
+            if bool(checked.certified.all()):
+                assert checked.solution is not None
+                solved = checked.solution.squeeze(-1)
+            elif sigma_hh.dtype is torch.float64:
+                raise FloatingPointError(
+                    "GaugeGate Mahalanobis system could not be certified in float64")
+            else:
+                high = validated_cholesky_solve(sigma_hh.double(), rhs.double())
+                if not bool(high.certified.all()):
+                    raise FloatingPointError(
+                        "GaugeGate Mahalanobis system could not be certified after float64 "
+                        "escalation")
+                assert checked.solution is not None and high.solution is not None
+                solved = torch.where(
+                    checked.certified.unsqueeze(-1).unsqueeze(-1),
+                    checked.solution.double(), high.solution,
+                ).squeeze(-1)
             mu_blocks.append(mu_h)
             sigma_solutions.append(solved)
-            invariants.append((mu_h * solved).sum(dim=-1))
+            invariants.append((mu_h.to(solved.dtype) * solved).sum(dim=-1))
             start = stop
         return torch.stack(invariants, dim=-1), mu_blocks, sigma_solutions
 
@@ -198,16 +217,24 @@ class GaugeGateBlockMLP(nn.Module):
         *,
         need_jacobian: bool,
     ) -> 'tuple[torch.Tensor, Optional[torch.Tensor]]':
-        hidden_pre = self.fc1(invariants)
-        raw_gates = self.fc2(self.activation(hidden_pre))
+        hidden_pre = torch.nn.functional.linear(
+            invariants,
+            self.fc1.weight.to(invariants.dtype),
+            self.fc1.bias.to(invariants.dtype),
+        )
+        raw_gates = torch.nn.functional.linear(
+            self.activation(hidden_pre),
+            self.fc2.weight.to(hidden_pre.dtype),
+            self.fc2.bias.to(hidden_pre.dtype),
+        )
         if not need_jacobian:
             return self.dropout(raw_gates), None
         dropout_scale = _dropout_scale(self.dropout, raw_gates)
         dgate_ds = torch.einsum(
             "oh,...h,hi->...oi",
-            self.fc2.weight,
+            self.fc2.weight.to(hidden_pre.dtype),
             _activation_derivative(self.activation_name, hidden_pre),
-            self.fc1.weight,
+            self.fc1.weight.to(hidden_pre.dtype),
         )
         return dropout_scale * raw_gates, dropout_scale.unsqueeze(-1) * dgate_ds
 
@@ -238,20 +265,21 @@ class GaugeGateBlockMLP(nn.Module):
             return BlockMLPMomentResult(mu_out, sigma, None)
 
         K = mu.shape[-1]
-        jacobian = torch.zeros(*mu.shape[:-1], K, K, dtype=mu.dtype, device=mu.device)
+        jacobian = torch.zeros(
+            *mu.shape[:-1], K, K, dtype=gates.dtype, device=mu.device)
         row_start = 0
         for out_index, (out_dim, mu_h) in enumerate(zip(self.irrep_dims, mu_blocks)):
             row_stop = row_start + out_dim
             jacobian[..., row_start:row_stop, row_start:row_stop] = \
                 (1.0 + gates[..., out_index]).unsqueeze(-1).unsqueeze(-1) \
-                * torch.eye(out_dim, dtype=mu.dtype, device=mu.device)
+                * torch.eye(out_dim, dtype=gates.dtype, device=mu.device)
             col_start = 0
             for in_index, (in_dim, solved) in enumerate(
                     zip(self.irrep_dims, sigma_solutions)):
                 col_stop = col_start + in_dim
                 cross = torch.einsum(
                     "...i,...,...j->...ij",
-                    mu_h,
+                    mu_h.to(jacobian.dtype),
                     dgate_ds[..., out_index, in_index],
                     2.0 * solved,
                 )
@@ -260,7 +288,10 @@ class GaugeGateBlockMLP(nn.Module):
                 col_start = col_stop
             row_start = row_stop
         return BlockMLPMomentResult(
-            mu_out, _delta_covariance(jacobian, sigma, self.covariance_floor), jacobian)
+            mu_out,
+            _delta_covariance(jacobian, sigma.to(jacobian.dtype), self.covariance_floor),
+            jacobian,
+        )
 
 
 class CanonicalFrameBlockMLP(BlockMLP):

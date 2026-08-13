@@ -14,7 +14,7 @@ guards that activate only when the pure path fails, and they are documented as s
 
 import weakref
 from collections import OrderedDict
-from typing import Callable, Dict, List, Literal, Optional, Tuple
+from typing import Callable, Dict, List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -502,6 +502,131 @@ def safe_eigh(
     evals = torch.cat([p.eigenvalues for p in parts], dim=0).reshape(*matrix.shape[:-1])
     evecs = torch.cat([p.eigenvectors for p in parts], dim=0).reshape(matrix.shape)
     return evals, evecs
+
+
+class ValidatedCholeskySolve(NamedTuple):
+    r"""Zero-jitter Cholesky result plus explicit numerical-validity evidence."""
+
+    factor: torch.Tensor
+    solution: Optional[torch.Tensor]
+    certified: torch.Tensor
+    condition: torch.Tensor
+    symmetry_residual: torch.Tensor
+    factor_residual: torch.Tensor
+    solve_residual: torch.Tensor
+
+
+def validated_cholesky_solve(
+    matrix: torch.Tensor,                 # (..., K, K) candidate SPD system
+    rhs: Optional[torch.Tensor] = None,   # (..., K, R), when a checked solve is required
+
+    *,
+    residual_tol: Optional[float] = None,
+    condition_limit: Optional[float] = None,
+) -> ValidatedCholeskySolve:
+    r"""Factor and optionally solve an SPD system, certifying the unjittered result per row.
+
+    The shared defaults are dtype- and dimension-aware: residuals must be at most ``64 K eps`` and
+    the spectral condition number at most ``1 / (64 K eps)`` for matrix dimension ``K``. The
+    dimension factor accounts for accumulated inner-product error. Matrix symmetry and Cholesky
+    reconstruction use max-entry residuals normalized by ``max(abs(A))``. The solve uses the
+    normwise backward error ``max(abs(A x - b)) / (||A||_inf max(abs(x)) + max(abs(b)))``. No ridge,
+    symmetrizing projection, or eigenvalue floor changes the returned semantics; symmetrization is
+    used only after the original asymmetry has been measured and bounded.
+    """
+    if matrix.dim() < 2 or matrix.shape[-1] != matrix.shape[-2]:
+        raise ValueError(
+            "validated_cholesky_solve requires square trailing matrix axes, got "
+            f"shape {tuple(matrix.shape)}")
+    if matrix.dtype not in (torch.float32, torch.float64):
+        raise ValueError(
+            "validated_cholesky_solve requires float32 or float64 input, got "
+            f"{matrix.dtype}")
+    if rhs is not None and (
+        rhs.dim() < 2
+        or rhs.shape[:-2] != matrix.shape[:-2]
+        or rhs.shape[-2] != matrix.shape[-1]
+    ):
+        raise ValueError(
+            "validated_cholesky_solve rhs must have shape (..., K, R) matching matrix "
+            f"shape {tuple(matrix.shape)}, got {tuple(rhs.shape)}")
+
+    eps = torch.finfo(matrix.dtype).eps
+    dimension_factor = 64.0 * float(matrix.shape[-1])
+    residual_tol = dimension_factor * eps if residual_tol is None else float(residual_tol)
+    condition_limit = 1.0 / (dimension_factor * eps) \
+        if condition_limit is None else float(condition_limit)
+    if residual_tol < 0.0 or condition_limit < 1.0:
+        raise ValueError(
+            "validated_cholesky_solve requires residual_tol >= 0 and condition_limit >= 1, "
+            f"got residual_tol={residual_tol!r}, condition_limit={condition_limit!r}")
+
+    symmetric = _symmetrize(matrix)
+    factor, info = torch.linalg.cholesky_ex(symmetric)
+    factor_ok = info == 0
+    solution: Optional[torch.Tensor] = None
+    if rhs is not None:
+        eye = torch.eye(matrix.shape[-1], dtype=matrix.dtype, device=matrix.device)
+        usable_factor = torch.where(
+            factor_ok.unsqueeze(-1).unsqueeze(-1), factor, eye)
+        solution = torch.cholesky_solve(rhs, usable_factor)
+
+    with torch.no_grad():
+        detached = matrix.detach()
+        detached_symmetric = symmetric.detach()
+        matrix_finite = torch.isfinite(detached).all(dim=(-2, -1))
+        eye = torch.eye(matrix.shape[-1], dtype=matrix.dtype, device=matrix.device)
+        spectral_input = torch.where(
+            matrix_finite.unsqueeze(-1).unsqueeze(-1), detached_symmetric, eye)
+        eigenvalues = safe_eigvalsh(spectral_input)
+        lam_min = eigenvalues[..., 0]
+        condition = eigenvalues[..., -1] / lam_min.clamp_min(torch.finfo(matrix.dtype).tiny)
+        condition = torch.where(
+            lam_min > 0.0, condition, condition.new_full((), float("inf")))
+
+        matrix_scale = detached.abs().amax(dim=(-2, -1)).clamp_min(
+            torch.finfo(matrix.dtype).tiny)
+        symmetry_residual = (
+            detached - detached.transpose(-1, -2)
+        ).abs().amax(dim=(-2, -1)) / matrix_scale
+        factor_residual = (
+            factor.detach() @ factor.detach().transpose(-1, -2) - detached_symmetric
+        ).abs().amax(dim=(-2, -1)) / matrix_scale
+
+        solve_residual = torch.zeros_like(condition)
+        solution_finite = torch.ones_like(factor_ok)
+        if rhs is not None and solution is not None:
+            detached_rhs = rhs.detach()
+            detached_solution = solution.detach()
+            solution_finite = torch.isfinite(detached_solution).all(dim=(-2, -1))
+            numerator = (
+                detached_symmetric @ detached_solution - detached_rhs
+            ).abs().amax(dim=(-2, -1))
+            denominator = (
+                detached_symmetric.abs().sum(dim=-1).amax(dim=-1)
+                * detached_solution.abs().amax(dim=(-2, -1))
+                + detached_rhs.abs().amax(dim=(-2, -1))
+            ).clamp_min(torch.finfo(matrix.dtype).tiny)
+            solve_residual = numerator / denominator
+
+        certified = (
+            matrix_finite
+            & factor_ok
+            & torch.isfinite(factor.detach()).all(dim=(-2, -1))
+            & solution_finite
+            & torch.isfinite(condition)
+            & (condition <= condition_limit)
+            & torch.isfinite(symmetry_residual)
+            & (symmetry_residual <= residual_tol)
+            & torch.isfinite(factor_residual)
+            & (factor_residual <= residual_tol)
+            & torch.isfinite(solve_residual)
+            & (solve_residual <= residual_tol)
+        )
+
+    return ValidatedCholeskySolve(
+        factor, solution, certified, condition, symmetry_residual,
+        factor_residual, solve_residual)
 
 
 def floor_eigenvalues(
