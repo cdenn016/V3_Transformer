@@ -117,3 +117,52 @@ No test failure or error was hidden by these warnings.
 - Confirmed reflection scope comes from the instantiated PriorBank at both run finalizers and in actual ablation execution.
 - Confirmed old report keys and diagnostic execution remain intact.
 - Confirmed `git diff --check` and `git diff --cached --check` were clean before the implementation commit.
+
+## Review Correction Pass
+
+Review-fix date: 2026-08-13
+
+Correction commit: `5b53186b4741abc79a2b4b1148e323dc15192fa8`
+
+The Task 3 review identified one critical and three important gaps. All four are corrected:
+
+- `theory_flags` now transparently contains every named legacy `pure_flags` requirement plus `gauge_pure_path`, `causal_lm_path`, and `transport_exact_when_applicable`. `on_theory_pure_path` is their full conjunction; no opaque legacy aggregate substitutes for the individual keys.
+- Successful ablation rows pass `artifacts.history` into certificate derivation. Fresh-result and cached-result merges fill only absent defaults and preserve persisted execution-derived evidence. Aggregation validates the persisted exactness vocabulary and runtime-derived field types instead of comparing them to empty-history defaults.
+- The existing `tests/test_reporting_additions.py` consumer fixture is genuinely gauge-pure: no fixed spectral cap, a fail-closed pre-clamp transport bound, inert clipping/adaptive/emission/encoder seams, and explicit compatible metadata. It asserts the old schema as a subset plus the additive certificate keys.
+- The gauge truth table now pins the complete 19-key `gauge_flags` set. One active seam is flipped per row, including both norms, spectral and M-step caps, pullback trust, missing/over-limit exponential bounds, E-step phi retraction, adaptive trace temperature, fixed-basis emission, additive encoding, transport metadata, immutable BlockMLP metadata, and every preexisting gauge facet. Transport and norm override/restore behavior is exercised against the active registration/callable.
+
+Theory tests flip each enumerated legacy requirement and assert the exact failed `theory_flags` key set. The three additive facets also have exact failed-key cases. Transport exactness cannot be made inapplicable-false while retaining the legacy `flat_transport` requirement, so the incomplete covariant case transparently reports both failed keys rather than concealing that logical coupling.
+
+### Review RED
+
+```powershell
+$env:CUDA_VISIBLE_DEVICES='-1'; $env:VFE3_TEST_DEVICE='cpu'; & 'C:/Python314/python.exe' -m pytest -q tests/test_ultradeep_remediation_certificates_20260813.py tests/test_reporting_additions.py::test_pure_path_report_structure_and_flags tests/test_ablation_tackon.py::test_success_and_cached_resume_preserve_runtime_certificate_history --junitxml=.verification/remediation-2026-08-13/task-03-review-red.xml
+```
+
+Machine-readable result: 67 tests, 18 failures, 0 errors, 0 skipped. The expected failures were 11 legacy theory-requirement rows, one transparent theory-key-set assertion, three successful history cases, and three fresh/cache-resume cases.
+
+### Review GREEN
+
+Focused correction lane: 67 tests, 67 passed, 0 failed/errors/skipped (`task-03-review-focused-green.xml`).
+
+Expanded reporting and resume consumers: 184 tests, 184 passed, 0 failed/errors/skipped (`task-03-review-consumers-green.xml`).
+
+Full expanded Task 3 lane:
+
+```powershell
+$env:CUDA_VISIBLE_DEVICES='-1'; $env:VFE3_TEST_DEVICE='cpu'; & 'C:/Python314/python.exe' -m pytest -q tests/test_run_artifacts.py tests/test_validated_geometry_numerics_20260713.py tests/test_tier12_attention.py tests/test_ultradeep_remediation_certificates_20260813.py tests/test_ablation_reporting.py tests/test_reporting_additions.py tests/test_ablation_tackon.py tests/test_ablation_artifact_resume_20260712.py --junitxml=.verification/remediation-2026-08-13/task-03-review-full-green.xml
+```
+
+Machine-readable result: 271 tests, 270 passed, 0 failures, 0 errors, 1 expected slow skip. The skipped test remains `test_train_with_artifacts_writes_attention_pngs`, which requires `--runslow`.
+
+Active registry compatibility: 89 tests, 89 passed, 0 failures/errors/skips (`task-03-review-registry-green.xml`).
+
+Warnings remained expected and disclosed: intentional query-adaptive GL-breaking; inert-setting `ConfigNotice` instances in fixture sweeps; tiny-run parameter-motion warnings; the deliberate covariant/full-family numerical warning in the three certificate-history fixtures; and the preexisting one-step resume config-drift warning. No warning hid a failure or error.
+
+### Review Self-Check
+
+- Negative runtime exactness evidence still dominates missing rows (`approximate`); incomplete evidence without a negative remains `unknown`; complete affirmative history is `exact`.
+- Cache reuse preserves persisted runtime-derived certificate values and refuses malformed/missing runtime-derived fields during aggregation.
+- Pre-run and failure rows remain conservatively reconstructed without runtime history.
+- Causality remains independent of gauge purity; reflection metadata and the four-value exactness enum are unchanged.
+- No diagnostic configuration was rejected, and the A01/A02 provenance waiver remains unchanged.
