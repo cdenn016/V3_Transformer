@@ -66,3 +66,50 @@ The final evidence is CPU-only as required; no GPU lane was run.
 - Tests use direct float64 mathematical oracles rather than the helper under test.
 - The only source files changed are `vfe3/numerics.py`, `vfe3/geometry/transport.py`, and
   `vfe3/model/block_mlp.py`; regression changes are limited to the two Task 4 test modules.
+
+## Review remediation
+
+Review findings C1, I1, and M1 were remediated in implementation commit
+`b4145eafeea5757c95d818e3a5a93a7a8bebed3a` (`fix: certify all covariance transport routes`).
+
+### Review RED evidence
+
+CPU-only command environment remained `C:/Python314/python.exe`, `CUDA_VISIBLE_DEVICES=-1`, and
+`VFE3_TEST_DEVICE=cpu`.
+
+- `.verification/remediation-2026-08-13/task-04-review-red.xml`: 29 tests, 10 failures, 0 errors,
+  0 skipped. The failures isolated the unchecked DirectLinkTransport, equal-block FactoredTransport,
+  heterogeneous FactoredTransport, and RoPE-over-direct full-covariance routes, plus all six NaN or
+  infinite custom-bound cases. Dense, compact, other wrapper controls, mixed GaugeGate rows, and the
+  float64 fail-visible branch passed before the production repair.
+
+### Review implementation
+
+- `_certify_full_congruence` is now the single authoritative post-congruence acceptance and dtype
+  boundary for dense, DirectLink, compact head-block, compact full, equal-block factored, and
+  heterogeneous factored routes. RoPE wrappers reach the same boundary through their base route.
+- Direct and factored contractions now use the selected fast working dtype first. They no longer
+  cast unchecked structural results back to the source dtype. A certified benign fp32 result stays
+  fp32; failed fp32 recomputes and remains float64; failed float64 raises `FloatingPointError`.
+- Public container output shapes and existing wrapper semantics are preserved. Parameterized tests
+  cover ten dense/container/wrapper routes for both benign fast and finite-but-indefinite inputs.
+- `validated_cholesky_solve` now rejects NaN, positive infinity, and negative infinity for both
+  custom bounds before applying the existing range checks. A non-identity SPD matrix pins a real,
+  positive normalized factor residual violation at zero tolerance.
+- The stale `fp32_escalate` comment now documents the finite, symmetric, zero-jitter Cholesky,
+  residual, and conditioning certificate rather than finiteness-only escalation.
+
+### Review GREEN evidence
+
+- `.verification/remediation-2026-08-13/task-04-review-focused-green.xml`: 29 tests, 0 failures,
+  0 errors, 0 skipped.
+- `.verification/remediation-2026-08-13/task-04-review-green.xml`: 186 tests, 0 failures, 0 errors,
+  0 skipped across the requested Task 4 modules and dense/direct/compact/factored/RoPE structural
+  wrapper regressions.
+- `C:/Python314/python.exe -m compileall -q` passed for all four changed Python files, and
+  `git diff --check` reported no whitespace errors.
+
+The full structural lane emitted 16 pre-existing configuration/oracle warnings from
+`test_exact_congruence_family.py`, `test_p1_compact_phi_block_transport_20260711.py`, and
+`test_audit_transport_registry_20260720.py`; none concern numerical certification or this diff.
+No GPU lane was run, as required.
