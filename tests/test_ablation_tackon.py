@@ -1055,7 +1055,7 @@ def test_main_records_global_figure_invalidation_failure_and_returns_nonzero(
         "max_steps":  None,
     }.items():
         monkeypatch.setitem(ablation.CONFIG, key, value)
-    monkeypatch.setattr(ablation, "validate_sweeps", lambda _names: None)
+    monkeypatch.setattr(ablation, "validate_sweeps", lambda _names, **_kwargs: None)
     monkeypatch.setattr(
         ablation,
         "_run_ablation_figures_isolated",
@@ -1095,7 +1095,7 @@ def test_main_records_requested_render_failure_and_returns_nonzero(
         "max_steps":  None,
     }.items():
         monkeypatch.setitem(ablation.CONFIG, key, value)
-    monkeypatch.setattr(ablation, "validate_sweeps", lambda _names: None)
+    monkeypatch.setattr(ablation, "validate_sweeps", lambda _names, **_kwargs: None)
     monkeypatch.setattr(
         ablation,
         "_cross_sweep_cohort_identity",

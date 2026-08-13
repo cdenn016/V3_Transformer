@@ -1360,6 +1360,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # alpha form (diagonal-only), both of which a naive single-field sweep would have rejected.
     "covariance": {
         "description": "belief covariance structure (diagonal vs full Gaussian)",
+        "requires": {"decode_mode": "family_chunked"},
         "configs": [
             {"label": "diagonal", "family": "gaussian_diagonal"},
             {"label": "full",     "family": "gaussian_full", "e_step_update": "gradient",
@@ -1437,7 +1438,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
             {"label": "renyi_order=1.5", "renyi_order": 1.5, "e_step_update": "gradient"},
             {"label": "renyi_order=2.0", "renyi_order": 2.0, "e_step_update": "gradient"},
         ],
-        "requires": {"oracle_unroll_grad": True},
+        "requires": {"oracle_unroll_grad": True, "decode_mode": "family_chunked"},
         "collect_diagnostics": True,
     },
 
@@ -2368,7 +2369,7 @@ def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True
             valid_candidates = 0
             for index, overrides in enumerate(_parameter_grid_overrides(SWEEPS[name])):
                 try:
-                    VFE3Config(**{**BASELINE_CONFIG, **overrides})
+                    VFE3Config(**{**_resolved_sweep_baseline(), **overrides})
                     valid_candidates += 1
                 except (TypeError, ValueError):
                     pass
@@ -2407,7 +2408,7 @@ def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True
         }
         abstain_per_arm: List[set] = []
         for label, overrides in runs:
-            cfg = dict(BASELINE_CONFIG)
+            cfg = _resolved_sweep_baseline()
             cfg.update(overrides)
             try:
                 # An INERT arm is a silent measurement failure, not a construction failure: the run
@@ -2571,44 +2572,22 @@ def make_run_overrides(sweep_name: str) -> List[Tuple[str, Dict[str, Any]]]:
         param = sweep["param"]
         for value in _sweep_values(sweep):
             runs.append((f"{param}={value}", {**requires, param: value}))
-    return [(label, _repair_arm_prerequisites(overrides)) for label, overrides in runs]
+    return runs
 
 
-# The three toggles pos_phi_compose='group_product' requires (config.py rejects any other value of
-# them alongside it). Kept next to the repair so the two cannot drift apart.
-_GROUP_PRODUCT_REQUIRES = {
-    "gauge_parameterization": "phi",
-    "transport_mode":         "flat",
-    "s_frame_mode":           "tied",
-}
+def _resolved_sweep_baseline() -> Dict[str, Any]:
+    r"""Return the one broadly compatible baseline used before applying every sweep arm.
 
-
-def _repair_arm_prerequisites(overrides: Dict[str, Any]) -> Dict[str, Any]:
-    r"""Downgrade baseline settings an arm's own overrides have made invalid.
-
-    ``pos_phi_compose='group_product'`` is the exact positional composition -- it forms the frame as
-    the true product ``exp(X) exp(Y)`` instead of a truncated-BCH single coordinate -- but it is
-    admissible ONLY with ``gauge_parameterization='phi'``, ``transport_mode='flat'`` and
-    ``s_frame_mode='tied'``. Sweeps exist to vary precisely those three, so once the BASELINE carries
-    group_product every such arm becomes unconstructible: 26 arms across seven sweeps failed
-    ``validate_sweeps`` this way. Since group_product is a property of the baseline rather than of
-    those arms, the arm keeps its swept dimension and falls back to the ordinary ``'bch'`` chart,
-    which every configuration accepts. Arms that set ``pos_phi_compose`` explicitly are left alone,
-    so the dedicated ``pos_phi_composition`` sweep still contrasts the two charts directly.
-
-    Returned as a NEW dict; the sweep declarations are never mutated.
+    ``BASELINE_CONFIG`` remains the user's explicit click-to-run declaration, including any
+    ``group_product`` selection. That chart is intentionally narrow, however, and cannot be
+    inherited by arms that vary its prerequisites. Resolve the common sweep baseline once, before
+    expansion, so labels and arm overrides state only their declared contrast; an arm that wants
+    group-product composition must still declare it explicitly.
     """
-    if overrides.get("pos_phi_compose", BASELINE_CONFIG.get("pos_phi_compose")) != "group_product":
-        return overrides
-    if "pos_phi_compose" in overrides:            # an explicit arm choice is authoritative
-        return overrides
-    conflicting = [
-        field for field, required in _GROUP_PRODUCT_REQUIRES.items()
-        if overrides.get(field, BASELINE_CONFIG.get(field)) != required
-    ]
-    if not conflicting:
-        return overrides
-    return {**overrides, "pos_phi_compose": "bch"}
+    resolved = copy.deepcopy(BASELINE_CONFIG)
+    if resolved.get("pos_phi_compose") == "group_product":
+        resolved["pos_phi_compose"] = "bch"
+    return resolved
 
 
 # =============================================================================
@@ -2683,7 +2662,7 @@ def _cell_cfg_dict(
     Single source of truth for cell construction, shared by ``run_single`` and the resume
     staleness check so the cached-config comparison is faithful.
     """
-    d = copy.deepcopy(BASELINE_CONFIG)
+    d = _resolved_sweep_baseline()
     d.update(overrides)
     d["checkpoint_interval"] = 0                             # no per-cell step_N.pt blowup
     d["seed"] = _require_exact_seed(seed, "seed")

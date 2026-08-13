@@ -327,7 +327,7 @@ class VFE3Config:
     # axis. The theoretically PURE no-composition path is "none". Validated against the pos_phi
     # registry.
     pos_phi:                   str             = "learned"   # "none" | "learned" | "frozen"
-    pos_phi_compose:           str             = "group_product"       # composition chart: bch (default) | euclidean
+    pos_phi_compose:           str             = "bch"                 # composition chart: bch (default) | euclidean
     
     bch_pe_order:              int             = 4           # BCH Dynkin truncation order (compose_phi order) 4 is just as good as 6
     bch_residual_max:          Optional[float] = None        # opt-in fail-closed BCH/group-product relative residual
@@ -611,7 +611,7 @@ class VFE3Config:
     use_prior_bank:            bool  = False
     decode_bias:               bool  = False  # use_prior_bank=False only: learned per-vocab log-unigram bias on logits=mu_q@W^T+b (zero-init, weight-decay-free). Inert (warns) under use_prior_bank=True.
    
-    decode_tau:                float = 0.01
+    decode_tau:                float = 1.0
     decode_mode:               str   = "diagonal_chunked"    #"full_chunked", "diagonal_chunked", "expected_liklihood_chunked", "diagonal_untied", "full"
     
     # decode_chunk_size: vocabulary-chunk width V is iterated over by the fused CE kernels (the
@@ -3993,6 +3993,16 @@ def migrate_serialized_config(
             )
 
     migrated = {key: value for key, value in raw_config.items() if key in known}
+    # These fields were absent from older serialized-config schemas. Their historical values are
+    # deliberately declared here, rather than inherited from the current dataclass defaults: a
+    # future reusable-default change must not reinterpret an existing checkpoint.
+    _LEGACY_SERIALIZED_DEFAULTS = {
+        "pos_phi_compose": "bch",
+        "decode_tau": 1.0,
+        "decode_ce_checkpoint": "always",
+    }
+    for field_name, historical_value in _LEGACY_SERIALIZED_DEFAULTS.items():
+        migrated.setdefault(field_name, historical_value)
     migrated.setdefault("m_phi_update_mode", "adamw")
     bool_fields = {
         name for name, field in config_fields.items()
