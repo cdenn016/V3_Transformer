@@ -243,3 +243,101 @@ run, coverage percentage, or unrelated scaling repair is claimed.
 - The non-overlap sentinel tests rule out unconditional float64 recomputation.
 - No files outside `vfe3/model/prior_bank.py`, the Task 5 fixture, this report, and ignored
   revision-bound verification artifacts were changed by the review remediation.
+
+## Performance-contract addendum (supersedes the review interval-scan closure)
+
+A subsequent performance review found that the interval logic fixed in `c07f4c1` cast complete
+`(B,N,V)` dense logits/bounds and `(B,N,Vc)` fused chunk tensors to float64 before reducing them.
+That preserved correctness but violated the non-overlap workspace contract. The performance defect
+is fixed in implementation commit `e0e1ecd`.
+
+### Performance RED
+
+```powershell
+C:/Python314/python.exe -m pytest `
+  tests/test_ultradeep_remediation_domains_20260813.py `
+  -k "never_casts_vocab_or_chunk or bound_matmul_is_included" -q `
+  --junitxml=.verification/remediation-2026-08-13/task-05-performance-red.xml
+```
+
+Machine-readable result: 6 tests, 6 expected failures, 0 errors, 0 skipped. Four execution
+sentinels observed forbidden float64 casts in dense/fused diagonal/full non-overlap scans. Two
+workspace fixtures observed that the checkpoint estimate counted one `(B,N,Vc)` tensor instead of
+both the expanded score and absolute-bound matmul.
+
+### Outward-rounded reduction and workspace contract
+
+The final propagated fp32 bound is rounded upward by one representable value with
+`nextafter(bound, +inf)`. Interval endpoints are then formed in fp32 and rounded outward again:
+`nextafter(logit - bound, -inf)` for lower endpoints and
+`nextafter(logit + bound, +inf)` for upper endpoints. This preserves the conservative overlap
+decision without a vocabulary-sized promotion.
+
+For dense decoding, the nominal winner and its bound are gathered first, producing only `(B,N)`
+values; competitor upper endpoints reduce across `V` in fp32. Only the resulting winner-lower and
+competitor-upper `(B,N)` summaries are cast to float64 for the stable comparison. For fused
+decoding, each chunk reduces in fp32 to nominal winner/bound plus maximum and runner-up upper
+endpoints. The global chunk dimension then reduces in fp32, and again only the two final `(B,N)`
+summaries promote. The conditional complete float64 recompute remains unchanged and occurs only
+when these conservatively outward-rounded intervals overlap.
+
+The execution sentinel wraps both `Tensor.double()` and `Tensor.to(dtype=float64)` and rejects any
+cast whose shape contains the literal vocabulary width `V=7` or chunk width `Vc=2`. It exercises
+dense and fused diagonal/full decoders on clearly separated logits, checks the fused backward pass,
+and confirms outputs remain fp32. Workspace fixtures intercept the real checkpoint gate and pin
+each chunk estimate to `B*N*Vc*2*4` bytes: two fp32 expanded tensors (score and absolute bound).
+
+### Final evidence
+
+Focused correctness/performance lane:
+
+```powershell
+C:/Python314/python.exe -m pytest `
+  tests/test_ultradeep_remediation_domains_20260813.py `
+  -k "partial_invalid_vocab or global_cross_chunk or global_final_ranking or global_interval_nonoverlap or never_casts_vocab_or_chunk or bound_matmul_is_included" -q `
+  --junitxml=.verification/remediation-2026-08-13/task-05-performance-focused-final.xml
+```
+
+Result: 20 tests, 0 failures, 0 errors, 0 skipped.
+
+Full Task 5 lane:
+
+```powershell
+C:/Python314/python.exe -m pytest tests/test_cg.py tests/test_prior_bank.py `
+  tests/test_families.py tests/test_decode_nonpd_fallback_20260806.py `
+  tests/test_ultradeep_remediation_domains_20260813.py tests/test_tier12_decode.py -q `
+  --junitxml=.verification/remediation-2026-08-13/task-05-performance-full-green.xml
+```
+
+Result: 122 tests, 0 failures, 0 errors, 0 skipped. This is the prior 116-test lane plus the six
+new performance-contract cases.
+
+Numerical-preservation lane:
+
+```powershell
+C:/Python314/python.exe -m pytest tests/test_precision_policies_20260806.py `
+  tests/test_family_chunked_canonical_dispatch_20260808.py `
+  tests/test_family_chunked_workspace_20260807.py -q `
+  --junitxml=.verification/remediation-2026-08-13/task-05-performance-numerical-green.xml
+```
+
+Result: 59 tests, 0 failures, 0 errors, 0 skipped. All runs were CPU-only with
+`C:/Python314/python.exe`, `CUDA_VISIBLE_DEVICES=-1`, and `VFE3_TEST_DEVICE=cpu`.
+
+The fixtures are small rather than stress-scale: across the Task 5 lane the maximum `K/embed_dim`
+is 9, maximum sequence/context length is 6, and maximum vocabulary is 50. The largest batch value
+is 5 in small CG tensor algebra; decoder/model fixtures use at most batch 3 here and ordinarily
+batch 2. No scale, training, CUDA, diagnostic, or unrelated brute-force workload was launched.
+
+### Performance self-review
+
+- No non-overlap path casts a `V`- or `Vc`-shaped tensor to float64; promotion is limited to final
+  `(B,N)` comparison summaries or the already-required complete recompute after overlap.
+- Outward rounding is applied to the propagated bound and both endpoint directions, so removing
+  the large float64 scan does not weaken uncertainty safety.
+- Dense and fused diagonal/full value and gradient fixtures remain green, including cross-chunk,
+  unigram-cancellation, and head-evidence-cancellation cases.
+- The expanded checkpoint budget now includes the absolute-bound matmul in addition to the score
+  tensor; the test pins every chunk width, including the final short chunk.
+- Expected Renyi convex-regime and preexisting detached-oracle/configuration warnings remain; no
+  new warning class appeared.
