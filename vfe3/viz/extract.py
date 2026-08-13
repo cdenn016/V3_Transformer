@@ -555,15 +555,20 @@ def belief_ce_bank(
                                                     omega=(beliefs.omega if tied_model_frame else None),
                                                     reflection=(beliefs.reflection if tied_model_frame else None),
                                                     s_belief=s_belief)
+            block_mlp_transport, block_mlp_frame = model._block_mlp_frame_transport(
+                beliefs, rope)
             out = vfe_stack(
                 beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
                 log_prior=log_prior, block_norm=model.block_norm,
                 block_mlps=model.block_mlps,
+                block_mlp_frame=block_mlp_frame,
                 head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,
                 lambda_beta=cfg.lambda_beta,
                 kappa_beta_override=model.effective_kappa_beta(device),   # learned tau, not init (audit M1)
                 transport_state=model.transport_state,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+                prebuilt_transport=block_mlp_transport,
+                prebuilt_transport_authoritative=block_mlp_frame is not None,
                 gauge_parameterization=cfg.gauge_parameterization, rope_insertion=cfg.rope_insertion)
             trs = metrics.sigma_trace(
                 out.sigma,
@@ -693,15 +698,20 @@ def belief_bank(
                                                     omega=(beliefs.omega if tied_model_frame else None),
                                                     reflection=(beliefs.reflection if tied_model_frame else None),
                                                     s_belief=s_belief)
+            block_mlp_transport, block_mlp_frame = model._block_mlp_frame_transport(
+                beliefs, rope)
             out = vfe_stack(
                 beliefs, beliefs.mu, beliefs.sigma, model.group, cfg,
                 log_prior=log_prior, block_norm=model.block_norm,
                 block_mlps=model.block_mlps,
+                block_mlp_frame=block_mlp_frame,
                 head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,   # replay the trained
                 lambda_beta=cfg.lambda_beta,  # model
                 kappa_beta_override=model.effective_kappa_beta(device),   # learned tau, not init (audit M1)
                 transport_state=model.transport_state,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+                prebuilt_transport=block_mlp_transport,
+                prebuilt_transport_authoritative=block_mlp_frame is not None,
                 gauge_parameterization=cfg.gauge_parameterization, rope_insertion=cfg.rope_insertion)
             b = tokens.shape[0]
             mus.append(_cpu_bank_value(out.mu.reshape(b * n, -1)))
@@ -933,14 +943,19 @@ def across_layer_belief_trace(
         mu_p, sigma_p = belief.mu, belief.sigma
         rho, rho_s = cfg.prior_handoff_rho, cfg.prior_handoff_sigma
         mus, sigmas = [], []
+        block_mlp_transport, block_mlp_frame = model._block_mlp_frame_transport(
+            belief, rope)
         for layer_index in range(cfg.n_layers):
             belief = vfe_block(
                 belief, mu_p, sigma_p, model.group, cfg, log_prior=log_prior,
                 block_norm=model.block_norm, head_mixer=model.head_mixer,
                 block_mlp=(model.block_mlps[layer_index] if model.block_mlps is not None else None),
+                block_mlp_frame=block_mlp_frame,
                 cg_coupling=model.cg_coupling,                       # replay the trained model
                 lambda_beta=cfg.lambda_beta, transport_state=model.transport_state,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
+                prebuilt_transport=block_mlp_transport,
+                prebuilt_transport_authoritative=block_mlp_frame is not None,
                 gauge_parameterization=cfg.gauge_parameterization, rope_insertion=cfg.rope_insertion)
             mus.append(belief.mu)
             sigmas.append(belief.sigma)
@@ -1086,16 +1101,21 @@ def converged_state(
         if snapshot is None:
             belief, log_prior, rope = _encode_one(model, token_ids)
             cap: dict = {}                                       # q* capture (F self-term, as diagnostics)
+            block_mlp_transport, block_mlp_frame = model._block_mlp_frame_transport(
+                belief, rope)
             out = vfe_stack(
                 belief, belief.mu, belief.sigma, model.group, cfg,
                 log_prior=log_prior, block_norm=model.block_norm,
                 block_mlps=model.block_mlps,
+                block_mlp_frame=block_mlp_frame,
                 head_mixer=model.head_mixer, cg_coupling=model.cg_coupling,
                 lambda_beta=cfg.lambda_beta,
                 kappa_beta_override=model.effective_kappa_beta(belief.mu.device),
                 transport_state=model.transport_state,
                 rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
                 capture=cap,
+                prebuilt_transport=block_mlp_transport,
+                prebuilt_transport_authoritative=block_mlp_frame is not None,
                 gauge_parameterization=cfg.gauge_parameterization, rope_insertion=cfg.rope_insertion)
         else:
             snapshot = model._validate_diagnostic_snapshot(token_ids, snapshot)

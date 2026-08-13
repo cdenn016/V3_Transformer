@@ -13,7 +13,7 @@ import torch
 
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
-from vfe3.contracts import EStepGradientRecord, MStepCapture
+from vfe3.contracts import CanonicalFrameContext, EStepGradientRecord, MStepCapture
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.transport import TransportState, merge_legacy_transport_state
 from vfe3.free_energy import attention_tau
@@ -81,7 +81,8 @@ def vfe_block(
     *,
     log_prior:       Optional[torch.Tensor]                  = None,
     block_norm:      Optional[Callable[..., torch.Tensor]]   = None,      # cached norm instance (None -> off)
-    block_mlp:       Optional[Callable[[torch.Tensor], torch.Tensor]] = None,  # coordinate residual MLP (None -> off)
+    block_mlp:       Optional[Callable]                      = None,      # selected residual moment transform (None -> off)
+    block_mlp_frame: Optional[CanonicalFrameContext]         = None,      # realized frame for canonical_frame mode
     head_mixer:      Optional[Callable[..., 'tuple']]        = None,      # opt-in Schur head mixer (None -> off)
     cg_coupling:     Optional[Callable[..., 'tuple']]        = None,      # opt-in CG cross-type coupling (None -> off)
     lambda_beta:     'float | torch.Tensor'                  = 1.0,       # belief-coupling weight (cfg.lambda_beta)
@@ -205,6 +206,11 @@ def vfe_block(
             out = out._replace(mu=mu_cg, sigma=sigma_cg)   # _replace preserves phi/omega/reflection
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)
         out = out._replace(mu=block_norm(out.mu, out.sigma))   # _replace preserves phi/omega/reflection
-    if block_mlp is not None:                # default-off coordinate augmentation, after norm before handoff
-        out = out._replace(mu=block_mlp(out.mu))
+    if block_mlp is not None:                # default-off residual moment transform, after norm before handoff
+        if hasattr(block_mlp, "forward_moments"):
+            result = block_mlp.forward_moments(
+                out.mu, out.sigma, frame=block_mlp_frame)
+            out = out._replace(mu=result.mu, sigma=result.sigma)
+        else:                                # legacy callable compatibility: coordinate mean only
+            out = out._replace(mu=block_mlp(out.mu))
     return out

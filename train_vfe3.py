@@ -156,7 +156,10 @@ config = dict(
     decode_bias               = True,      # only if use_prior_bank = False
     use_head_mixer            = False,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
                                            # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
-    use_block_mlp             = True,      # opt-in coordinate mean-only residual MLP; not gauge-pure
+    use_block_mlp             = True,      # opt-in post-block residual transform
+    block_mlp_mode            = "gauge_gate",  # "coordinate" (legacy, not pure) | "gauge_gate" (strict per scalar-mask realization; in-distribution across independent masks) | "canonical_frame" (left-equivariant, right-frame fixed)
+    block_mlp_covariance      = "passthrough", # "passthrough" | "delta_full" (first-order J Sigma J^T; full covariance)
+    block_mlp_covariance_floor = 1e-4,       # covariant SPD floor: Sigma+ = J Sigma J^T + floor Sigma
     block_mlp_expansion       = 4,
     block_mlp_activation      = "gelu",
     block_mlp_dropout         = 0.01,

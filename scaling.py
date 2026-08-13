@@ -763,8 +763,10 @@ def predict_n_params(cfg: VFE3Config) -> Tuple[int, int]:
         n += HeadMixer.parameter_count(group.irrep_dims, group.irrep_labels)
     if cfg.use_block_mlp:
         expansion = int(cfg.block_mlp_expansion)
+        mlp_width = (
+            len(group.irrep_dims) if cfg.block_mlp_mode == "gauge_gate" else K)
         n += int(cfg.n_layers) * (
-            2 * expansion * K * K + (expansion + 1) * K
+            2 * expansion * mlp_width * mlp_width + (expansion + 1) * mlp_width
         )
     return n, n_gen
 

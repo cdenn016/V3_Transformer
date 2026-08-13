@@ -56,7 +56,7 @@ from vfe3.geometry.transport import (
 )
 from vfe3.model.canonical_content import project_canonical_diagonal
 from vfe3.model.head_mixer import HeadMixer
-from vfe3.model.block_mlp import BlockMLP
+from vfe3.model.block_mlp import build_block_mlp
 from vfe3.model.block import _as_coeff, vfe_block
 from vfe3.model.model_frame import resolve_model_frame
 from vfe3.model.positional_phi import apply_positional_phi, positional_phi_coords
@@ -360,12 +360,20 @@ class VFEModel(nn.Module):
                                                          family=cfg.family,
                                                          affine=cfg.layernorm_affine) \
             if cfg.norm_type_block != "none" else None
-        # One untied coordinate MLP per block is an explicitly non-gauge-pure structural
-        # augmentation. The disabled path adds no MLP module, parameter, or state-dict key.
+        # One untied selected residual transform per block. The disabled path adds no module,
+        # parameter, or state-dict key; coordinate + passthrough retains the historical topology.
         self.block_mlps = (
             nn.ModuleList([
-                BlockMLP(cfg.embed_dim, cfg.block_mlp_expansion,
-                         cfg.block_mlp_activation, cfg.block_mlp_dropout)
+                build_block_mlp(
+                    cfg.block_mlp_mode,
+                    embed_dim=cfg.embed_dim,
+                    irrep_dims=self.group.irrep_dims,
+                    expansion=cfg.block_mlp_expansion,
+                    covariance_floor=cfg.block_mlp_covariance_floor,
+                    activation=cfg.block_mlp_activation,
+                    dropout=cfg.block_mlp_dropout,
+                    covariance_contract=cfg.block_mlp_covariance,
+                )
                 for _ in range(cfg.n_layers)
             ]) if cfg.use_block_mlp else None
         )
@@ -847,9 +855,14 @@ class VFEModel(nn.Module):
     @staticmethod
     def _canonical_frame_context(
         transport: 'CompactFactoredTransport | FactoredTransport | RopeTransport',
+        *,
+        fold_rope: bool = False,
     ) -> CanonicalFrameContext:
         r"""Read dense per-vertex factors from the exact flat transport used by this forward."""
-        base = transport.base if isinstance(transport, RopeTransport) else transport
+        if isinstance(transport, RopeTransport):
+            base = transport.score_operator() if fold_rope else transport.base
+        else:
+            base = transport
         if isinstance(base, FactoredTransport):
             if not base.same_frame_flat_cocycle:
                 raise RuntimeError(
@@ -868,6 +881,24 @@ class VFEModel(nn.Module):
         raise RuntimeError(
             "projected canonical content requires FactoredTransport or "
             f"CompactFactoredTransport vertex factors, got {type(base).__name__}")
+
+    def _block_mlp_frame_transport(
+        self,
+        beliefs: BeliefState,
+        rope: Optional[torch.Tensor],
+    ) -> 'tuple[Optional[object], Optional[CanonicalFrameContext]]':
+        if not (
+            self.cfg.use_block_mlp
+            and self.cfg.block_mlp_mode == "canonical_frame"
+        ):
+            return None, None
+        transport = self._build_shared_flat_transport(
+            beliefs, rope, require_vertex_factors=True)
+        if not isinstance(transport, (FactoredTransport, CompactFactoredTransport, RopeTransport)):
+            raise RuntimeError(
+                "canonical_frame block MLP did not receive factored vertex frames")
+        return transport, self._canonical_frame_context(
+            transport, fold_rope=True)
 
     def _build_shared_flat_transport(
         self,
@@ -1262,6 +1293,7 @@ class VFEModel(nn.Module):
         with run, amp:
             shared_omega = None
             canonical_frame: Optional[CanonicalFrameContext] = None
+            block_mlp_frame: Optional[CanonicalFrameContext] = None
             projected_content = self.cfg.encode_mode == "canonical_content_projected"
             share_refine_s = (
                 self.cfg.s_frame_mode == "tied"
@@ -1296,6 +1328,13 @@ class VFEModel(nn.Module):
                     rope=rope, prebuilt_transport=shared_omega)
                 s_belief = (s_mu1, s_sigma1)
                 beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
+            if self.cfg.use_block_mlp and self.cfg.block_mlp_mode == "canonical_frame":
+                if shared_omega is None:
+                    shared_omega, block_mlp_frame = self._block_mlp_frame_transport(
+                        beliefs, rope)
+                else:
+                    block_mlp_frame = self._canonical_frame_context(
+                        shared_omega, fold_rope=True)
             # Effective belief-channel attention prior: fold the DETACHED precision-weighted reliability
             # bias -log(b0 + tr Sigma_j) (cfg.precision_weighted_attention) and, under
             # cfg.gamma_as_beta_prior, the DETACHED hierarchical gamma prior onto the RAW
@@ -1340,6 +1379,7 @@ class VFEModel(nn.Module):
                 emission=emission,
                 log_prior=log_prior, block_norm=self.block_norm,
                 block_mlps=self.block_mlps,
+                block_mlp_frame=block_mlp_frame,
                 head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
                 lambda_beta=lambda_beta,
                 transport_state=transport_state,
@@ -1350,7 +1390,8 @@ class VFEModel(nn.Module):
                 capture=capture, grad_record=grad_rec,
                 transport_status=self._transport_status,
                 prebuilt_transport=shared_omega,
-                prebuilt_transport_authoritative=projected_content,
+                prebuilt_transport_authoritative=(
+                    projected_content or block_mlp_frame is not None),
                 gauge_parameterization=self.cfg.gauge_parameterization,
                 kappa_beta_override=self.effective_kappa_beta(token_ids.device))
         if estep_grad_out is not None:                           # one host sync, only when requested
@@ -2432,16 +2473,21 @@ class VFEModel(nn.Module):
                                                            if tied_model_frame and belief.reflection is not None else None),
                                                s_belief=s_belief)[0]
         rope = self._rope_rotation(n, token_ids.device)
+        block_mlp_transport, block_mlp_frame = self._block_mlp_frame_transport(
+            belief, rope)
         out = vfe_stack(                                             # converged belief gauge frame
             belief, belief.mu, belief.sigma, self.group, self.cfg,
             log_prior=log_prior, block_norm=self.block_norm,
             block_mlps=self.block_mlps,
+            block_mlp_frame=block_mlp_frame,
             head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
             lambda_beta=self.cfg.lambda_beta,
             transport_state=self.transport_state,
             rope=rope, rope_on_cov=self.cfg.rope_full_gauge, rope_on_value=self.cfg.rope_on_value,
             rope_insertion=self.cfg.rope_insertion,
             transport_status=self._transport_status,
+            prebuilt_transport=block_mlp_transport,
+            prebuilt_transport_authoritative=block_mlp_frame is not None,
             gauge_parameterization=self.cfg.gauge_parameterization,
             kappa_beta_override=self.effective_kappa_beta(belief.mu.device),
         )
@@ -3045,10 +3091,13 @@ class VFEModel(nn.Module):
                     s_belief=s_belief)[0]
             rope = self._rope_rotation(n, token_ids.device)
             cap: dict = {}
+            block_mlp_transport, block_mlp_frame = self._block_mlp_frame_transport(
+                belief, rope)
             out = vfe_stack(
                 belief, belief.mu, belief.sigma, self.group, cfg,
                 log_prior=log_prior, block_norm=self.block_norm,
                 block_mlps=self.block_mlps,
+                block_mlp_frame=block_mlp_frame,
                 head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
                 lambda_beta=cfg.lambda_beta,
                 transport_state=self.transport_state,
@@ -3056,6 +3105,8 @@ class VFEModel(nn.Module):
                 rope_on_value=cfg.rope_on_value,
                 capture=cap,
                 transport_status=self._transport_status,
+                prebuilt_transport=block_mlp_transport,
+                prebuilt_transport_authoritative=block_mlp_frame is not None,
                 gauge_parameterization=cfg.gauge_parameterization,
                 kappa_beta_override=self.effective_kappa_beta(belief.mu.device), rope_insertion=cfg.rope_insertion)
         else:
@@ -3653,6 +3704,8 @@ class VFEModel(nn.Module):
             beta = attention_weights(energy, tau=tau, log_prior=log_prior)
             return beta.unsqueeze(0) if beta.dim() == 2 else beta     # single-block group -> H=1
 
+        block_mlp_transport, block_mlp_frame = self._block_mlp_frame_transport(
+            belief, rope)
         maps = []
         for layer_index in range(cfg.n_layers):
             if score_at != "converged":
@@ -3661,6 +3714,7 @@ class VFEModel(nn.Module):
                 belief, mu_p, sigma_p, self.group, cfg, log_prior=log_prior,
                 block_norm=self.block_norm,
                 block_mlp=(self.block_mlps[layer_index] if self.block_mlps is not None else None),
+                block_mlp_frame=block_mlp_frame,
                 head_mixer=self.head_mixer,                            # replay the mixer too (audit 2026-06-09 overnight F32)
                 lambda_beta=cfg.lambda_beta,
                 transport_state=self.transport_state,
@@ -3668,6 +3722,8 @@ class VFEModel(nn.Module):
                 rope=rope, rope_on_cov=cfg.rope_full_gauge,            # match forward: converge WITH rope
                 rope_on_value=cfg.rope_on_value,
                 transport_status=self._transport_status,
+                prebuilt_transport=block_mlp_transport,
+                prebuilt_transport_authoritative=block_mlp_frame is not None,
                 gauge_parameterization=cfg.gauge_parameterization,
                 # query_adaptive_tau replay fidelity: the ENTERING belief's per-query tau, exactly as
                 # vfe_stack passes the forward E-step; OFF path returns _base_tau (value-identical to
@@ -3765,6 +3821,10 @@ class VFEModel(nn.Module):
         if log_likelihood is not None:
             keys.append("observation_likelihood")
         rec: dict = {k: [] for k in keys}
+        block_mlp_transport, block_mlp_frame = (
+            self._block_mlp_frame_transport(belief, rope)
+            if snapshot is None else (None, None)
+        )
         for layer_index in range(cfg.n_layers):
             if snapshot is None:
                 cap: dict = {}
@@ -3772,11 +3832,14 @@ class VFEModel(nn.Module):
                     belief, mu_p, sigma_p, self.group, cfg, log_prior=log_prior,
                     block_norm=self.block_norm, head_mixer=self.head_mixer, cg_coupling=self.cg_coupling,
                     block_mlp=(self.block_mlps[layer_index] if self.block_mlps is not None else None),
+                    block_mlp_frame=block_mlp_frame,
                     lambda_beta=cfg.lambda_beta,
                     transport_state=self.transport_state,
                     rope=rope, rope_on_cov=cfg.rope_full_gauge, rope_on_value=cfg.rope_on_value,
                     rope_insertion=cfg.rope_insertion,
                     transport_status=self._transport_status,
+                    prebuilt_transport=block_mlp_transport,
+                    prebuilt_transport_authoritative=block_mlp_frame is not None,
                     gauge_parameterization=cfg.gauge_parameterization,
                     tau=self._beta_tau(belief.sigma, belief.mu, _tau),
                     capture=cap,

@@ -3035,11 +3035,15 @@ def _cost_model_fields(
     lower = K * (K - 1) // 2 if not cfg.diagonal_covariance else 0
     token_row = 2 * K + n_gen + (lower if cfg.prior_source == "model_channel" else 0)
     block_mlp_active = bool(getattr(cfg, "use_block_mlp", False))
+    block_mlp_mode = getattr(cfg, "block_mlp_mode", "coordinate")
+    block_mlp_covariance = getattr(cfg, "block_mlp_covariance", "passthrough")
     block_mlp_expansion = int(getattr(cfg, "block_mlp_expansion", 4))
+    block_mlp_width = n_blocks if block_mlp_mode == "gauge_gate" else K
     block_mlp_params = (
-        int(cfg.n_layers) * (2 * block_mlp_expansion * K * K + (block_mlp_expansion + 1) * K)
-        if block_mlp_active else 0
-    )
+        int(cfg.n_layers)
+        * (2 * block_mlp_expansion * block_mlp_width * block_mlp_width
+           + (block_mlp_expansion + 1) * block_mlp_width)
+        if block_mlp_active else 0)
     if cfg.use_prior_bank:
         decode_readout = 2 * V * K
     else:
@@ -3060,7 +3064,17 @@ def _cost_model_fields(
     belief_estep       = L * T * estep_kernel
     model_estep        = T * estep_kernel if cfg.s_e_step else 0.0
     fpt_estep          = belief_estep + model_estep
-    fpt_block_mlp      = 4.0 * L * block_mlp_expansion * K * K if block_mlp_active else 0.0
+    fpt_block_mlp = 0.0
+    if block_mlp_active:
+        fpt_block_mlp = 4.0 * L * block_mlp_expansion * block_mlp_width * block_mlp_width
+        if block_mlp_mode == "gauge_gate":
+            # Per-block SPD solves for the Mahalanobis invariants; order-1 proxy constants.
+            fpt_block_mlp += L * sum(
+                2.0 * dim ** 3 + 2.0 * dim ** 2 for dim in model.group.irrep_dims)
+        elif block_mlp_mode == "canonical_frame":
+            fpt_block_mlp += 4.0 * L * K * K       # pull to and push from the vertex frame
+        if block_mlp_covariance == "delta_full":
+            fpt_block_mlp += 4.0 * L * K ** 3      # J Sigma J^T
     est_flops_analytic = (fpt_decode + fpt_estep + fpt_block_mlp) * float(tokens_seen)
     out: Dict[str, object] = {
         "embed_dim":               K,
@@ -4393,9 +4407,29 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
     if head_mixer_gauge_compatible is None:
         head_mixer_gauge_compatible = VFE3Config.head_mixer_gauge_compatible.fget(cfg)
     block_mlp_active = bool(getattr(cfg, "use_block_mlp", False))
-    block_mlp_structural_mode = "coordinate_mean_only_nonintertwiner" if block_mlp_active else "disabled"
-    block_mlp_covariance_contract = "passthrough" if block_mlp_active else "not_applicable"
-    block_mlp_intertwiner_compatible = not block_mlp_active
+    block_mlp_covariance_floor = float(getattr(cfg, "block_mlp_covariance_floor", 1e-4))
+    block_mlp_mode = getattr(cfg, "block_mlp_mode", "coordinate")
+    block_mlp_covariance = getattr(cfg, "block_mlp_covariance", "passthrough")
+    if not block_mlp_active:
+        block_mlp_structural_mode = "disabled"
+        block_mlp_covariance_contract = "not_applicable"
+        block_mlp_intertwiner_compatible = True
+    elif block_mlp_mode == "gauge_gate":
+        block_mlp_structural_mode = "invariant_scalar_gate"
+        block_mlp_covariance_contract = ("delta_full_plus_covariant_floor" if block_mlp_covariance == "delta_full" else block_mlp_covariance)
+        block_mlp_intertwiner_compatible = True
+    elif block_mlp_mode == "canonical_frame":
+        block_mlp_structural_mode = "canonical_frame_left_equivariant_right_fixed"
+        block_mlp_covariance_contract = ("delta_full_plus_covariant_floor" if block_mlp_covariance == "delta_full" else block_mlp_covariance)
+        block_mlp_intertwiner_compatible = False
+    else:
+        block_mlp_structural_mode = (
+            "coordinate_mean_only_nonintertwiner"
+            if block_mlp_covariance == "passthrough"
+            else "coordinate_delta_full_covariant_floor_nonintertwiner"
+        )
+        block_mlp_covariance_contract = ("delta_full_plus_covariant_floor" if block_mlp_covariance == "delta_full" else block_mlp_covariance)
+        block_mlp_intertwiner_compatible = False
     covariance_feature_exact = _last("regime_ii_covariant_feature_exact")
     feature_jitter_recovered = covariance_feature_exact is not None and covariance_feature_exact < 0.5
     if cfg.transport_mode != "regime_ii_covariant":
@@ -4474,7 +4508,10 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             "use_priorbank_head_evidence_mixer": priorbank_head_evidence_mixer,
             "encode_mode":                  getattr(cfg, "encode_mode", "per_token"),
             "use_block_mlp":                block_mlp_active,
+            "block_mlp_mode":               block_mlp_mode,
+            "block_mlp_covariance":         block_mlp_covariance,
             "block_mlp_expansion":          int(getattr(cfg, "block_mlp_expansion", 4)),
+            "block_mlp_covariance_floor":   block_mlp_covariance_floor,
             "block_mlp_activation":         getattr(cfg, "block_mlp_activation", "gelu"),
             "block_mlp_dropout":            float(getattr(cfg, "block_mlp_dropout", 0.0)),
             "block_mlp_lr_resolved":        float(
