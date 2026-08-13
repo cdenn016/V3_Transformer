@@ -13,7 +13,7 @@ import torch
 from vfe3.families.base import (
     BeliefParams, register_family, safe_kl_clamp, _logdet_chol,
 )
-from vfe3.numerics import safe_cholesky
+from vfe3.numerics import safe_cholesky, validated_cholesky_solve
 
 
 # fp32 catastrophic-cancellation band around the alpha->1 (KL) limit of the Renyi logdet term.
@@ -32,9 +32,9 @@ def _full_gaussian_public_dtype(*dtypes: torch.dtype) -> torch.dtype:
 # --- full-covariance KL precision policy (audit 2026-08-05) --------------------------------
 # "fp64": the historical unconditional float64 island -- the default, so every existing caller,
 #         test, and viz path is byte-identical to the pre-policy build.
-# "fp32_escalate": evaluate the pair grid in float32 and recompute in float64 only when a
-#         Cholesky actually fails. Measured 15.7x faster on the live (B,N,N,K,K) grid, with
-#         attention weights moving by at most 4.0e-6 at the trained operating point.
+# "fp32_escalate": evaluate the pair grid in float32 and retain it only when Task 4's
+#         zero-jitter residual/conditioning certificate passes; otherwise recompute and return
+#         float64. "fp32_escalate_cond" adds its legacy pivot-ratio trigger to that shared gate.
 # The module-level value remains the standalone-call default. Model-owned callers pass an immutable
 # instance policy instead, so constructing another model cannot alter an existing model's numerics.
 _FULL_COV_KL_PRECISIONS = ("fp64", "fp32_escalate", "fp32_escalate_cond")
@@ -851,6 +851,7 @@ class FullGaussian(BeliefParams):
         result_dtype = (torch.float64
                         if torch.float64 in (self._public_dtype, other._public_dtype)
                         else torch.float32)
+        return_dtype = result_dtype
         # Precision policy (audit 2026-08-05). Historically this was an unconditional
         # `compute_dtype = torch.float64` -- unlike the `result_dtype` line directly above it and
         # unlike DiagonalGaussian.renyi_closed_form, which keys on its operand dtypes. On the live
@@ -894,31 +895,26 @@ class FullGaussian(BeliefParams):
             # entirely on the float64 policy, which is why that path stays bit-identical to the
             # pre-policy build.
             #
-            # TRIGGER (audit 2026-08-06 C2/F1). "fp32_escalate" keys on the Cholesky `ok` mask, and
-            # that mask is effectively always True: safe_cholesky's jitter ladder repairs every
-            # float32 PD loss at t=0 -- measured 3000/3000 across cond 1e4..1e12, with ZERO failures
-            # below cond 1e8 -- so the branch is dead code and the policy is unconditional float32.
-            # Cholesky failure is not a proxy for ACCURACY; the two are decoupled by ~6 decades of
-            # conditioning (measured fp32-vs-fp64 KL error at K=20: cond 1e6 -> median 3.4e-2, cond
-            # 1e7 -> median 3.4e-1 / max 8.24, while the factorization still succeeds).
+            # TRIGGER (Task 5, audit 2026-08-13). Successful jittered Cholesky is not an accuracy
+            # certificate. Both fp32 policies reuse Task 4's zero-jitter validated solve, which
+            # quantifies symmetry/factor residuals and rejects condition numbers above
+            # 1/(64 K eps). The *_cond spelling retains its older, stricter pivot-ratio trigger in
+            # addition to the shared certificate. The whole grid promotes if any row is uncertified
+            # so vocabulary ranking never mixes arithmetic precisions.
             #
-            # "fp32_escalate_cond" keys on an ACCURACY proxy instead: the free Cholesky conditioning
-            # estimate from the factors already computed. It is a separate policy spelling rather
-            # than a change to "fp32_escalate" so runs already on disk stay reproducible.
-            #
-            # Severity, so this is not over-read: at the trained operating point the repo's own
-            # recorded conditioning is median 2.7e3 / p95 2.1e4 (config.py:854-856), where the fp32
-            # error gives an attention-weight ratio of 1.0000-1.0002 -- the documented 4e-6 bound is
-            # CORRECT where the model actually lives. This guards an excursion, which
-            # e_sigma_q_trust=10 makes reachable in ONE step, not a live error.
+            # The default limit is conservative and dimension/dtype dependent; at K=20 float32 it
+            # is about 6.55e3, so upper-tail rows may promote even when Cholesky succeeds.
+            # That is the explicit accuracy policy, not a failure fallback.
             if compute_dtype is not torch.float64:
-                escalate = bool((~ok).any())
+                q_certificate = validated_cholesky_solve(sigma_q)
+                t_certificate = validated_cholesky_solve(sigma_t)
+                escalate_mask = (~ok | ~q_certificate.certified | ~t_certificate.certified)
                 if (full_cov_kl_precision() if policy is None else policy) == "fp32_escalate_cond":
-                    escalate = escalate or bool((inv_cond < _FULL_COV_KL_COND_FLOOR).any())
-                if escalate:
-                    div_escalated, ok, _ = _full_gaussian_kl_terms(
+                    escalate_mask = escalate_mask | (inv_cond < _FULL_COV_KL_COND_FLOOR)
+                if bool(escalate_mask.any()):
+                    div, ok, _ = _full_gaussian_kl_terms(
                         mu_q.double(), sigma_q.double(), mu_t.double(), sigma_t.double(), K, eps)
-                    div = div_escalated.to(compute_dtype)
+                    return_dtype = torch.float64
             div = torch.where(ok, div, div.new_tensor(float("nan")))
         else:
             # alpha > 1 leaves the convex regime: the blend can be indefinite for some
@@ -993,4 +989,4 @@ class FullGaussian(BeliefParams):
             else:
                 ok = ok_q & ok_t                   # convex blend of SPD is SPD; only factors can fail
             div = torch.where(ok, div, div.new_tensor(float("nan")))
-        return safe_kl_clamp(div, kl_max=kl_max).to(result_dtype)
+        return safe_kl_clamp(div, kl_max=kl_max).to(return_dtype)

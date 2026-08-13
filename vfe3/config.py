@@ -313,6 +313,7 @@ class VFE3Config:
     # full-covariance Gaussian family (family='gaussian_full') because J Sigma J^T is dense; the
     # means-only 'passthrough' is the pure default. Validated below.
     cg_covariance_mode:        str   = "passthrough"     # "passthrough" | "delta_full"
+    cg_covariance_floor:       float = 1e-6              # delta_full: J Sigma J^T + floor * Sigma
 
     # CG moment-energy regularizer weight (opt-in; default 0.0 = off, everything untouched). When
     # > 0 the outer objective adds ONCE cg_energy_weight * mean_layers(mean_tokens(D(q_post||q_pre))),
@@ -1497,6 +1498,11 @@ class VFE3Config:
                 f"(family='gaussian_full'); the delta-method J Sigma J^T is dense and a "
                 f"diagonal/non-Gaussian family cannot carry it (got family={self.family!r})."
             )
+        if not (math.isfinite(self.cg_covariance_floor) and self.cg_covariance_floor > 0.0):
+            raise ValueError(
+                "cg_covariance_floor must be finite and strictly positive; got "
+                f"{self.cg_covariance_floor!r}")
+
         if not math.isfinite(self.cg_energy_weight) or self.cg_energy_weight < 0.0:
             raise ValueError(
                 f"cg_energy_weight must be finite and >= 0; got {self.cg_energy_weight!r}"
@@ -2634,6 +2640,15 @@ class VFE3Config:
         # sigma and its own active registration controls dense-vs-fused training; decode_mode does not
         # route that no-prior path, so the cross-check stays gated on use_prior_bank.
         decode_registration = _DECODERS[self.decode_mode]
+        if (self.use_prior_bank
+                and decode_registration.family_consistent
+                and self.divergence_family == "renyi"
+                and self.renyi_order > 1.0):
+            raise ValueError(
+                "family-consistent prior-bank Renyi decoding requires renyi_order <= 1 "
+                "because alpha > 1 cannot guarantee a finite score across the entire prior bank; "
+                f"got renyi_order={self.renyi_order}.")
+
         if (
             self.encode_mode in ("canonical_content_gauge", "canonical_content_projected")
             and not has_builtin_canonical_content_encoder(self.encode_mode)

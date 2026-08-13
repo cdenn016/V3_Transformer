@@ -448,7 +448,8 @@ class VFEModel(nn.Module):
             self.cg_coupling = CGCoupling(
                 cfg.group_n, self.group.algebra,
                 self.group.irrep_dims, self.group.irrep_labels,
-                cg_covariance_mode=cfg.cg_covariance_mode)
+                cg_covariance_mode=cfg.cg_covariance_mode,
+                cg_covariance_floor=cfg.cg_covariance_floor)
         else:
             self.cg_coupling = None
         if (cfg.use_head_mixer
@@ -1008,16 +1009,13 @@ class VFEModel(nn.Module):
         decode_last:     bool = False,
     ) -> torch.Tensor:
         r"""Decode one realized belief through the model-owned frame/context boundary."""
-        if decode_last:
-            mu_q = mu_q[:, -1:]
-            sigma_q = sigma_q[:, -1:]
-            canonical_frame = self._slice_canonical_frame(canonical_frame, slice(-1, None))
         with self._amp_off_context(mu_q.device):
-            return self.prior_bank.decode(
+            logits = self.prior_bank.decode(
                 mu_q.float(),
                 sigma_q.float(),
                 canonical_frame=canonical_frame,
             )
+        return logits[:, -1:] if decode_last else logits
 
     def _resolve_model_frame(
         self,
@@ -1859,6 +1857,7 @@ class VFEModel(nn.Module):
             and decode_registration.supports_chunked
         )
         scored_tokens = None
+        excluded_tokens = None
         if fused_chunked:
             with self._amp_off_context(token_ids.device):
                 fused_kwargs = {"z_loss_weight": self.cfg.z_loss_weight}
@@ -1888,12 +1887,14 @@ class VFEModel(nn.Module):
                             f"but returned {type(fused_result).__name__}"
                         )
                     ce = fused_result.ce
+                    excluded_tokens = fused_result.excluded_tokens
                     scored_tokens = fused_result.scored_tokens
                 else:
                     ce = fused_result
                     if return_decode_stats:
                         # Legacy custom fused decoders have no exclusion channel beyond ignore_index.
                         scored_tokens = (targets != -100).sum(dtype=torch.int64)
+                        excluded_tokens = scored_tokens.new_tensor(targets.numel()) - scored_tokens
             logits = None                                        # no (B, N, V) tensor on the fused path
         else:
             logits = self._decode_belief_with_context(
@@ -1925,6 +1926,7 @@ class VFEModel(nn.Module):
                 # gives 0/1 = a finite grad-connected 0; F.cross_entropy's default mean would be
                 # 0/0 = NaN there, poisoning logging / NaN-guards / grad-accum means.
                 scored_tokens = (flat_targets != -100).sum(dtype=torch.int64)
+                excluded_tokens = scored_tokens.new_tensor(flat_targets.numel()) - scored_tokens
                 n_valid = scored_tokens.clamp_min(1)
                 ce = F.cross_entropy(flat_logits, flat_targets, ignore_index=-100,
                                      reduction="sum") / n_valid
@@ -2084,9 +2086,10 @@ class VFEModel(nn.Module):
         # beta/gamma are frozen or envelope-eliminated, and keep the optimizer objective-agnostic.
         ce_detached = ce.detach()
         if return_decode_stats:
-            if scored_tokens is None:
-                raise RuntimeError("decoder stats requested without a scored-token count")
-            return logits, loss, DecodeCEResult(ce_detached, scored_tokens)
+            if scored_tokens is None or excluded_tokens is None:
+                raise RuntimeError("decoder stats requested without scored/excluded-token counts")
+            return logits, loss, DecodeCEResult(
+                ce_detached, scored_tokens, excluded_tokens)
         return logits, loss, ce_detached
 
     @property

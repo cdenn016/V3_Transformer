@@ -205,26 +205,28 @@ def test_cg_forward_moments_jacobian_matches_autograd_multipath():
     assert torch.allclose(res.jacobian, J_auto, atol=1e-10, rtol=0.0)
 
 
-def test_cg_forward_moments_delta_covariance_is_J_sigma_JT_spd():
+def test_cg_forward_moments_delta_covariance_is_J_sigma_JT_plus_covariant_floor_spd():
     cpl, _ = _l2_coupling(mode="delta_full", weight=0.5)
     sigma = _sym_spd(5)
     mu = torch.randn(5, dtype=torch.float64)
     res = cpl.forward_moments(mu, sigma)
     J = res.jacobian
-    expected = J @ sigma @ J.transpose(-1, -2)
-    expected = 0.5 * (expected + expected.transpose(-1, -2))
+    pushed = J @ sigma @ J.transpose(-1, -2)
+    expected = 0.5 * (pushed + pushed.transpose(-1, -2)) \
+        + cpl.cg_covariance_floor * sigma
     assert torch.allclose(res.sigma, expected, atol=1e-12, rtol=0.0)
     assert torch.allclose(res.sigma, res.sigma.transpose(-1, -2), atol=1e-14)   # symmetric
     assert (torch.linalg.eigvalsh(res.sigma) > 0).all()                          # SPD
 
 
-def test_cg_forward_moments_zero_weight_is_exact_identity():
+def test_cg_forward_moments_zero_weight_preserves_covariance_with_documented_floor():
     cpl, _ = _l2_coupling(mode="delta_full")           # path_weights zero-init
     sigma = _sym_spd(5)
     mu = torch.randn(5, dtype=torch.float64)
     res = cpl.forward_moments(mu, sigma)
     assert torch.equal(res.mu, mu)                                               # mu_out = mu exactly
-    assert torch.equal(res.sigma, sigma)                                         # sigma_out = sigma exactly
+    expected_sigma = (1.0 + cpl.cg_covariance_floor) * sigma
+    assert torch.allclose(res.sigma, expected_sigma, atol=1e-12, rtol=0.0)
     assert torch.equal(res.jacobian, torch.eye(5, dtype=torch.float64))          # J = I exactly
 
 

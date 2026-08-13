@@ -8,13 +8,14 @@ solved CG intertwiners,
 
 one learned scalar w_p per path (source copy pair x target copy x multiplicity slot),
 zero-initialized so step 0 is byte-identical to the coupling-off path. Equivariance holds
-for ANY weights because the weights multiply intertwiners. Covariance is MEANS-ONLY in
-this phase: sigma passes through untouched (a bilinear map of Gaussians has no closed-form
-pushforward; the honest sigma treatment belongs to the deferred F-term phase -- see the
-2026-06-09 design spec). NEURAL-NETWORK EXCEPTION (sanctioned, default-off), the
+for ANY weights because the weights multiply intertwiners. Covariance either passes through
+untouched or uses the explicitly approximate first-order delta closure
+sym(J Sigma J^T) + floor Sigma; a bilinear map of Gaussians has no exact Gaussian pushforward.
+NEURAL-NETWORK EXCEPTION (sanctioned, default-off), the
 use_head_mixer family.
 """
 
+import math
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
@@ -29,9 +30,10 @@ class CGMomentResult(NamedTuple):
 
     ``mu`` is mu + delta (the bilinear CG update); ``sigma`` is the pushed-forward covariance
     (untouched under ``cg_covariance_mode='passthrough'``, the symmetrized delta-method image
-    sym(J Sigma J^T) under 'delta_full'); ``jacobian`` is J = d mu_out / d mu at the current mean,
-    (..., K, K). At zero path weights J is exactly the identity, mu == input mu, and sigma is the
-    input sigma exactly."""
+    sym(J Sigma J^T) + floor Sigma under 'delta_full'); ``jacobian`` is J = d mu_out / d mu at
+    the current mean, (..., K, K). At zero path weights J is exactly the identity and mu equals
+    the input; delta-full covariance is then (1 + floor) Sigma while passthrough covariance is
+    exactly the input Sigma."""
     mu:       torch.Tensor
     sigma:    torch.Tensor
     jacobian: torch.Tensor
@@ -84,9 +86,15 @@ class CGCoupling(nn.Module):
         *,
         atol:               float = 1e-8,        # CG null-space solve tolerance (shared with the prune)
         cg_covariance_mode: str   = "passthrough",  # 'passthrough' | 'delta_full' (delta-method J Sigma J^T)
+        cg_covariance_floor: float = 1e-6,       # positive covariant floor: floor * input Sigma
     ) -> None:
         super().__init__()
+        if not (math.isfinite(cg_covariance_floor) and cg_covariance_floor > 0.0):
+            raise ValueError(
+                "cg_covariance_floor must be finite and strictly positive, got "
+                f"{cg_covariance_floor!r}")
         self.cg_covariance_mode = cg_covariance_mode
+        self.cg_covariance_floor = float(cg_covariance_floor)
         if irrep_labels is None:
             raise ValueError(
                 "CGCoupling requires a labeled irrep tower (gauge_group 'so_n'/'sp_n')"
@@ -225,10 +233,11 @@ class CGCoupling(nn.Module):
         of ``mu``, so its Jacobian is exact and analytic (no autograd): for a path C(x (x) y) the two
         contractions C(. (x) y) and C(x (x) .) are the mean-derivative blocks landing in the
         (target, source_a) and (target, source_b) sub-blocks of J. J starts at the identity, so at
-        zero path weights J == I, mu_out == mu, and (under 'delta_full') sigma_out == sigma exactly.
-        The covariance is pushed forward by the delta method sigma_out = sym(J Sigma J^T) under
-        'delta_full' (a FIRST-ORDER Gaussian moment closure, explicitly not an exact distributional
-        pushforward), or passed through untouched under 'passthrough'.
+        zero path weights J == I and mu_out == mu. The covariance is pushed forward by the delta
+        method sigma_out = sym(J Sigma J^T) + floor Sigma under 'delta_full'; the covariant floor
+        preserves input covariance directions even when J is singular. This is a FIRST-ORDER
+        Gaussian moment closure, explicitly not an exact distributional pushforward. Covariance is
+        passed through untouched under 'passthrough'.
         """
         cg = self._cast_buffers(mu.dtype, mu.device)              # per-(dtype, device), cached
         w = self.path_weights.to(dtype=mu.dtype)                  # one cast, differentiable
@@ -264,7 +273,8 @@ class CGCoupling(nn.Module):
         if self.cg_covariance_mode == "delta_full":
             js = torch.einsum("...ij,...jk->...ik", jac, sigma)      # J Sigma
             jsj = torch.einsum("...ik,...lk->...il", js, jac)        # (J Sigma) J^T
-            sigma_out = 0.5 * (jsj + jsj.transpose(-1, -2))          # symmetrize the delta-method image
+            sigma_out = (0.5 * (jsj + jsj.transpose(-1, -2))
+                         + self.cg_covariance_floor * sigma)
         else:
             sigma_out = sigma
         return CGMomentResult(mu_out, sigma_out, jac)

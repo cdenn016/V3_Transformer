@@ -351,12 +351,22 @@ def _decode_av(
         lhs = _decode_av_lhs(sq, mc_q, coord_delta)
     rhs = torch.cat([inv_v, mc_v * inv_v], dim=-1)             # (Vc, 2K)
     if coord_delta is None:
-        return lhs @ rhs.transpose(-1, -2) + (mc_v ** 2 * inv_v).sum(-1) + lsum
-    return (
-        lhs @ rhs.transpose(-1, -2)
-        + (mc_v ** 2 * inv_v * coord_delta).sum(-1)
-        + lsum
-    )
+        bias = (mc_v ** 2 * inv_v).sum(-1) + lsum
+    else:
+        bias = (mc_v ** 2 * inv_v * coord_delta).sum(-1) + lsum
+    out = lhs @ rhs.transpose(-1, -2) + bias
+    if sq.dtype is torch.float32 and _DECODE_AV_PRECISION == "fp32" and out.shape[-1] > 1:
+        absolute_sum = lhs.abs() @ rhs.abs().transpose(-1, -2) + bias.abs()
+        gamma = ((2.0 * lhs.shape[-1] + 4.0) * torch.finfo(out.dtype).eps)
+        error_bound = gamma * absolute_sum
+        top = out.topk(2, dim=-1, largest=False)
+        top_bound = error_bound.gather(-1, top.indices)
+        uncertain = (top.values[..., 0] - top.values[..., 1]).abs() <= top_bound.sum(-1)
+        if bool(uncertain.any()):
+            return _decode_av(
+                sq.double(), mc_q.double(), mc_v.double(), inv_v.double(), lsum.double(),
+                lhs=None, coord_delta=None if coord_delta is None else coord_delta.double())
+    return out
 
 
 def _decode_head_evidence_kl_delta(
@@ -394,7 +404,8 @@ def _decode_analytic_kl_logits(
     kl_v = (0.5 * (a_v - per_pos)).clamp(min=0.0)
     if evidence_delta is not None:
         kl_v = kl_v + evidence_delta
-    return (-kl_v / tau_eff).to(output_dtype)
+    result_dtype = torch.float64 if kl_v.dtype is torch.float64 else output_dtype
+    return (-kl_v / tau_eff).to(result_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +512,7 @@ class DecodeCEResult:
 
     ce:            torch.Tensor
     scored_tokens: torch.Tensor
+    excluded_tokens: Optional[torch.Tensor] = None
 
 
 def _decode_ce_result(
@@ -511,7 +523,9 @@ def _decode_ce_result(
     """Keep scalar CE as the default while exposing a device-side int64 count on request."""
     if not return_stats:
         return ce
-    return DecodeCEResult(ce=ce, scored_tokens=valid.sum(dtype=torch.int64))
+    scored = valid.sum(dtype=torch.int64)
+    excluded = valid.new_tensor(valid.numel(), dtype=torch.int64) - scored
+    return DecodeCEResult(ce=ce, scored_tokens=scored, excluded_tokens=excluded)
 
 # Once-per-process guard for the decode_unigram_prior=True-with-unset-table warning
 # (the decode then degenerates to the current uniform-prior behavior).
@@ -664,6 +678,32 @@ def get_decode(name: str) -> 'DecodeCallable':
     return get_decode_registration(name).callable
 
 
+def validate_reflection_checkpoint_state(
+    saved_state: object,
+    expected_state: Mapping[str, torch.Tensor],
+    *,
+    context: str,
+) -> None:
+    r"""Validate every reflection buffer before ``load_state_dict`` can mutate a module."""
+    if not isinstance(saved_state, Mapping):
+        return
+    for key, expected in expected_state.items():
+        if not key.endswith("reflection_sign") or key not in saved_state:
+            continue
+        actual = saved_state[key]
+        if (not isinstance(actual, torch.Tensor)
+                or actual.shape != expected.shape
+                or actual.dtype != expected.dtype
+                or actual.layout != expected.layout):
+            raise RuntimeError(
+                f"{context} reflection_sign has an incompatible shape/dtype/layout")
+        if not bool(torch.isfinite(actual).all().item()):
+            raise RuntimeError(f"{context} reflection_sign contains nonfinite values")
+        if not bool(((actual == -1) | (actual == 1)).all().item()):
+            raise RuntimeError(
+                f"{context} reflection_sign must contain exact values in {{-1, +1}}")
+
+
 _LEGACY_DORMANT_PRIOR_TABLES = {
     "prior_bank.mu_embed":        "prior_bank.s_mu_embed",
     "prior_bank.sigma_log_embed": "prior_bank.s_sigma_log_embed",
@@ -685,6 +725,7 @@ def normalize_legacy_model_state(
     dtype, layout, and finiteness are validated against that live table before removal. Token-prior
     models retain the base keys in their expected state and therefore remain fully strict.
     """
+    validate_reflection_checkpoint_state(saved_state, expected_model_state, context=context)
     if not isinstance(saved_state, Mapping):
         return saved_state
     removable = [
@@ -1193,6 +1234,16 @@ class PriorBank(nn.Module):
             if phi_reflection == "init_seed":
                 with torch.no_grad():
                     self.reflection_sign[1::2] = -1.0
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        """Load atomically with respect to the discrete reflection-domain contract."""
+        validate_reflection_checkpoint_state(
+            state_dict,
+            self.state_dict(),
+            context="PriorBank state_dict",
+        )
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+
 
     def head_evidence_weights(
         self,
@@ -2361,7 +2412,7 @@ class PriorBank(nn.Module):
         def _chunk_summaries(q_mu_:   torch.Tensor, q_sigma_:   torch.Tensor,
                              mu_v_c:  torch.Tensor, sigma_v_c:  torch.Tensor,
                              in_chunk_f: torch.Tensor, local_idx: torch.Tensor,
-                             u_c:     Optional[torch.Tensor]) -> 'tuple[torch.Tensor, torch.Tensor]':
+                             u_c:     Optional[torch.Tensor]) -> 'tuple[torch.Tensor, ...]':
             r"""Reduce one vocab chunk to (lse_chunk, target_contrib), both (B, N), on the inside.
 
             The functional workspace ((B, N, Vc) diagonal / (B, N, Vc, K, K) full) is born and dies
@@ -2377,13 +2428,17 @@ class PriorBank(nn.Module):
             logit_chunk = -energy / tau_eff                                # (B, N, Vc)
             if u_c is not None:
                 logit_chunk = logit_chunk + u_c                            # unigram log-prior chunk slice
-            lse_chunk = torch.logsumexp(logit_chunk, dim=-1)               # (B, N)
-            gathered = logit_chunk.gather(-1, local_idx.unsqueeze(-1)).squeeze(-1)  # (B, N)
-            # SELECT rather than multiply (audit 2026-08-06 F31): `gathered * in_chunk_f` is
-            # `-inf * 0.0` = NaN in every chunk that does NOT contain the target, so a degenerate
-            # position poisoned target_logit through chunks it has no business contributing to.
-            # Byte-identical for finite logits (x*1.0 == x, x*0.0 == 0.0).
-            return lse_chunk, torch.where(in_chunk_f > 0, gathered, torch.zeros_like(gathered))
+            finite = torch.isfinite(logit_chunk)
+            row_finite = finite.any(dim=-1)
+            safe_logits = torch.where(
+                finite, logit_chunk, logit_chunk.new_tensor(float("-inf")))
+            safe_logits = torch.where(
+                row_finite.unsqueeze(-1), safe_logits, torch.zeros_like(safe_logits))
+            lse_chunk = torch.logsumexp(safe_logits, dim=-1)                # (B, N)
+            gathered = logit_chunk.gather(-1, local_idx.unsqueeze(-1)).squeeze(-1)
+            target_finite = torch.isfinite(gathered) & (in_chunk_f > 0)
+            contrib = torch.where(target_finite, gathered, torch.zeros_like(gathered))
+            return lse_chunk, contrib, row_finite, target_finite
 
         # A position whose Sigma_q is not PD is EXCLUDED, exactly like an ignore_index token, rather
         # than scored (audit 2026-08-06 F31). This route was left OUT of that fix (audit 2026-08-07):
@@ -2399,7 +2454,9 @@ class PriorBank(nn.Module):
         if degenerate is not None:
             valid = valid & ~degenerate
         lse_chunks = []
-        target_logit = torch.zeros(mu_q.shape[:-1], device=mu_q.device, dtype=mu_q.dtype)  # (B, N)
+        target_logit = torch.zeros(mu_q.shape[:-1], device=mu_q.device, dtype=mu_q.dtype)
+        any_finite = torch.zeros_like(valid)
+        target_finite = torch.zeros_like(valid)
 
         # Promote the whole diagonal prior table ONCE rather than per slice when it is small enough
         # to be worth it (audit 2026-08-07). The per-slice ``diag_embed`` writes the same (V, K, K)
@@ -2447,18 +2504,23 @@ class PriorBank(nn.Module):
             in_chunk_f = in_chunk.to(mu_q.dtype)                           # (B, N) 0/1, carried into the checkpoint
             local_idx = (targets - v0).clamp(min=0, max=v1 - v0 - 1)       # (B, N) safe gather index
             if should_checkpoint:
-                lse_chunk, contrib = _checkpoint.checkpoint(
+                lse_chunk, contrib, finite_chunk, target_finite_chunk = _checkpoint.checkpoint(
                     _chunk_summaries, q_mu, q_sigma, mu_v_c, sigma_v_c, in_chunk_f, local_idx,
                     u_c, use_reentrant=False,
                 )
             else:
-                lse_chunk, contrib = _chunk_summaries(
+                lse_chunk, contrib, finite_chunk, target_finite_chunk = _chunk_summaries(
                     q_mu, q_sigma, mu_v_c, sigma_v_c, in_chunk_f, local_idx, u_c
                 )
             lse_chunks.append(lse_chunk)
-            target_logit = target_logit + contrib                          # exactly one chunk contributes per valid pos
+            target_logit = target_logit + contrib
+            any_finite = any_finite | finite_chunk
+            target_finite = target_finite | target_finite_chunk
 
-        logsumexp_v = torch.logsumexp(torch.stack(lse_chunks, dim=0), dim=0)  # (B, N)
+        logsumexp_v = torch.logsumexp(torch.stack(lse_chunks, dim=0), dim=0)
+        valid = valid & any_finite & target_finite
+        logsumexp_v = torch.where(valid, logsumexp_v, torch.zeros_like(logsumexp_v))
+        target_logit = torch.where(valid, target_logit, torch.zeros_like(target_logit))
         ce_per_pos = logsumexp_v - target_logit                            # (B, N) = -log-softmax at target
         # Device-side masked mean: clamp the denominator so an all-ignore microbatch yields a finite
         # grad-connected 0 (the numerator is then 0) without a host sync to branch on valid.sum() == 0.

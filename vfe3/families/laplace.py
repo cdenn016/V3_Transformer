@@ -68,6 +68,7 @@ class DiagonalLaplace(BeliefParams):
     def __init__(self, mu: torch.Tensor, sigma: torch.Tensor) -> None:
         self.mu = mu                                   # (..., K) location
         self.sigma = sigma                             # (..., K) scale b (the belief sigma slot)
+        self._public_dtype = torch.promote_types(mu.dtype, sigma.dtype)
 
     def coordinate_dim(self) -> int:
         return self.mu.shape[-1]
@@ -201,7 +202,8 @@ class DiagonalLaplace(BeliefParams):
 
     def entropy(self) -> torch.Tensor:
         # H = sum_k log(2 b_k e) = sum_k [ log(2 b_k) + 1 ].
-        return (torch.log(2.0 * self.sigma.clamp(min=1e-12)) + 1.0).sum(dim=-1)
+        sigma = self.sigma.to(self._public_dtype)
+        return (torch.log(2.0 * sigma.clamp(min=1e-12)) + 1.0).sum(dim=-1)
 
     def natural_gradient(
         self,
@@ -220,12 +222,16 @@ class DiagonalLaplace(BeliefParams):
         ``b^2 > 0`` strictly, so the step is sign-preserving and ``grad=0 -> step=0`` (every
         stationary point of F preserved). ``eps`` floors ``b`` (the belief sigma floor, ``cfg.eps``)
         exactly as the divergence does."""
-        orig_dtype = self.sigma.dtype
-        with torch.amp.autocast(self.sigma.device.type, enabled=False):  # tensor-keyed (audit 2026-07-05 m10)
-            b2        = self.sigma.float().clamp(min=eps).square()      # (..., K) b^2 = I^{-1}
-            nat_mu    = b2 * grad_mu.float()
-            nat_sigma = None if grad_sigma is None else b2 * grad_sigma.float()
-        return nat_mu.to(orig_dtype), None if nat_sigma is None else nat_sigma.to(orig_dtype)
+        result_dtype = torch.promote_types(self._public_dtype, grad_mu.dtype)
+        if grad_sigma is not None:
+            result_dtype = torch.promote_types(result_dtype, grad_sigma.dtype)
+        compute_dtype = torch.float64 if result_dtype is torch.float64 else torch.float32
+        with torch.amp.autocast(self.sigma.device.type, enabled=False):
+            b2 = self.sigma.to(compute_dtype).clamp(min=eps).square()
+            nat_mu = b2 * grad_mu.to(compute_dtype)
+            nat_sigma = None if grad_sigma is None else b2 * grad_sigma.to(compute_dtype)
+        return (nat_mu.to(result_dtype),
+                None if nat_sigma is None else nat_sigma.to(result_dtype))
 
     def _renyi_terms(
         self,
@@ -238,10 +244,12 @@ class DiagonalLaplace(BeliefParams):
         r"""Per-coordinate Renyi/KL D^(k)(self || other), unclamped. KL (|alpha-1|<1e-6) uses the
         exact discrete form in float32; alpha != 1 uses the float64 integral form (covers the
         per-coordinate removable singularity at c_p==c_q and the alpha->1 outer cancellation)."""
-        mu_q = self.mu.float()
-        b_q = self.sigma.float().clamp(min=eps)
-        mu_p = other.mu.float()
-        b_p = other.sigma.float().clamp(min=eps)
+        result_dtype = torch.promote_types(self._public_dtype, other._public_dtype)
+        compute_dtype = torch.float64 if result_dtype is torch.float64 else torch.float32
+        mu_q = self.mu.to(compute_dtype)
+        b_q = self.sigma.to(compute_dtype).clamp(min=eps)
+        mu_p = other.mu.to(compute_dtype)
+        b_p = other.sigma.to(compute_dtype).clamp(min=eps)
         s = (mu_q - mu_p).abs()
         if abs(alpha - 1.0) < 1e-6:
             return torch.log(b_p) - torch.log(b_q) + s / b_p + (b_q / b_p) * torch.exp(-s / b_q) - 1.0
@@ -287,7 +295,7 @@ class DiagonalLaplace(BeliefParams):
                        - alpha * torch.log(b_q64) - (1.0 - alpha) * torch.log(b_p64))
             div = log_int / (alpha - 1.0)
             div = torch.where(convergent, div, div.new_tensor(float("nan")))
-            return div.to(mu_q.dtype)
+            return div.to(result_dtype)
 
         d    = c_p - c_q
         e_q  = torch.exp(-c_q * s64)
@@ -317,7 +325,7 @@ class DiagonalLaplace(BeliefParams):
         div = log_int / (alpha - 1.0)
         # alpha > 1 can drive the blend rate non-positive (integral diverges) -> NaN -> kl_max.
         div = torch.where(csum > 0.0, div, div.new_tensor(float("nan")))
-        return div.to(mu_q.dtype)
+        return div.to(result_dtype)
 
     def renyi_closed_form(
         self,

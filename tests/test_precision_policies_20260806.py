@@ -101,11 +101,13 @@ def test_escalation_removes_the_float32_arithmetic_error():
     for cond_exp in (6, 7, 8):
         sigma = _spd(cond_exp, seed=cond_exp)
         reference = _kl(mu, sigma, "fp64")
-        plain = _kl(mu, sigma, "fp32_escalate")
-        keyed = _kl(mu, sigma, "fp32_escalate_cond")
+        certified = _kl(mu, sigma, "fp32_escalate")
+        stricter = _kl(mu, sigma, "fp32_escalate_cond")
         rel = lambda v: abs(v - reference) / max(abs(reference), 1e-12)   # noqa: E731
-        assert rel(keyed) < 1e-6, f"cond 1e{cond_exp}: escalation did not recover the arithmetic"
-        assert rel(keyed) < rel(plain) / 100.0
+        assert rel(certified) < 1e-6, \
+            f"cond 1e{cond_exp}: certificate escalation did not recover the arithmetic"
+        assert rel(stricter) < 1e-6
+        assert certified == stricter
 
 
 @pytest.mark.parametrize("cond_exp", [3, 4, 5])
