@@ -2,6 +2,7 @@
 
 from dataclasses import asdict
 
+import pytest
 import ablation
 
 from vfe3.config import VFE3Config, migrate_serialized_config
@@ -48,3 +49,12 @@ def test_sweep_resolution_uses_one_compatible_baseline_without_arm_repair(monkey
     assert label == "transport_mode=regime_ii"
     assert "pos_phi_compose" not in overrides
     assert VFE3Config(**ablation._cell_cfg_dict(overrides, seed=6)).pos_phi_compose == "bch"
+
+
+@pytest.mark.parametrize("sweep_name", ("covariance", "renyi_order"))
+def test_registered_sweep_arms_declare_family_consistent_decode_mode(sweep_name: str) -> None:
+    """Covariance and Renyi comparisons must resolve their decode prerequisite explicitly."""
+    runs = ablation.make_run_overrides(sweep_name)
+
+    assert runs
+    assert all(overrides["decode_mode"] == "family_chunked" for _label, overrides in runs)

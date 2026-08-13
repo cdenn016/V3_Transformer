@@ -29,7 +29,7 @@ import multiseed_analysis
 import scaling
 import scaling_analysis
 import train_vfe3
-from vfe3.config import VFE3Config
+from vfe3.config import ConfigNotice, VFE3Config
 from vfe3.run_artifacts import RunArtifacts
 from vfe3.viz import embedding_comparison, figures, report
 
@@ -1488,19 +1488,22 @@ def test_scaling_rejects_integer_enum_seed_values():
         scaling._validated_scaling_seeds([Seed.ONE])
 
 
-def test_default_parameter_match_grid_retains_two_realized_30m_widths():
+def test_current_parameter_match_grid_fails_closed_with_one_width_within_tolerance():
     sweep = ablation.SWEEPS["parameter_matched"]
     grid = sweep["parameter_grid"]
     assert ablation.CONFIG["target_n_params"] == 30_000_000
     assert ablation.CONFIG["max_param_relative_deviation"] == 0.02
-    assert set(grid) == {"embed_dim", "n_heads"}
-    assert all(type(width) is int and width > 0 for width in grid["embed_dim"])
-    assert all(type(heads) is int and heads > 0 for heads in grid["n_heads"])
-    assert len(ablation._parameter_grid_overrides(sweep)) == (
-        len(grid["embed_dim"]) * len(grid["n_heads"])
-    )
+    assert grid == {
+        "embed_dim": [32, 40, 48, 60, 64, 66, 75, 80, 96],
+        "n_heads": [4, 6, 8, 10, 11, 12, 15, 16],
+    }
+    assert len(ablation._parameter_grid_overrides(sweep)) == 72
 
-    with pytest.raises(ValueError, match="retained 1 width"):
+    with pytest.raises(
+        ValueError,
+        match=(r"retained 1 width\(s\).*embed_dim=60: n_params=30,200,381, "
+               r"relative_deviation=0.006679"),
+    ):
         ablation._parameter_match_selection("parameter_matched")
 
 
@@ -1561,8 +1564,26 @@ def test_every_ablation_arm_constructs_with_only_invalid_arm_prerequisites_repai
     assert pullback_group["transport_chart_max_norm"] == 6.0
 
     errors = []
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+    expected_warning_prefixes = (
+        "decode_bias=True is inert when use_prior_bank=True",
+        "inert configuration setting(s) --",
+        "lambda_h_mode='state_dependent' has no effect with lambda_h=0",
+        "cross_couplings collapses block_glk to a single irrep block",
+        "e_step_gradient='straight_through' severs the per-iteration E-step tangent",
+        "gauge_transport='frozen':",
+        "gauge_transport='off':",
+        "lambda_h_mode='state_dependent' ignores the lambda_h VALUE",
+        "pos_rotation='rope' is a deliberate residual gauge-FIXING layer",
+        "pos_rotation='rope' with rope_full_gauge=False",
+        "precision_weighted_attention=True uses a detached precision prior",
+        "query_adaptive_tau with query_tau_c>0 is an opt-in GL(K)-breaking baseline",
+        "s_e_step=True with lambda_h=0 and lambda_gamma=0",
+        "s_frame_mode='phi_tilde' with lambda_gamma=0",
+        "transport_mode='regime_ii' with family='gaussian_full'",
+        "transport_mode='regime_ii_covariant' with family='gaussian_full'",
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         for sweep_name in ablation.SWEEPS:
             try:
                 runs = ablation.make_run_overrides(sweep_name)
@@ -1570,10 +1591,19 @@ def test_every_ablation_arm_constructs_with_only_invalid_arm_prerequisites_repai
                 if sweep_name == "parameter_matched" and "retained 1 width(s)" in str(exc):
                     continue
                 raise
+            for label, overrides in runs:
                 try:
                     VFE3Config(**ablation._cell_cfg_dict(overrides, seed=6))
                 except Exception as exc:
                     errors.append((sweep_name, label, str(exc)))
+    assert caught, "registered sweep construction must disclose its intentional non-pure/inert arms"
+    unexpected_warnings = [
+        (warning.category.__name__, str(warning.message))
+        for warning in caught
+        if warning.category not in (ConfigNotice, UserWarning)
+        or not str(warning.message).startswith(expected_warning_prefixes)
+    ]
+    assert unexpected_warnings == []
     assert errors == []
 
 
