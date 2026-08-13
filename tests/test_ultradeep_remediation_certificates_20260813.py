@@ -4,6 +4,10 @@ import types
 
 import pytest
 
+import ablation
+from vfe3.geometry import norms as norms_module
+from vfe3.geometry import transport as transport_module
+
 from vfe3.contracts import ExecutableBuildMetadata
 from vfe3.model.block_mlp import block_mlp_build_metadata
 from vfe3.run_artifacts import _pure_path_report
@@ -17,6 +21,8 @@ def _cfg(**overrides: object) -> types.SimpleNamespace:
         "lambda_beta": 1.0,
         "use_prior_bank": True,
         "use_head_mixer": False,
+        "head_mixer_compatibility": "disabled",
+        "head_mixer_gauge_compatible": True,
         "use_priorbank_head_evidence_mixer": False,
         "encode_mode": "per_token",
         "use_block_mlp": False,
@@ -97,7 +103,7 @@ def _block_build(*, enabled: bool, mode: str) -> ExecutableBuildMetadata:
             [{"regime_ii_covariant_feature_exact": 1.0}],
             True,
             "exact",
-            True,
+            False,
         ),
         (
             {"transport_mode": "regime_ii_covariant"},
@@ -241,3 +247,272 @@ def test_certificate_schema_is_additive() -> None:
 
     assert preexisting <= report.keys()
     assert additions <= report.keys()
+
+_GAUGE_KEYS = {
+    "learned_gauge_transport",
+    "transport_gauge_equivariant",
+    "no_positional_rotation",
+    "no_model_channel_coupling",
+    "phi_parameterization",
+    "no_reflection_sampling",
+    "family_group_invariant",
+    "head_mixer_intertwiner_compatible",
+    "block_mlp_intertwiner_compatible",
+    "block_norm_gauge_equivariant",
+    "final_norm_gauge_equivariant",
+    "no_fixed_coordinate_spectral_cap",
+    "no_phi_mstep_chart_cap",
+    "no_pullback_trust_region",
+    "no_transport_exponential_clipping",
+    "no_e_step_phi_retraction_clipping",
+    "no_query_adaptive_trace_temperature",
+    "no_fixed_basis_emission",
+    "no_additive_encoder_control",
+}
+
+
+def test_gauge_truth_table_passing_fixture_covers_every_enumerated_key() -> None:
+    report = _pure_path_report(_cfg(), [])
+
+    assert set(report["gauge_flags"]) == _GAUGE_KEYS
+    assert all(report["gauge_flags"].values())
+    assert report["on_gauge_pure_path"] is True
+
+
+@pytest.mark.parametrize(
+    ("failed_key", "overrides", "block_mode"),
+    [
+        ("learned_gauge_transport", {"gauge_transport": "off"}, None),
+        ("transport_gauge_equivariant", {"transport_mode": "regime_ii"}, None),
+        ("no_positional_rotation", {"pos_rotation": "rope"}, None),
+        ("no_model_channel_coupling", {"lambda_gamma": 0.1}, None),
+        ("phi_parameterization", {"gauge_parameterization": "omega_direct"}, None),
+        ("no_reflection_sampling", {"phi_reflection": "init_seed"}, None),
+        ("family_group_invariant", {"family": "gaussian_diagonal"}, None),
+        (
+            "head_mixer_intertwiner_compatible",
+            {
+                "use_head_mixer": True,
+                "gauge_group": "block_glk",
+                "head_mixer_compatibility": "independent_head_nonintertwiner",
+                "head_mixer_gauge_compatible": False,
+            },
+            None,
+        ),
+        ("block_mlp_intertwiner_compatible", {}, "coordinate"),
+        ("block_norm_gauge_equivariant", {"norm_type_block": "layernorm"}, None),
+        ("final_norm_gauge_equivariant", {"norm_type_final": "layernorm"}, None),
+        ("no_fixed_coordinate_spectral_cap", {"sigma_max": 10.0}, None),
+        ("no_phi_mstep_chart_cap", {"phi_mstep_max_matrix_norm": 5.0}, None),
+        ("no_pullback_trust_region", {"m_phi_update_mode": "pullback_group"}, None),
+        ("no_transport_exponential_clipping", {"transport_chart_max_norm": None}, None),
+        ("no_transport_exponential_clipping", {"transport_chart_max_norm": 21.0}, None),
+        ("no_e_step_phi_retraction_clipping", {"e_phi_lr": 0.1}, None),
+        (
+            "no_query_adaptive_trace_temperature",
+            {"query_adaptive_tau": True, "query_tau_c": 1.0},
+            None,
+        ),
+        (
+            "no_fixed_basis_emission",
+            {"emission_mode": "separate", "emission_weight": 0.5},
+            None,
+        ),
+        ("no_additive_encoder_control", {"encode_mode": "per_token_additive"}, None),
+    ],
+)
+def test_each_active_gauge_breaker_fails_exactly_its_registered_key(
+    failed_key: str,
+    overrides: dict[str, object],
+    block_mode: str | None,
+) -> None:
+    executable_build = (
+        _block_build(enabled=True, mode=block_mode) if block_mode is not None else None
+    )
+    report = _pure_path_report(
+        _cfg(**overrides),
+        [],
+        executable_build=executable_build,
+    )
+
+    failed = {name for name, enabled in report["gauge_flags"].items() if not enabled}
+    assert failed == {failed_key}
+    assert report["on_gauge_pure_path"] is False
+
+
+_THEORY_REQUIREMENT_CASES = [
+    ("canonical_attention_entropy", {"include_attention_entropy": False}, [], None),
+    (
+        "flat_transport",
+        {"transport_mode": "regime_ii_covariant"},
+        [{"regime_ii_covariant_feature_exact": 1.0}],
+        None,
+    ),
+    ("constant_lambda_alpha", {"lambda_alpha_mode": "state_dependent"}, [], None),
+    ("prior_bank_decode", {"use_prior_bank": False}, [], None),
+    ("no_head_mixer", {"use_head_mixer": True}, [], None),
+    (
+        "no_priorbank_head_evidence_mixer",
+        {"use_priorbank_head_evidence_mixer": True},
+        [],
+        None,
+    ),
+    (
+        "unweighted_attention+no_fixed_prior_surrogate",
+        {"precision_weighted_attention": True},
+        [],
+        None,
+    ),
+    ("full_sigma_update", {"skip_belief_sigma_update": True}, [], None),
+    ("no_twohop_coupling", {"lambda_twohop": 0.1}, [], None),
+    ("no_block_mlp", {"use_block_mlp": True, "block_mlp_mode": "gauge_gate"}, [], None),
+    ("gradient_e_step_update", {"e_step_update": "mm_exact"}, [], None),
+]
+
+
+@pytest.mark.parametrize(
+    ("case", "overrides", "history", "expected_false"),
+    [
+        (
+            case,
+            overrides,
+            history,
+            {"unweighted_attention", "no_fixed_prior_surrogate"}
+            if case == "unweighted_attention+no_fixed_prior_surrogate"
+            else {case},
+        )
+        for case, overrides, history, _unused in _THEORY_REQUIREMENT_CASES
+    ],
+)
+def test_theory_purity_transparently_fails_each_legacy_requirement(
+    case: str,
+    overrides: dict[str, object],
+    history: list[dict[str, object]],
+    expected_false: set[str],
+) -> None:
+    del case
+    report = _pure_path_report(_cfg(**overrides), history)
+
+    assert {name for name, value in report["pure_flags"].items() if not value} == expected_false
+    assert {name for name, value in report["theory_flags"].items() if not value} == expected_false
+    assert report["on_gauge_pure_path"] is True
+    assert report["on_causal_lm_path"] is True
+    assert report["transport_exactness_status"] in {"exact", "not_applicable"}
+    assert report["on_theory_pure_path"] is False
+
+
+def test_theory_flags_enumerate_all_legacy_requirements_and_new_facets() -> None:
+    report = _pure_path_report(_cfg(), [])
+
+    assert report["pure_flags"].keys() <= report["theory_flags"].keys()
+    assert {
+        name: report["theory_flags"][name]
+        for name in report["pure_flags"]
+    } == report["pure_flags"]
+    assert set(report["theory_flags"]) == {
+        *report["pure_flags"],
+        "gauge_pure_path",
+        "causal_lm_path",
+        "transport_exact_when_applicable",
+    }
+    assert report["on_theory_pure_path"] is True
+
+
+@pytest.mark.parametrize(
+    ("history", "expected"),
+    [
+        ([{"regime_ii_covariant_feature_exact": 1.0}], "exact"),
+        ([{"regime_ii_covariant_feature_exact": 1.0}, {}], "unknown"),
+        ([{"regime_ii_covariant_feature_exact": 0.0}, {}], "approximate"),
+    ],
+)
+def test_successful_ablation_reporting_uses_completed_runtime_history(
+    history: list[dict[str, object]],
+    expected: str,
+) -> None:
+    fields = ablation._gauge_reporting_fields(
+        _cfg(transport_mode="regime_ii_covariant"),
+        history=history,
+    )
+
+    assert fields["transport_exactness_status"] == expected
+
+
+def _install_transport_registration(
+    name: str,
+    registration: transport_module.TransportRegistration,
+    *,
+    gauge_equivariant: bool,
+) -> None:
+    transport_module.register_transport(
+        name,
+        covariance_class=registration.covariance_class,
+        needs_mu=registration.needs_mu,
+        needs_sigma=registration.needs_sigma,
+        batch_independent=registration.batch_independent,
+        pair_transport_kind=registration.pair_transport_kind,
+        rope_right_foldable=registration.rope_right_foldable,
+        state_builder=registration.state_builder,
+        serialization_keys=registration.serialization_keys,
+        offdiag_serialization_keys=registration.offdiag_serialization_keys,
+        gauge_equivariant=gauge_equivariant,
+        runtime_exactness_key=registration.runtime_exactness_key,
+        override=True,
+    )(registration.callable)
+
+
+def test_gauge_certificate_tracks_transport_registration_override_and_restore() -> None:
+    original = transport_module.get_transport_registration("flat")
+    try:
+        _install_transport_registration("flat", original, gauge_equivariant=False)
+        report = _pure_path_report(_cfg(), [])
+        failed = {name for name, value in report["gauge_flags"].items() if not value}
+        assert failed == {"transport_gauge_equivariant"}
+        assert report["on_gauge_pure_path"] is False
+    finally:
+        _install_transport_registration(
+            "flat", original, gauge_equivariant=original.gauge_equivariant
+        )
+    assert transport_module.get_transport_registration("flat") == original
+
+
+def test_gauge_certificate_tracks_active_norm_callable_and_restore() -> None:
+    original = norms_module._NORMS["none"]
+
+    def replacement(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("reporting must not construct the norm")
+
+    norms_module._NORMS["none"] = replacement
+    try:
+        report = _pure_path_report(_cfg(norm_type_final="mahalanobis"), [])
+        failed = {name for name, value in report["gauge_flags"].items() if not value}
+        assert failed == {"block_norm_gauge_equivariant"}
+        assert report["on_gauge_pure_path"] is False
+    finally:
+        norms_module._NORMS["none"] = original
+
+    assert norms_module.get_norm_registration("none").gauge_equivariant is True
+
+@pytest.mark.parametrize(
+    ("overrides", "history", "expected_failed_theory_keys"),
+    [
+        ({"norm_type_block": "layernorm"}, [], {"gauge_pure_path"}),
+        ({"beta_attention_prior": "uniform"}, [], {"causal_lm_path"}),
+        (
+            {"transport_mode": "regime_ii_covariant"},
+            [{"regime_ii_covariant_feature_exact": 1.0}, {}],
+            {"flat_transport", "transport_exact_when_applicable"},
+        ),
+    ],
+)
+def test_theory_facets_fail_transparently_and_independently(
+    overrides: dict[str, object],
+    history: list[dict[str, object]],
+    expected_failed_theory_keys: set[str],
+) -> None:
+    report = _pure_path_report(_cfg(**overrides), history)
+
+    failed = {name for name, value in report["theory_flags"].items() if not value}
+    assert failed == expected_failed_theory_keys
+    assert report["on_theory_pure_path"] is False

@@ -1145,3 +1145,83 @@ def test_sanitize_distinct_labels_do_not_collide() -> None:
     assert len({ablation._sanitize("a=b"), ablation._sanitize("a b"),
                 ablation._sanitize("a/b")}) == 3
     assert ablation._sanitize("kappa=2") == ablation._sanitize("kappa=2")
+
+@pytest.mark.parametrize(
+    ("history", "expected_status"),
+    [
+        ([{"regime_ii_covariant_feature_exact": 1.0}], "exact"),
+        ([{"regime_ii_covariant_feature_exact": 1.0}, {}], "unknown"),
+        ([{"regime_ii_covariant_feature_exact": 0.0}, {}], "approximate"),
+    ],
+)
+def test_success_and_cached_resume_preserve_runtime_certificate_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    history: list[dict[str, object]],
+    expected_status: str,
+) -> None:
+    sweep_name = f"runtime-certificate-{expected_status}"
+    overrides = {"transport_mode": "regime_ii_covariant"}
+    monkeypatch.setitem(ablation.SWEEPS, sweep_name, {"description": "runtime certificate"})
+    monkeypatch.setattr(
+        ablation,
+        "make_run_overrides",
+        lambda _name: [("cell", dict(overrides))],
+    )
+    monkeypatch.setattr(ablation, "_git_code_identity", lambda: dict(_CODE_IDENTITY))
+    monkeypatch.setattr(
+        ablation,
+        "cache_source_identity",
+        lambda dataset, split, *, cache_dir=None: _source_identities()[split],
+    )
+    monkeypatch.setattr(ablation, "_cleanup", lambda: None)
+
+    def fresh_run(label, cell_overrides, run_dir, **kwargs):
+        del kwargs
+        cfg = ablation.VFE3Config(**ablation._cell_cfg_dict(cell_overrides, seed=6))
+        checkpoint = run_dir / "checkpoints" / "terminal.pt"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_bytes(b"runtime certificate terminal")
+        return {
+            "label": label,
+            "error_kind": None,
+            "primary_val_ppl": 8.0,
+            "final_val_ppl": 9.0,
+            "n_params": 1000,
+            "seed": 6,
+            "overrides": dict(cell_overrides),
+            "terminal_checkpoint": str(checkpoint),
+            "_loaded_data_sources": _source_identities(),
+            **ablation._gauge_reporting_fields(cfg, history=history),
+        }
+
+    monkeypatch.setattr(ablation, "run_single", fresh_run)
+    fresh = ablation.run_sweep(
+        sweep_name,
+        tmp_path,
+        dataset="wikitext-103",
+        device=None,
+        seed=6,
+        resume=False,
+    )
+    marker_path = tmp_path / sweep_name / ablation._sanitize("cell") / "ablation_result.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["transport_exactness_status"] == expected_status
+    assert fresh[0]["transport_exactness_status"] == expected_status
+
+    monkeypatch.setattr(
+        ablation,
+        "run_single",
+        lambda *args, **kwargs: pytest.fail("valid cached cell was unexpectedly recomputed"),
+    )
+    cached = ablation.run_sweep(
+        sweep_name,
+        tmp_path,
+        dataset="wikitext-103",
+        device=None,
+        seed=6,
+        resume=True,
+    )
+    cached_marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert cached_marker["transport_exactness_status"] == expected_status
+    assert cached[0]["transport_exactness_status"] == expected_status

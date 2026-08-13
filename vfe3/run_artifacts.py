@@ -4626,6 +4626,7 @@ def _pure_path_report(
     }
     on_gauge_pure_path = all(gauge_flags.values())
     theory_flags = {
+        **pure_flags,
         "gauge_pure_path": on_gauge_pure_path,
         "causal_lm_path": on_causal_lm_path,
         "transport_exact_when_applicable": transport_exactness_status in {"exact", "not_applicable"},

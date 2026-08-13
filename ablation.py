@@ -2670,13 +2670,17 @@ def _cell_cfg_dict(
 def _gauge_reporting_fields(
     cfg: VFE3Config,
     *,
+    history: Optional[List[Dict[str, object]]] = None,
     executable_build=None,
     reflection_scope=None,
     reflection_group_component_count=None,
 ) -> Dict[str, object]:
-    """Return the executable gauge-purity classification carried by every ablation row."""
+    """Return the executable scientific-certificate fields carried by an ablation row."""
     report = _pure_path_report(
-        cfg, [], executable_build=executable_build, reflection_scope=reflection_scope,
+        cfg,
+        ([] if history is None else history),
+        executable_build=executable_build,
+        reflection_scope=reflection_scope,
         reflection_group_component_count=reflection_group_component_count,
     )
     toggles = report["config_toggles"]
@@ -2694,6 +2698,44 @@ def _gauge_reporting_fields(
         "reflection_effective_scope":         str(report["reflection"]["effective_scope"]),
         "reflection_accessible_component_count": report["reflection"]["accessible_component_count"],
     }
+
+_EXECUTION_DERIVED_REPORT_FIELDS = frozenset({
+    "block_mlp_structural_mode",
+    "block_mlp_covariance_contract",
+    "block_mlp_intertwiner_compatible",
+    "on_gauge_pure_path",
+    "transport_exactness_status",
+    "on_theory_pure_path",
+    "reflection_effective_scope",
+    "reflection_accessible_component_count",
+})
+_EXACTNESS_STATUSES = frozenset({"exact", "approximate", "not_applicable", "unknown"})
+
+
+def _merge_gauge_reporting_defaults(
+    result: Dict[str, object],
+    expected_fields: Mapping[str, object],
+) -> None:
+    """Fill absent report fields without replacing persisted execution-derived evidence."""
+    for key, value in expected_fields.items():
+        result.setdefault(key, value)
+
+
+def _execution_derived_reporting_fields_are_valid(result: Mapping[str, object]) -> bool:
+    """Fail closed on missing or malformed persisted execution-derived certificate fields."""
+    if not _EXECUTION_DERIVED_REPORT_FIELDS <= result.keys():
+        return False
+    component_count = result["reflection_accessible_component_count"]
+    return (
+        isinstance(result["block_mlp_structural_mode"], str)
+        and isinstance(result["block_mlp_covariance_contract"], str)
+        and type(result["block_mlp_intertwiner_compatible"]) is bool
+        and type(result["on_gauge_pure_path"]) is bool
+        and result["transport_exactness_status"] in _EXACTNESS_STATUSES
+        and type(result["on_theory_pure_path"]) is bool
+        and isinstance(result["reflection_effective_scope"], str)
+        and (component_count is None or type(component_count) is int)
+    )
 
 
 @torch.no_grad()
@@ -3005,7 +3047,7 @@ def run_single(
         "_loaded_data_sources": loaded_data_sources,
     }
     result.update(_gauge_reporting_fields(
-        cfg, executable_build=model.executable_build,
+        cfg, history=artifacts.history, executable_build=model.executable_build,
         reflection_scope=model.prior_bank.reflection_scope,
         reflection_group_component_count=len(model.group.irrep_dims),
     ))
@@ -4160,7 +4202,13 @@ def _collect_sweep_results(
             required=bool(aggregation["diagnostic_flags"]["paired_token_bootstrap"]),
         ):
             continue
-        if any(result.get(key) != value for key, value in gauge_fields.items()):
+        if (
+            not _execution_derived_reporting_fields_are_valid(result)
+            or any(
+                key not in _EXECUTION_DERIVED_REPORT_FIELDS and result.get(key) != value
+                for key, value in gauge_fields.items()
+            )
+        ):
             continue
         results.append(dict(result))
 
@@ -4680,7 +4728,7 @@ def run_sweep(
                     and _paired_token_artifact_is_current(run_dir, required=paired_token_bootstrap)):
                 print(f"\n--- {i + 1}/{len(cells)}: {label}  [CACHED] ---")
                 cached_result = dict(cached_result)
-                cached_result.update(expected_gauge_fields)
+                _merge_gauge_reporting_defaults(cached_result, expected_gauge_fields)
                 cached_result["sweep"] = sweep_scope
                 cached_result["label"] = label
                 cached_result["seed"] = cell_seed
@@ -4753,7 +4801,7 @@ def run_sweep(
                 "param_difference":         parameter_record["param_difference"],
                 "param_relative_deviation": parameter_record["param_relative_deviation"],
             })
-        result.update(expected_gauge_fields or {
+        reporting_fields = expected_gauge_fields or {
             "head_mixer_compatibility":         "unavailable",
             "head_mixer_gauge_compatible":      False,
             "block_mlp_structural_mode":        "unavailable",
@@ -4765,7 +4813,11 @@ def run_sweep(
             "on_theory_pure_path":               False,
             "reflection_effective_scope":        "unknown",
             "reflection_accessible_component_count": None,
-        })
+        }
+        if result.get("error_kind") is None:
+            _merge_gauge_reporting_defaults(result, reporting_fields)
+        else:
+            result.update(reporting_fields)
         result["collect_diagnostics"] = diagnostic_flags["collect_diagnostics"]
         result["collect_extrapolation"] = diagnostic_flags["collect_extrapolation"]
         # The request flag always lands in the marker; the artifact identity fields default to null on
