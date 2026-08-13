@@ -33,6 +33,21 @@ from vfe3.config import ConfigNotice, VFE3Config
 from vfe3.run_artifacts import RunArtifacts
 from vfe3.viz import embedding_comparison, figures, report
 
+_PARAMETER_MATCHED_ONE_WIDTH_ERROR = (
+    "parameter-matched sweep retained 1 width(s), but at least 2 are required within relative "
+    "tolerance 0.020000; closest rejected candidates: embed_dim=32: n_params=19,331,473, "
+    "relative_deviation=0.355618; embed_dim=40: n_params=28,195,137, "
+    "relative_deviation=0.060162; embed_dim=48: n_params=28,997,221, "
+    "relative_deviation=0.033426; embed_dim=60: n_params=30,200,381, "
+    "relative_deviation=0.006679; embed_dim=64: n_params=25,764,609, "
+    "relative_deviation=0.141180; embed_dim=66: n_params=33,220,430, "
+    "relative_deviation=0.107348; embed_dim=75: n_params=33,971,701, "
+    "relative_deviation=0.132390; embed_dim=80: n_params=36,236,497, "
+    "relative_deviation=0.207883; embed_dim=96: n_params=48,320,705, "
+    "relative_deviation=0.610690"
+)
+
+
 
 def _tiny_config(**overrides: object) -> VFE3Config:
     values = {
@@ -1499,12 +1514,9 @@ def test_current_parameter_match_grid_fails_closed_with_one_width_within_toleran
     }
     assert len(ablation._parameter_grid_overrides(sweep)) == 72
 
-    with pytest.raises(
-        ValueError,
-        match=(r"retained 1 width\(s\).*embed_dim=60: n_params=30,200,381, "
-               r"relative_deviation=0.006679"),
-    ):
+    with pytest.raises(ValueError) as exc_info:
         ablation._parameter_match_selection("parameter_matched")
+    assert str(exc_info.value) == _PARAMETER_MATCHED_ONE_WIDTH_ERROR
 
 
 def test_every_ablation_arm_constructs_with_only_invalid_arm_prerequisites_repaired():
@@ -1588,7 +1600,8 @@ def test_every_ablation_arm_constructs_with_only_invalid_arm_prerequisites_repai
             try:
                 runs = ablation.make_run_overrides(sweep_name)
             except ValueError as exc:
-                if sweep_name == "parameter_matched" and "retained 1 width(s)" in str(exc):
+                if (sweep_name == "parameter_matched"
+                        and str(exc) == _PARAMETER_MATCHED_ONE_WIDTH_ERROR):
                     continue
                 raise
             for label, overrides in runs:
