@@ -113,3 +113,38 @@ The full structural lane emitted 16 pre-existing configuration/oracle warnings f
 `test_exact_congruence_family.py`, `test_p1_compact_phi_block_transport_20260711.py`, and
 `test_audit_transport_registry_20260720.py`; none concern numerical certification or this diff.
 No GPU lane was run, as required.
+
+## Post-cast certification remediation
+
+The remaining Critical review finding was remediated in implementation commit
+`f0da488e8a6de450af4e5e0c0546599b9bc03cd7` (`fix: certify covariance casts before return`).
+
+### Post-cast RED evidence
+
+- `.verification/remediation-2026-08-13/task-04-post-cast-red.xml`: 40 selected tests,
+  10 failures, 0 errors, 0 skipped. Every failure was the `fp64` policy returning an uncertified
+  fp32 cast for one of the ten dense/DirectLink/compact/equal-factored/heterogeneous-factored/RoPE
+  structural routes. All `fp32_escalate` retained-float64 cases and all 20 benign controls passed.
+
+### Post-cast implementation
+
+- `_certify_full_congruence` now treats the source-dtype cast as a separate candidate requiring the
+  same finite, symmetry, zero-jitter Cholesky, normalized-residual, and conditioning certificate.
+- A certified cast is returned at source dtype. If the cast fails but the working float64 result is
+  certified, that exact float64 tensor is retained, preserving its direct high-precision autograd
+  graph. The existing uncertified-float64 exception remains fail-visible.
+- The audited finite-but-indefinite fixture now covers both `fp64` and `fp32_escalate` policies for
+  every public structural route. A separate identity matrix covers benign certified fp32 casts for
+  both policies.
+- The older full-Gaussian regression was aligned with the binding policy: it independently proves
+  that the fp32 cast is indefinite, then requires the public result to equal the certified direct
+  float64 oracle.
+
+### Post-cast GREEN evidence
+
+- `.verification/remediation-2026-08-13/task-04-post-cast-focused-green.xml`: 40 tests,
+  0 failures, 0 errors, 0 skipped.
+- `.verification/remediation-2026-08-13/task-04-post-cast-green.xml`: 206 tests, 0 failures,
+  0 errors, 0 skipped across the prior 186-test Task 4 structural/full suite plus 20 new
+  policy-route cases.
+- Changed files passed `C:/Python314/python.exe -m compileall -q`, and `git diff --check` reported
