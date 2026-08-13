@@ -2,10 +2,12 @@ import copy
 
 import pytest
 import torch
+import torch.nn.functional as F
+import vfe3.model.prior_bank as prior_bank_module
 
 from tests.test_amp import _tiny_model
 from vfe3.config import VFE3Config
-from vfe3.families.gaussian import FullGaussian
+from vfe3.families.gaussian import DiagonalGaussian, FullGaussian
 from vfe3.families.laplace import DiagonalLaplace
 from vfe3.geometry.groups import get_group
 from vfe3.model.cg_coupling import CGCoupling
@@ -193,3 +195,197 @@ def test_decode_last_is_bit_identical_to_last_position_of_full_decoder():
             token_ids, return_logits=True, decode_last=True)
 
     assert torch.equal(last_logits, full_logits[:, -1:])
+
+
+@pytest.mark.parametrize("checkpoint_mode", ["never", "always"])
+@pytest.mark.parametrize("chunk_width", [2, 3])
+def test_family_chunked_partial_invalid_vocab_matches_dense_finite_mask_value_and_gradients(
+    checkpoint_mode, chunk_width,
+):
+    vocab = 2 * chunk_width
+    bank = PriorBank(
+        vocab, 2, 1, family="gaussian_diagonal", divergence_family="renyi",
+        renyi_order=1.5, decode_mode="family_chunked", decode_chunk_size=chunk_width,
+        decode_ce_checkpoint=checkpoint_mode,
+    )
+    oracle_bank = copy.deepcopy(bank)
+    with torch.no_grad():
+        # alpha=1.5 blend = -0.5 Sigma_q + 1.5 Sigma_v. Sigma_q=10 makes
+        # the first chunk finite (Sigma_v=4) and the second wholly invalid (Sigma_v=1).
+        bank.mu_embed.zero_()
+        bank.mu_embed[:chunk_width, 0] = torch.arange(chunk_width) * 0.25
+        bank.sigma_log_embed[:chunk_width].fill_(torch.log(torch.tensor(4.0)))
+        bank.sigma_log_embed[chunk_width:].zero_()
+        oracle_bank.load_state_dict(bank.state_dict())
+
+    mu = torch.tensor([[[0.1, -0.2]]], requires_grad=True)
+    sigma = torch.full((1, 1, 2), 10.0, requires_grad=True)
+    mu_ref = mu.detach().clone().requires_grad_(True)
+    sigma_ref = sigma.detach().clone().requires_grad_(True)
+    targets = torch.tensor([[0]])
+
+    got = bank.decode_ce_family_chunked(
+        mu, sigma, targets, return_stats=True, chunk_size=chunk_width)
+
+    q = DiagonalGaussian(mu_ref.unsqueeze(-2), sigma_ref.unsqueeze(-2))
+    p = DiagonalGaussian(
+        oracle_bank.mu_embed[:chunk_width],
+        oracle_bank.sigma_log_embed[:chunk_width].exp(),
+    )
+    finite_logits = -q.renyi_closed_form(
+        p, alpha=1.5, kl_max=float("inf"), eps=bank.eps)
+    expected = F.cross_entropy(finite_logits.reshape(1, chunk_width), targets.reshape(-1))
+
+    torch.testing.assert_close(got.ce, expected, atol=2e-7, rtol=2e-7)
+    assert int(got.scored_tokens) == 1 and int(got.excluded_tokens) == 0
+    got.ce.backward()
+    expected.backward()
+    torch.testing.assert_close(mu.grad, mu_ref.grad, atol=2e-7, rtol=2e-7)
+    torch.testing.assert_close(sigma.grad, sigma_ref.grad, atol=2e-7, rtol=2e-7)
+    torch.testing.assert_close(
+        bank.mu_embed.grad[:chunk_width], oracle_bank.mu_embed.grad[:chunk_width],
+        atol=2e-7, rtol=2e-7)
+    torch.testing.assert_close(
+        bank.sigma_log_embed.grad[:chunk_width],
+        oracle_bank.sigma_log_embed.grad[:chunk_width], atol=2e-7, rtol=2e-7)
+    assert torch.equal(
+        bank.mu_embed.grad[chunk_width:],
+        torch.zeros_like(bank.mu_embed.grad[chunk_width:]))
+    assert torch.equal(
+        bank.sigma_log_embed.grad[chunk_width:],
+        torch.zeros_like(bank.sigma_log_embed.grad[chunk_width:]))
+
+
+def _assert_fused_and_dense_match_promoted_value_and_gradients(
+    bank, mu, sigma, targets, *, chunk_size,
+):
+    fast_bank = copy.deepcopy(bank)
+    dense_bank = copy.deepcopy(bank)
+    ref_bank = copy.deepcopy(bank).double()
+    mu_fast = mu.detach().clone().requires_grad_(True)
+    sigma_fast = sigma.detach().clone().requires_grad_(True)
+    mu_dense = mu.detach().clone().requires_grad_(True)
+    sigma_dense = sigma.detach().clone().requires_grad_(True)
+    mu_ref = mu.detach().double().clone().requires_grad_(True)
+    sigma_ref = sigma.detach().double().clone().requires_grad_(True)
+
+    fused = (
+        fast_bank.decode_ce_full_chunked
+        if sigma.dim() == 4 else fast_bank.decode_ce_diagonal_chunked
+    )(mu_fast, sigma_fast, targets, chunk_size=chunk_size, return_stats=True)
+    dense_logits = dense_bank.decode(mu_dense, sigma_dense)
+    dense_ce = F.cross_entropy(
+        dense_logits.reshape(-1, bank.vocab_size), targets.reshape(-1))
+    previous = set_decode_av_precision("fp64")
+    try:
+        ref_logits = ref_bank.decode(mu_ref, sigma_ref)
+        ref_ce = F.cross_entropy(
+            ref_logits.reshape(-1, bank.vocab_size), targets.reshape(-1))
+    finally:
+        set_decode_av_precision(previous)
+
+    assert fused.ce.dtype is torch.float64
+    assert dense_logits.dtype is torch.float64
+    torch.testing.assert_close(fused.ce, ref_ce, atol=2e-12, rtol=2e-12)
+    torch.testing.assert_close(dense_ce, ref_ce, atol=2e-12, rtol=2e-12)
+    assert int(fused.scored_tokens) == targets.numel()
+    assert int(fused.excluded_tokens) == 0
+
+    fused.ce.backward()
+    dense_ce.backward()
+    ref_ce.backward()
+    for got_grad, want_grad in (
+        (mu_fast.grad, mu_ref.grad), (sigma_fast.grad, sigma_ref.grad),
+        (mu_dense.grad, mu_ref.grad), (sigma_dense.grad, sigma_ref.grad),
+        (fast_bank.mu_embed.grad, ref_bank.mu_embed.grad),
+        (fast_bank.sigma_log_embed.grad, ref_bank.sigma_log_embed.grad),
+        (dense_bank.mu_embed.grad, ref_bank.mu_embed.grad),
+        (dense_bank.sigma_log_embed.grad, ref_bank.sigma_log_embed.grad),
+    ):
+        torch.testing.assert_close(
+            got_grad.double(), want_grad, atol=5e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2])
+@pytest.mark.parametrize("full", [False, True])
+def test_global_cross_chunk_near_tie_promotes_complete_dense_and_fused_decode(chunk_size, full):
+    bank = PriorBank(
+        3, 4, 1, mu_init_std=0.0,
+        family="gaussian_full" if full else "gaussian_diagonal",
+        decode_mode="full_chunked" if full else "diagonal_chunked",
+    )
+    table = torch.tensor([
+        [10000.0068359375, 9999.9990234375, 10000.001953125, 9999.990234375],
+        [9999.953125, 10000.0146484375, 9999.9765625, 9999.982421875],
+        [9999.9873046875, 10000.009765625, 9999.99609375, 9999.9716796875],
+    ])
+    with torch.no_grad():
+        bank.mu_embed.copy_(table)
+        bank.sigma_log_embed.fill_(-9.0)
+    mu = torch.tensor([[[10000.01171875, 9999.9912109375, 10000.0234375, 9999.9501953125]]])
+    diagonal = torch.full((1, 1, 4), 1e-4)
+    sigma = torch.diag_embed(diagonal) if full else diagonal
+    _assert_fused_and_dense_match_promoted_value_and_gradients(
+        bank, mu, sigma, torch.tensor([[0]]), chunk_size=chunk_size)
+
+
+def test_global_final_ranking_includes_unigram_cancellation_value_and_gradients():
+    bank = PriorBank(
+        2, 2, 1, mu_init_std=0.0, decode_mode="diagonal_chunked",
+        decode_unigram_prior=True,
+    )
+    with torch.no_grad():
+        bank.mu_embed.copy_(torch.tensor([[0.0, 0.0], [3.0, 4.0]]))
+        bank.sigma_log_embed.zero_()
+        bank.unigram_log_prior.copy_(torch.tensor([-20.0, -7.5000005]))
+        bank._unigram_set = True
+    _assert_fused_and_dense_match_promoted_value_and_gradients(
+        bank, torch.zeros(1, 1, 2), torch.ones(1, 1, 2), torch.tensor([[0]]),
+        chunk_size=1)
+
+
+def test_global_final_ranking_includes_head_evidence_cancellation_value_and_gradients():
+    bank = PriorBank(
+        2, 2, 1, mu_init_std=0.0, decode_mode="diagonal_chunked",
+        irrep_dims=[1, 1], use_priorbank_head_evidence_mixer=True,
+    )
+    with torch.no_grad():
+        bank.mu_embed.copy_(torch.tensor([[1.0, 0.0], [1.0, 10.0]]))
+        bank.sigma_log_embed.zero_()
+        bank.head_evidence_logits.copy_(torch.tensor([10.0, -10.0]))
+    _assert_fused_and_dense_match_promoted_value_and_gradients(
+        bank, torch.zeros(1, 1, 2), torch.ones(1, 1, 2), torch.tensor([[0]]),
+        chunk_size=1)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2])
+@pytest.mark.parametrize("full", [False, True])
+def test_global_interval_nonoverlap_keeps_fp32_fast_path(
+    monkeypatch, chunk_size, full,
+):
+    bank = PriorBank(
+        3, 2, 1, mu_init_std=0.0,
+        family="gaussian_full" if full else "gaussian_diagonal",
+        decode_mode="full_chunked" if full else "diagonal_chunked",
+    )
+    with torch.no_grad():
+        bank.mu_embed.copy_(
+            torch.tensor([[0.0, 0.0], [3.0, 0.0], [6.0, 0.0]]))
+        bank.sigma_log_embed.zero_()
+    mu = torch.zeros(1, 1, 2, requires_grad=True)
+    diagonal = torch.ones(1, 1, 2)
+    sigma = torch.diag_embed(diagonal) if full else diagonal
+
+    def _unexpected_promotion(*args, **kwargs):
+        raise AssertionError("non-overlapping score intervals must not recompute")
+
+    monkeypatch.setattr(
+        prior_bank_module, "_promoted_expanded_decode", _unexpected_promotion)
+    logits = bank.decode(mu, sigma)
+    fused = (
+        bank.decode_ce_full_chunked
+        if full else bank.decode_ce_diagonal_chunked
+    )(mu, sigma, torch.tensor([[0]]), chunk_size=chunk_size, return_stats=True)
+    assert logits.dtype is torch.float32
+    assert fused.ce.dtype is torch.float32
+    assert int(fused.scored_tokens) == 1 and int(fused.excluded_tokens) == 0
