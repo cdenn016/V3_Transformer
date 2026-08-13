@@ -153,7 +153,7 @@ Full expanded Task 3 lane:
 $env:CUDA_VISIBLE_DEVICES='-1'; $env:VFE3_TEST_DEVICE='cpu'; & 'C:/Python314/python.exe' -m pytest -q tests/test_run_artifacts.py tests/test_validated_geometry_numerics_20260713.py tests/test_tier12_attention.py tests/test_ultradeep_remediation_certificates_20260813.py tests/test_ablation_reporting.py tests/test_reporting_additions.py tests/test_ablation_tackon.py tests/test_ablation_artifact_resume_20260712.py --junitxml=.verification/remediation-2026-08-13/task-03-review-full-green.xml
 ```
 
-Machine-readable result: 271 tests, 270 passed, 0 failures, 0 errors, 1 expected slow skip. The skipped test remains `test_train_with_artifacts_writes_attention_pngs`, which requires `--runslow`.
+Machine-readable result: 274 tests, 273 passed, 0 failures, 0 errors, 1 expected slow skip. The skipped test remains `test_train_with_artifacts_writes_attention_pngs`, which requires `--runslow`.
 
 Active registry compatibility: 89 tests, 89 passed, 0 failures/errors/skips (`task-03-review-registry-green.xml`).
 
