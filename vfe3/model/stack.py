@@ -22,7 +22,7 @@ import torch
 
 from vfe3.belief import BeliefState
 from vfe3.config import VFE3Config
-from vfe3.contracts import EStepGradientRecord, MStepCapture
+from vfe3.contracts import CanonicalFrameContext, EStepGradientRecord, MStepCapture
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.transport import TransportState, merge_legacy_transport_state
 from vfe3.free_energy import attention_tau, query_adaptive_tau
@@ -39,7 +39,8 @@ def vfe_stack(
     *,
     log_prior:       Optional[torch.Tensor]                  = None,
     block_norm:      Optional[Callable[..., torch.Tensor]]   = None,      # cached norm instance (None -> off)
-    block_mlps:      Optional[Sequence[Callable[[torch.Tensor], torch.Tensor]]] = None,  # one coordinate MLP per block
+    block_mlps:      Optional[Sequence[Callable]]            = None,      # one selected residual transform per block
+    block_mlp_frame: Optional[CanonicalFrameContext]         = None,      # shared fixed vertex frame for canonical mode
     head_mixer:      Optional[Callable[..., 'tuple']]        = None,      # opt-in Schur head mixer (None -> off)
     cg_coupling:     Optional[Callable[..., 'tuple']]        = None,      # opt-in CG cross-type coupling (None -> off)
     lambda_beta:     'float | torch.Tensor'                  = 1.0,       # belief-coupling weight (cfg.lambda_beta)
@@ -136,6 +137,7 @@ def vfe_stack(
         belief = vfe_block(belief, mu_p, sigma_p, group, cfg, log_prior=log_prior,
                            block_norm=block_norm, head_mixer=head_mixer, cg_coupling=cg_coupling,
                            block_mlp=(block_mlps[layer_index] if block_mlps is not None else None),
+                           block_mlp_frame=block_mlp_frame,
                            lambda_beta=lambda_beta,
                            transport_state=transport_state,
                            e_step_gradient=e_step_gradient, rope=rope, rope_on_cov=rope_on_cov,

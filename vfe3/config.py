@@ -662,6 +662,9 @@ class VFE3Config:
 
     # Optional residual feed-forward unit applied after each belief block.
     use_block_mlp:             bool  = False
+    block_mlp_mode:            str   = "coordinate"   # "coordinate" | "gauge_gate" | "canonical_frame"
+    block_mlp_covariance:      str   = "passthrough"  # "passthrough" | "delta_full"
+    block_mlp_covariance_floor: float = 1e-4       # covariant SPD floor: Sigma+ = J Sigma J^T + floor Sigma
     block_mlp_expansion:       int   = 4
     block_mlp_activation:      str   = "gelu"
     block_mlp_dropout:         float = 0.0
@@ -2954,6 +2957,60 @@ class VFE3Config:
                 "block_mlp_expansion must be an integer >= 1, "
                 f"got {self.block_mlp_expansion!r}"
             )
+        if self.block_mlp_mode not in ("coordinate", "gauge_gate", "canonical_frame"):
+            raise ValueError(
+                "block_mlp_mode must be 'coordinate', 'gauge_gate', or 'canonical_frame'; "
+                f"got {self.block_mlp_mode!r}"
+            )
+        if self.block_mlp_covariance not in ("passthrough", "delta_full"):
+            raise ValueError(
+                "block_mlp_covariance must be 'passthrough' or 'delta_full'; "
+                f"got {self.block_mlp_covariance!r}"
+            )
+        if (isinstance(self.block_mlp_covariance_floor, bool)
+                or not isinstance(self.block_mlp_covariance_floor, Real)
+                or not math.isfinite(float(self.block_mlp_covariance_floor))
+                or float(self.block_mlp_covariance_floor) <= 0.0):
+            raise ValueError(
+                "block_mlp_covariance_floor must be a finite real value > 0, "
+                f"got {self.block_mlp_covariance_floor!r}"
+            )
+        if self.use_block_mlp and (
+                self.block_mlp_mode == "gauge_gate"
+                or self.block_mlp_covariance == "delta_full"
+        ) and self.family != "gaussian_full":
+            raise ValueError(
+                "block_mlp_mode='gauge_gate' and block_mlp_covariance='delta_full' need a "
+                "full-covariance Gaussian family (family='gaussian_full'); invariant "
+                "Mahalanobis gates and dense J Sigma J^T cannot be represented by a "
+                f"diagonal/non-Gaussian family (got family={self.family!r})."
+            )
+        if self.use_block_mlp and self.block_mlp_mode == "canonical_frame":
+            incompatible = []
+            if self.transport_mode != "flat":
+                incompatible.append(f"transport_mode={self.transport_mode!r}")
+            if self.gauge_parameterization != "phi":
+                incompatible.append(
+                    f"gauge_parameterization={self.gauge_parameterization!r}")
+            if self.e_phi_lr != 0.0:
+                incompatible.append(f"e_phi_lr={self.e_phi_lr!r}")
+            if self.phi_reflection != "off":
+                incompatible.append(f"phi_reflection={self.phi_reflection!r}")
+            if self.pos_rotation == "rope":
+                if self.rope_insertion != "right":
+                    incompatible.append(f"rope_insertion={self.rope_insertion!r}")
+                if not self.rope_full_gauge:
+                    incompatible.append("rope_full_gauge=False")
+                if not self.rope_on_value:
+                    incompatible.append("rope_on_value=False")
+            if incompatible:
+                raise ValueError(
+                    "block_mlp_mode='canonical_frame' requires a fixed factored flat frame: "
+                    "transport_mode='flat', gauge_parameterization='phi', e_phi_lr=0, "
+                    "phi_reflection='off', and active RoPE must use right insertion with "
+                    "rope_full_gauge=True and rope_on_value=True; got "
+                    + ", ".join(incompatible)
+                )
         if self.block_mlp_activation not in ("gelu", "silu", "relu"):
             raise ValueError(f"unknown block_mlp_activation {self.block_mlp_activation!r}")
         if (isinstance(self.block_mlp_dropout, bool)
@@ -3500,11 +3557,12 @@ class VFE3Config:
 
         _inert: List[str] = []
         if not self.use_block_mlp and _changed(
-                "block_mlp_expansion", "block_mlp_activation", "block_mlp_dropout",
-                "m_block_mlp_lr"):
+                "block_mlp_mode", "block_mlp_covariance", "block_mlp_covariance_floor", "block_mlp_expansion",
+                "block_mlp_activation", "block_mlp_dropout", "m_block_mlp_lr"):
             _inert.append(
-                "block MLP settings block_mlp_expansion/block_mlp_activation/"
-                "block_mlp_dropout/m_block_mlp_lr (only read when use_block_mlp=True)")
+                "block MLP settings block_mlp_mode/block_mlp_covariance/block_mlp_covariance_floor/"
+                "block_mlp_expansion/block_mlp_activation/block_mlp_dropout/"
+                "m_block_mlp_lr (only read when use_block_mlp=True)")
         if canonical_e_step_update != "mm_exact" and _changed("mm_damping"):
             _inert.append(f"mm_damping={self.mm_damping} (only read by e_step_update='mm_exact')")
         # The REVERSE direction of the rule above (audit 2026-07-27). The mm_exact branch of

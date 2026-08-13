@@ -301,7 +301,10 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
     decode_bias               = True,     # only if use_prior_bank = False
     use_head_mixer            = True,      # opt-in Schur-commutant head mixer (needs >=2 equal blocks (block_glk/tied_block_glk) OR a labeled irrep tower (so_n/sp_n: per-isotypic-component mixing; mults-one towers get scalar gains));
                                            # breaks strict equivariance under block_glk (exact at init); EXACT under tied_block_glk (full-cov)
-    use_block_mlp             = False,      # opt-in coordinate mean-only residual MLP; not gauge-pure
+    use_block_mlp             = False,      # opt-in post-block residual transform
+    block_mlp_mode            = "coordinate",  # "coordinate" (legacy, not pure) | "gauge_gate" (strict per scalar-mask realization; in-distribution across independent masks) | "canonical_frame" (left-equivariant, right-frame fixed)
+    block_mlp_covariance      = "passthrough", # "passthrough" | "delta_full" (first-order J Sigma J^T; full covariance)
+    block_mlp_covariance_floor = 1e-4,       # covariant SPD floor: Sigma+ = J Sigma J^T + floor Sigma
     block_mlp_expansion       = 4,
     block_mlp_activation      = "gelu",
     block_mlp_dropout         = 0.0,
@@ -725,6 +728,40 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         "configs": [
             {"label": "block_mlp_off", "use_block_mlp": False},
             {"label": "block_mlp_on", "use_block_mlp": True},
+        ],
+    },
+
+    "block_mlp_mode": {
+        "description": "post-block residual structure: coordinate, strict invariant gate, or frame-fixed",
+        "configs": [
+            {
+                "label": "block_mlp_mode=coordinate",
+                "use_block_mlp": True, "block_mlp_mode": "coordinate",
+            },
+            {
+                "label": "block_mlp_mode=gauge_gate",
+                "use_block_mlp": True, "block_mlp_mode": "gauge_gate",
+                "family": "gaussian_full",
+            },
+            {
+                "label": "block_mlp_mode=canonical_frame",
+                "use_block_mlp": True, "block_mlp_mode": "canonical_frame",
+            },
+        ],
+    },
+
+    "block_mlp_covariance": {
+        "description": "post-block covariance contract: pass through or delta-method full pushforward",
+        "configs": [
+            {
+                "label": "block_mlp_covariance=passthrough",
+                "use_block_mlp": True, "block_mlp_covariance": "passthrough",
+            },
+            {
+                "label": "block_mlp_covariance=delta_full",
+                "use_block_mlp": True, "block_mlp_covariance": "delta_full",
+                "family": "gaussian_full",
+            },
         ],
     },
 
