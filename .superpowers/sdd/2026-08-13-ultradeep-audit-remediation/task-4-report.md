@@ -148,3 +148,28 @@ The remaining Critical review finding was remediated in implementation commit
   0 errors, 0 skipped across the prior 186-test Task 4 structural/full suite plus 20 new
   policy-route cases.
 - Changed files passed `C:/Python314/python.exe -m compileall -q`, and `git diff --check` reported
+  no whitespace errors.
+
+The full lane emitted the same 16 pre-existing configuration/oracle warnings documented above.
+No GPU lane was run. The final diff does not change registrations, signatures, provenance,
+certificates, configuration, decoder, diagnostics, or training behavior.
+
+## Reduced-dtype cast remediation
+
+The final Important review finding was remediated in implementation commit
+`b42376b773643252369442257d13df766c205ba4` (`fix: retain certified reduced-dtype casts`).
+
+- `.verification/remediation-2026-08-13/task-04-reduced-cast-red.xml`: 4 tests, 4 failures,
+  0 errors, 0 skipped. Both bf16 and fp16 cast candidates were incorrectly passed to
+  `validated_cholesky_solve` under both `fp64` and `fp32_escalate`.
+- The authoritative boundary now treats source dtypes outside float32/float64 as uncertifiable and
+  retains the already certified working tensor without calling or weakening the shared validator.
+  The returned working dtype is float64 under `fp64` and float32 under `fp32_escalate`.
+- `.verification/remediation-2026-08-13/task-04-reduced-cast-focused-green.xml`: 4 tests,
+  0 failures, 0 errors, 0 skipped. CPU execution supports both bf16 and fp16 fixtures.
+- `.verification/remediation-2026-08-13/task-04-reduced-cast-green.xml`: 210 tests, 0 failures,
+  0 errors, 0 skipped across the prior 206-test Task 4 structural/full lane plus the four new
+  reduced-dtype policy cases.
+
+The reduced-dtype change is confined to cast-candidate routing and its regression coverage. The
+same 16 unrelated warnings remain; no GPU lane was run.
