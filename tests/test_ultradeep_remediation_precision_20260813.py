@@ -177,6 +177,34 @@ def test_every_public_structural_route_returns_benign_certified_fp32_cast(
     assert torch.equal(actual, torch.eye(K).reshape(1, 1, K, K))
 
 
+@pytest.mark.parametrize(
+    ("policy", "expected_dtype"),
+    (("fp64", torch.float64), ("fp32_escalate", torch.float32)),
+)
+@pytest.mark.parametrize("source_dtype", (torch.bfloat16, torch.float16))
+def test_unsupported_reduced_dtype_cast_retains_certified_working_tensor(
+    source_dtype: torch.dtype,
+    policy: str,
+    expected_dtype: torch.dtype,
+):
+    set_full_cov_congruence_precision(policy)
+    omega = torch.eye(3, dtype=source_dtype).reshape(1, 1, 3, 3)
+    sigma = torch.eye(3, dtype=source_dtype).reshape(1, 3, 3)
+    try:
+        torch.einsum("...ijkl,...jlm,...ijnm->...ijkn", omega, sigma, omega)
+    except RuntimeError as error:
+        pytest.skip(f"CPU torch does not support {source_dtype} einsum: {error}")
+
+    actual = transport_covariance(omega, sigma, diagonal_out=False)
+
+    assert actual.dtype is expected_dtype
+    assert torch.equal(
+        actual,
+        torch.eye(3, dtype=expected_dtype).reshape(1, 1, 3, 3),
+    )
+    assert bool((torch.linalg.cholesky_ex(actual)[1] == 0).all())
+
+
 def test_public_full_covariance_route_fails_when_float64_is_uncertifiable():
     set_full_cov_congruence_precision("fp32_escalate")
     singular = torch.zeros(1, 1, 3, 3, dtype=torch.float32)

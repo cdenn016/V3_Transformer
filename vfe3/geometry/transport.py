@@ -1466,14 +1466,19 @@ def _certify_full_congruence(
     Certification is zero-jitter: finiteness alone cannot accept a symmetric-but-indefinite or
     accuracy-uncertain covariance. A working result may return at source dtype only when the cast
     candidate independently certifies there. If a certified float64 working result loses its
-    certificate on cast, float64 is retained. A failed fast representation recomputes and retains
-    float64.
+    certificate on cast, float64 is retained. Reduced dtypes outside the certificate API's
+    float32/float64 domain are treated as uncertifiable and retain the certified working tensor.
+    A failed fast representation recomputes and retains float64.
     """
     certificate = validated_cholesky_solve(out)
     if bool(certificate.certified.all()):
         if retain_full_precision or out.dtype == source_dtype:
             return out
         cast_candidate = out.to(source_dtype)
+        if cast_candidate.dtype not in (torch.float32, torch.float64):
+            # The shared validator intentionally rejects reduced dtypes. Do not weaken it or call
+            # it outside its contract; retain the already certified working representation.
+            return out
         cast_certificate = validated_cholesky_solve(cast_candidate)
         if bool(cast_certificate.certified.all()):
             return cast_candidate
