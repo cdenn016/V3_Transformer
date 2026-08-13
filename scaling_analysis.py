@@ -111,7 +111,10 @@ CONFIG: Dict[str, Any] = {
 
 _CSV_COLUMNS = [
     "route", "scale_knob", "label", "seed", "n_params", "n_learnable_params", "embed_dim", "n_heads",
-    "n_gen", "gauge_group", "n_layers", "n_e_steps", "family", "tokens_seen", "est_flops_6ND",
+    "n_gen", "gauge_group", "n_layers", "n_e_steps", "family",
+    "use_block_mlp", "block_mlp_mode", "block_mlp_covariance", "block_mlp_expansion",
+    "block_mlp_activation", "block_mlp_dropout", "block_mlp_covariance_floor",
+    "tokens_seen", "est_flops_6ND",
     "est_flops_analytic", "active_params_per_token", "test_ce", "test_ppl",
     "test_bits_per_token", "test_bpc",
     "estep_final_f_per_token", "best_val_ppl",
@@ -132,6 +135,9 @@ _SCALING_SOURCE_SPLITS = ("train", "validation", "test")
 _SCALING_STRUCTURAL_FIELDS = (
     "n_params", "scale_knob", "embed_dim", "n_heads", "n_layers", "n_e_steps",
     "n_gen", "gauge_group", "family", "tokens_seen",
+    "use_block_mlp", "block_mlp_mode", "block_mlp_covariance",
+    "block_mlp_expansion", "block_mlp_activation", "block_mlp_dropout",
+    "block_mlp_covariance_floor",
     "git_sha", "git_dirty", "git_dirty_fingerprint",
     "train_source_identity", "validation_source_identity", "test_source_identity",
 )
@@ -449,6 +455,13 @@ def harvest(
             "n_layers":    sp.get("n_layers", cfg.get("n_layers")),
             "n_e_steps":   sp.get("n_e_steps", cfg.get("n_e_steps")),
             "family":      cfg.get("family"),
+            "use_block_mlp": cfg.get("use_block_mlp"),
+            "block_mlp_mode": cfg.get("block_mlp_mode"),
+            "block_mlp_covariance": cfg.get("block_mlp_covariance"),
+            "block_mlp_expansion": cfg.get("block_mlp_expansion"),
+            "block_mlp_activation": cfg.get("block_mlp_activation"),
+            "block_mlp_dropout": cfg.get("block_mlp_dropout"),
+            "block_mlp_covariance_floor": cfg.get("block_mlp_covariance_floor"),
             "tokens_seen": sp.get("tokens_seen"),
             "est_flops_6ND":           sp.get("est_flops_6ND"),
             "est_flops_analytic":      sp.get("est_flops_analytic"),

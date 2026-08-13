@@ -185,7 +185,7 @@ def run_process_tree(
     timeout:        Optional[float]             = None,
     encoding:       Optional[str]               = None,
     errors:         Optional[str]               = None,
-) -> subprocess.CompletedProcess[str]:
+) -> 'subprocess.CompletedProcess[bytes] | subprocess.CompletedProcess[str]':
     r"""Run ``command`` in a process tree that is destroyed on timeout or parent exit.
 
     Windows descendants are assigned to a Job Object with

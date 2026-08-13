@@ -450,15 +450,44 @@ class DecodeRegistration:
     fused_ce_supports_stats: bool                  = False
 
     def __post_init__(self) -> None:
+        if not callable(self.callable):
+            raise TypeError("decoder callable must be callable")
+        for field_name in (
+            "supports_full",
+            "supports_chunked",
+            "family_consistent",
+            "can_omit_base_mean",
+            "can_omit_base_variance",
+            "fused_ce_supports_stats",
+        ):
+            if type(getattr(self, field_name)) is not bool:
+                raise TypeError(f"decoder {field_name} declaration must be bool")
         # Resolve the covariance-kind set. Omitted -> the legacy singleton derived from
         # supports_full (a frozen dataclass, so the resolved value is written via object.__setattr__).
         if self.covariance_kinds is None:
-            object.__setattr__(
-                self, "covariance_kinds",
-                frozenset({"full"} if self.supports_full else {"diagonal"}),
-            )
+            resolved_kinds = frozenset({"full"} if self.supports_full else {"diagonal"})
         else:
-            object.__setattr__(self, "covariance_kinds", frozenset(self.covariance_kinds))
+            resolved_kinds = frozenset(self.covariance_kinds)
+        if not resolved_kinds or not resolved_kinds <= {"diagonal", "full"}:
+            raise ValueError(
+                "decoder covariance_kinds must be a nonempty subset of "
+                f"{{'diagonal', 'full'}}, got {sorted(resolved_kinds)}"
+            )
+        resolved_full = "full" in resolved_kinds
+        if self.supports_full != resolved_full:
+            raise ValueError(
+                "decoder has contradictory rank metadata: "
+                f"supports_full={self.supports_full} but covariance_kinds="
+                f"{sorted(resolved_kinds)} implies supports_full={resolved_full}"
+            )
+        if self.supports_chunked != (self.fused_ce is not None):
+            raise ValueError(
+                "decoder has contradictory chunk metadata: supports_chunked must be true "
+                "exactly when fused_ce is provided"
+            )
+        if self.fused_ce_supports_stats and self.fused_ce is None:
+            raise ValueError("decoder cannot support fused CE stats without fused_ce")
+        object.__setattr__(self, "covariance_kinds", resolved_kinds)
 
 
 _DECODERS: Dict[str, DecodeRegistration] = {}

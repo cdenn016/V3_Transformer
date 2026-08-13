@@ -209,7 +209,7 @@ def vfe_block(
     if block_mlp is not None:                # default-off residual moment transform, after norm before handoff
         if hasattr(block_mlp, "forward_moments"):
             result = block_mlp.forward_moments(
-                out.mu, out.sigma, frame=block_mlp_frame)
+                out.mu, out.sigma, frame_context=block_mlp_frame)
             out = out._replace(mu=result.mu, sigma=result.sigma)
         else:                                # legacy callable compatibility: coordinate mean only
             out = out._replace(mu=block_mlp(out.mu))

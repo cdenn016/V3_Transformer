@@ -211,11 +211,11 @@ def test_canonical_frame_passthrough_is_left_equivariant():
     gauge_inv = torch.linalg.inv(gauge)
 
     base = mlp.forward_moments(
-        mu, sigma, frame=CanonicalFrameContext(frame, frame_inv))
+        mu, sigma, frame_context=CanonicalFrameContext(frame, frame_inv))
     transformed = mlp.forward_moments(
         (gauge @ mu.unsqueeze(-1)).squeeze(-1),
         _congruence(gauge, sigma),
-        frame=CanonicalFrameContext(gauge @ frame, frame_inv @ gauge_inv),
+        frame_context=CanonicalFrameContext(gauge @ frame, frame_inv @ gauge_inv),
     )
 
     assert torch.allclose(
@@ -236,7 +236,7 @@ def test_canonical_frame_delta_full_matches_realized_coordinate_jacobian():
     sigma = _spd((), 4)
     frame = _block_gauge((), 2)
     frame_context = CanonicalFrameContext(frame, torch.linalg.inv(frame))
-    result = mlp.forward_moments(mu, sigma, frame=frame_context)
+    result = mlp.forward_moments(mu, sigma, frame_context=frame_context)
     reference_jacobian = torch.autograd.functional.jacobian(
         lambda value: mlp.mean_update(value, frame_context), mu, create_graph=True,
     )
@@ -261,7 +261,7 @@ def test_canonical_frame_is_not_invariant_to_a_generic_right_frame_change():
     changed_context = CanonicalFrameContext(
         frame @ right, torch.linalg.inv(right) @ torch.linalg.inv(frame))
 
-    base = mlp.forward_moments(mu, sigma, frame=base_context)
-    changed = mlp.forward_moments(mu, sigma, frame=changed_context)
+    base = mlp.forward_moments(mu, sigma, frame_context=base_context)
+    changed = mlp.forward_moments(mu, sigma, frame_context=changed_context)
 
     assert not torch.allclose(changed.mu, base.mu, atol=1e-9, rtol=1e-9)

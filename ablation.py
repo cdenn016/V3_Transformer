@@ -706,7 +706,7 @@ BASELINE_CONFIG["kl_max"] = 8 * BASELINE_CONFIG["embed_dim"]
 # One sweep per sweepable VFE3Config toggle. `requires` pre-satisfies a cross-field constraint
 # so the cell is a clean single-variable comparison rather than a config error; multi-arm
 # `configs` is used where arms must differ in several fields at once. The few fields that are NOT
-# meaningfully ablatable are listed under NON_SWEPT_FIELDS below.
+# meaningfully ablatable are documented below.
 SWEEPS: Dict[str, Dict[str, Any]] = {
 
     # === model structure / capacity ========================================
@@ -1899,10 +1899,6 @@ SWEEPS["e_q_mu_sigma_lr_grid"] = {
 #  drives the full-covariance SPD retraction's eigh to non-convergence -- a deferred robust-eigh
 #  issue, separate from the now-fixed full-cov KL Cholesky.)
 # (gauge_parameterization is swept via the "gauge_parameterization" arm in SWEEPS, not here.)
-NON_SWEPT_FIELDS = (
-    "vocab_size", "encode_mode", "divergence_family", "seed",
-    "max_steps", "log_interval", "eval_interval", "checkpoint_interval", "eval_max_batches",
-)
 
 
 # Which sweeps run (and in what order) when CONFIG["sweep"] is None. This is a CURATED subset of
@@ -4996,6 +4992,26 @@ def _aggregate_cells(
     return out
 
 
+def _print_ablation_rows(rows: List[Dict[str, Any]], *, parameter_matched: bool) -> None:
+    """Print one reachable ablation table with the complete structural gauge label."""
+    if parameter_matched:
+        print(f"{'label':<34}{'val PPL':>12}{'params':>12}{'budget dev':>12}  gauge classification")
+        print("-" * 116)
+    else:
+        print(f"{'label':<34}{'val PPL':>12}{'params':>12}  gauge classification")
+        print("-" * 104)
+    for row in rows:
+        ppl = "inf" if row.get("_ppl", _as_float(row.get("primary_val_ppl"))) == float("inf") else f"{row.get('_ppl', _as_float(row.get('primary_val_ppl'))):.3f}"
+        params = f"{int(_as_float(row.get('n_params'))):,}" if row.get("n_params") not in ("", None) else "-"
+        gauge = _sensitivity_gauge_label(row)
+        if parameter_matched:
+            relative = _as_float(row.get("param_relative_deviation"))
+            deviation = "-" if relative == float("inf") else f"{relative * 100:.2f}%"
+            print(f"{row['label']:<34}{ppl:>12}{params:>12}{deviation:>12}  {gauge}")
+        else:
+            print(f"{row['label']:<34}{ppl:>12}{params:>12}  {gauge}")
+
+
 def analyze_sweep(sweep_dir: Path) -> None:
     rows = _read_sweep_csv(sweep_dir)
     if not rows:
@@ -5007,22 +5023,7 @@ def analyze_sweep(sweep_dir: Path) -> None:
 
     print(f"\n{'=' * 70}\nANALYSIS: {sweep_dir.name}\n{'=' * 70}")
     parameter_matched = any(r.get("target_n_params") not in ("", None) for r in rows)
-    if parameter_matched:
-        print(f"{'label':<34}{'val PPL':>12}{'params':>12}{'budget dev':>12}  gauge classification")
-        print("-" * 116)
-    else:
-        print(f"{'label':<34}{'val PPL':>12}{'params':>12}  gauge classification")
-        print("-" * 104)
-    for r in rows:
-        ppl = "inf" if r["_ppl"] == float("inf") else f"{r['_ppl']:.3f}"
-        params = f"{int(_as_float(r.get('n_params'))):,}" if r.get("n_params") not in ("", None) else "-"
-        gauge = r.get("head_mixer_compatibility") or "unavailable"
-        if parameter_matched:
-            relative = _as_float(r.get("param_relative_deviation"))
-            deviation = "-" if relative == float("inf") else f"{relative * 100:.2f}%"
-            print(f"{r['label']:<34}{ppl:>12}{params:>12}{deviation:>12}  {gauge}")
-        else:
-            print(f"{r['label']:<34}{ppl:>12}{params:>12}  {gauge}")
+    _print_ablation_rows(rows, parameter_matched=parameter_matched)
 
     finished = [r for r in rows if r["_ppl"] < float("inf")]
     if len(finished) > 1:
@@ -5041,15 +5042,6 @@ def analyze_sweep(sweep_dir: Path) -> None:
         print("-" * 68)
         for a in agg:
             print(f"{a['label']:<34}{a['n']:>4}{a['mean']:>12.3f}{a['sd']:>10.3f}{a['cv'] * 100:>8.1f}")
-
-
-def _sweep_is_complete(sweep_dir: Path) -> bool:
-    """Return true only when one persisted sweep explicitly completed its invocation."""
-    try:
-        meta = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8"))
-    except Exception:
-        return False
-    return isinstance(meta, Mapping) and meta.get("status") == "complete"
 
 
 def _cross_sweep_cohort_identity(
@@ -5125,7 +5117,7 @@ def summarize_sweeps(
         if not rows:
             continue
         best = min(rows, key=lambda r: _as_float(r.get("primary_val_ppl")))
-        gauge = best.get("head_mixer_compatibility") or "unavailable"
+        gauge = _sensitivity_gauge_label(best)
         print(f"{d.name:<24}{best['label']:<30}{_as_float(best['primary_val_ppl']):>10.3f}  {gauge}")
 
 

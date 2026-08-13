@@ -32,6 +32,64 @@ class CanonicalFrameContext:
             raise ValueError(
                 "canonical forward and inverse factors must be on the same device, got "
                 f"{self.forward.device} and {self.inverse.device}")
+        if not self.forward.is_floating_point() or not self.inverse.is_floating_point():
+            raise ValueError("canonical frame factors must use a floating-point dtype")
+        if not torch.isfinite(self.forward).all() or not torch.isfinite(self.inverse).all():
+            raise ValueError("canonical frame factors must contain only finite values")
+
+        dimension = self.forward.shape[-1]
+        identity = torch.eye(
+            dimension,
+            dtype=self.forward.dtype,
+            device=self.forward.device,
+        )
+        forward_inverse = self.forward @ self.inverse
+        inverse_forward = self.inverse @ self.forward
+        residual = torch.maximum(
+            (forward_inverse - identity).abs().amax(dim=(-2, -1)),
+            (inverse_forward - identity).abs().amax(dim=(-2, -1)),
+        )
+        forward_scale = self.forward.abs().sum(dim=-1).amax(dim=-1)
+        inverse_scale = self.inverse.abs().sum(dim=-1).amax(dim=-1)
+        conditioning_scale = torch.clamp(forward_scale * inverse_scale, min=1.0)
+        tolerance = (
+            64.0
+            * float(dimension)
+            * torch.finfo(self.forward.dtype).eps
+            * conditioning_scale
+        )
+        if not bool(torch.all(residual <= tolerance)):
+            raise ValueError(
+                "canonical forward and inverse factors must be mutual inverses within a "
+                "dtype-scaled residual; got max residual "
+                f"{float(residual.max().detach().cpu()):.6g} and tolerance "
+                f"{float(tolerance.max().detach().cpu()):.6g}"
+            )
+
+
+@dataclass(frozen=True)
+class BlockMLPBuildMetadata:
+    """Immutable executable BlockMLP structure captured when a model is built."""
+
+    enabled: bool
+    mode: str
+    covariance: str
+    expansion: int
+    activation: str
+    dropout: float
+    covariance_floor: float
+    parameter_count: int
+    report_label: str
+    covariance_report_label: str
+    gauge_class: str
+    intertwiner_compatible: bool
+
+
+@dataclass(frozen=True)
+class ExecutableBuildMetadata:
+    """Small immutable description of components actually constructed by VFEModel."""
+
+    block_mlp: BlockMLPBuildMetadata
 
 
 class EffectiveBetaPriorContext(NamedTuple):

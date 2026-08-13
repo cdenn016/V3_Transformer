@@ -48,8 +48,12 @@ from vfe3.config import (
     VFE3Config,
     migrate_serialized_config,
 )
-from vfe3.contracts import DataState, DataStateBuffer
+from vfe3.contracts import DataState, DataStateBuffer, ExecutableBuildMetadata
 from vfe3.ema import EMA
+from vfe3.model.block_mlp import (
+    block_mlp_build_metadata,
+    get_block_mlp_registration,
+)
 from vfe3.model.prior_bank import normalize_legacy_model_state
 from vfe3.process_utils import run_process_tree
 from vfe3.runtime import deterministic_state
@@ -3034,16 +3038,26 @@ def _cost_model_fields(
     # coordinates; base token priors and every decode vocabulary prior remain diagonal.
     lower = K * (K - 1) // 2 if not cfg.diagonal_covariance else 0
     token_row = 2 * K + n_gen + (lower if cfg.prior_source == "model_channel" else 0)
-    block_mlp_active = bool(getattr(cfg, "use_block_mlp", False))
-    block_mlp_mode = getattr(cfg, "block_mlp_mode", "coordinate")
-    block_mlp_covariance = getattr(cfg, "block_mlp_covariance", "passthrough")
-    block_mlp_expansion = int(getattr(cfg, "block_mlp_expansion", 4))
-    block_mlp_width = n_blocks if block_mlp_mode == "gauge_gate" else K
-    block_mlp_params = (
-        int(cfg.n_layers)
-        * (2 * block_mlp_expansion * block_mlp_width * block_mlp_width
-           + (block_mlp_expansion + 1) * block_mlp_width)
-        if block_mlp_active else 0)
+    executable_build = getattr(model, "executable_build", None)
+    block_mlp_build = (
+        executable_build.block_mlp
+        if isinstance(executable_build, ExecutableBuildMetadata)
+        else block_mlp_build_metadata(
+            enabled=bool(getattr(cfg, "use_block_mlp", False)),
+            mode=getattr(cfg, "block_mlp_mode", "coordinate"),
+            covariance=getattr(cfg, "block_mlp_covariance", "passthrough"),
+            expansion=int(getattr(cfg, "block_mlp_expansion", 4)),
+            activation=getattr(cfg, "block_mlp_activation", "gelu"),
+            dropout=float(getattr(cfg, "block_mlp_dropout", 0.0)),
+            covariance_floor=float(getattr(cfg, "block_mlp_covariance_floor", 1e-4)),
+            embed_dim=K,
+            irrep_dims=model.group.irrep_dims,
+            n_layers=int(cfg.n_layers),
+        )
+    )
+    block_mlp_active = block_mlp_build.enabled
+    block_mlp_registration = get_block_mlp_registration(block_mlp_build.mode)
+    block_mlp_params = block_mlp_build.parameter_count
     if cfg.use_prior_bank:
         decode_readout = 2 * V * K
     else:
@@ -3066,15 +3080,13 @@ def _cost_model_fields(
     fpt_estep          = belief_estep + model_estep
     fpt_block_mlp = 0.0
     if block_mlp_active:
-        fpt_block_mlp = 4.0 * L * block_mlp_expansion * block_mlp_width * block_mlp_width
-        if block_mlp_mode == "gauge_gate":
-            # Per-block SPD solves for the Mahalanobis invariants; order-1 proxy constants.
-            fpt_block_mlp += L * sum(
-                2.0 * dim ** 3 + 2.0 * dim ** 2 for dim in model.group.irrep_dims)
-        elif block_mlp_mode == "canonical_frame":
-            fpt_block_mlp += 4.0 * L * K * K       # pull to and push from the vertex frame
-        if block_mlp_covariance == "delta_full":
-            fpt_block_mlp += 4.0 * L * K ** 3      # J Sigma J^T
+        fpt_block_mlp = block_mlp_registration.flops_per_token(
+            embed_dim=K,
+            irrep_dims=model.group.irrep_dims,
+            expansion=block_mlp_build.expansion,
+            covariance_contract=block_mlp_build.covariance,
+            n_layers=L,
+        )
     est_flops_analytic = (fpt_decode + fpt_estep + fpt_block_mlp) * float(tokens_seen)
     out: Dict[str, object] = {
         "embed_dim":               K,
@@ -3361,7 +3373,7 @@ def finalize_run(
     # stress metrics that say whether the numerical guards stayed inert. A REPORT of where the run sits,
     # not a judgment that any toggle is wrong (toggles are changed intentionally). Best-effort.
     try:
-        artifacts.save_json("pure_path_report.json", _pure_path_report(cfg, artifacts.history))
+        artifacts.save_json("pure_path_report.json", _pure_path_report(cfg, artifacts.history, executable_build=model.executable_build))
     except Exception as exc:
         logger.warning("pure-path report failed (%s); skipped", exc)
 
@@ -4293,7 +4305,7 @@ def finalize_validation_run(
             data_seed=data_seed, max_tokens=max_tokens, tokenizer_tag=tokenizer_tag,
         )
         try:
-            artifacts.save_json("pure_path_report.json", _pure_path_report(cfg, artifacts.history))
+            artifacts.save_json("pure_path_report.json", _pure_path_report(cfg, artifacts.history, executable_build=model.executable_build))
         except Exception as exc:
             logger.warning("pure-path report failed (%s); skipped", exc)
         if bool(getattr(cfg, "generate_figures", True)):
@@ -4366,7 +4378,12 @@ def finalize_validation_run(
     }
 
 
-def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
+def _pure_path_report(
+    cfg: VFE3Config,
+    history: List[Dict],
+    *,
+    executable_build: Optional[ExecutableBuildMetadata] = None,
+) -> Dict:
     r"""Where a run sits relative to the theoretically pure path: the toggle states that define it plus
     the converged-state stress metrics that say whether the numerical guards stayed inert.
 
@@ -4406,30 +4423,39 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
     head_mixer_gauge_compatible = getattr(cfg, "head_mixer_gauge_compatible", None)
     if head_mixer_gauge_compatible is None:
         head_mixer_gauge_compatible = VFE3Config.head_mixer_gauge_compatible.fget(cfg)
-    block_mlp_active = bool(getattr(cfg, "use_block_mlp", False))
-    block_mlp_covariance_floor = float(getattr(cfg, "block_mlp_covariance_floor", 1e-4))
-    block_mlp_mode = getattr(cfg, "block_mlp_mode", "coordinate")
-    block_mlp_covariance = getattr(cfg, "block_mlp_covariance", "passthrough")
-    if not block_mlp_active:
-        block_mlp_structural_mode = "disabled"
-        block_mlp_covariance_contract = "not_applicable"
-        block_mlp_intertwiner_compatible = True
-    elif block_mlp_mode == "gauge_gate":
-        block_mlp_structural_mode = "invariant_scalar_gate"
-        block_mlp_covariance_contract = ("delta_full_plus_covariant_floor" if block_mlp_covariance == "delta_full" else block_mlp_covariance)
-        block_mlp_intertwiner_compatible = True
-    elif block_mlp_mode == "canonical_frame":
-        block_mlp_structural_mode = "canonical_frame_left_equivariant_right_fixed"
-        block_mlp_covariance_contract = ("delta_full_plus_covariant_floor" if block_mlp_covariance == "delta_full" else block_mlp_covariance)
-        block_mlp_intertwiner_compatible = False
+    if executable_build is not None:
+        block_mlp_build = executable_build.block_mlp
+        block_mlp_active = block_mlp_build.enabled
+        block_mlp_mode = block_mlp_build.mode
+        block_mlp_covariance = block_mlp_build.covariance
+        block_mlp_expansion = block_mlp_build.expansion
+        block_mlp_activation = block_mlp_build.activation
+        block_mlp_dropout = block_mlp_build.dropout
+        block_mlp_covariance_floor = block_mlp_build.covariance_floor
+        block_mlp_structural_mode = block_mlp_build.report_label
+        block_mlp_covariance_contract = block_mlp_build.covariance_report_label
+        block_mlp_intertwiner_compatible = block_mlp_build.intertwiner_compatible
     else:
+        block_mlp_active = bool(getattr(cfg, "use_block_mlp", False))
+        block_mlp_mode = getattr(cfg, "block_mlp_mode", "coordinate")
+        block_mlp_covariance = getattr(cfg, "block_mlp_covariance", "passthrough")
+        block_mlp_expansion = int(getattr(cfg, "block_mlp_expansion", 4))
+        block_mlp_activation = getattr(cfg, "block_mlp_activation", "gelu")
+        block_mlp_dropout = float(getattr(cfg, "block_mlp_dropout", 0.0))
+        block_mlp_covariance_floor = float(getattr(cfg, "block_mlp_covariance_floor", 1e-4))
+        registration = get_block_mlp_registration(block_mlp_mode)
         block_mlp_structural_mode = (
-            "coordinate_mean_only_nonintertwiner"
-            if block_mlp_covariance == "passthrough"
-            else "coordinate_delta_full_covariant_floor_nonintertwiner"
+            registration.report_label(block_mlp_covariance)
+            if block_mlp_active else "disabled"
         )
-        block_mlp_covariance_contract = ("delta_full_plus_covariant_floor" if block_mlp_covariance == "delta_full" else block_mlp_covariance)
-        block_mlp_intertwiner_compatible = False
+        block_mlp_covariance_contract = (
+            "not_applicable" if not block_mlp_active else
+            "delta_full_plus_covariant_floor"
+            if block_mlp_covariance == "delta_full" else block_mlp_covariance
+        )
+        block_mlp_intertwiner_compatible = (
+            registration.intertwiner_compatible if block_mlp_active else True
+        )
     covariance_feature_exact = _last("regime_ii_covariant_feature_exact")
     feature_jitter_recovered = covariance_feature_exact is not None and covariance_feature_exact < 0.5
     if cfg.transport_mode != "regime_ii_covariant":
@@ -4510,10 +4536,10 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             "use_block_mlp":                block_mlp_active,
             "block_mlp_mode":               block_mlp_mode,
             "block_mlp_covariance":         block_mlp_covariance,
-            "block_mlp_expansion":          int(getattr(cfg, "block_mlp_expansion", 4)),
+            "block_mlp_expansion":          block_mlp_expansion,
             "block_mlp_covariance_floor":   block_mlp_covariance_floor,
-            "block_mlp_activation":         getattr(cfg, "block_mlp_activation", "gelu"),
-            "block_mlp_dropout":            float(getattr(cfg, "block_mlp_dropout", 0.0)),
+            "block_mlp_activation":         block_mlp_activation,
+            "block_mlp_dropout":            block_mlp_dropout,
             "block_mlp_lr_resolved":        float(
                 getattr(cfg, "m_block_mlp_lr", None)
                 if getattr(cfg, "m_block_mlp_lr", None) is not None else getattr(cfg, "m_p_mu_lr", 0.0)),

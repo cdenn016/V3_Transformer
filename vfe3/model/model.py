@@ -34,6 +34,7 @@ from vfe3.config import VFE3Config
 from vfe3.emission import bohning_emission_terms
 from vfe3.contracts import (
     CanonicalFrameContext,
+    ExecutableBuildMetadata,
     EffectiveBetaPriorContext,
     EStepGradientOutput,
     EStepGradientRecord,
@@ -56,7 +57,11 @@ from vfe3.geometry.transport import (
 )
 from vfe3.model.canonical_content import project_canonical_diagonal
 from vfe3.model.head_mixer import HeadMixer
-from vfe3.model.block_mlp import build_block_mlp
+from vfe3.model.block_mlp import (
+    block_mlp_build_metadata,
+    build_block_mlp,
+    get_block_mlp_registration,
+)
 from vfe3.model.block import _as_coeff, vfe_block
 from vfe3.model.model_frame import resolve_model_frame
 from vfe3.model.positional_phi import apply_positional_phi, positional_phi_coords
@@ -376,6 +381,21 @@ class VFEModel(nn.Module):
                 )
                 for _ in range(cfg.n_layers)
             ]) if cfg.use_block_mlp else None
+        )
+        self._block_mlp_registration = get_block_mlp_registration(cfg.block_mlp_mode)
+        self.executable_build = ExecutableBuildMetadata(
+            block_mlp=block_mlp_build_metadata(
+                enabled=cfg.use_block_mlp,
+                mode=cfg.block_mlp_mode,
+                covariance=cfg.block_mlp_covariance,
+                expansion=cfg.block_mlp_expansion,
+                activation=cfg.block_mlp_activation,
+                dropout=cfg.block_mlp_dropout,
+                covariance_floor=cfg.block_mlp_covariance_floor,
+                embed_dim=cfg.embed_dim,
+                irrep_dims=self.group.irrep_dims,
+                n_layers=cfg.n_layers,
+            )
         )
         self.final_norm = get_norm(cfg.norm_type_final)(cfg.embed_dim, eps=cfg.eps,
                                                          family=cfg.family,
@@ -887,9 +907,10 @@ class VFEModel(nn.Module):
         beliefs: BeliefState,
         rope: Optional[torch.Tensor],
     ) -> 'tuple[Optional[object], Optional[CanonicalFrameContext]]':
+        block_mlp_build = self.executable_build.block_mlp
         if not (
-            self.cfg.use_block_mlp
-            and self.cfg.block_mlp_mode == "canonical_frame"
+            block_mlp_build.enabled
+            and self._block_mlp_registration.requires_frame_context
         ):
             return None, None
         transport = self._build_shared_flat_transport(
@@ -1328,7 +1349,10 @@ class VFEModel(nn.Module):
                     rope=rope, prebuilt_transport=shared_omega)
                 s_belief = (s_mu1, s_sigma1)
                 beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
-            if self.cfg.use_block_mlp and self.cfg.block_mlp_mode == "canonical_frame":
+            if (
+                self.executable_build.block_mlp.enabled
+                and self._block_mlp_registration.requires_frame_context
+            ):
                 if shared_omega is None:
                     shared_omega, block_mlp_frame = self._block_mlp_frame_transport(
                         beliefs, rope)

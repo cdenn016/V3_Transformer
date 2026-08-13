@@ -2957,15 +2957,13 @@ class VFE3Config:
                 "block_mlp_expansion must be an integer >= 1, "
                 f"got {self.block_mlp_expansion!r}"
             )
-        if self.block_mlp_mode not in ("coordinate", "gauge_gate", "canonical_frame"):
+        from vfe3.model.block_mlp import get_block_mlp_registration
+        block_mlp_registration = get_block_mlp_registration(self.block_mlp_mode)
+        if self.block_mlp_covariance not in block_mlp_registration.covariance_kinds:
             raise ValueError(
-                "block_mlp_mode must be 'coordinate', 'gauge_gate', or 'canonical_frame'; "
-                f"got {self.block_mlp_mode!r}"
-            )
-        if self.block_mlp_covariance not in ("passthrough", "delta_full"):
-            raise ValueError(
-                "block_mlp_covariance must be 'passthrough' or 'delta_full'; "
-                f"got {self.block_mlp_covariance!r}"
+                f"block_mlp_covariance for mode {self.block_mlp_mode!r} must be one of "
+                f"{sorted(block_mlp_registration.covariance_kinds)}, got "
+                f"{self.block_mlp_covariance!r}"
             )
         if (isinstance(self.block_mlp_covariance_floor, bool)
                 or not isinstance(self.block_mlp_covariance_floor, Real)
@@ -2976,7 +2974,7 @@ class VFE3Config:
                 f"got {self.block_mlp_covariance_floor!r}"
             )
         if self.use_block_mlp and (
-                self.block_mlp_mode == "gauge_gate"
+                block_mlp_registration.gauge_class == "invariant_scalar_intertwiner"
                 or self.block_mlp_covariance == "delta_full"
         ) and self.family != "gaussian_full":
             raise ValueError(
@@ -2985,7 +2983,7 @@ class VFE3Config:
                 "Mahalanobis gates and dense J Sigma J^T cannot be represented by a "
                 f"diagonal/non-Gaussian family (got family={self.family!r})."
             )
-        if self.use_block_mlp and self.block_mlp_mode == "canonical_frame":
+        if self.use_block_mlp and block_mlp_registration.requires_frame_context:
             incompatible = []
             if self.transport_mode != "flat":
                 incompatible.append(f"transport_mode={self.transport_mode!r}")
