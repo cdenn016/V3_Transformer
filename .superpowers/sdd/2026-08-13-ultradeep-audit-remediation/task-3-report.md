@@ -1,0 +1,119 @@
+# Task 3 Report: Truthful Scientific Certificates
+
+Date: 2026-08-13
+Base revision: `383f17ecb52397b16abe9da383e9b6c8281b9a9b`
+Implementation commit: `beaaf7b32ea8667789b8dd41daa829a6141de9fb`
+Status: implemented and focused CPU suites green
+
+## Scope and Result
+
+Task 3 makes the persisted certificate facets describe the active executable path without rejecting diagnostic configurations. It adds independent causality, transport-exactness, and conjunctive theory-purity facets; expands gauge purity across the registered active GL-breaking seams; and persists runtime-owned reflection scope and accessible orientation-component metadata. All preexisting report keys remain present.
+
+The implementation consumes Task 2's immutable `ExecutableBuildMetadata` for BlockMLP. Transport, norm, attention-prior, clipping, adaptive-temperature, encoder, emission, and reflection facts come from active registrations, runtime evidence, or the live execution-selector config where no immutable runtime record exists. The report does not reconstruct BlockMLP from mutable config when executable metadata is supplied.
+
+Diagnostic GL-breaking and noncausal configurations remain executable. They now report false on the corresponding facet rather than being rejected.
+
+## TDD RED Evidence
+
+Initial command:
+
+```powershell
+$env:CUDA_VISIBLE_DEVICES='-1'; $env:VFE3_TEST_DEVICE='cpu'; & 'C:/Python314/python.exe' -m pytest -q tests/test_ultradeep_remediation_certificates_20260813.py tests/test_run_artifacts.py tests/test_validated_geometry_numerics_20260713.py tests/test_tier12_attention.py --junitxml=.verification/remediation-2026-08-13/task-03-red.xml
+```
+
+Machine-readable result from `task-03-red.xml`: 109 tests, 21 failures, 0 errors, 1 skipped, 87 passed, 23.053 seconds. The failures were the intended missing-contract failures: absent additive report keys, incomplete gauge-purity predicates, absent causality registration metadata, missing reflection scope/count, and the old affirmative exactness behavior for empty covariant history.
+
+Self-review added a second RED edge for a negative exactness observation followed by a missing row:
+
+```powershell
+$env:CUDA_VISIBLE_DEVICES='-1'; $env:VFE3_TEST_DEVICE='cpu'; & 'C:/Python314/python.exe' -m pytest -q tests/test_ultradeep_remediation_certificates_20260813.py -k certificate_truth_table --junitxml=.verification/remediation-2026-08-13/task-03-negative-red.xml
+```
+
+Machine-readable result: 16 tests, 1 failure, 0 errors, 0 skipped. The failure proved that a known negative observation was incorrectly classified as `unknown` when another history row lacked evidence. The minimal correction makes any finite negative observation `approximate`; a wholly affirmative complete history is `exact`; missing evidence without a negative observation is `unknown`.
+
+## GREEN Evidence
+
+Required focused suite:
+
+```powershell
+$env:CUDA_VISIBLE_DEVICES='-1'; $env:VFE3_TEST_DEVICE='cpu'; & 'C:/Python314/python.exe' -m pytest -q tests/test_run_artifacts.py tests/test_validated_geometry_numerics_20260713.py tests/test_tier12_attention.py tests/test_ultradeep_remediation_certificates_20260813.py tests/test_ablation_reporting.py --junitxml=.verification/remediation-2026-08-13/task-03-green.xml
+```
+
+Machine-readable result from `task-03-green.xml`: 121 tests, 0 failures, 0 errors, 1 skipped, 120 passed, 21.948 seconds. The skip is the preexisting slow `test_train_with_artifacts_writes_attention_pngs`, which requires `--runslow` and is not part of this focused CPU lane.
+
+Registry/schema compatibility lane:
+
+```powershell
+$env:CUDA_VISIBLE_DEVICES='-1'; $env:VFE3_TEST_DEVICE='cpu'; & 'C:/Python314/python.exe' -m pytest -q tests/test_attention_prior.py tests/test_alpha_i.py tests/test_round3_registry_guards.py tests/test_round3_geometry_wiring.py tests/test_norms.py tests/test_transport.py --junitxml=.verification/remediation-2026-08-13/task-03-registry-green.xml
+```
+
+Machine-readable result: 89 tests, 0 failures, 0 errors, 0 skipped, 89 passed, 0.326 seconds. This independently covers duplicate-key fail-closed behavior, override/restore behavior, complete transport-registration restoration, and the preexisting norm/prior/transport public seams.
+
+The self-review edge was rerun after the fix into `task-03-negative-green.xml`: 16 tests, 0 failures, 0 errors, 0 skipped.
+
+## Implemented Certificate Semantics
+
+- `on_causal_lm_path` is the conjunction of the beta and gamma active attention-prior registrations. Uniform, ALiBi-only, windowed, and bidirectional T5 paths remain executable and report false. Causality does not alter `on_gauge_pure_path`.
+- `transport_exactness_status` emits only `exact`, `approximate`, `not_applicable`, or `unknown`. Flat is `not_applicable`; gauge-fixed or structurally noninvariant transport is `approximate`; a complete affirmative covariant history is `exact`; a finite negative observation is `approximate`; missing evidence is `unknown`. The covariant charted-link registration has no runtime exactness record and therefore reports `unknown`, never an inferred affirmative.
+- `on_theory_pure_path` is the explicit conjunction of `gauge_pure_path`, `causal_lm_path`, and `transport_exact_when_applicable` in the new `theory_flags` map.
+- `on_gauge_pure_path` retains its key and boolean type, but now includes active transport covariance class, both norm registrations including LayerNorm, positional rotation, model-channel coupling, parameterization, reflection, family/group invariance, HeadMixer, immutable BlockMLP class, fixed-coordinate covariance spectral cap, post-M-step chart cap, pullback trust region, fail-closed exponential validity bound, E-step phi retraction clipping, query-adaptive trace temperature, fixed-basis emission, and additive encoder control.
+- Reflection persistence records configured and effective scope, effective subgroup, accessible blocks, accessible component count, and total represented component count. Multi-block `block_glk` with the existing reflection proposal reports `block_zero_only`, block 0, two accessible components, and `2**H` represented product-group components.
+
+## Schema Compatibility
+
+`test_certificate_schema_is_additive` asserts that the preexisting top-level keys remain present:
+
+- `on_pure_path`
+- `pure_flags`
+- `gauge_flags`
+- `on_gauge_pure_path`
+- `config_toggles`
+- `converged_stress`
+
+It also asserts the additive keys:
+
+- `on_causal_lm_path`
+- `transport_exactness_status`
+- `on_theory_pure_path`
+- `causal_flags`
+- `theory_flags`
+- `reflection`
+
+Ablation rows and `_CSV_COLUMNS` add the three certificate facets plus `reflection_effective_scope` and `reflection_accessible_component_count`; existing columns and result fields are retained. Failure rows use conservative false/`unknown` values.
+
+The A01/A02 provenance waiver is preserved. No provenance-drift rejection behavior was added or changed.
+
+## Files
+
+- `vfe3/run_artifacts.py`: derives and persists the additive certificate facets and runtime reflection metadata.
+- `vfe3/geometry/transport.py`: adds gauge and runtime-exactness metadata to complete active transport registrations.
+- `vfe3/geometry/norms.py`: adds active norm gauge-class metadata with override/restore-safe callable identity.
+- `vfe3/attention_prior.py`: adds active next-token causality metadata, including T5's live bidirectionality selector.
+- `ablation.py`: propagates immutable BlockMLP metadata, runtime reflection scope, additive result keys, CSV columns, and conservative failure values.
+- `tests/test_run_artifacts.py`: updates legacy exactness expectations and makes the gauge-pure fixture genuinely unclipped/uncapped.
+- `tests/test_ultradeep_remediation_certificates_20260813.py`: adds the certificate truth table, causality independence, reflection scope/count, immutable BlockMLP, and additive-schema assertions.
+
+The brief's `vfe3/model/free_energy.py` path was a typo; the live file is `vfe3/free_energy.py`. No change there was necessary because the active query-adaptive temperature selector already reaches the reporting seam. `tests/test_validated_geometry_numerics_20260713.py` and `tests/test_tier12_attention.py` were exercised unchanged.
+
+## Warnings
+
+The required green suite emitted only expected, preexisting, or intentionally exercised warnings:
+
+- two parameter-motion warnings in `tests/test_run_artifacts.py` for `pos_phi_free` and `prior_bank.phi_embed` under zero-motion tiny fixtures;
+- one intentional query-adaptive-temperature GL-breaking warning;
+- two `decode_bias=True` inert `ConfigNotice` instances in ablation metadata tests;
+- two grouped inert-setting `ConfigNotice` instances in the same ablation tests;
+- two tiny-ablation parameter-motion warnings.
+
+No test failure or error was hidden by these warnings.
+
+## Self-Review
+
+- Confirmed Task 3 touches only the seven implementation/test paths listed above plus this report; no numerical-precision, diagnostic, or training-loop remediation was implemented.
+- Confirmed all status outputs are from the four-value exactness vocabulary.
+- Confirmed empty/incomplete covariant evidence cannot publish `exact` and a known negative cannot be softened to `unknown`.
+- Confirmed BlockMLP uses immutable executable metadata whenever present.
+- Confirmed active prior and norm registry metadata follows the currently active callable across override/restore operations.
+- Confirmed reflection scope comes from the instantiated PriorBank at both run finalizers and in actual ablation execution.
+- Confirmed old report keys and diagnostic execution remain intact.
+- Confirmed `git diff --check` and `git diff --cached --check` were clean before the implementation commit.
