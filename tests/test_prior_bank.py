@@ -297,6 +297,31 @@ def test_direct_decode_registration_is_backward_compatible():
     assert reg_diag.covariance_kinds == frozenset({"diagonal"})
 
 
+def test_decode_registration_rejects_noncallable_fused_ce_direct_and_decorator():
+    def _fn(pb, mu_q, sigma_q, tau_eff):
+        return mu_q
+
+    with pytest.raises(TypeError, match="fused_ce.*callable"):
+        DecodeRegistration(
+            _fn,
+            supports_full=False,
+            supports_chunked=True,
+            fused_ce=object(),
+        )
+
+    name = "_pb_task2_noncallable_fused"
+    try:
+        with pytest.raises(TypeError, match="fused_ce.*callable"):
+            register_decode(
+                name,
+                supports_full=False,
+                supports_chunked=True,
+                fused_ce=object(),
+            )(_fn)
+    finally:
+        _DECODERS.pop(name, None)
+
+
 def test_registered_family_modes_are_family_consistent_dual_rank():
     for name in ("family", "family_chunked"):
         r = get_decode_registration(name)

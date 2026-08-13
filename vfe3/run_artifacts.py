@@ -1621,13 +1621,17 @@ class RunArtifacts:
         self.history: List[Dict[str, float]] = []          # in-memory copy of the CSV rows (for figures)
         self._fieldnames: Optional[List[str]] = None
 
-        self.save_json("config.json", {
+        config_record = {
             "config":    asdict(cfg),
             "n_params":  int(sum(p.numel() for p in model.parameters())),
             "dataset":   dataset,
             "device":    str(device),
             "timestamp": timestamp,
-        })
+        }
+        executable_build = getattr(model, "executable_build", None)
+        if isinstance(executable_build, ExecutableBuildMetadata):
+            config_record["executable_build"] = asdict(executable_build)
+        self.save_json("config.json", config_record)
 
     def bind_selection_data_identity(self, identity: Mapping[str, object]) -> None:
         """Bind every selected-weight comparison in this run to one validation data contract."""
@@ -3056,7 +3060,6 @@ def _cost_model_fields(
         )
     )
     block_mlp_active = block_mlp_build.enabled
-    block_mlp_registration = get_block_mlp_registration(block_mlp_build.mode)
     block_mlp_params = block_mlp_build.parameter_count
     if cfg.use_prior_bank:
         decode_readout = 2 * V * K
@@ -3078,15 +3081,7 @@ def _cost_model_fields(
     belief_estep       = L * T * estep_kernel
     model_estep        = T * estep_kernel if cfg.s_e_step else 0.0
     fpt_estep          = belief_estep + model_estep
-    fpt_block_mlp = 0.0
-    if block_mlp_active:
-        fpt_block_mlp = block_mlp_registration.flops_per_token(
-            embed_dim=K,
-            irrep_dims=model.group.irrep_dims,
-            expansion=block_mlp_build.expansion,
-            covariance_contract=block_mlp_build.covariance,
-            n_layers=L,
-        )
+    fpt_block_mlp = block_mlp_build.flops_per_token if block_mlp_active else 0.0
     est_flops_analytic = (fpt_decode + fpt_estep + fpt_block_mlp) * float(tokens_seen)
     out: Dict[str, object] = {
         "embed_dim":               K,

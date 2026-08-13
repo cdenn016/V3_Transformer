@@ -349,6 +349,35 @@ def _validated_bound_scaling_run(
     }
 
 
+_BLOCK_MLP_STRUCTURAL_METADATA_FIELDS = {
+    "use_block_mlp": "enabled",
+    "block_mlp_mode": "mode",
+    "block_mlp_covariance": "covariance",
+    "block_mlp_expansion": "expansion",
+    "block_mlp_activation": "activation",
+    "block_mlp_dropout": "dropout",
+    "block_mlp_covariance_floor": "covariance_floor",
+}
+
+
+def _block_mlp_structural_values(
+    config_json: Mapping[str, Any],
+    serialized_config: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Prefer what the executable built; retain serialized-config fallback for old runs."""
+    executable = config_json.get("executable_build")
+    block_mlp = executable.get("block_mlp") if isinstance(executable, Mapping) else None
+    if not isinstance(block_mlp, Mapping):
+        return {
+            field: serialized_config.get(field)
+            for field in _BLOCK_MLP_STRUCTURAL_METADATA_FIELDS
+        }
+    return {
+        field: block_mlp.get(metadata_field, serialized_config.get(field))
+        for field, metadata_field in _BLOCK_MLP_STRUCTURAL_METADATA_FIELDS.items()
+    }
+
+
 def _structural_signature(row: Mapping[str, Any]) -> tuple:
     """Exact typed identity of fields that must not vary among seeds of one scaling cell."""
     return tuple(
@@ -439,6 +468,7 @@ def harvest(
         )
         if verified is None or not isinstance(sp, Mapping) or not isinstance(cfg, Mapping):
             continue
+        block_mlp_structure = _block_mlp_structural_values(cfgj, cfg)
         rows.append({
             "run_dir":     str(run.resolve()),
             "route":       cell["route"],
@@ -455,13 +485,7 @@ def harvest(
             "n_layers":    sp.get("n_layers", cfg.get("n_layers")),
             "n_e_steps":   sp.get("n_e_steps", cfg.get("n_e_steps")),
             "family":      cfg.get("family"),
-            "use_block_mlp": cfg.get("use_block_mlp"),
-            "block_mlp_mode": cfg.get("block_mlp_mode"),
-            "block_mlp_covariance": cfg.get("block_mlp_covariance"),
-            "block_mlp_expansion": cfg.get("block_mlp_expansion"),
-            "block_mlp_activation": cfg.get("block_mlp_activation"),
-            "block_mlp_dropout": cfg.get("block_mlp_dropout"),
-            "block_mlp_covariance_floor": cfg.get("block_mlp_covariance_floor"),
+            **block_mlp_structure,
             "tokens_seen": sp.get("tokens_seen"),
             "est_flops_6ND":           sp.get("est_flops_6ND"),
             "est_flops_analytic":      sp.get("est_flops_analytic"),

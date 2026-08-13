@@ -480,6 +480,8 @@ class DecodeRegistration:
                 f"supports_full={self.supports_full} but covariance_kinds="
                 f"{sorted(resolved_kinds)} implies supports_full={resolved_full}"
             )
+        if self.fused_ce is not None and not callable(self.fused_ce):
+            raise TypeError("decoder fused_ce must be callable or None")
         if self.supports_chunked != (self.fused_ce is not None):
             raise ValueError(
                 "decoder has contradictory chunk metadata: supports_chunked must be true "

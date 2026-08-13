@@ -37,27 +37,44 @@ class CanonicalFrameContext:
         if not torch.isfinite(self.forward).all() or not torch.isfinite(self.inverse).all():
             raise ValueError("canonical frame factors must contain only finite values")
 
+        validation_dtype = torch.float64
+        validation_forward = self.forward.to(dtype=validation_dtype)
+        validation_inverse = self.inverse.to(dtype=validation_dtype)
         dimension = self.forward.shape[-1]
         identity = torch.eye(
             dimension,
-            dtype=self.forward.dtype,
+            dtype=validation_dtype,
             device=self.forward.device,
         )
-        forward_inverse = self.forward @ self.inverse
-        inverse_forward = self.inverse @ self.forward
+        forward_inverse = validation_forward @ validation_inverse
+        inverse_forward = validation_inverse @ validation_forward
+        if (
+            not torch.isfinite(forward_inverse).all()
+            or not torch.isfinite(inverse_forward).all()
+        ):
+            raise ValueError("canonical frame factors must produce finite products")
         residual = torch.maximum(
             (forward_inverse - identity).abs().amax(dim=(-2, -1)),
             (inverse_forward - identity).abs().amax(dim=(-2, -1)),
         )
-        forward_scale = self.forward.abs().sum(dim=-1).amax(dim=-1)
-        inverse_scale = self.inverse.abs().sum(dim=-1).amax(dim=-1)
+        forward_scale = validation_forward.abs().sum(dim=-1).amax(dim=-1)
+        inverse_scale = validation_inverse.abs().sum(dim=-1).amax(dim=-1)
         conditioning_scale = torch.clamp(forward_scale * inverse_scale, min=1.0)
-        tolerance = (
+        unbounded_tolerance = (
             64.0
             * float(dimension)
             * torch.finfo(self.forward.dtype).eps
             * conditioning_scale
         )
+        if (
+            not torch.isfinite(residual).all()
+            or not torch.isfinite(conditioning_scale).all()
+            or not torch.isfinite(unbounded_tolerance).all()
+        ):
+            raise ValueError(
+                "canonical frame inverse validation must have finite residuals and tolerances"
+            )
+        tolerance = torch.clamp(unbounded_tolerance, max=1e-2)
         if not bool(torch.all(residual <= tolerance)):
             raise ValueError(
                 "canonical forward and inverse factors must be mutual inverses within a "
@@ -78,7 +95,11 @@ class BlockMLPBuildMetadata:
     activation: str
     dropout: float
     covariance_floor: float
+    embed_dim: int
+    irrep_dims: Tuple[int, ...]
+    n_layers: int
     parameter_count: int
+    flops_per_token: float
     report_label: str
     covariance_report_label: str
     gauge_class: str

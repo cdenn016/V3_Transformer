@@ -1,4 +1,5 @@
 import inspect
+import json
 
 import pytest
 import torch
@@ -12,7 +13,7 @@ from vfe3.model import block_mlp
 from vfe3.model.block_mlp import build_block_mlp
 from vfe3.model.model import VFEModel
 from vfe3.model.prior_bank import DecodeRegistration
-from vfe3.run_artifacts import _pure_path_report
+from vfe3.run_artifacts import RunArtifacts, _cost_model_fields, _pure_path_report
 
 
 def _block_mlp_kwargs(mode: str, covariance: str = "passthrough") -> dict:
@@ -75,6 +76,52 @@ def test_canonical_frame_context_rejects_invalid_factors(
         CanonicalFrameContext(forward, inverse)
 
 
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32, torch.float64))
+@pytest.mark.parametrize("dimension", (4, 20))
+def test_canonical_frame_context_rejects_scaled_identity_in_every_float_dtype(
+    dtype: torch.dtype,
+    dimension: int,
+) -> None:
+    identity = torch.eye(dimension, dtype=dtype)
+    with pytest.raises(ValueError, match="mutual inverses"):
+        CanonicalFrameContext(identity, 2 * identity)
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32, torch.float64))
+@pytest.mark.parametrize("dimension", (4, 20))
+def test_canonical_frame_context_accepts_representative_batched_inverse_pairs(
+    dtype: torch.dtype,
+    dimension: int,
+) -> None:
+    diagonal = torch.ones(2, dimension, dtype=dtype)
+    diagonal[0, ::2] = 2.0
+    diagonal[1, 1::2] = 0.5
+    forward = torch.diag_embed(diagonal)
+    inverse = torch.diag_embed(diagonal.reciprocal())
+
+    context = CanonicalFrameContext(forward, inverse)
+    assert context.forward.shape == (2, dimension, dimension)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "scale"),
+    [
+        (torch.float16, 300.0),
+        (torch.bfloat16, 2.0e19),
+        (torch.float32, 2.0e20),
+        (torch.float64, 1.0e200),
+    ],
+)
+def test_canonical_frame_context_rejects_finite_factors_with_overflowing_product(
+    dtype: torch.dtype,
+    scale: float,
+) -> None:
+    factor = scale * torch.eye(4, dtype=dtype)
+    assert torch.isfinite(factor).all()
+    with pytest.raises(ValueError, match="finite products|mutual inverses"):
+        CanonicalFrameContext(factor, factor)
+
+
 def _decode(*_args):
     raise AssertionError("not called")
 
@@ -87,6 +134,7 @@ def _decode(*_args):
         {"supports_chunked": False, "fused_ce": _decode},
         {"fused_ce_supports_stats": True, "fused_ce": None},
         {"family_consistent": True, "covariance_kinds": frozenset()},
+        {"supports_chunked": True, "fused_ce": object()},
     ],
 )
 def test_decode_registration_rejects_contradictory_capabilities(kwargs: dict) -> None:
@@ -97,7 +145,10 @@ def test_decode_registration_rejects_contradictory_capabilities(kwargs: dict) ->
         "fused_ce": None,
         **kwargs,
     }
-    with pytest.raises((TypeError, ValueError), match="contradictory|nonempty|fused|chunk"):
+    with pytest.raises(
+        (TypeError, ValueError),
+        match="contradictory|nonempty|fused|chunk|callable",
+    ):
         DecodeRegistration(**values)
 
 
@@ -122,6 +173,105 @@ def test_model_executable_build_report_is_immutable_after_config_mutation() -> N
         report["config_toggles"]["block_mlp_structural_mode"]
         == "coordinate_mean_only_nonintertwiner"
     )
+
+
+def test_all_block_mlp_reports_use_immutable_executable_structure_after_mutation(
+    tmp_path,
+) -> None:
+    cfg = VFE3Config(
+        vocab_size=11,
+        embed_dim=4,
+        n_heads=2,
+        max_seq_len=4,
+        n_layers=2,
+        use_block_mlp=True,
+        block_mlp_mode="coordinate",
+        block_mlp_covariance="passthrough",
+        block_mlp_expansion=3,
+        block_mlp_activation="silu",
+        block_mlp_dropout=0.125,
+        block_mlp_covariance_floor=2e-4,
+    )
+    model = VFEModel(cfg)
+    n_params = sum(parameter.numel() for parameter in model.parameters())
+    built = model.executable_build.block_mlp
+    baseline_cost = _cost_model_fields(
+        model,
+        cfg,
+        n_params=n_params,
+        tokens_seen=13,
+    )
+
+    cfg.use_block_mlp = False
+    cfg.block_mlp_mode = "gauge_gate"
+    cfg.block_mlp_covariance = "delta_full"
+    cfg.block_mlp_expansion = 9
+    cfg.block_mlp_activation = "relu"
+    cfg.block_mlp_dropout = 0.75
+    cfg.block_mlp_covariance_floor = 0.5
+    cfg.embed_dim = 8
+    cfg.n_heads = 1
+    cfg.n_layers = 5
+
+    report = _pure_path_report(cfg, [], executable_build=model.executable_build)
+    toggles = report["config_toggles"]
+    assert toggles["use_block_mlp"] is built.enabled
+    assert toggles["block_mlp_mode"] == built.mode
+    assert toggles["block_mlp_covariance"] == built.covariance
+    assert toggles["block_mlp_expansion"] == built.expansion
+    assert toggles["block_mlp_activation"] == built.activation
+    assert toggles["block_mlp_dropout"] == built.dropout
+    assert toggles["block_mlp_covariance_floor"] == built.covariance_floor
+
+    mutated_cost = _cost_model_fields(
+        model,
+        cfg,
+        n_params=n_params,
+        tokens_seen=13,
+    )
+    assert mutated_cost["block_mlp_params"] == baseline_cost["block_mlp_params"]
+    assert (
+        mutated_cost["flops_per_token_block_mlp"]
+        == baseline_cost["flops_per_token_block_mlp"]
+    )
+    assert built.embed_dim == 4
+    assert built.irrep_dims == (2, 2)
+    assert built.n_layers == 2
+    assert built.flops_per_token == baseline_cost["flops_per_token_block_mlp"]
+
+    artifacts = RunArtifacts(tmp_path / "run", cfg, model, dataset="synthetic")
+    persisted = json.loads((artifacts.run_dir / "config.json").read_text(encoding="utf-8"))
+    persisted_block_mlp = persisted["executable_build"]["block_mlp"]
+    assert persisted_block_mlp["mode"] == built.mode
+    assert persisted_block_mlp["n_layers"] == built.n_layers
+    assert persisted_block_mlp["flops_per_token"] == built.flops_per_token
+
+    structural = scaling_analysis._block_mlp_structural_values(
+        persisted,
+        persisted["config"],
+    )
+    assert structural == {
+        "use_block_mlp": True,
+        "block_mlp_mode": "coordinate",
+        "block_mlp_covariance": "passthrough",
+        "block_mlp_expansion": 3,
+        "block_mlp_activation": "silu",
+        "block_mlp_dropout": 0.125,
+        "block_mlp_covariance_floor": 2e-4,
+    }
+
+
+def test_scaling_block_mlp_structure_falls_back_for_legacy_artifacts() -> None:
+    legacy = {
+        "use_block_mlp": False,
+        "block_mlp_mode": "coordinate",
+        "block_mlp_covariance": "passthrough",
+        "block_mlp_expansion": 4,
+        "block_mlp_activation": "gelu",
+        "block_mlp_dropout": 0.0,
+        "block_mlp_covariance_floor": 1e-4,
+    }
+    assert scaling_analysis._block_mlp_structural_values({"config": legacy}, legacy) == legacy
 
 
 def test_scaling_signature_distinguishes_equal_parameter_block_mlp_structures() -> None:

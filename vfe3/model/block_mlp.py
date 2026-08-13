@@ -432,6 +432,20 @@ def block_mlp_build_metadata(
     registration = get_block_mlp_registration(mode)
     if covariance not in registration.covariance_kinds:
         raise ValueError(f"unknown BlockMLP covariance contract {covariance!r}")
+    realized_irrep_dims = tuple(int(dim) for dim in irrep_dims)
+    realized_parameter_count = registration.parameter_count(
+        embed_dim=embed_dim,
+        irrep_dims=realized_irrep_dims,
+        expansion=expansion,
+        n_layers=n_layers,
+    )
+    realized_flops_per_token = registration.flops_per_token(
+        embed_dim=embed_dim,
+        irrep_dims=realized_irrep_dims,
+        expansion=expansion,
+        covariance_contract=covariance,
+        n_layers=n_layers,
+    )
     covariance_report = (
         "not_applicable" if not enabled else
         "delta_full_plus_covariant_floor" if covariance == "delta_full" else covariance
@@ -444,12 +458,11 @@ def block_mlp_build_metadata(
         activation=activation,
         dropout=float(dropout),
         covariance_floor=float(covariance_floor),
-        parameter_count=(registration.parameter_count(
-            embed_dim=embed_dim,
-            irrep_dims=irrep_dims,
-            expansion=expansion,
-            n_layers=n_layers,
-        ) if enabled else 0),
+        embed_dim=int(embed_dim),
+        irrep_dims=realized_irrep_dims,
+        n_layers=int(n_layers),
+        parameter_count=(realized_parameter_count if enabled else 0),
+        flops_per_token=(realized_flops_per_token if enabled else 0.0),
         report_label=(registration.report_label(covariance) if enabled else "disabled"),
         covariance_report_label=covariance_report,
         gauge_class=(registration.gauge_class if enabled else "disabled"),
