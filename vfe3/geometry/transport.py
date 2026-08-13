@@ -1464,12 +1464,23 @@ def _certify_full_congruence(
     r"""Authoritative post-congruence boundary for every full-covariance structural route.
 
     Certification is zero-jitter: finiteness alone cannot accept a symmetric-but-indefinite or
-    accuracy-uncertain covariance. Certified fast results preserve their source dtype unless the
-    caller requested full retention. A failed fast representation recomputes and retains float64.
+    accuracy-uncertain covariance. A working result may return at source dtype only when the cast
+    candidate independently certifies there. If a certified float64 working result loses its
+    certificate on cast, float64 is retained. A failed fast representation recomputes and retains
+    float64.
     """
     certificate = validated_cholesky_solve(out)
     if bool(certificate.certified.all()):
-        return out if retain_full_precision else out.to(source_dtype)
+        if retain_full_precision or out.dtype == source_dtype:
+            return out
+        cast_candidate = out.to(source_dtype)
+        cast_certificate = validated_cholesky_solve(cast_candidate)
+        if bool(cast_certificate.certified.all()):
+            return cast_candidate
+        # ``out`` itself is already certified. A failed lower-precision representation must not
+        # replace it; retaining this tensor also preserves the direct high-precision autograd path.
+        if out.dtype is torch.float64:
+            return out
     if work is torch.float64:
         raise FloatingPointError(
             "float64 congruence could not be certified as finite, symmetric, zero-jitter SPD "

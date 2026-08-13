@@ -135,9 +135,12 @@ def _structural_transport(route: str, block: torch.Tensor) -> 'tuple[object, tor
     raise AssertionError(f"unhandled structural route {route!r}")
 
 
+@pytest.mark.parametrize("policy", ("fp64", "fp32_escalate"))
 @pytest.mark.parametrize("route", _STRUCTURAL_ROUTES)
-def test_every_public_structural_route_escalates_finite_indefinite_fp32(route: str):
-    set_full_cov_congruence_precision("fp32_escalate")
+def test_every_public_structural_route_retains_certified_float64_when_fp32_is_indefinite(
+    route: str, policy: str,
+):
+    set_full_cov_congruence_precision(policy)
     container, dense_operator = _structural_transport(route, _FINITE_INDEFINITE_OMEGA[0, 0])
     K = dense_operator.shape[-1]
     sigma = torch.eye(K, dtype=torch.float32).reshape(1, K, K)
@@ -157,9 +160,12 @@ def test_every_public_structural_route_escalates_finite_indefinite_fp32(route: s
     torch.testing.assert_close(actual, reference, rtol=2.0e-14, atol=2.0e-15)
 
 
+@pytest.mark.parametrize("policy", ("fp64", "fp32_escalate"))
 @pytest.mark.parametrize("route", _STRUCTURAL_ROUTES)
-def test_every_public_structural_route_keeps_benign_fp32_fast_path(route: str):
-    set_full_cov_congruence_precision("fp32_escalate")
+def test_every_public_structural_route_returns_benign_certified_fp32_cast(
+    route: str, policy: str,
+):
+    set_full_cov_congruence_precision(policy)
     identity_block = torch.eye(4, dtype=torch.float32)
     container, dense_operator = _structural_transport(route, identity_block)
     K = dense_operator.shape[-1]
