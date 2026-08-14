@@ -265,8 +265,13 @@ def test_diagnostics_runs_under_rope():
     x = torch.randint(0, 6, (1, 8))
     roped = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left"))
     diag = roped.diagnostics(x)
-    available = [value for value in diag.values() if value is not None]
-    assert diag and available and all(abs(value) < float("inf") for value in available)
+    optional_none = {"phi_mstep_max_matrix_norm", "transport_chart_max_norm"}
+    assert {key for key, value in diag.items() if value is None} == optional_none
+    required = {
+        key: value for key, value in diag.items()
+        if key not in optional_none
+    }
+    assert required and all(torch.isfinite(torch.as_tensor(v)).all() for v in required.values())
 
 
 from vfe3.gradients.kernels import belief_gradients

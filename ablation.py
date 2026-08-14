@@ -1425,18 +1425,15 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # to the priors/gauge-frame tables, while renyi_order == 1 uses the always-live analytic kernel.
         # Without this the sweep measures gradient-truncation, not divergence order (it makes alpha != 1
         # spuriously ~2.5x faster AND worse). No-op at renyi_order == 1 (the kernel ignores the toggle).
-        # alpha<1 is mass-covering, alpha>1 mode-seeking; for alpha>1 the non-PD blend saturates to
-        # kl_max with zero gradient (S27), predicting a non-monotone H(beta)-vs-alpha tail.
-        # collect_diagnostics captures attn_entropy (H(beta)) + energy_klmax_frac (the saturation
-        # fraction) per cell -> the renyi_saturation figure.
-        "description": "Renyi divergence order alpha (both sides of 1) + non-PD saturation diagnostic [B2/EXP-12]",
+        # This family-consistent prior-bank sweep is scoped to alpha<=1: Task 5's fail-closed domain
+        # rejects alpha>1 because its covariance blend is not guaranteed SPD. Keeping only the two
+        # mass-covering arms and the KL endpoint makes every registered arm constructible while
+        # preserving one-factor semantics. Diagnostics still capture H(beta) and guard activation.
+        "description": "Renyi divergence order alpha in the family-consistent alpha<=1 domain [B2/EXP-12]",
         "configs": [
             {"label": "renyi_order=0.5", "renyi_order": 0.5, "e_step_update": "gradient"},
             {"label": "renyi_order=0.8", "renyi_order": 0.8, "e_step_update": "gradient"},
             {"label": "renyi_order=1.0", "renyi_order": 1.0},
-            {"label": "renyi_order=1.2", "renyi_order": 1.2, "e_step_update": "gradient"},
-            {"label": "renyi_order=1.5", "renyi_order": 1.5, "e_step_update": "gradient"},
-            {"label": "renyi_order=2.0", "renyi_order": 2.0, "e_step_update": "gradient"},
         ],
         "requires": {"oracle_unroll_grad": True, "decode_mode": "family_chunked"},
         "collect_diagnostics": True,

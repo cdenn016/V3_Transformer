@@ -1551,10 +1551,11 @@ def test_every_ablation_arm_constructs_with_only_invalid_arm_prerequisites_repai
 
     renyi = dict(ablation.make_run_overrides("renyi_order"))
     assert {arm["decode_mode"] for arm in renyi.values()} == {"family_chunked"}
+    assert set(renyi) == {"renyi_order=0.5", "renyi_order=0.8", "renyi_order=1.0"}
     assert "e_step_update" not in renyi["renyi_order=1.0"]
     assert all(
         renyi[f"renyi_order={value}"]["e_step_update"] == "gradient"
-        for value in (0.5, 0.8, 1.2, 1.5, 2.0)
+        for value in (0.5, 0.8)
     )
 
     gauges = dict(ablation.make_run_overrides("gauge_group"))

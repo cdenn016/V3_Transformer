@@ -87,9 +87,8 @@ def test_covariant_builder_exposes_jitter_exactness_status() -> None:
     assert not bool(exactness["regime_ii_covariant_feature_exact"])
 
 
-def test_production_jitter_status_reaches_logged_artifact(
+def test_singular_model_covariance_fails_closed_at_certified_congruence(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path:    Path,
 ) -> None:
     cfg = VFE3Config(
         vocab_size=5,
@@ -111,20 +110,50 @@ def test_production_jitter_status_reaches_logged_artifact(
         return belief._replace(sigma=singular)
 
     monkeypatch.setattr(model.prior_bank, "encode", _singular_encode)
+    with pytest.raises(
+        FloatingPointError,
+        match="float64 recomputation could not be certified as finite, symmetric, zero-jitter SPD",
+    ):
+        model.forward_beliefs(torch.tensor([[0, 1]]))
+
+
+def test_production_jitter_status_reaches_logged_artifact(tmp_path: Path) -> None:
+    cfg = VFE3Config(
+        vocab_size=5,
+        embed_dim=2,
+        n_heads=1,
+        max_seq_len=2,
+        n_layers=1,
+        n_e_steps=1,
+        family="gaussian_full",
+        transport_mode="regime_ii_covariant",
+    )
+    model = VFEModel(cfg)
+    phi = torch.zeros(1, 2, model.group.generators.shape[0])
+    mu = torch.zeros(1, 2, 2)
+    singular = torch.diag(torch.tensor([0.0, 1.0])).expand(1, 2, 2, 2).clone()
+    get_transport("regime_ii_covariant")(
+        phi,
+        model.group,
+        mu=mu,
+        sigma=singular,
+        connection_M=model.connection_M,
+        exactness_out=model._transport_status,
+    )
+    assert not bool(model._transport_status["regime_ii_covariant_feature_exact"])
+
+    # The status sink is run-sticky. Exercise the production forward and artifact paths with the
+    # model's genuine SPD covariance; the earlier jitter result remains visible without feeding a
+    # singular covariance through the certified full-congruence boundary.
     tokens = torch.tensor([[0, 1]])
     model.forward_beliefs(tokens)
     metrics = model.diagnostics(tokens)
 
-    monkeypatch.setattr(model.prior_bank, "encode", original_encode)
-    model.forward_beliefs(tokens)
-    recovered_metrics = model.diagnostics(tokens)
-
     artifacts = RunArtifacts(tmp_path / "run", cfg, model)
-    artifacts.log_metrics({"step": 1.0, **recovered_metrics})
+    artifacts.log_metrics({"step": 1.0, **metrics})
     report = _pure_path_report(cfg, artifacts.history)
 
     assert metrics["regime_ii_covariant_feature_exact"] == 0.0
-    assert recovered_metrics["regime_ii_covariant_feature_exact"] == 0.0
     assert report["config_toggles"]["regime_ii_covariant_exact"] is False
     assert report["config_toggles"]["regime_ii_covariant_exactness"] == "jitter_recovered_approximation"
 

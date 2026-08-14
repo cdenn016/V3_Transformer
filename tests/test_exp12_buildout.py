@@ -1,7 +1,8 @@
-r"""Tests for the 2026-06-22 B2/EXP-12 build-out (Rényi α-attention sweep + non-PD saturation):
+r"""Tests for the 2026-06-22 B2/EXP-12 build-out (Renyi alpha-attention diagnostics):
 
-  * the renyi_order sweep spans α both sides of 1 and collects diagnostics;
-  * _cell_diagnostics emits the kl_max energy-saturation fraction (the α>1 diagnostic);
+  * the family-consistent prior-bank sweep stays in its supported alpha<=1 domain and collects
+    diagnostics;
+  * _cell_diagnostics emits the kl_max energy-guard fraction;
   * the renyi_saturation figure renders and its driver reads per-cell JSON.
 
 Device-agnostic (CPU). Figures use the Agg backend.
@@ -22,10 +23,10 @@ from vfe3.viz import figures as figs
 DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 
-def test_renyi_sweep_spans_alpha_and_collects():
+def test_renyi_sweep_stays_in_supported_alpha_domain_and_collects():
     runs = dict(ablation.make_run_overrides("renyi_order"))
     alphas = sorted(float(lab.split("=")[-1]) for lab in runs)
-    assert min(alphas) < 1.0 < max(alphas)                          # mass-covering AND mode-seeking
+    assert alphas == [0.5, 0.8, 1.0]
     assert all(ov["oracle_unroll_grad"] is True for ov in runs.values())
     assert ablation.SWEEPS["renyi_order"].get("collect_diagnostics") is True
     assert "energy_klmax_frac" in ablation._CSV_COLUMNS

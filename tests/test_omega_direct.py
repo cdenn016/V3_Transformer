@@ -1209,7 +1209,13 @@ def test_compact_free_energy_and_diagnostics_never_dense_materialize(monkeypatch
     diagnostics = m.diagnostics(token_ids)
 
     assert torch.isfinite(value)
-    assert all(torch.isfinite(torch.tensor(v)) for v in diagnostics.values())
+    optional_none = {"phi_mstep_max_matrix_norm", "transport_chart_max_norm"}
+    assert {key for key, value in diagnostics.items() if value is None} == optional_none
+    required = {
+        key: value for key, value in diagnostics.items()
+        if key not in optional_none
+    }
+    assert required and all(torch.isfinite(torch.as_tensor(v)).all() for v in required.values())
     block_logdet = torch.linalg.slogdet(active_blocks).logabsdet
     block_svd = torch.linalg.svdvals(active_blocks)
     full_logdet = block_logdet.sum(dim=-1)
