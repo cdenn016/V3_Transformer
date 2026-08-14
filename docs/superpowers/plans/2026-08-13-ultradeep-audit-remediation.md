@@ -62,7 +62,7 @@ pytest, JUnit XML, Ruff, Git, JSON/SHA-256.
 - General sweep construction selects one compatible baseline before arm application; it does not
   repair only selected arms after labeling.
 
-- [ ] **Step 1: Write RED default and migration regressions**
+- [x] **Step 1: Write RED default and migration regressions**
 
   Add literal assertions for the three reusable defaults. Serialize an old config with
   `pos_phi_compose`, `decode_tau`, and `decode_ce_checkpoint` absent and assert migration yields
@@ -70,13 +70,13 @@ pytest, JUnit XML, Ruff, Git, JSON/SHA-256.
   omitted `pos_phi_compose` inherited `group_product`; assert it constructs with the reusable
   default.
 
-- [ ] **Step 2: Write RED sweep regressions**
+- [x] **Step 2: Write RED sweep regressions**
 
   Assert every `covariance` and `renyi_order` arm resolves with `family_chunked`. Construct an
   incompatible baseline plus a one-factor arm and assert the resolved arm label and overrides
   contain no hidden positional-composition mutation.
 
-- [ ] **Step 3: Prove RED**
+- [x] **Step 3: Prove RED**
 
   Run:
 
@@ -92,19 +92,19 @@ pytest, JUnit XML, Ruff, Git, JSON/SHA-256.
   Expected: default/migration assertions fail, and the registered sweep prerequisite assertions
   fail on the audited source.
 
-- [ ] **Step 4: Implement the minimal contract correction**
+- [x] **Step 4: Implement the minimal contract correction**
 
   Restore reusable defaults, make historical migration explicit by schema/version rather than
   current dataclass construction, restore the two sweep prerequisites, and replace selective
   `_repair_pos_phi_compose_prerequisite` behavior with one compatible resolved baseline.
 
-- [ ] **Step 5: Prove GREEN and adjacent construction coverage**
+- [x] **Step 5: Prove GREEN and adjacent construction coverage**
 
   Run the three listed modules plus `tests/test_ablation_sweep_route_compatibility_20260711.py`,
   `tests/test_ablation_reporting.py`, and `tests/test_ablation_tackon.py` into
   `.verification/remediation-2026-08-13/task-01-green.xml`. Parse the XML and record totals.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
   ```powershell
   git add vfe3/config.py ablation.py tests/test_config.py `
@@ -148,26 +148,26 @@ pytest, JUnit XML, Ruff, Git, JSON/SHA-256.
 - `_SCALING_STRUCTURAL_FIELDS` includes BlockMLP mode, covariance, expansion, activation, dropout,
   covariance floor, and enabled state.
 
-- [ ] **Step 1: Write RED contract regressions**
+- [x] **Step 1: Write RED contract regressions**
 
   Assert canonical mode rejects a missing frame; all modes accept the common `forward_moments`
   signature; invalid covariance strings fail identically at construction; noninverse frame pairs
   fail before propagation; contradictory decode registrations fail at construction; and mutating
   `cfg.use_block_mlp` after model construction cannot change executable-build reporting.
 
-- [ ] **Step 2: Write RED scaling/ablation/dead-path regressions**
+- [x] **Step 2: Write RED scaling/ablation/dead-path regressions**
 
   Create two equal-parameter scaling rows that differ only by BlockMLP mode/covariance and assert
   their structural signatures differ. Assert the reachable ablation table uses the same combined
   gauge label as sensitivity output. Assert inactive scaling decode temperature is reported
   `active=false`, not as an effective temperature.
 
-- [ ] **Step 3: Prove RED**
+- [x] **Step 3: Prove RED**
 
   Run the new contract module, BlockMLP tests, and focused scaling tests into
   `.verification/remediation-2026-08-13/task-02-red.xml`.
 
-- [ ] **Step 4: Implement registration and validation boundaries**
+- [x] **Step 4: Implement registration and validation boundaries**
 
   Add the immutable registration, route constructors/accounting/reporting through it, validate
   frame inverses with a dtype-scaled residual, validate decode metadata in `__post_init__`, capture
@@ -176,14 +176,14 @@ pytest, JUnit XML, Ruff, Git, JSON/SHA-256.
   Remove `_sweep_is_complete`, unify gauge-label formatting, and correct
   `CompletedProcess[bytes]`.
 
-- [ ] **Step 5: Prove GREEN and call-site completeness**
+- [x] **Step 5: Prove GREEN and call-site completeness**
 
   Run the five listed test modules plus `tests/test_model.py`,
   `tests/test_ablation_reporting.py`, and `tests/test_block_mlp_ablation_reporting.py` into
   `.verification/remediation-2026-08-13/task-02-green.xml`. Use `rg` to confirm BlockMLP modes are
   not duplicated in construction, accounting, and reporting switch statements.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
   ```powershell
   git add vfe3/model/block_mlp.py vfe3/contracts.py vfe3/model/prior_bank.py `
@@ -222,37 +222,37 @@ pytest, JUnit XML, Ruff, Git, JSON/SHA-256.
 - Preserve `on_gauge_pure_path`, but calculate it from every active GL-breaking executable seam.
 - Persist reflection effective subgroup/scope.
 
-- [ ] **Step 1: Write RED certificate truth-table tests**
+- [x] **Step 1: Write RED certificate truth-table tests**
 
   Table-drive flat/covariant/gauge-fixed transports, LayerNorm, spectral cap, trust/exponential
   clipping, BlockMLP modes, and adaptive temperature. For each, assert the literal expected gauge,
   causal, exactness, and theory-pure outputs. Assert empty Regime-II history is `unknown`; an
   affirmative complete history is `exact`; a negative observation is `approximate`.
 
-- [ ] **Step 2: Write RED causality/reflection tests**
+- [x] **Step 2: Write RED causality/reflection tests**
 
   Assert `uniform`/bidirectional priors produce `on_causal_lm_path=false` under next-token
   training, causal priors produce true, and gauge purity is not used as a synonym for causality.
   Assert block-GL reflection metadata identifies block zero and the accessible component count.
 
-- [ ] **Step 3: Prove RED**
+- [x] **Step 3: Prove RED**
 
   Run the new module and focused existing certificate tests into
   `.verification/remediation-2026-08-13/task-03-red.xml`.
 
-- [ ] **Step 4: Implement additive certificate facets**
+- [x] **Step 4: Implement additive certificate facets**
 
   Derive flags from the active registrations and immutable Task-2 build metadata. Treat missing
   runtime evidence as unknown. Keep GL-breaking and noncausal diagnostic configurations
   executable but truthfully labeled.
 
-- [ ] **Step 5: Prove GREEN and report-schema compatibility**
+- [x] **Step 5: Prove GREEN and report-schema compatibility**
 
   Run the four listed modules plus `tests/test_ablation_reporting.py` into
   `.verification/remediation-2026-08-13/task-03-green.xml`. Assert all preexisting report keys
   remain present and new keys are additive.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
   ```powershell
   git add vfe3/run_artifacts.py vfe3/geometry/transport.py vfe3/geometry/norms.py `
@@ -285,34 +285,34 @@ pytest, JUnit XML, Ruff, Git, JSON/SHA-256.
 - Failed fast congruence recomputes and returns float64 rather than recasting to the failing dtype.
 - GaugeGate uses checked Cholesky solves and float64 escalation for uncertain rows.
 
-- [ ] **Step 1: Write RED congruence regression**
+- [x] **Step 1: Write RED congruence regression**
 
   Use the audited strictly SPD fixture whose fp32 sandwich is finite and indefinite. Assert the
   public active helper returns an SPD float64 result matching direct float64 congruence and finite
   backward gradients.
 
-- [ ] **Step 2: Write RED GaugeGate regression**
+- [x] **Step 2: Write RED GaugeGate regression**
 
   Construct two gauge-related, in-bounds ill-conditioned SPD inputs. Assert Mahalanobis invariants
   and final learned gates agree to a literal tolerance derived from float64 reference, while a
   well-conditioned fp32 case stays on the fast path.
 
-- [ ] **Step 3: Prove RED**
+- [x] **Step 3: Prove RED**
 
   Run the four files with a focused expression into
   `.verification/remediation-2026-08-13/task-04-red.xml`.
 
-- [ ] **Step 4: Implement validity-aware escalation**
+- [x] **Step 4: Implement validity-aware escalation**
 
   Add reusable residual/condition validation in `vfe3/numerics.py`, use it in congruence and
   GaugeGate, retain escalated precision, and fail visibly when neither path certifies the result.
 
-- [ ] **Step 5: Prove GREEN and geometry invariants**
+- [x] **Step 5: Prove GREEN and geometry invariants**
 
   Run the full four modules plus `tests/test_transport.py` into
   `.verification/remediation-2026-08-13/task-04-green.xml`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
   ```powershell
   git add vfe3/geometry/transport.py vfe3/model/block_mlp.py vfe3/numerics.py `
@@ -352,28 +352,28 @@ pytest, JUnit XML, Ruff, Git, JSON/SHA-256.
 - Laplace APIs use promoted public dtype.
 - `decode_last` delegates to the identical last-position full-decoder kernel.
 
-- [ ] **Step 1: Write RED domain regressions**
+- [x] **Step 1: Write RED domain regressions**
 
   Add literal fixtures for a singular CG Jacobian, invalid reflection checkpoint, Rényi all-invalid
   row, successful-but-inaccurate fp32 KL, near-tied decoder rank reversal, mixed Laplace dtypes,
   and last-position/full-decode parity.
 
-- [ ] **Step 2: Prove RED**
+- [x] **Step 2: Prove RED**
 
   Run only the new cases into `.verification/remediation-2026-08-13/task-05-red.xml`; confirm each
   failure is the audited behavior rather than test setup.
 
-- [ ] **Step 3: Implement minimal domain guards**
+- [x] **Step 3: Implement minimal domain guards**
 
   Add the covariant CG floor, load-state validation hook, config restriction plus runtime invalid
   row guard, error-bound-driven KL/decoder escalation, dtype promotion, and shared decode kernel.
 
-- [ ] **Step 4: Prove GREEN and adjacent decoder/family behavior**
+- [x] **Step 4: Prove GREEN and adjacent decoder/family behavior**
 
   Run all five listed modules plus `tests/test_tier12_decode.py` into
   `.verification/remediation-2026-08-13/task-05-green.xml`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
   ```powershell
   git add vfe3/model/cg_coupling.py vfe3/model/prior_bank.py `
@@ -416,37 +416,37 @@ pytest, JUnit XML, Ruff, Git, JSON/SHA-256.
 - Exploratory naming/selection uses validation metrics, not held-out test PPL.
 - `data_seed=None` reports nonshared data order.
 
-- [ ] **Step 1: Write RED diagnostic-state and label regressions**
+- [x] **Step 1: Write RED diagnostic-state and label regressions**
 
   Assert no mixed pre/post total is emitted, a one-step/no-halt run is `final_iterate` without a
   convergence claim, target blindness carries no correlation-sign expectation, and non-KL plots
   never label the objective KL.
 
-- [ ] **Step 2: Write RED accounting/split regressions**
+- [x] **Step 2: Write RED accounting/split regressions**
 
   Evaluate a fixture with known expected/scored/excluded counts and assert exact persisted values.
   Assert CE 25 yields PPL `exp(25)` rather than `exp(20)`, overflow yields `inf`, run sorting uses
   validation PPL, and `data_seed=None` does not claim shared order. Update the stale exact
   diagnostics dictionary to include the four production numerical-policy fields.
 
-- [ ] **Step 3: Prove RED**
+- [x] **Step 3: Prove RED**
 
   Run the new module and focused existing cases into
   `.verification/remediation-2026-08-13/task-06-red.xml`.
 
-- [ ] **Step 4: Implement reporting corrections**
+- [x] **Step 4: Implement reporting corrections**
 
   Split state-specific diagnostics, gate scientific labels on evidence, source figure labels from
   registrations, carry exact denominator counts, remove the PPL cap, move exploratory naming to
   validation metrics, correct data-seed and scheduler metadata, and update tests only after the
   production contract is fixed.
 
-- [ ] **Step 5: Prove GREEN and serialized compatibility**
+- [x] **Step 5: Prove GREEN and serialized compatibility**
 
   Run the six listed test modules plus `tests/test_run_naming.py` and
   `tests/test_scaling_mup.py` into `.verification/remediation-2026-08-13/task-06-green.xml`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
   ```powershell
   git add vfe3/model/model.py vfe3/train.py vfe3/run_artifacts.py `
@@ -480,33 +480,33 @@ pytest, JUnit XML, Ruff, Git, JSON/SHA-256.
 - Periodic generation enters eval mode temporarily and restores model mode, CPU RNG, and every
   CUDA RNG state after generation.
 
-- [ ] **Step 1: Write RED UMAP lifecycle regressions**
+- [x] **Step 1: Write RED UMAP lifecycle regressions**
 
   Use a controlled hanging worker followed by a successful worker. Assert the first request times
   out within the bound, the executor identity changes, the second request succeeds, and finalizer
   cleanup cannot wait indefinitely.
 
-- [ ] **Step 2: Write RED generation-state regressions**
+- [x] **Step 2: Write RED generation-state regressions**
 
   With active BlockMLP dropout, assert periodic generation leaves model/dropout training mode and
   CPU RNG exactly as found. If CUDA is unavailable in the CPU lane, assert the saved/restored CUDA
   RNG helper is invoked only when CUDA state exists; Task 9 supplies device integration.
 
-- [ ] **Step 3: Prove RED**
+- [x] **Step 3: Prove RED**
 
   Run the three listed test modules into
   `.verification/remediation-2026-08-13/task-07-red.xml`.
 
-- [ ] **Step 4: Implement bounded lifecycle and RNG guards**
+- [x] **Step 4: Implement bounded lifecycle and RNG guards**
 
   Replace the poisoned executor after timeout, use condition-based bounded cleanup, wrap generation
   in a mode/RNG preservation context, and avoid touching unrelated worker processes.
 
-- [ ] **Step 5: Prove GREEN**
+- [x] **Step 5: Prove GREEN**
 
   Run the full three modules into `.verification/remediation-2026-08-13/task-07-green.xml`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
   ```powershell
   git add vfe3/viz/figures.py vfe3/viz/report.py vfe3/process_utils.py vfe3/train.py `
@@ -529,32 +529,32 @@ pytest, JUnit XML, Ruff, Git, JSON/SHA-256.
 - Exact totals come from fresh JUnit XML.
 - No known audit failure is relabeled stale without tracing the executable contract.
 
-- [ ] **Step 1: Run static checks**
+- [x] **Step 1: Run static checks**
 
   Run `ruff check` over every Python file changed since `714e3c5` and `git diff --check`. Repair
   only task-owned defects through a failing regression when behavior changes.
 
-- [ ] **Step 2: Run the targeted audit seam**
+- [x] **Step 2: Run the targeted audit seam**
 
   Re-run the audit's 421-test targeted selection into
   `.verification/remediation-2026-08-13/targeted-final.xml`.
 
-- [ ] **Step 3: Run CPU-fast**
+- [x] **Step 3: Run CPU-fast**
 
   Use the repository's CPU-fast policy/selection with the CPU interpreter and write
   `.verification/remediation-2026-08-13/cpu-fast-final.xml`.
 
-- [ ] **Step 4: Run CPU-slow**
+- [x] **Step 4: Run CPU-slow**
 
   Use the repository's CPU-slow policy/selection and write
   `.verification/remediation-2026-08-13/cpu-slow-final.xml`.
 
-- [ ] **Step 5: Parse and reconcile failures**
+- [x] **Step 5: Parse and reconcile failures**
 
   Parse XML, cluster failures by traceback root, and fix only regressions within the approved
   scope. Re-run every affected lane after the last fix; no stale pre-fix XML can support closure.
 
-- [ ] **Step 6: Commit any evidence-driven repairs**
+- [x] **Step 6: Commit any evidence-driven repairs**
 
   Commit production/tests only. Keep JUnit XML ignored.
 
@@ -576,23 +576,23 @@ pytest, JUnit XML, Ruff, Git, JSON/SHA-256.
   CUDA RNG, and training metrics.
 - Ledger states distinguish fixed, waived, refuted, and genuinely unavailable obligations.
 
-- [ ] **Step 1: Wait for an idle GPU gate**
+- [x] **Step 1: Wait for an idle GPU gate**
 
   Verify Anaconda torch/CUDA, then inspect utilization, memory, and compute processes. If occupied,
   wait with bounded rechecks and do not launch tests until idle.
 
-- [ ] **Step 2: Run targeted CUDA coverage**
+- [x] **Step 2: Run targeted CUDA coverage**
 
   Execute the project's CUDA lane with the required device environment into
   `.verification/remediation-2026-08-13/cuda-final.xml`.
 
-- [ ] **Step 3: Run the M19 cadence-parity experiment**
+- [x] **Step 3: Run the M19 cadence-parity experiment**
 
   Run two deterministic short training trajectories differing only in periodic generation.
   Persist inputs, config, environment, and exact comparison output. Require equality of model and
   optimizer state plus CPU/CUDA RNG state at the comparison boundary.
 
-- [ ] **Step 4: Dispatch broad final review and fix once**
+- [x] **Step 4: Dispatch broad final review and fix once**
 
   Review `714e3c5..HEAD` against the spec, plan, SDD rulings, and fresh evidence. Send all accepted
   findings to one fix worker, run covering tests, and perform one scoped re-review.
