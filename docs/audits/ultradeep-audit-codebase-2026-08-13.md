@@ -211,6 +211,29 @@ out-of-scope profiling obligations and therefore **INCONCLUSIVE**; this remediat
 unmeasured performance claim. `M19` moves from **INCONCLUSIVE** to **EVIDENCE_VERIFIED** through
 the bounded real-CUDA cadence comparison described below.
 
+### Approved items 3-16 coverage map
+
+The approved design operationalizes numbered items 3-16 through the exact finding groups in the
+tracked plan. This table binds every assigned group to its implementation/review range and to the
+fresh final-ledger claim that closes it. `FIXED` is an audit disposition; the ledger uses the
+formal state `EVIDENCE_VERIFIED`.
+
+| Delivery | Exact approved finding IDs | Implementation / closure revision | Independent review | Fresh final-ledger claim |
+|---|---|---|---|---|
+| Task 1 | `A03`, `A04`, `A05`, `A06`, `A16` | `953cfb5..4eb24c9` | `task-1-review.md`: Approved | `FINAL-TASK1-APPROVED-SCOPE` |
+| Task 2 | `A07`-`A15`, `A19`, `M31`, `M32` | `4eb24c9..383f17e` | `task-2-review.md`: Approved | `FINAL-TASK2-APPROVED-SCOPE` |
+| Task 3 | `M02`-`M05`, `M07`, `M20`, `M29`, `M30` | `383f17e..8888069` | `task-3-review.md`: Approved | `FINAL-TASK3-APPROVED-SCOPE` |
+| Task 4 | `M13`, `M14` | `8888069..59a6ca2` | `task-4-review.md`: Approved | `FINAL-TASK4-APPROVED-SCOPE` |
+| Task 5 | `M01`, `M06`, `M08`, `M10`-`M12`, `M22` | `59a6ca2..50540b5` | `task-5-review.md`: Approved | `FINAL-TASK5-APPROVED-SCOPE` |
+| Task 6 | `M15`-`M18`, `M24`-`M28`, `T01` | `50540b5..5927100`; final barrier repair `659487c` | `task-6-review.md`: Approved; final scoped review | `FINAL-TASK6-APPROVED-SCOPE`; `FINAL-TARGET-ACCOUNTING-HOT-PATH` |
+| Task 7 | `A17`, `A18`, `M19` | `5927100..06cc097`; cleanup compatibility repair `f8ab5f8`; CUDA close at `659487c` | `task-7-review.md`: Approved; final scoped review | `FINAL-TASK7-APPROVED-SCOPE`; `FINAL-M19-CADENCE-PARITY` |
+| Tasks 8-9 control plane | Comparative CPU/static/CUDA/status closure; no new finding scope | code/test `f8ab5f8` and `659487c`; docs-only descendants | `task-8-review.md`; `broad-final-review.md`; final scoped review | `FINAL-CPU-NO-NEW-ROOTS`; `FINAL-REPOSITORY-CPU-ALL-GREEN`; `FINAL-CANONICAL-CUDA-24`; `FINAL-DURABLE-DOCUMENTATION-STATUS` |
+
+Task-local reports and reviews live under
+`.superpowers/sdd/2026-08-13-ultradeep-audit-remediation/`. The fresh final ledger lives under
+`.verification/remediation-2026-08-14/`; its artifact revision and the final docs-only transfer
+record supply the binding to the checked-out documentation HEAD.
+
 ### Revision-bound closure evidence
 
 All CPU lanes used `C:/Python314/python.exe` with CUDA hidden and `VFE3_TEST_DEVICE=cpu`. CUDA

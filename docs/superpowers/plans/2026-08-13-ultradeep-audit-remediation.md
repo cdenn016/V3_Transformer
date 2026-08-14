@@ -17,6 +17,11 @@ pytest, JUnit XML, Ruff, Git, JSON/SHA-256.
 
 **Spec:** `docs/superpowers/specs/2026-08-13-ultradeep-audit-remediation-design.md`
 
+**Status:** Complete on `codex/ultradeep-remediation-20260813`. Source/test evidence is bound to
+`659487ccd8ad9dd3c7b6afa042a4db04f578c04b`; the containing documentation commit is a docs-only
+descendant and is recorded exactly in the final transfer artifact and closure ledger. No merge or
+push was performed.
+
 ## Global Constraints
 
 - Work only in `C:/tmp/V3_Transformer_ultradeep_remediation_20260813` on
@@ -597,20 +602,20 @@ pytest, JUnit XML, Ruff, Git, JSON/SHA-256.
   Review `714e3c5..HEAD` against the spec, plan, SDD rulings, and fresh evidence. Send all accepted
   findings to one fix worker, run covering tests, and perform one scoped re-review.
 
-- [ ] **Step 5: Build and validate the closure ledger**
+- [x] **Step 5: Build and validate the closure ledger**
 
   Start a fresh closure ledger after the final source commit. Code/experiment claims link current
   mechanical output; mathematical claims link current derivations. Record `A01`/`A02` as owner-
   waived policy decisions rather than fixed claims. Validate with the installed verification gate
   and retire the active marker through the hook.
 
-- [ ] **Step 6: Append remediation status and commit documentation**
+- [x] **Step 6: Append remediation status and commit documentation**
 
   Append final revision, exact JUnit totals, claim states, owner waivers, and any open obligation to
   the audit. Update plan checkboxes, commit documentation, and revalidate any revision-bound
   evidence affected by the documentation commit.
 
-- [ ] **Step 7: Handoff without merge or push**
+- [x] **Step 7: Handoff without merge or push**
 
   Report branch, commits, exact evidence totals, validated ledger path, rulings, and remaining
   obligations. Do not merge, push, or modify the live checkout without a separate request.
