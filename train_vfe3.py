@@ -616,7 +616,7 @@ def _run_label(cfg: VFE3Config, dataset: str) -> str:
     timestamp, no PPL).
 
     The stable part of the run-folder name: ``_run_dir`` prefixes it with a timestamp while the run is
-    in progress, and ``_rename_run_by_validation_ppl`` swaps that prefix for validation perplexity at finalize. The
+    in progress, and ``_rename_run_by_test_ppl`` swaps that prefix for held-out test perplexity at finalize. The
     ``_s<seed>`` suffix keeps a multi-seed launch's run folders distinct (and identifiable by seed).
     """
     _validate_path_component(dataset, "dataset")
@@ -650,8 +650,8 @@ def _run_dir(
 ) -> 'str | None':
     r"""Reserve ``<run_root>/<timestamp>_<label>/`` (None when persistence is disabled).
 
-    The timestamp keeps concurrent runs from colliding while training; ``_rename_run_by_validation_ppl`` drops it in
-    favor of the selected validation perplexity once finalization completes.
+    The timestamp keeps concurrent runs from colliding while training; ``_rename_run_by_test_ppl`` drops it in
+    favor of the held-out test perplexity once finalization completes.
     """
     selected_root = RUN_ROOT if run_root is None else run_root
     if selected_root is None:
@@ -662,17 +662,19 @@ def _run_dir(
     return str(_reserve_directory(Path(selected_root), base))
 
 
-def _rename_run_by_validation_ppl(
+def _rename_run_by_test_ppl(
     run_dir:  str,                       # in-progress timestamped run directory
     label:    str,                       # descriptive part to keep (see _run_label)
-    val_ppl:  'float | None',            # selected validation perplexity (None / non-finite -> no rename)
+    test_ppl: 'float | None',            # held-out test perplexity (None / non-finite -> no rename)
 
     logger:   logging.Logger,
 ) -> str:
-    r"""Rename ``run_dir`` to ``vfe3_runs/<val_ppl:.2f>_<label>/`` so exploratory runs sort by validation perplexity.
+    r"""Rename ``run_dir`` to ``vfe3_runs/<test_ppl:.2f>_<label>/`` so runs sort by held-out test perplexity.
 
-    The folder is created with a timestamp prefix because validation PPL is unavailable before
-    selection; finalization swaps that prefix for the selected validation PPL and drops the timestamp. Returns the
+    Model selection remains validation-only; this is a naming convenience applied AFTER the held-out
+    test evaluation of the reloaded best-val checkpoint, so no test metric enters selection. The
+    folder is created with a timestamp prefix because the test PPL is unavailable before
+    finalization; finalization swaps that prefix for the test PPL and drops the timestamp. Returns the
     new path -- or the original unchanged when the PPL is missing/non-finite (the timestamped name is
     then the only stable handle) or when the OS refuses the move (an open handle / locked directory --
     the numeric results are already on disk, so a failed rename is logged, never fatal). A name clash
@@ -682,12 +684,12 @@ def _rename_run_by_validation_ppl(
     from pathlib import Path
 
     src = Path(run_dir)
-    if val_ppl is None or not math.isfinite(val_ppl) or not src.exists():
+    if test_ppl is None or not math.isfinite(test_ppl) or not src.exists():
         return run_dir
-    dst = src.parent / f"{val_ppl:.2f}_{label}"
+    dst = src.parent / f"{test_ppl:.2f}_{label}"
     i = 2
     while dst.exists():
-        dst = src.parent / f"{val_ppl:.2f}_{label}_{i}"
+        dst = src.parent / f"{test_ppl:.2f}_{label}_{i}"
         i += 1
     try:
         src.rename(dst)
@@ -698,8 +700,10 @@ def _rename_run_by_validation_ppl(
     return str(dst)
 
 
-# Compatibility alias for callers that imported the old boundary. Its argument is validation PPL.
-_rename_run_by_ppl = _rename_run_by_validation_ppl
+# Compatibility aliases for callers that imported an older boundary. The PPL argument is now the
+# held-out TEST perplexity, not validation.
+_rename_run_by_ppl = _rename_run_by_test_ppl
+_rename_run_by_validation_ppl = _rename_run_by_test_ppl
 
 
 def _run_once(
@@ -806,8 +810,8 @@ def _run_once(
             wall_time=wall,
             logger=logger,
         )
-        run_dir = _rename_run_by_validation_ppl(
-            run_dir, _run_label(cfg, DATASET), results.get("best_val_ppl"), logger)
+        run_dir = _rename_run_by_test_ppl(
+            run_dir, _run_label(cfg, DATASET), results.get("test_ppl"), logger)
         logger.info("Artifacts written to %s", run_dir)
 
 
