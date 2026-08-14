@@ -2007,7 +2007,15 @@ def test_validation_finalizer_scores_terminal_ema_before_best_selection(tmp_path
 
     def fake_evaluate(m, loader, *, tokens_per_char=None, device=None):
         calls.append({name: t.detach().clone() for name, t in m.state_dict().items()})
-        return {"ce": 2.0, "ppl": 9.0, "bits_per_token": 2.0 / math.log(2.0), "bpc": None}
+        return {
+            "ce": 2.0,
+            "ppl": 9.0,
+            "bits_per_token": 2.0 / math.log(2.0),
+            "bpc": None,
+            "expected_targets": 4,
+            "scored_targets": 4,
+            "excluded_targets": 0,
+        }
 
     monkeypatch.setattr("vfe3.train.evaluate", fake_evaluate)
 

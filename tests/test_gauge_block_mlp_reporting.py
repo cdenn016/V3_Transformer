@@ -26,6 +26,8 @@ def _pure_cfg(mode, covariance="passthrough"):
         pos_phi="none",
         pos_phi_compose="bch",
         pos_rotation="none",
+        sigma_max=None,
+        transport_chart_max_norm=12.0,
         e_phi_lr=0.0,
     )
 

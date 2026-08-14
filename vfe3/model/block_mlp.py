@@ -443,7 +443,7 @@ def get_block_mlp_registration(mode: str) -> BlockMLPRegistration:
         return BLOCK_MLP_REGISTRATIONS[mode]
     except KeyError as exc:
         raise ValueError(
-            f"unknown block MLP mode {mode!r}; available: {sorted(BLOCK_MLP_REGISTRATIONS)}"
+            f"unknown block_mlp_mode {mode!r}; available: {sorted(BLOCK_MLP_REGISTRATIONS)}"
         ) from exc
 
 
