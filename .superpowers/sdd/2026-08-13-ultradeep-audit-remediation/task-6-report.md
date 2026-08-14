@@ -103,4 +103,4 @@ failure or unresolved accounting invariant. No GPU claims were made.
 
 ## Commit
 
-Implementation commit: `e49038378c3466635176024311cf018f7c3da301` (`fix: make diagnostics and evaluation accounting honest`).
+Implementation commit: `1448106484e8236c23bdec4b23a3927cd9ba674e` (`fix: make diagnostics and evaluation accounting honest`).`r`n`r`nThe report-finalization commit is docs-only and is identified in the Task 6 handoff.
