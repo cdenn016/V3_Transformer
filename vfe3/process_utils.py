@@ -8,13 +8,16 @@ import os
 import signal
 import subprocess
 import sys
-from time import monotonic
+from time import monotonic, sleep
 from ctypes import wintypes
 from typing import Mapping, Optional, Sequence
 
 
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_JOB_OBJECT_BASIC_PROCESS_ID_LIST = 3
+_ERROR_MORE_DATA = 234
+_JOB_DRAIN_POLL_SECONDS = 0.005
 _PROCESS_REAP_TIMEOUT_SECONDS = 10.0
 _TASKKILL_TIMEOUT_SECONDS = 10.0
 _WINDOWS_GATED_LAUNCHER = (
@@ -63,6 +66,16 @@ class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION_STRUCT(ctypes.Structure):
     ]
 
 
+class _JOBOBJECT_BASIC_PROCESS_ID_LIST(ctypes.Structure):
+    """Header of the job's live-PID listing; only the two counts are read back here."""
+
+    _fields_ = [
+        ("NumberOfAssignedProcesses", wintypes.DWORD),
+        ("NumberOfProcessIdsInList", wintypes.DWORD),
+        ("ProcessIdList", ctypes.c_size_t * 1),
+    ]
+
+
 class _WindowsJob:
     """Own one Windows Job Object whose closure kills all assigned descendants."""
 
@@ -81,6 +94,14 @@ class _WindowsJob:
         kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
         kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
         kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.QueryInformationJobObject.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryInformationJobObject.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
 
@@ -109,6 +130,25 @@ class _WindowsJob:
         if self._handle and not self._kernel32.TerminateJobObject(self._handle, exit_code):
             raise ctypes.WinError(ctypes.get_last_error())
 
+    def active_process_count(self) -> Optional[int]:
+        """Processes still assigned to the job (0 once drained, None when the query fails)."""
+        if not self._handle:
+            return 0
+        listing = _JOBOBJECT_BASIC_PROCESS_ID_LIST()
+        returned = wintypes.DWORD(0)
+        ok = self._kernel32.QueryInformationJobObject(
+            self._handle,
+            _JOB_OBJECT_BASIC_PROCESS_ID_LIST,
+            ctypes.byref(listing),
+            ctypes.sizeof(listing),
+            ctypes.byref(returned),
+        )
+        # A job holding more than one live PID overflows the single-slot listing, but Windows still
+        # fills both counts before failing with ERROR_MORE_DATA -- that is a valid "not drained yet".
+        if not ok and ctypes.get_last_error() != _ERROR_MORE_DATA:
+            return None
+        return int(listing.NumberOfAssignedProcesses)
+
     def close(self) -> None:
         if self._handle:
             handle = self._handle
@@ -128,13 +168,25 @@ def _kill_process_tree(
     if timeout <= 0.0:
         raise ValueError("process-tree termination timeout must be positive")
     if os.name == "nt":
+        deadline = monotonic() + timeout
         if job is not None:
             try:
                 job.terminate()
-                return True
             except OSError:
                 pass
-        deadline = monotonic() + timeout
+            else:
+                # TerminateJobObject is ASYNCHRONOUS: it signals every assigned process and returns
+                # immediately, so the root can be reaped while a grandchild (the gated launcher
+                # spawns the real workload as its own child) is still alive holding the inherited
+                # stderr handle. Deleting that log then fails with WinError 32. Confirm the job has
+                # actually drained before reporting the tree terminated.
+                while True:
+                    remaining_processes = job.active_process_count()
+                    if remaining_processes == 0:
+                        return True
+                    if remaining_processes is None or monotonic() >= deadline:
+                        return False
+                    sleep(min(_JOB_DRAIN_POLL_SECONDS, max(0.0, deadline - monotonic())))
         taskkill = subprocess.Popen(
             ["taskkill", "/PID", str(process.pid), "/T", "/F"],
             stdout=subprocess.DEVNULL,

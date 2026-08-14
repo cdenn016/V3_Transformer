@@ -170,6 +170,7 @@ _UMAP_WORKER_SRC = (
 # Cap on concurrent UMAP interpreters. Each fit is single-threaded by construction (random_state
 # forces it), so the pool is the ONLY parallelism available and one core per fit is the right unit.
 _UMAP_MAX_WORKERS = 8
+_STDERR_UNLINK_POLL_SECONDS = 0.005      # Windows handle-release lag after a drained process tree
 
 
 def _numba_cache_dir() -> Optional[str]:
@@ -438,12 +439,25 @@ class UMAPWorker:
                     cleanup_errors.append(f"{label} close: {type(exc).__name__}: {exc}")
 
             if stderr_path is not None:
-                try:
-                    os.remove(stderr_path)
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:
-                    cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+                # Windows releases a terminated tree's INHERITED handles a few milliseconds after the
+                # job reports itself drained (the gated launcher hands its stderr to the real worker,
+                # so the log outlives both). A single unlinked attempt therefore lost the race and
+                # published WinError 32 on every worker. Retry inside the caller's cleanup budget --
+                # the same policy close() already applies to the scratch directory itself.
+                remove_deadline = retirement_started + self.cleanup_timeout
+                while True:
+                    try:
+                        os.remove(stderr_path)
+                    except FileNotFoundError:
+                        break
+                    except OSError as exc:
+                        remaining = remove_deadline - monotonic()
+                        if remaining <= 0.0:
+                            cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+                            break
+                        Event().wait(min(_STDERR_UNLINK_POLL_SECONDS, remaining))
+                    else:
+                        break
         finally:
             status["elapsed_s"] = monotonic() - retirement_started
             existing_error = status.get("cleanup_error")
