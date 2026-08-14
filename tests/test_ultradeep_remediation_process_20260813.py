@@ -203,6 +203,33 @@ def test_workdir_cleanup_failure_is_structured_and_not_raised(monkeypatch):
     )
 
 
+def test_workdir_cleanup_retries_a_transient_sharing_failure(monkeypatch):
+    controlled_worker = "import sys\nfor _line in sys.stdin:\n    pass\n"
+    monkeypatch.setattr(figures, "_UMAP_WORKER_SRC", controlled_worker)
+    worker = figures.UMAPWorker(timeout=0.10, cleanup_timeout=0.25, max_workers=1)
+    worker._ensure(1)
+    workdir = worker._workdir
+    real_rmtree = shutil.rmtree
+    attempts = []
+
+    def _fail_once(path):
+        attempts.append(path)
+        if len(attempts) == 1:
+            raise PermissionError("transient workdir sharing violation")
+        return real_rmtree(path)
+
+    monkeypatch.setattr(shutil, "rmtree", _fail_once)
+
+    statuses = worker.close()
+
+    assert len(attempts) == 2
+    assert workdir is not None and not figures.os.path.exists(workdir)
+    assert not any(
+        status["reason"] == "workdir_cleanup"
+        for status in statuses
+    )
+
+
 def test_concurrent_double_close_retires_each_worker_once(monkeypatch):
     controlled_worker = "import time\nwhile True: time.sleep(0.01)\n"
     monkeypatch.setattr(figures, "_UMAP_WORKER_SRC", controlled_worker)

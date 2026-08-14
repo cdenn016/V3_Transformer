@@ -610,6 +610,7 @@ class UMAPWorker:
                 self._cleanup_request_path(path)
 
     def close(self) -> List[Dict[str, object]]:
+        from time import monotonic
         import shutil
         statuses: List[Dict[str, object]] = []
         with self._lifecycle_lock:
@@ -627,14 +628,23 @@ class UMAPWorker:
             self._cleanup_request_path(path)
         if workdir is not None:
             # The numba cache lives OUTSIDE this tree on purpose; only the request scratch goes.
-            try:
-                shutil.rmtree(workdir)
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                statuses.append(self._record_cleanup_failure(
-                    reason="workdir_cleanup", path=workdir, exc=exc,
-                ))
+            # Windows can retain a terminated worker's file handles briefly. Retry only inside
+            # the caller's explicit cleanup budget and publish the terminal failure, if any.
+            cleanup_deadline = monotonic() + self.cleanup_timeout
+            while True:
+                try:
+                    shutil.rmtree(workdir)
+                    break
+                except FileNotFoundError:
+                    break
+                except OSError as exc:
+                    remaining = cleanup_deadline - monotonic()
+                    if remaining <= 0.0:
+                        statuses.append(self._record_cleanup_failure(
+                            reason="workdir_cleanup", path=workdir, exc=exc,
+                        ))
+                        break
+                    Event().wait(min(0.01, remaining))
         with self._lifecycle_lock:
             self._closing = False
         return statuses
