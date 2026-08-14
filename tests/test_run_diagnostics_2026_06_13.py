@@ -29,6 +29,13 @@ from vfe3.train import build_optimizer, train, train_step, _floor_lr_lambdas
 DEVICE = torch.device(os.environ.get("VFE3_TEST_DEVICE", "cpu"))
 
 # diagnostics() keys the rollout adds (all should be present and finite on the pure path).
+_POLICY_DIAG_KEYS = {
+    "m_phi_group_trust_radius": "m_phi_group_trust_radius",
+    "phi_mstep_max_matrix_norm": "phi_mstep_max_matrix_norm",
+    "transport_chart_max_norm": "transport_chart_max_norm",
+    "exp_fp64_norm_threshold": "exp_fp64_norm_threshold",
+}
+
 _NEW_DIAG_KEYS = [
     "holonomy_ci_lo", "holonomy_ci_hi", "gauge_invariant_mean", "gauge_invariant_spread",
     "phi_norm_mean", "phi_norm_std", "belief_cond_median", "belief_cond_p95", "belief_cond_max",
@@ -61,6 +68,9 @@ def test_diagnostics_has_extended_keys_finite() -> None:
     missing = [k for k in _NEW_DIAG_KEYS if k not in d]
     assert not missing, f"diagnostics missing new keys: {missing}"
     assert all(math.isfinite(d[k]) for k in _NEW_DIAG_KEYS)
+    assert {key: d[key] for key in _POLICY_DIAG_KEYS} == {
+        key: getattr(cfg, config_field) for key, config_field in _POLICY_DIAG_KEYS.items()
+    }
     # existing invariants untouched: total still present, holonomy mean key preserved
     assert "total" in d and "holonomy_deviation" in d
     # pure path: clamps inert and frames non-collapsed
@@ -431,10 +441,13 @@ def test_finalize_writes_tier3_research_and_provenance() -> None:
         assert math.isfinite(zero_estep["ce_delta_vs_headline"])
         assert "test_ce_no_estep" not in res and "estep_capacity_gain" not in res
         assert model.cfg.n_e_steps == cfg.n_e_steps                # restored after the probe
-        # C2/EXP-5: the converged final E-step F/token is persisted (for the F-vs-CE decorrelation)
-        assert "estep_final_f_per_token" in res and math.isfinite(res["estep_final_f_per_token"])
+        # C2/EXP-5: final_iterate is unconditional; no convergence evidence is fabricated.
+        assert "estep_final_iterate_f_per_token" in res
+        assert math.isfinite(res["estep_final_iterate_f_per_token"])
+        assert res["estep_iterate_evidence"]["iterate_label"] == "final_iterate"
+        assert res["estep_iterate_evidence"]["convergence_evidence"] is False
         summ = json.loads((root / "summary.json").read_text())
-        assert math.isfinite(float(summ["estep_final_f_per_token"]))
+        assert math.isfinite(float(summ["estep_final_iterate_f_per_token"]))
         # provenance.json: code/data/env state a config-only record omits
         prov = json.loads((root / "provenance.json").read_text())
         assert {"seed", "torch_version", "git_sha", "git_dirty"} <= set(prov)

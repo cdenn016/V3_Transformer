@@ -484,6 +484,9 @@ def _requested_seed_design(
         json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         for contract in provenance_contracts.values()
     }
+    data_order = _data_order_status([
+        contract.get("data_seed") for contract in provenance_contracts.values()
+    ])
     provenance_verified = (
         bool(cells)
         and len(provenance_contracts) == len(cells)
@@ -531,6 +534,7 @@ def _requested_seed_design(
         "request_verified": manifest["request_verified"],
         "manifest_status": manifest["manifest_status"],
         "provenance_verified": provenance_verified,
+        "data_order": data_order,
         "status": "complete" if complete else "incomplete",
         "complete": complete,
         "cells": cells,
@@ -807,7 +811,7 @@ def flag_noise_dominated(
 # =============================================================================
 CONFIG: Dict[str, Any] = {
     "run_root": "K=60_GL(10)",   # run folder (bare name resolves under vfe3_runs/) OR a path
-    "key":      "test_ppl",      # headline metric for the per-seed noise band
+    "key":      "best_val_ppl",  # exploratory selection/noise metric; test remains final endpoint
 }
 
 # Headline scalars to aggregate (searched in summary.json -> test_results.json -> research.json).
@@ -856,9 +860,17 @@ PER_LAYER_METRICS: List[str] = [                                  # per-layer ba
     "holonomy_deviation", "gauge_trace_spread", "belief_cond_median",
 ]
 
-CAVEAT = ("Per-run reseed shares the data-shuffle order across seeds, so every SD here is the "
-          "init+optimization spread only -- a LOWER BOUND on deployment variance "
-          "(companion fix: docs/experiments/2026-06-21-experiment-readiness.md S6).")
+def _data_order_status(data_seeds: Iterable[object]) -> Dict[str, object]:
+    values = list(data_seeds)
+    if values and all(type(value) is int for value in values) and len(set(values)) == 1:
+        return {"status": "shared_explicit", "shared": True, "data_seed": values[0]}
+    if values and all(value is None for value in values):
+        return {"status": "nonshared_unspecified", "shared": False, "data_seed": None}
+    return {"status": "nonshared_or_mixed", "shared": False, "data_seed": None}
+
+
+CAVEAT = ("Data-order sharing is reported only for one explicit common data_seed; data_seed=None "
+          "means nonshared/unspecified order, not a shared shuffle stream.")
 
 
 def _slug(s: str) -> str:
@@ -1094,6 +1106,7 @@ def main() -> int:
             "n_observed_runs": request_design["n_observed_runs"],
             "request_verified": request_design["request_verified"],
             "manifest_status": request_design["manifest_status"],
+            "data_order": request_design["data_order"],
             "status": "complete" if publication_complete else "incomplete",
             "complete": publication_complete,
             "cells": headline["cells"],

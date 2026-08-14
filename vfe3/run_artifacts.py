@@ -3114,6 +3114,43 @@ def _cost_model_fields(
     return out
 
 
+def _estep_iterate_evidence(
+    *,
+    free_energy: Iterable[float],
+    halted: bool,
+    fixed_point_residual: Optional[float],
+    fixed_point_tolerance: Optional[float],
+) -> Dict[str, object]:
+    """Gate scientific iterate labels on explicit mechanical evidence."""
+    values = [float(value) for value in free_energy]
+    descent = len(values) >= 2 and all(
+        current <= previous for previous, current in zip(values, values[1:]))
+    fixed = bool(
+        halted and fixed_point_residual is not None and fixed_point_tolerance is not None
+        and float(fixed_point_residual) <= float(fixed_point_tolerance)
+    )
+    return {
+        "iterate_label": "final_iterate",
+        "descent_evidence": descent,
+        "convergence_evidence": fixed,
+        "fixed_point_evidence": fixed,
+    }
+
+
+def _target_blind_objective_interpretation() -> str:
+    """State only the justified structural conclusion of a target-blind E-step."""
+    return "The target-blind latent objective is structurally separate from held-out prediction."
+
+
+def _scheduler_metadata(*, min_lr: float, min_lr_frac: float) -> Dict[str, object]:
+    return {
+        "kind": "warmup_half_cosine_with_floor",
+        "absolute_floor": float(min_lr),
+        "fractional_floor": float(min_lr_frac),
+        "floor_description": "max(absolute_floor, fractional_floor * group_base_lr)",
+    }
+
+
 def finalize_run(
     model:       torch.nn.Module,
     artifacts:   RunArtifacts,
@@ -3179,6 +3216,12 @@ def finalize_run(
             "test_ppl":            m["ppl"],
             "test_bits_per_token": m["bits_per_token"],
             "test_bpc":            m["bpc"],
+            "expected_targets":    m["expected_targets"],
+            "scored_targets":      m["scored_targets"],
+            "excluded_targets":    m["excluded_targets"],
+            "test_expected_targets": m["expected_targets"],
+            "test_scored_targets":   m["scored_targets"],
+            "test_excluded_targets": m["excluded_targets"],
         })
         logger.info(
             "Test (held-out) | CE: %.4f | PPL: %.2f | BPT: %.4f | BPC: %s",
@@ -3232,8 +3275,13 @@ def finalize_run(
             _b = next(iter(test_loader))
             _tok = (_b[0] if isinstance(_b, (tuple, list)) else _b).to(device)
             _tr = e_step_belief_trace(model, _tok)              # n_iter defaults to cfg.n_e_steps
-            results["estep_final_f_per_token"] = float(_tr["free_energy"][-1]) / max(1, int(_tok.shape[1]))
-            logger.info("Converged final E-step F/token: %.4f", results["estep_final_f_per_token"])
+            results["estep_final_iterate_f_per_token"] = float(_tr["free_energy"][-1]) / max(1, int(_tok.shape[1]))
+            results["estep_final_f_per_token"] = results["estep_final_iterate_f_per_token"]  # compatibility alias
+            results["estep_iterate_evidence"] = _estep_iterate_evidence(
+                free_energy=[float(value) for value in _tr["free_energy"]],
+                halted=False, fixed_point_residual=None, fixed_point_tolerance=None,
+            )
+            logger.info("Final E-step iterate F/token: %.4f", results["estep_final_iterate_f_per_token"])
         except Exception as exc:
             logger.warning("estep final-F probe failed (%s); skipped", exc)
 
@@ -3332,6 +3380,9 @@ def finalize_run(
         "test_ppl":             results.get("test_ppl"),
         "test_bits_per_token":  results.get("test_bits_per_token"),
         "test_bpc":             results.get("test_bpc"),
+        "expected_targets":      results.get("expected_targets"),
+        "scored_targets":        results.get("scored_targets"),
+        "excluded_targets":      results.get("excluded_targets"),
     }
     try:
         scaling_point.update(_cost_model_fields(model, cfg, n_params, tokens_seen, wall_time=wall_time))
@@ -3353,8 +3404,17 @@ def finalize_run(
         "test_ce":      results.get("test_ce"),
         "test_bits_per_token": results.get("test_bits_per_token"),
         "test_bpc":     results.get("test_bpc"),
+        "expected_targets": results.get("expected_targets"),
+        "scored_targets": results.get("scored_targets"),
+        "excluded_targets": results.get("excluded_targets"),
+        "test_expected_targets": results.get("test_expected_targets"),
+        "test_scored_targets": results.get("test_scored_targets"),
+        "test_excluded_targets": results.get("test_excluded_targets"),
         "diagnostics":  results["diagnostics"],
+        "estep_final_iterate_f_per_token": results.get("estep_final_iterate_f_per_token"),
         "estep_final_f_per_token": results.get("estep_final_f_per_token"),
+        "estep_iterate_evidence": results.get("estep_iterate_evidence"),
+        "scheduler": _scheduler_metadata(min_lr=cfg.min_lr, min_lr_frac=cfg.min_lr_frac),
         "final_train_loss": (losses[-1] if losses else None),
         "wall_time_s":  wall_time,
         "use_prior_bank":  cfg.use_prior_bank,
@@ -4244,6 +4304,11 @@ def finalize_validation_run(
         final_ppl = float(metrics["ppl"])
         final_bits_per_token = float(metrics["bits_per_token"])
         final_bpc = (float(metrics["bpc"]) if metrics["bpc"] is not None else None)
+        target_counts = {
+            "expected_targets": int(metrics["expected_targets"]),
+            "scored_targets": int(metrics["scored_targets"]),
+            "excluded_targets": int(metrics["excluded_targets"]),
+        }
 
         # Terminal metrics row: an empty history adopts the compact terminal schema. An established
         # training history retains its exact rectangular field set, but every non-terminal field is
@@ -4293,6 +4358,10 @@ def finalize_validation_run(
             "val_ppl":         final_ppl,
             "val_bits_per_token": final_bits_per_token,
             "val_bpc":         final_bpc,
+            **target_counts,
+            "val_expected_targets": target_counts["expected_targets"],
+            "val_scored_targets": target_counts["scored_targets"],
+            "val_excluded_targets": target_counts["excluded_targets"],
             "primary_val_ppl": float(primary_val_ppl),
             "best_val_ppl":    best_val_ppl,
             "best_step":       artifacts.best_step,
@@ -4357,6 +4426,10 @@ def finalize_validation_run(
         "final_val_ppl":       final_ppl,
         "final_val_bits_per_token": final_bits_per_token,
         "final_val_bpc":       final_bpc,
+        **target_counts,
+        "val_expected_targets": target_counts["expected_targets"],
+        "val_scored_targets": target_counts["scored_targets"],
+        "val_excluded_targets": target_counts["excluded_targets"],
         "best_val_ppl":        best_val_ppl,
         "best_step":           artifacts.best_step,
         "n_steps":             completed_step,
@@ -4377,6 +4450,10 @@ def finalize_validation_run(
         "final_val_ce":        final_ce,
         "final_val_bits_per_token": final_bits_per_token,
         "final_val_bpc":       final_bpc,
+        **target_counts,
+        "val_expected_targets": target_counts["expected_targets"],
+        "val_scored_targets": target_counts["scored_targets"],
+        "val_excluded_targets": target_counts["excluded_targets"],
         "best_val_ppl":        best_val_ppl,
         "best_step":           artifacts.best_step,
         "final_train_loss":    final_train_loss,
@@ -4986,6 +5063,7 @@ def _save_figures(
             iae = getattr(cfg, "include_attention_entropy", True)
             fig = figs.plot_free_energy_decomposition(
                 hist, lambda_beta=lam, lambda_gamma=gam, include_attention_entropy=iae,
+                divergence_family=getattr(cfg, "divergence_family", "renyi"),
                 path=str(run / "free_energy_decomposition.png"))
             figs.plt.close(fig)
             fig = figs.plot_free_energy_codescent(

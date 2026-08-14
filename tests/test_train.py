@@ -411,9 +411,11 @@ def test_evaluate_returns_finite_ppl_bpc_consistent_with_ce():
     model = VFEModel(cfg)
     loader = _periodic_loader(seed=0)
     m = evaluate(model, loader, tokens_per_char=1.0)
-    assert set(m.keys()) == {"ce", "ppl", "bits_per_token", "bpc"}
+    assert set(m.keys()) == {"ce", "ppl", "bits_per_token", "bpc",
+                                  "expected_targets", "scored_targets", "excluded_targets"}
     assert all(math.isfinite(v) for v in m.values())
-    assert m["ppl"] == pytest.approx(math.exp(min(m["ce"], 20.0)))
+    assert m["expected_targets"] == m["scored_targets"] + m["excluded_targets"]
+    assert m["ppl"] == pytest.approx(math.exp(m["ce"]))
     assert m["bits_per_token"] == pytest.approx(m["ce"] / math.log(2.0))
     assert m["bpc"] == pytest.approx(m["ce"] / math.log(2.0))
 
@@ -429,12 +431,15 @@ class _ScriptedDecodeStatsModel(torch.nn.Module):
 
     def forward(self, tokens, targets=None, *, return_decode_stats=False):
         assert return_decode_stats, "evaluation must request the decoder-owned denominator"
-        ce_value, scored_tokens = self._batches.pop(0)
+        batch = self._batches.pop(0)
+        ce_value, scored_tokens = batch[:2]
+        excluded_tokens = batch[2] if len(batch) == 3 else targets.numel() - scored_tokens
         ce = self.prior_bank.phi_embed * 0.0 + ce_value
         from vfe3.model.prior_bank import DecodeCEResult
         stats = DecodeCEResult(
             ce=ce.detach(),
             scored_tokens=torch.tensor(scored_tokens, dtype=torch.int64, device=ce.device),
+            excluded_tokens=torch.tensor(excluded_tokens, dtype=torch.int64, device=ce.device),
         )
         return None, ce, stats
 
@@ -446,8 +451,12 @@ def test_evaluate_weights_by_decoder_scored_tokens_and_preserves_result_keys():
         (torch.zeros(1, 4, dtype=torch.long), torch.zeros(1, 4, dtype=torch.long)),
     ]
     result = evaluate(model, loader)
-    assert set(result) == {"ce", "ppl", "bits_per_token", "bpc"}
+    assert set(result) == {"ce", "ppl", "bits_per_token", "bpc",
+                                  "expected_targets", "scored_targets", "excluded_targets"}
     assert result["ce"] == pytest.approx(3.5)
+    assert result["expected_targets"] == 8
+    assert result["scored_targets"] == 4
+    assert result["excluded_targets"] == 4
 
 
 def test_evaluate_rejects_a_corpus_with_zero_decoder_scored_tokens():
@@ -944,6 +953,8 @@ def test_validation_finalizer_records_validation_without_test_fields(tmp_path, m
         assert forbidden not in summary
     for required in ("primary_val_ppl", "final_val_ce", "final_val_ppl",
                      "final_val_bits_per_token", "final_val_bpc",
+                     "expected_targets", "scored_targets", "excluded_targets",
+                     "val_expected_targets", "val_scored_targets", "val_excluded_targets",
                      "best_val_ppl", "best_step", "n_steps", "n_params", "final_train_loss",
                      "wall_time_s", "terminal_checkpoint", "figures_written",
                      "phi_chart_norm_route"):
@@ -957,6 +968,8 @@ def test_validation_finalizer_records_validation_without_test_fields(tmp_path, m
 
     assert set(mapping) == {"primary_val_ppl", "final_val_ppl", "final_val_ce",
                             "final_val_bits_per_token", "final_val_bpc",
+                            "expected_targets", "scored_targets", "excluded_targets",
+                            "val_expected_targets", "val_scored_targets", "val_excluded_targets",
                             "best_val_ppl", "best_step", "final_train_loss", "n_params",
                             "terminal_checkpoint"}
     # After the terminal maybe_save_best the primary equals the selected finite best (no earlier best).

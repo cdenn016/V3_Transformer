@@ -20,6 +20,8 @@ import matplotlib
 
 matplotlib.use("Agg")                                            # non-interactive (headless / tests)
 import matplotlib.pyplot as plt
+
+from vfe3.families.base import get_functional
 import numpy as np
 from matplotlib.colors import LogNorm
 from matplotlib.ticker import FuncFormatter, MaxNLocator
@@ -1024,6 +1026,14 @@ def plot_free_energy_codescent(
     return _save(fig, path)
 
 
+def _registered_divergence_axis(name: str) -> tuple[str, str]:
+    """Return diagnostic display metadata from the active registered functional."""
+    functional = get_functional(name)
+    label = getattr(functional, "diagnostic_label", name.replace("_", " "))
+    units = getattr(functional, "diagnostic_units", "registered objective units")
+    return str(label), str(units)
+
+
 @register_figure("free_energy_decomposition")
 def plot_free_energy_decomposition(
     history: Dict,                       # step, self_coupling, belief_coupling, attention_entropy, val_ce, [hyper_prior_weighted, gamma_*]
@@ -1032,6 +1042,7 @@ def plot_free_energy_decomposition(
     lambda_beta:               'float | np.ndarray' = 1.0,
     lambda_gamma:              float = 0.0,
     include_attention_entropy: bool  = True,
+    divergence_family:         str = "renyi",
     path:                      Optional[str] = None,
 ):
     r"""The per-token inner alignment-energy budget and how its terms move over training.
@@ -1048,8 +1059,13 @@ def plot_free_energy_decomposition(
     """
     step, comps, _total, _ce = _fe_terms(history, lambda_beta, lambda_gamma=lambda_gamma,
                                          include_attention_entropy=include_attention_entropy)
-    names  = [_FE_LABELS[k][1] for k, _ in comps]
-    labels = [_FE_LABELS[k][0] for k, _ in comps]
+    objective_label, objective_units = _registered_divergence_axis(divergence_family)
+    dynamic_labels = dict(_FE_LABELS)
+    dynamic_labels["self"] = ("self-coupling", f"self-coupling\n{objective_label}(q,p)")
+    dynamic_labels["belief"] = (
+        "belief coupling", f"belief-coupling\n{objective_label}(q,transported q)")
+    names  = [dynamic_labels[k][1] for k, _ in comps]
+    labels = [dynamic_labels[k][0] for k, _ in comps]
     series = [c for _, c in comps]
     colors = _CB[:len(series)]
     last = np.array([s[-1] for s in series])
@@ -1063,7 +1079,7 @@ def plot_free_energy_decomposition(
         axes[0].annotate(f"{val:.1f}", xy=(val, yi), xytext=(4, 0), textcoords="offset points",
                          va="center", ha="left", fontsize=9)
     axes[0].set_xlim(float(last.min()) * 0.5, float(last.max()) * 3.0)
-    axes[0].set(xlabel="inner-energy contribution (nats/token, log scale)",
+    axes[0].set(xlabel=f"inner-energy contribution ({objective_units}/token, log scale)",
                 title=f"Budget at step {int(step[-1]):,}")
     # Panel B -- early/mid/late medians, log y so the flat dominant term and the moving terms coexist.
     thirds  = np.array_split(np.arange(step.size), 3)
@@ -1077,7 +1093,8 @@ def plot_free_energy_decomposition(
     axes[1].set_yscale("log")
     axes[1].set_ylim(top=axes[1].get_ylim()[1] * 2.2)            # headroom for the legend above the bars
     axes[1].set_xticks(centers); axes[1].set_xticklabels(["early", "mid", "late"])
-    axes[1].set(xlabel="training third", ylabel="inner term (median, nats/token, log scale)",
+    axes[1].set(xlabel="training third",
+                ylabel=f"inner term (median, {objective_units}/token, log scale)",
                 title="Self-coupling flat; other terms descend")
     axes[1].legend(fontsize=7.5, frameon=False, ncol=2, loc="upper right")
     fig.tight_layout()
@@ -1261,13 +1278,15 @@ def plot_estep_convergence(
     fig, axes = plt.subplots(1, 2, figsize=(9, 3.6))
     axes[0].plot(np.arange(fe.size), fe, "o-", color=_CB[0], ms=4, lw=1.6)
     axes[0].axhline(fe[-1], color="#888888", ls=":", lw=1)
-    axes[0].set(xlabel="E-step inner iteration", ylabel="free energy (nats)", title="E-step descent")
+    axes[0].set(xlabel="E-step inner iteration", ylabel="free energy (registered objective units)",
+                title="E-step iterate trajectory")
     t = np.arange(1, _np(res["r_mu"]).shape[0] + 1)
     _median_band(axes[1], t, _np(res["r_mu"]), _CB[0], r"$r_\mu$")
     _median_band(axes[1], t, _np(res["r_sigma"]), _CB[1], r"$r_\Sigma$ (SPD)")
     _median_band(axes[1], t, _np(res["r_phi"]), _CB[2], r"$r_\phi$")
     axes[1].set_yscale("log")
-    axes[1].set(xlabel="E-step inner iteration", ylabel="belief step length", title="Convergence to fixed point")
+    axes[1].set(xlabel="E-step inner iteration", ylabel="belief step length",
+                title="Final-iterate movement")
     axes[1].legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
@@ -4013,13 +4032,11 @@ def plot_f_ce_decorrelation(
     *,
     path: Optional[str] = None,
 ):
-    r"""C2/EXP-5: converged final E-step free energy per token vs held-out CE, one point per n_e_steps.
+    r"""Final-iterate target-blind objective per token versus held-out CE.
 
-    The structural non-Neal-Hinton EM prediction: the E-step descends its OWN target-blind functional
-    F, NOT the likelihood, so across an n_e_steps sweep final F should fall steeply (Pearson(n_e_steps,
-    F) < 0) while staying DECORRELATED from CE (Pearson(F, CE) ~ 0, or even > 0). A strongly NEGATIVE
-    Pearson(F, CE) would instead say F tracks the loss, contradicting the EM separation. Points are
-    ordered and annotated by n_e_steps; both Pearsons are in the title."""
+    Target blindness establishes structural separation from the prediction objective. It does not
+    imply any correlation sign across a finite depth sweep; the displayed correlations are descriptive.
+    Points are ordered and annotated by n_e_steps."""
     pts = sorted(arms, key=lambda a: float(a["n_e_steps"]))
     ne = np.array([float(a["n_e_steps"]) for a in pts])
     ff = np.array([float(a["final_f"]) for a in pts])
@@ -4037,7 +4054,8 @@ def plot_f_ce_decorrelation(
             ax.annotate(f"T={int(float(a['n_e_steps']))}", (float(a["final_f"]), float(a["ce"])),
                         textcoords="offset points", xytext=(6, 4), fontsize=8)
         fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02, label="n_e_steps")
-    ax.set(xlabel="converged final E-step F / token (nats)", ylabel="held-out CE (nats)")
+    ax.set(xlabel="final-iterate E-step objective / token (registered objective units)",
+           ylabel="held-out CE (nats)")
     ax.set_title(rf"E-step F vs CE  (Pearson$(F,CE)$={r_fce:+.3f}, Pearson$(T,F)$={r_nef:+.3f})")
     fig.tight_layout()
     return _save(fig, path)

@@ -1532,7 +1532,7 @@ def _make_figures(
             series, n_params=n_flat, path=str(fig_dir / "inference_capacity.png")))
 
         # C2/EXP-5: the n_e_steps arms -> the F-vs-CE decorrelation scatter (needs f_mean + ce_mean)
-        # and E-step-as-capacity (BPC + converged F vs T; additionally needs bpc_mean -- gated
+        # and E-step-as-capacity (BPC + final-iterate F vs T; additionally needs bpc_mean -- gated
         # separately so a heterogeneous run set missing test_bpc on some cells still gets the
         # decorrelation figure rather than a NaN BPC point).
         estep = sorted([p for p in infer_points if p["scale_knob"] == "n_e_steps"

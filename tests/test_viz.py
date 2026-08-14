@@ -364,7 +364,11 @@ def _fe_hist(n=30):
 
 def test_plot_free_energy_decomposition_saves(tmp_path):
     p = tmp_path / "decomp.png"
-    fig = plot_free_energy_decomposition(_fe_hist(), lambda_beta=1.0, path=str(p)); plt.close(fig)
+    fig = plot_free_energy_decomposition(
+        _fe_hist(), lambda_beta=1.0, divergence_family="renyi", path=str(p))
+    labels = " ".join(text.get_text() for axis in fig.axes for text in axis.get_yticklabels())
+    assert "KL" not in labels
+    plt.close(fig)
     assert _saved_nonempty(p)
 
 
@@ -458,7 +462,11 @@ def test_plot_estep_convergence_saves(tmp_path):
     trace = {"mu": torch.randn(T, N, K).cumsum(0), "sigma": torch.rand(T, N, K) + 0.3,
              "phi": torch.randn(T, N, 2), "free_energy": torch.linspace(50, 30, T)}
     p = tmp_path / "f2.png"
-    fig = plot_estep_convergence(trace, path=str(p)); plt.close(fig)
+    fig = plot_estep_convergence(trace, path=str(p))
+    titles = [axis.get_title().lower() for axis in fig.axes]
+    assert not any("convergence" in title or "fixed point" in title or "descent" in title
+                   for title in titles)
+    plt.close(fig)
     assert _saved_nonempty(p)
 
 
@@ -883,12 +891,14 @@ def test_phi_extractors_remain_unchanged(monkeypatch):
         before = len(diagnostic_calls)
         assert replay() is not None, name
         calls = diagnostic_calls[before:]
-        assert len(calls) == 1, (name, calls)
-        call = calls[0]
-        assert call["gauge_parameterization"] == "phi", name
-        assert call["omega"] is None, name
-        assert torch.equal(call["reflection"], initial.reflection), name
-        assert call["reflection_effect"] > 1e-3, name
+        # diagnostics now scores separately captured pre/post BlockMLP states; the sibling replays
+        # retain one state. Every state-specific transport must carry the same active reflection.
+        assert len(calls) == (2 if name == "diagnostics" else 1), (name, calls)
+        for call in calls:
+            assert call["gauge_parameterization"] == "phi", name
+            assert call["omega"] is None, name
+            assert torch.equal(call["reflection"], initial.reflection), name
+            assert call["reflection_effect"] > 1e-3, name
 
 
 def test_reflected_so_frame_drives_model_gauge_invariants():

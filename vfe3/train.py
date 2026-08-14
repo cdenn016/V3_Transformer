@@ -651,6 +651,8 @@ def train_step(
             tokens, targets, estep_grad_out=_egrad, return_decode_stats=True)
         ce = decode_stats.ce
         _scored_det = decode_stats.scored_tokens.detach()
+        _excluded_det = decode_stats.excluded_tokens.detach()
+        _expected_det = _scored_det + _excluded_det
         _scaler.scale(loss).backward()
         _loss_det = loss.detach()                               # host read DEFERRED: fused with the grad-finite
         step_loss = None                                        # flag at the gate below (audit 2026-07-01 round-3)
@@ -667,6 +669,7 @@ def train_step(
         tok_chunks = torch.chunk(tokens, grad_accum_steps, dim=0)
         tgt_chunks = torch.chunk(targets, grad_accum_steps, dim=0)
         count_tensors = []
+        excluded_count_tensors = []
         loss_numerator = torch.zeros((), dtype=torch.float64, device=tokens.device)
         ce_numerator = torch.zeros((), dtype=torch.float64, device=tokens.device)
         for tok_mb, tgt_mb in zip(tok_chunks, tgt_chunks):
@@ -676,6 +679,7 @@ def train_step(
             ce_mb = decode_stats_mb.ce
             count_mb = decode_stats_mb.scored_tokens.detach()
             count_tensors.append(count_mb)
+            excluded_count_tensors.append(decode_stats_mb.excluded_tokens.detach())
             if _egrad_mb is not None:
                 for _name, _value in _egrad_mb.items():
                     if isinstance(_value, Real):
@@ -689,6 +693,8 @@ def train_step(
                 ce_mb.detach().to(dtype=torch.float64) * count_mb)
         _counts = torch.stack(count_tensors)
         _scored_det = _counts.sum(dtype=torch.int64)
+        _excluded_det = torch.stack(excluded_count_tensors).sum(dtype=torch.int64)
+        _expected_det = _scored_det + _excluded_det
         _denominator = _scored_det.clamp_min(1).to(dtype=torch.float64)
         _loss_det = loss_numerator / _denominator
         _ce_det = ce_numerator / _denominator
@@ -820,6 +826,8 @@ def train_step(
                 _total / _egrad_counts[_name])
         metrics_out["loss_finite"] = float(loss_finite)
         metrics_out["train_ce"] = step_ce            # pre-step CE (matches step_loss; not a post-update re-forward)
+        metrics_out.update(_target_accounting_from_device(
+            _expected_det, _scored_det, _excluded_det))
         if _mb_tok:                                             # grad_accum_steps>1: token-spread bias check
             metrics_out["grad_accum_tok_spread"] = float(max(_mb_tok) - min(_mb_tok))
         if scaler is not None and scaler.is_enabled():          # fp16: surface the loss-scale (Tier-2 health)
@@ -956,6 +964,38 @@ def _maybe_metropolis_omega(
         model.metropolis_omega_step(token_ids, generator=generator)
 
 
+def _perplexity_from_ce(ce: float) -> float:
+    """Return exact ``exp(CE)``; mathematical overflow is represented as infinity."""
+    try:
+        return math.exp(float(ce))
+    except OverflowError:
+        return float("inf")
+
+
+def _target_accounting(expected: int, scored: int, excluded: int) -> Dict[str, int]:
+    """Validate and serialize one exact target partition."""
+    expected, scored, excluded = int(expected), int(scored), int(excluded)
+    if min(expected, scored, excluded) < 0 or expected != scored + excluded:
+        raise RuntimeError(
+            "target accounting requires expected_targets == scored_targets + excluded_targets; "
+            f"got {expected} != {scored} + {excluded}")
+    return {
+        "expected_targets": expected,
+        "scored_targets": scored,
+        "excluded_targets": excluded,
+    }
+
+
+def _target_accounting_from_device(
+    expected: torch.Tensor,
+    scored: torch.Tensor,
+    excluded: torch.Tensor,
+) -> Dict[str, int]:
+    """Transfer Task 5's device-side counts together, then validate their partition."""
+    values = torch.stack((expected, scored, excluded)).to(dtype=torch.int64).cpu().tolist()
+    return _target_accounting(*values)
+
+
 @torch.no_grad()
 def evaluate(
     model:  VFEModel,
@@ -970,7 +1010,7 @@ def evaluate(
 
     .. math::
         \mathrm{CE} = \frac{\sum_b n_b\, \mathrm{ce}_b}{\sum_b n_b},\quad
-        \mathrm{PPL} = e^{\min(\mathrm{CE},\,20)},\quad
+        \mathrm{PPL} = e^{\mathrm{CE}},\quad
         \mathrm{BPT} = \frac{\mathrm{CE}}{\ln 2},\quad
         \mathrm{BPC} = \mathrm{BPT}\,\cdot\,\mathrm{tokens\_per\_char},
 
@@ -988,10 +1028,13 @@ def evaluate(
     model.eval()
     try:
         total_nats = torch.zeros((), dtype=torch.float64, device=device)
-        total_tok = torch.zeros((), dtype=torch.float64, device=device)
+        total_tok = torch.zeros((), dtype=torch.int64, device=device)
+        total_expected = torch.zeros((), dtype=torch.int64, device=device)
+        total_excluded = torch.zeros((), dtype=torch.int64, device=device)
         for i, (tokens, targets) in enumerate(loader):
             tokens = tokens.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
+            total_expected.add_(targets.numel())
             valid = targets != -100
             has_ignored = bool((~valid).any())
             grouped_trailing_padding = False
@@ -1006,6 +1049,7 @@ def evaluate(
             if grouped_trailing_padding:
                 for length in torch.unique(valid_lengths).cpu().tolist():
                     if length == 0:
+                        total_excluded.add_((valid_lengths == length).sum() * targets.shape[1])
                         continue
                     rows = valid_lengths == length
                     group_tokens = tokens[rows, :length]
@@ -1015,14 +1059,24 @@ def evaluate(
                     n_b = decode_stats.scored_tokens
                     total_nats.add_(decode_stats.ce.to(dtype=torch.float64) * n_b)
                     total_tok.add_(n_b)
+                    total_excluded.add_(decode_stats.excluded_tokens)
+                    total_excluded.add_(rows.sum() * (targets.shape[1] - length))
             else:
                 _, _, decode_stats = model(tokens, targets, return_decode_stats=True)
                 n_b = decode_stats.scored_tokens
                 total_nats.add_(decode_stats.ce.to(dtype=torch.float64) * n_b)
                 total_tok.add_(n_b)
+                total_excluded.add_(decode_stats.excluded_tokens)
             if max_batches is not None and i + 1 >= max_batches:
                 break               # draw exactly max_batches (process-then-break; no extra pull)
-        total_nats_value, total_tok_value = torch.stack((total_nats, total_tok)).cpu().tolist()
+        values = torch.stack((
+            total_nats,
+            total_expected.to(dtype=torch.float64),
+            total_tok.to(dtype=torch.float64),
+            total_excluded.to(dtype=torch.float64),
+        )).cpu().tolist()
+        total_nats_value, expected_value, total_tok_value, excluded_value = values
+        accounting = _target_accounting(expected_value, total_tok_value, excluded_value)
         if total_tok_value == 0.0:
             raise ValueError(
                 "evaluation produced no scored target tokens; no non-ignored target tokens "
@@ -1035,10 +1089,11 @@ def evaluate(
     bits_per_token = ce / math.log(2.0)
     return {
         "ce":             ce,
-        "ppl":            math.exp(min(ce, 20.0)),
+        "ppl":            _perplexity_from_ce(ce),
         "bits_per_token": bits_per_token,
         "bpc":            (bits_per_token * tokens_per_char
                            if tokens_per_char is not None else None),
+        **accounting,
     }
 
 
@@ -1900,7 +1955,7 @@ def train(
             logger.info(
                 "Step %d/%d | Loss: %.4f | CE: %.4f | H(b): %.3f | train it/s: %.2f | \n\n         Train PPL: %.1f \n",
                 step + 1, n_steps, losses[-1], ce, d["attn_entropy"],
-                train_timing.train_steps_per_s, math.exp(min(ce, 20.0)),
+                train_timing.train_steps_per_s, _perplexity_from_ce(ce),
             )
             bits_per_token = ce / math.log(2.0)
             bpc_text = (
@@ -1965,6 +2020,9 @@ def train(
                 "ppl":            m["ppl"],
                 "bits_per_token": m["bits_per_token"],
                 "bpc":            m["bpc"],
+                "expected_targets": m["expected_targets"],
+                "scored_targets": m["scored_targets"],
+                "excluded_targets": m["excluded_targets"],
             }
             if artifacts is not None:
                 # Held-out per-eval probes (validation F decomposition, attention-map structure,
@@ -2050,7 +2108,7 @@ def train(
                 "step":              step + 1,
                 "train_loss":        losses[-1],
                 "train_ce":          ce,                      # true CE (nats), off the graph
-                "train_ppl":         math.exp(min(ce, 20.0)),  # train perplexity = exp(CE), mirrors the console line
+                "train_ppl":         _perplexity_from_ce(ce),  # exact exp(CE), infinity on overflow
                 "lr_block_mlp":       aux_lrs["block_mlp"],
                 "lr_mu":             lrs["mu"],
                 "lr_sigma":          lrs["sigma"],
@@ -2063,6 +2121,9 @@ def train(
                                        else float("nan")),
                 "val_bpc":           (last_val["bpc"] if do_eval and last_val["bpc"] is not None
                                       else float("nan")),
+                "val_expected_targets": (last_val["expected_targets"] if do_eval else float("nan")),
+                "val_scored_targets": (last_val["scored_targets"] if do_eval else float("nan")),
+                "val_excluded_targets": (last_val["excluded_targets"] if do_eval else float("nan")),
                 "attn_entropy":       d["attn_entropy"],
                 "self_coupling":      d["self_coupling"]     / n_tok,   # alpha-regularized F self-term sum_i[alpha_i D + R(alpha_i)]
                 "self_divergence":    d["self_divergence"]   / n_tok,   # raw sum_i D(q_i||p_i) drift; == self_coupling only at lambda_alpha_mode='constant'
@@ -2159,7 +2220,8 @@ def train(
                             "estep_grad_norm_sigma_microbatch_mean",
                             "estep_grad_norm_phi_microbatch_mean",
                             "loss_finite", "grad_finite", "step_skipped",
-                            "grad_scale", "grad_accum_tok_spread"):
+                            "grad_scale", "grad_accum_tok_spread",
+                            "expected_targets", "scored_targets", "excluded_targets"):
                     if _gk in step_metrics:
                         row[_gk] = step_metrics[_gk]
             if cfg.phi_mstep_max_matrix_norm is not None:
