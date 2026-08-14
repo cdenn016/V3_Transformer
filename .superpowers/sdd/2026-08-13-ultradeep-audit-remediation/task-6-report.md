@@ -103,4 +103,38 @@ failure or unresolved accounting invariant. No GPU claims were made.
 
 ## Commit
 
-Implementation commit: `1448106484e8236c23bdec4b23a3927cd9ba674e` (`fix: make diagnostics and evaluation accounting honest`).`r`n`r`nThe report-finalization commit is docs-only and is identified in the Task 6 handoff.
+Implementation commit: `1448106484e8236c23bdec4b23a3927cd9ba674e` (`fix: make diagnostics and evaluation accounting honest`).
+
+The report-finalization commit is docs-only and is identified in the Task 6 handoff.
+
+## Review-remediation closure
+
+The six Important review findings and one Minor report defect were addressed under strict TDD in implementation commit `45477b5` (`fix: close task 6 review gaps`). The focused RED fixture is `.verification/remediation-2026-08-13/task-06-review-red.xml`: **14 tests, 14 failures, 0 errors, 0 skips**. The post-fix focused contract modules passed **24 tests, 0 failures, 0 errors, 0 skips** before the final integration lane.
+
+The shared CE/PPL contract now drives evaluation plus both scaling consumers. CE=25 remains exact `exp(25)` and CE=1000 is positive `inf` only because exponentiation overflows. Training derives expected counts independently from every target tensor/microbatch; decoder scored/excluded counts must partition that value. Evaluation transfers nats as float64 and counts as int64. The `2**53 + 1` boundary is preserved exactly, and non-int64 device counts fail visibly.
+
+Scheduler metadata serializes every group base LR, role, frozen state, absolute/fractional floors, and executable effective floor. All built-in divergence functionals carry typed display label/units metadata; real overrides preserve metadata unless explicitly replaced. Every objective plot receives the active divergence family, with a unit-free `divergence` fallback.
+
+Default public artifacts are evidence-neutral: `iterate_trajectory.png`, `estep_endpoint_delta.png`, `free_energy_relationship.png`, and `f_ce_relationship.png`. Compatibility function/registry aliases remain. No endpoint delta is promoted to descent evidence. Target blindness is described only as structural separation, with no correlation-sign claim.
+
+The diagnostic capture now records the immediate BlockMLP input after mixer/CG/norm and immediate output. Each pre/post state serializes all weighted contributors (`self_coupling`, `belief_coupling`, `attention_entropy`, `twohop_coupling`, `hyper_prior`, `model_coupling`, `meta_entropy`, `observation_nll`) plus state-qualified raw self, observation, hyper-prior, and gamma components. Actual belief tensors establish equality; only proven-equal states share evaluation. Regression coverage includes mixer, CG, norm, two-hop, observation likelihood, reflection, model channel, and BlockMLP off/on cases, and reconciles both state totals.
+
+The final authoritative CPU lane is `.verification/remediation-2026-08-13/task-06-review-final.xml`: **377 tests, 0 failures, 0 errors, 3 expected skips**. The three skips are pre-existing opt-in slow integration cases. A broader exploratory lane also collected `tests/test_extract_forward_fidelity.py`; seven projected-encoder fixtures failed before Task 6 execution because their current configuration violates the existing canonical-content-projected admissibility contract. Those Task 5/config fixtures were outside Task 6 ownership and were not weakened. The two genuine compatibility failures in that exploratory lane were corrected and are green in the authoritative result.
+
+Serialized compatibility invariants:
+
+```json
+{
+  "ce_ppl": {"ce25_exact": true, "overflow_positive_inf": true},
+  "counts": {"dtype": "int64", "boundary": 9007199254740993, "partition_enforced": true},
+  "artifacts": {
+    "iterate": "iterate_trajectory.png",
+    "endpoint": "estep_endpoint_delta.png",
+    "f_ce": "f_ce_relationship.png",
+    "legacy_callable_aliases": true
+  },
+  "state_totals": {"pre_reconciles": true, "post_reconciles": true, "shared_only_if_equal": true}
+}
+```
+
+Warnings in the authoritative lane are existing configuration notices, deliberately short-run parameter-motion notices, scheduler-test call-order warnings, and known empty-artist plotting warnings. No warning indicates a Task 6 accounting, labeling, state-boundary, or PPL-contract failure. CPU-only execution was used as required; no GPU claim is made.
