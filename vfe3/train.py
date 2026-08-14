@@ -680,8 +680,9 @@ def train_step(
     A "step" stays an OPTIMIZER step (scheduler/warmup/max_steps accounting is unchanged), and the
     clip threshold is not rescaled by ``K``. The returned loss is the same scored-token-weighted
     accumulation-boundary objective. A zero-scored accumulation skips every update-side effect.
-    ``K == 1`` keeps the single-backward path (no chunking or gradient renormalization) and folds
-    the scored count into its existing host transfer. Requires ``B % K == 0``.
+    ``K == 1`` keeps the single-backward path (no chunking or gradient renormalization). Exact
+    target counts stay on-device on silent steps; partition-validity and zero-scored flags ride
+    the existing host transfer. Requires ``B % K == 0``.
 
     ``scaler`` is an optional :class:`torch.amp.GradScaler` for fp16 training (prevents
     gradient underflow through the unrolled E-step). A disabled scaler (``enabled=False``)
@@ -778,20 +779,25 @@ def train_step(
                 "exact objective.",
                 RuntimeWarning, stacklevel=2,
             )
-    _target_partition = _target_accounting_from_device(
+    _target_partition_valid_det = _target_partition_valid_from_device(
         _expected_det, _scored_det, _excluded_det)
+    _zero_scored_det = _scored_det == 0
     _scaler_enabled = scaler is not None and scaler.is_enabled()
-    scored_tokens_value = None
+    target_partition_valid = None
+    zero_scored_targets = None
     # The enabled scaler's ordinary finite-loss path delegates overflow detection to GradScaler.
     # Resolve the scalar loss first so the rare nonfinite-loss branch can explicitly inspect gradients
     # and distinguish scale backoff (nonfinite gradients) from scale hold (finite gradients).
     if _scaler_enabled:
         if step_loss is None:
-            _loss_count = torch.stack(
-                (_loss_det.to(dtype=torch.float64),
-                 _scored_det.to(dtype=torch.float64))).tolist()
-            step_loss = _loss_count[0]
-            scored_tokens_value = int(_loss_count[1])
+            _loss_flags = torch.stack((
+                _loss_det.to(dtype=torch.float64),
+                _target_partition_valid_det.to(dtype=torch.float64),
+                _zero_scored_det.to(dtype=torch.float64),
+            )).tolist()
+            step_loss = _loss_flags[0]
+            target_partition_valid = bool(_loss_flags[1])
+            zero_scored_targets = bool(_loss_flags[2])
         loss_finite = math.isfinite(step_loss)
     else:
         loss_finite = True                                  # resolved with the fused default-path scan below
@@ -818,11 +824,12 @@ def train_step(
     # Finite-GRADIENT gate (audit 2026-07-01 F1): a FINITE scalar loss can still carry a NaN/Inf
     # parameter gradient through the unrolled E-step on a degenerate batch; stepping AdamW on it
     # would permanently poison the exp_avg/exp_avg_sq moment buffers. Checked on EVERY step on the
-    # disabled-scaler default path; the deferred step-loss value and the grad-finite flag ride ONE
-    # fused D2H transfer, so the default path keeps exactly one unconditional sync per step
-    # (audit 2026-07-01 round-3). The enabled fp16 scaler path checks gradients internally via
-    # found_inf, but the scalar loss is still checked explicitly because it can be nonfinite while
-    # every parameter gradient is finite.
+    # disabled-scaler default path. The deferred loss, grad-finite flag, exact-partition validity,
+    # and zero-scored status ride ONE fused D2H transfer. Exact int64 counts are materialized only
+    # for requested metrics or an invalid-partition error, so the silent default path retains one
+    # unconditional synchronization per step (audit 2026-07-01 round-3). The enabled fp16 scaler
+    # path checks gradients internally via found_inf, but the scalar loss is still checked
+    # explicitly because it can be nonfinite while every parameter gradient is finite.
     grad_finite = True
     explicit_grad_check = (
         not _scaler_enabled
@@ -836,24 +843,38 @@ def train_step(
         if explicit_grad_check else []
     )
     if not _scaler_enabled and _flags and step_loss is None:    # fuse default-path loss + grad flag
-        _pair = torch.stack((
+        _values = torch.stack((
             _loss_det.to(dtype=torch.float64),
             torch.stack(_flags).all().to(dtype=torch.float64),
-            _scored_det.to(dtype=torch.float64),
+            _target_partition_valid_det.to(dtype=torch.float64),
+            _zero_scored_det.to(dtype=torch.float64),
         )).tolist()
-        step_loss   = _pair[0]
-        grad_finite = bool(_pair[1])
-        scored_tokens_value = int(_pair[2])
+        step_loss = _values[0]
+        grad_finite = bool(_values[1])
+        target_partition_valid = bool(_values[2])
+        zero_scored_targets = bool(_values[3])
     elif _flags:
         grad_finite = bool(torch.stack(_flags).all())
     if step_loss is None:                                       # fp16 / no-grads fallback: one plain loss sync
-        _loss_count = torch.stack(
-            (_loss_det.to(dtype=torch.float64),
-             _scored_det.to(dtype=torch.float64))).tolist()
-        step_loss = _loss_count[0]
-        scored_tokens_value = int(_loss_count[1])
-    elif scored_tokens_value is None:
-        scored_tokens_value = int(_scored_det)
+        _loss_flags = torch.stack((
+            _loss_det.to(dtype=torch.float64),
+            _target_partition_valid_det.to(dtype=torch.float64),
+            _zero_scored_det.to(dtype=torch.float64),
+        )).tolist()
+        step_loss = _loss_flags[0]
+        target_partition_valid = bool(_loss_flags[1])
+        zero_scored_targets = bool(_loss_flags[2])
+    if target_partition_valid is None or zero_scored_targets is None:
+        raise RuntimeError("target-accounting gate was not resolved at the host-transfer barrier")
+    if not target_partition_valid:
+        # Materialize exact int64 values only on this fail-visible path so the exception retains
+        # its actionable partition detail without charging the ordinary silent training cadence.
+        _target_accounting_from_device(_expected_det, _scored_det, _excluded_det)
+        raise RuntimeError("target accounting device partition is invalid")
+    _target_partition = (
+        _target_accounting_from_device(_expected_det, _scored_det, _excluded_det)
+        if metrics_out is not None else None
+    )
     loss_finite = math.isfinite(step_loss)
     if metrics_out is not None:
         # Pre-clip gradient health -- the global L2 norm clip_grad_norm_ RETURNS-and-discards, plus
@@ -893,6 +914,8 @@ def train_step(
                 _total / _egrad_counts[_name])
         metrics_out["loss_finite"] = float(loss_finite)
         metrics_out["train_ce"] = step_ce            # pre-step CE (matches step_loss; not a post-update re-forward)
+        if _target_partition is None:
+            raise RuntimeError("target accounting metrics were not materialized")
         metrics_out.update(_target_partition)
         if _mb_tok:                                             # grad_accum_steps>1: token-spread bias check
             metrics_out["grad_accum_tok_spread"] = float(max(_mb_tok) - min(_mb_tok))
@@ -902,7 +925,7 @@ def train_step(
     # gradients, so the disabled-scaler path additionally applies the explicit gradient gate. The
     # enabled scaler performs its own gradient found_inf check inside step().
     skip_step = (
-        scored_tokens_value == 0
+        zero_scored_targets
         or (not loss_finite)
         or (explicit_grad_check and not grad_finite)
     )
@@ -1049,12 +1072,12 @@ def _target_accounting(expected: int, scored: int, excluded: int) -> Dict[str, i
     }
 
 
-def _target_accounting_from_device(
+def _validated_target_count_tensors(
     expected: torch.Tensor,
     scored: torch.Tensor,
     excluded: torch.Tensor,
-) -> Dict[str, int]:
-    """Transfer exact device-side int64 counts together, then validate their partition."""
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Validate the structural contract for exact device-side target counts."""
     tensors = (expected, scored, excluded)
     if any(not isinstance(value, torch.Tensor) or value.dtype != torch.int64
            for value in tensors):
@@ -1063,6 +1086,33 @@ def _target_accounting_from_device(
         raise ValueError("target accounting device counts must all be scalar tensors")
     if len({value.device for value in tensors}) != 1:
         raise ValueError("target accounting device counts must share one device")
+    return tensors
+
+
+def _target_partition_valid_from_device(
+    expected: torch.Tensor,
+    scored: torch.Tensor,
+    excluded: torch.Tensor,
+) -> torch.Tensor:
+    """Return an exact scalar device predicate without materializing target counts on the host."""
+    expected, scored, excluded = _validated_target_count_tensors(
+        expected, scored, excluded)
+    return (
+        (expected >= 0)
+        & (scored >= 0)
+        & (excluded >= 0)
+        & (scored <= expected)
+        & (excluded == expected - scored)
+    )
+
+
+def _target_accounting_from_device(
+    expected: torch.Tensor,
+    scored: torch.Tensor,
+    excluded: torch.Tensor,
+) -> Dict[str, int]:
+    """Transfer exact device-side int64 counts together, then validate their partition."""
+    tensors = _validated_target_count_tensors(expected, scored, excluded)
     values = torch.stack(tensors).cpu().tolist()
     return _target_accounting(*values)
 
@@ -1972,8 +2022,9 @@ def train(
         do_log  = bool(log_interval) and (step + 1) % log_interval == 0
         do_eval = bool(eval_interval) and val_loader is not None and (step + 1) % eval_interval == 0
         do_csv  = artifacts is not None and (do_log or do_eval)
-        # Capture pre-clip gradient health only on a step that will log or persist, so the silent
-        # hot path stays byte-identical (metrics_out=None -> no extra unscale_, no grad-norm pass).
+        # Capture pre-clip gradient health only on a step that will log or persist. A silent step
+        # performs no exact-count host materialization, extra unscale_, or grad-norm pass; its
+        # device-side partition/zero-count predicates ride the existing scalar barrier.
         step_metrics: Optional[Dict[str, float]] = {} if (do_log or do_csv) else None
         if hasattr(optimizer, "_collect_gauge_diag"):        # D1/EXP-8: sparse log/eval diagnostics
             optimizer._collect_gauge_diag = bool(do_log or do_csv or do_eval)
