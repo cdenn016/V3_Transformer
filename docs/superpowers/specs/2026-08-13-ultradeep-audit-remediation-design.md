@@ -1,10 +1,10 @@
 # Ultradeep Audit Remediation
 
-**Date:** 2026-08-13  
-**Status:** Approved design  
-**Source revision:** `714e3c5be458ef489a93e720468efa8f637a838b` (`origin/main`)  
-**Branch:** `codex/ultradeep-remediation-20260813`  
-**Audit:** `docs/audits/ultradeep-audit-codebase-2026-08-13.md`  
+**Date:** 2026-08-13
+**Status:** Approved design
+**Source revision:** `714e3c5be458ef489a93e720468efa8f637a838b` (`origin/main`)
+**Branch:** `codex/ultradeep-remediation-20260813`
+**Audit:** `docs/audits/ultradeep-audit-codebase-2026-08-13.md`
 **Scope:** Implement punch-list items 3 through 16; explicitly waive items 1 and 2
 
 ## 1. Goal and owner policy
