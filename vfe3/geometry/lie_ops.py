@@ -811,12 +811,22 @@ def project_phi_to_slk(
     untied gauge the V_h have disjoint support, ``V V^T`` is diagonal, and the pseudo-inverse reduces
     to ``1/||V_h||^2`` (so the untied result is unchanged); a fully traceless basis (so_k) gives
     ``V = 0`` and the projection is a no-op.
+
+    Runs in an ``autocast(enabled=False)`` island: under AMP the ``V V^T`` matmul would be downcast
+    and ``linalg.pinv`` has no bf16/fp16 kernel. It is also a correctness island -- ``det(Omega_h) = 1``
+    is an exact algebraic constraint, and a bf16 trace solve would leave an O(1e-2) relative residual.
+    The island is a no-op without AMP (fp32 in, fp32 out), so the default path is byte-identical.
     """
-    V = _block_trace_vectors(generators, irrep_dims)      # (H, n_gen)
-    gram_pinv = torch.linalg.pinv(V @ V.transpose(-1, -2))   # (H, H); diag -> 1/||V_h||^2
-    s = phi @ V.transpose(-1, -2)                         # (..., H)
-    coeffs = s @ gram_pinv                                # (..., H) joint solve, not per-block
-    return phi - torch.einsum("...h,hg->...g", coeffs, V)
+    with torch.amp.autocast(phi.device.type, enabled=False):
+        # bf16/fp16 -> fp32 (neither pinv nor the mixed-dtype matmul below has a reduced-precision
+        # kernel); fp32/fp64 are returned unchanged by promote_types, so nothing is ever downcast.
+        phi_c = phi.to(torch.promote_types(phi.dtype, torch.float32))
+        V = _block_trace_vectors(generators, irrep_dims)      # (H, n_gen)
+        gram_pinv = torch.linalg.pinv(V @ V.transpose(-1, -2))   # (H, H); diag -> 1/||V_h||^2
+        s = phi_c @ V.transpose(-1, -2)                       # (..., H)
+        coeffs = s @ gram_pinv                                # (..., H) joint solve, not per-block
+        out = phi_c - torch.einsum("...h,hg->...g", coeffs, V)
+    return out.to(phi.dtype)
 
 
 def clamp_phi_trace(
@@ -833,13 +843,20 @@ def clamp_phi_trace(
     trace via the JOINT Gram solve ``delta = (s_clamped - s) (V V^T)^+`` so the tied gauge (coinciding
     V_h) is corrected once, not n_heads times; reduces to ``(s_clamped - s)/||V_h||^2`` for an
     orthogonal (untied) basis.
+
+    Runs in the same ``autocast(enabled=False)`` fp32 island as ``project_phi_to_slk`` (``linalg.pinv``
+    has no bf16/fp16 kernel, and the bound |s_h| <= T must hold in the precision it is asserted in).
+    The island is a no-op without AMP, so the default path is byte-identical.
     """
-    V = _block_trace_vectors(generators, irrep_dims)      # (H, n_gen)
-    gram_pinv = torch.linalg.pinv(V @ V.transpose(-1, -2))   # (H, H); diag -> 1/||V_h||^2
-    s = phi @ V.transpose(-1, -2)                         # (..., H)
-    s_clamped = s.clamp(min=-trace_max, max=trace_max)
-    delta = (s_clamped - s) @ gram_pinv                   # (..., H) joint solve, not per-block
-    return phi + torch.einsum("...h,hg->...g", delta, V)
+    with torch.amp.autocast(phi.device.type, enabled=False):
+        phi_c = phi.to(torch.promote_types(phi.dtype, torch.float32))   # bf16/fp16 -> fp32
+        V = _block_trace_vectors(generators, irrep_dims)      # (H, n_gen)
+        gram_pinv = torch.linalg.pinv(V @ V.transpose(-1, -2))   # (H, H); diag -> 1/||V_h||^2
+        s = phi_c @ V.transpose(-1, -2)                       # (..., H)
+        s_clamped = s.clamp(min=-trace_max, max=trace_max)
+        delta = (s_clamped - s) @ gram_pinv                   # (..., H) joint solve, not per-block
+        out = phi_c + torch.einsum("...h,hg->...g", delta, V)
+    return out.to(phi.dtype)
 
 
 _OMEGA_RETRACTIONS: Dict[str, Callable[[torch.Tensor], torch.Tensor]] = {}
