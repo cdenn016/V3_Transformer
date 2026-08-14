@@ -1434,6 +1434,7 @@ TRANSPORT_CLAMP_MAX_NORM: float = 20.0
 #         certificate is the required accuracy boundary rather than a finiteness-only guard.
 _FULL_COV_CONGRUENCE_PRECISIONS = ("fp64", "fp32_escalate")
 _FULL_COV_CONGRUENCE_PRECISION: str = "fp64"
+_FULL_COV_CONGRUENCE_CERTIFICATION: bool = True
 
 
 def set_full_cov_congruence_precision(policy: str) -> str:
@@ -1453,6 +1454,21 @@ def full_cov_congruence_precision() -> str:
     return _FULL_COV_CONGRUENCE_PRECISION
 
 
+def set_full_cov_congruence_certification(enabled: bool) -> bool:
+    r"""Set strict post-congruence certification; returns the previous value."""
+    if not isinstance(enabled, bool):
+        raise ValueError(f"full covariance congruence certification must be bool, got {enabled!r}")
+    global _FULL_COV_CONGRUENCE_CERTIFICATION
+    previous = _FULL_COV_CONGRUENCE_CERTIFICATION
+    _FULL_COV_CONGRUENCE_CERTIFICATION = enabled
+    return previous
+
+
+def full_cov_congruence_certification() -> bool:
+    r"""Return whether full pair-covariance fields receive the strict SPD certificate."""
+    return _FULL_COV_CONGRUENCE_CERTIFICATION
+
+
 def _certify_full_congruence(
     out:     torch.Tensor,               # contraction result at the working dtype
     work:    torch.dtype,                # the dtype it was contracted in
@@ -1470,6 +1486,10 @@ def _certify_full_congruence(
     float32/float64 domain are treated as uncertifiable and retain the certified working tensor.
     A failed fast representation recomputes and retains float64.
     """
+    if not _FULL_COV_CONGRUENCE_CERTIFICATION:
+        if retain_full_precision or out.dtype == source_dtype:
+            return out
+        return out.to(source_dtype)
     certificate = validated_cholesky_solve(out)
     if bool(certificate.certified.all()):
         if retain_full_precision or out.dtype == source_dtype:

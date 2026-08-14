@@ -121,8 +121,8 @@ def test_fp32_escalate_uses_error_certificate_and_retains_accurate_float64_kl():
     mu_p = torch.tensor([[0.1, -0.2]], dtype=torch.float32)
     sigma_q = torch.tensor([[[1.0, 0.0], [0.0, 1e-7]]], dtype=torch.float32)
     sigma_p = torch.tensor([[[2.0, 0.0], [0.0, 2e-7]]], dtype=torch.float32)
-    query = FullGaussian(mu_q, sigma_q, _precision_policy="fp32_escalate")
-    prior = FullGaussian(mu_p, sigma_p, _precision_policy="fp32_escalate")
+    query = FullGaussian(mu_q, sigma_q, _precision_policy="fp32_escalate_cond")
+    prior = FullGaussian(mu_p, sigma_p, _precision_policy="fp32_escalate_cond")
     reference = FullGaussian(
         mu_q.double(), sigma_q.double(), _precision_policy="fp64"
     ).renyi_closed_form(

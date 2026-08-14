@@ -31,10 +31,15 @@ def _pin_fp64_congruence():
     at the float32 path the moment the default was flipped. Pinning states the intent and keeps the
     file meaningful under either default.
     """
-    from vfe3.geometry.transport import set_full_cov_congruence_precision
+    from vfe3.geometry.transport import (
+        set_full_cov_congruence_certification,
+        set_full_cov_congruence_precision,
+    )
 
     previous = set_full_cov_congruence_precision("fp64")
+    previous_certificate = set_full_cov_congruence_certification(True)
     yield
+    set_full_cov_congruence_certification(previous_certificate)
     set_full_cov_congruence_precision(previous)
 
 

@@ -497,8 +497,15 @@ config = dict(
                                               # True: run a second spectral certificate across the
                                               # full pair grid and promote all rows if any row fails;
                                               # substantially slower at B=64, N=128, gaussian_full.
+    decode_ranking_fp64_escalation = False,    # False: keep chunked CE streamed in fp32.
+                                               # True: strict score-interval audit; any uncertain
+                                               # winner recomputes the complete (B,N,V) decode in
+                                               # differentiable fp64 (~3.1 GiB logits here).
                                              
     full_cov_congruence_precision = "fp32_escalate",      # "fp64" | "fp32_escalate"                                        
+    full_cov_congruence_certification = False, # False: no per-pair Cholesky certificate or
+                                                # whole-field fp64 retry. True: strict M13 audit
+                                                # over ~1.05M 20x20 matrices per call at B64/N128.
 
     safe_cholesky_jitter_mode     = "relative",      # "absolute" | "relative"
     mu_trust_cholesky_rounds = 3,

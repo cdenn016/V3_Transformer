@@ -75,7 +75,10 @@ from vfe3.model.prior_bank import (
 from vfe3.model.stack import vfe_stack
 from vfe3.families.base import get_family
 from vfe3.families.gaussian import FullGaussian, validate_full_cov_kl_precision
-from vfe3.geometry.transport import set_full_cov_congruence_precision
+from vfe3.geometry.transport import (
+    set_full_cov_congruence_certification,
+    set_full_cov_congruence_precision,
+)
 from vfe3.numerics import set_mu_trust_cholesky_rounds, set_safe_cholesky_jitter_mode
 from vfe3.runtime import set_fp32_matmul_precision
 
@@ -354,6 +357,7 @@ class VFEModel(nn.Module):
             cfg.effective_full_cov_kl_precision)
         # Same one-place-set rule for the congruence that feeds it (audit 2026-08-06 C1).
         set_full_cov_congruence_precision(cfg.full_cov_congruence_precision)
+        set_full_cov_congruence_certification(cfg.full_cov_congruence_certification)
         set_safe_cholesky_jitter_mode(cfg.safe_cholesky_jitter_mode)
         set_mu_trust_cholesky_rounds(cfg.mu_trust_cholesky_rounds)
         # ... and the fp32 matmul / TF32 policy (audit 2026-08-06 C7/F25), which is process-global
@@ -402,6 +406,7 @@ class VFEModel(nn.Module):
             encode_mode=cfg.encode_mode, decode_mode=cfg.decode_mode,
             decode_chunk_size=cfg.decode_chunk_size,
             decode_ce_checkpoint=cfg.decode_ce_checkpoint,
+            decode_ranking_fp64_escalation=cfg.decode_ranking_fp64_escalation,
             lambda_h=cfg.lambda_h, lambda_gamma=cfg.lambda_gamma,
             prior_source=cfg.prior_source, s_frame_mode=cfg.s_frame_mode,
             s_e_step=cfg.s_e_step,

@@ -631,6 +631,14 @@ class VFE3Config:
     # vocabulary reduction is a logsumexp over independent slices.
     decode_chunk_size:         int   = 8192
 
+    # Strict decoder ranking guard (audit remediation M08/M10-M12). When enabled, analytic
+    # fp32 decoders construct conservative score intervals and, if ANY row's winning interval
+    # overlaps a competitor, recompute the complete (B,N,V) decode in differentiable float64.
+    # That is an accuracy diagnostic, not a production-safe fallback: at B=64, N=128, V=50,257
+    # the promoted logits alone occupy about 3.1 GiB before backward intermediates. Keep it
+    # opt-in so the default chunked route remains streamed and bounded.
+    decode_ranking_fp64_escalation: bool = False
+
     # decode_ce_checkpoint: gates the gradient checkpoint every decode_ce_*_chunked fused-CE kernel
     # (prior_bank.py) wraps around its per-chunk (B, N, chunk_width) reduction. "always" reproduces
     # the pre-2026-08-07 unconditional behavior (checkpoint -- i.e. recompute the chunk in backward
@@ -1011,6 +1019,13 @@ class VFE3Config:
     # lost finiteness; the congruence SQUARES cond(Omega), so it is a real accuracy trade at high
     # ||phi||. A float64 SOURCE contracts in float64 under either setting.
     full_cov_congruence_precision: str = "fp32_escalate"      # "fp64" | "fp32_escalate"
+    # Strict post-congruence certificate (audit remediation M13). When enabled, factor every
+    # transported pair covariance and promote the complete pair field to float64 if any matrix is
+    # uncertified. At B=64, N=128, K=20 this checks 1,048,576 separate 20x20 matrices and the
+    # promoted field is about 3.1 GiB. Keep this opt-in for accuracy investigations; False retains
+    # the selected working precision without the additional certificate or fallback recompute.
+    full_cov_congruence_certification: bool = False
+
 
     # Scaling of safe_cholesky's jitter ladder (audit 2026-08-06 C3/F18). The ridge eps*10^t is
     # ABSOLUTE by default, so at an eigenvalue on the eps=1e-6 SPD floor the t=0 ridge DOUBLES it
@@ -2496,10 +2511,18 @@ class VFE3Config:
             raise ValueError(
                 "full_cov_kl_condition_escalation must be bool, got "
                 f"{self.full_cov_kl_condition_escalation!r}")
+        if not isinstance(self.decode_ranking_fp64_escalation, bool):
+            raise ValueError(
+                "decode_ranking_fp64_escalation must be bool, got "
+                f"{self.decode_ranking_fp64_escalation!r}")
         if self.full_cov_congruence_precision not in ("fp64", "fp32_escalate"):
             raise ValueError(
                 "full_cov_congruence_precision must be one of ('fp64', 'fp32_escalate'), "
                 f"got {self.full_cov_congruence_precision!r}")
+        if not isinstance(self.full_cov_congruence_certification, bool):
+            raise ValueError(
+                "full_cov_congruence_certification must be bool, got "
+                f"{self.full_cov_congruence_certification!r}")
         if self.safe_cholesky_jitter_mode not in ("absolute", "relative"):
             raise ValueError(
                 "safe_cholesky_jitter_mode must be one of ('absolute', 'relative'), "

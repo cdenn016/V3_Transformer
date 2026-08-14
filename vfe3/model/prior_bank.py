@@ -961,6 +961,7 @@ class PriorBank(nn.Module):
         decode_mode:         str   = "diagonal",
         decode_chunk_size:   int   = 8192,
         decode_ce_checkpoint: str  = "auto",
+        decode_ranking_fp64_escalation: bool = True,
         lambda_h:            float = 0.0,
         lambda_gamma:        float = 0.0,
         prior_source:        str   = "token",
@@ -1075,6 +1076,10 @@ class PriorBank(nn.Module):
                 "frame. Use encode_mode='per_token', or gauge_parameterization='phi' for the "
                 "additive control."
             )
+        if not isinstance(decode_ranking_fp64_escalation, bool):
+            raise ValueError(
+                "decode_ranking_fp64_escalation must be bool, got "
+                f"{decode_ranking_fp64_escalation!r}")
         if type(omega_compact_storage) is not bool:
             raise ValueError(
                 "omega_compact_storage must be a bool, got "
@@ -1137,6 +1142,7 @@ class PriorBank(nn.Module):
         self.decode_mode = decode_mode
         self.decode_chunk_size = decode_chunk_size
         self.decode_ce_checkpoint = decode_ce_checkpoint
+        self.decode_ranking_fp64_escalation = decode_ranking_fp64_escalation
         self.prior_source = prior_source
         self.s_frame_mode = s_frame_mode
         self.s_e_step = s_e_step
@@ -2071,10 +2077,10 @@ class PriorBank(nn.Module):
         global_bounds = torch.stack(bound_chunks, dim=-1)
         max_uppers = torch.stack(max_upper_chunks, dim=-1)
         runner_uppers = torch.stack(runner_upper_chunks, dim=-1)
-        if _streamed_final_ranking_uncertain(
+        if (self.decode_ranking_fp64_escalation and _streamed_final_ranking_uncertain(
             global_ranking, global_bounds, max_uppers, runner_uppers,
             vocab_size=V,
-        ):
+        )):
             _, promoted_logits = _promoted_expanded_decode(
                 self, mu_q, sigma_q, tau_eff, full_covariance=False)
             promoted_lse = torch.logsumexp(promoted_logits, dim=-1)
@@ -2289,6 +2295,25 @@ class PriorBank(nn.Module):
             ``sq_``/``mc_q_`` carry the UNEXPANDED query pieces alongside ``lhs_`` so the "exact"
             a_v form can difference before squaring (audit 2026-08-06 F32).
             """
+            if not self.decode_ranking_fp64_escalation:
+                a_v = _decode_av(
+                    sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_)
+                evidence_delta = None
+                if coord_delta_ is not None and delta_per_pos_ is not None:
+                    evidence_delta = _decode_head_evidence_kl_delta(
+                        sq_, mc_q_, mu_v_c, inv_v_c, log_v_c,
+                        coord_delta_, delta_per_pos_, evidence_lhs_,
+                    )
+                logit_chunk = _decode_analytic_kl_logits(
+                    a_v, per_pos_, tau_eff, lhs_.dtype,
+                    evidence_delta=evidence_delta)
+                if u_c is not None:
+                    logit_chunk = logit_chunk + u_c.to(logit_chunk.dtype)
+                lse_chunk = torch.logsumexp(logit_chunk, dim=-1)
+                gathered = logit_chunk.gather(
+                    -1, local_idx.unsqueeze(-1)).squeeze(-1)
+                return lse_chunk, torch.where(
+                    in_chunk_f > 0, gathered, torch.zeros_like(gathered))
             a_v, a_bound = _decode_av(
                 sq_, mc_q_, mu_v_c, inv_v_c, lsum_c, lhs=lhs_,
                 return_error_bound=True)                                   # (B, N, Vc)
@@ -2346,35 +2371,40 @@ class PriorBank(nn.Module):
             grad_active = torch.is_grad_enabled() and lhs.requires_grad
             activation_bytes = _decode_ce_chunk_activation_bytes(lhs, v1 - v0, inner=2)
             if _decode_ce_should_checkpoint(self.decode_ce_checkpoint, grad_active, activation_bytes):
-                (lse_chunk, contrib, ranking_chunk, bound_chunk,
-                 max_upper, runner_upper) = _checkpoint.checkpoint(
+                chunk_result = _checkpoint.checkpoint(
                     _chunk_summaries, lhs, per_pos, mc_v_c, inv_v_c, log_v_c, lsum_c,
                     in_chunk_f, local_idx, u_c, diag_sq, mc_q, coord_delta, delta_per_pos,
                     evidence_lhs,
                     use_reentrant=False,
                 )
             else:
-                (lse_chunk, contrib, ranking_chunk, bound_chunk,
-                 max_upper, runner_upper) = _chunk_summaries(
+                chunk_result = _chunk_summaries(
                     lhs, per_pos, mc_v_c, inv_v_c, log_v_c, lsum_c, in_chunk_f, local_idx, u_c,
                     diag_sq, mc_q, coord_delta, delta_per_pos, evidence_lhs,
                 )
+            lse_chunk, contrib = chunk_result[:2]
             lse_chunks.append(lse_chunk)
             target_logit = target_logit + contrib                          # exactly one chunk contributes per valid pos
-            ranking_chunks.append(ranking_chunk)
-            bound_chunks.append(bound_chunk)
-            max_upper_chunks.append(max_upper)
-            runner_upper_chunks.append(runner_upper)
+            if self.decode_ranking_fp64_escalation:
+                ranking_chunk, bound_chunk, max_upper, runner_upper = chunk_result[2:]
+                ranking_chunks.append(ranking_chunk)
+                bound_chunks.append(bound_chunk)
+                max_upper_chunks.append(max_upper)
+                runner_upper_chunks.append(runner_upper)
 
         logsumexp_v = torch.logsumexp(torch.stack(lse_chunks, dim=0), dim=0)  # (B, N)
-        global_ranking = torch.stack(ranking_chunks, dim=-1)
-        global_bounds = torch.stack(bound_chunks, dim=-1)
-        max_uppers = torch.stack(max_upper_chunks, dim=-1)
-        runner_uppers = torch.stack(runner_upper_chunks, dim=-1)
-        if _streamed_final_ranking_uncertain(
+        global_ranking = (
+            torch.stack(ranking_chunks, dim=-1) if self.decode_ranking_fp64_escalation else None)
+        global_bounds = (
+            torch.stack(bound_chunks, dim=-1) if self.decode_ranking_fp64_escalation else None)
+        max_uppers = (
+            torch.stack(max_upper_chunks, dim=-1) if self.decode_ranking_fp64_escalation else None)
+        runner_uppers = (
+            torch.stack(runner_upper_chunks, dim=-1) if self.decode_ranking_fp64_escalation else None)
+        if (self.decode_ranking_fp64_escalation and _streamed_final_ranking_uncertain(
             global_ranking, global_bounds, max_uppers, runner_uppers,
             vocab_size=V,
-        ):
+        )):
             _, promoted_logits = _promoted_expanded_decode(
                 self, mu_q, sigma_q, tau_eff, full_covariance=True)
             promoted_lse = torch.logsumexp(promoted_logits, dim=-1)
@@ -3004,7 +3034,7 @@ def _decode_diagonal(
         a_v, per_pos, tau_eff, mu_q.dtype, evidence_delta=evidence_delta,
         a_error_bound=a_bound, evidence_error_bound=evidence_bound,
         unigram_bias=unigram, return_error_bound=True)
-    if _final_ranking_uncertain(ranking_logits, ranking_bound):
+    if pb.decode_ranking_fp64_escalation and _final_ranking_uncertain(ranking_logits, ranking_bound):
         kernel_logits, _ = _promoted_expanded_decode(
             pb, mu_q, sigma_q, tau_eff, full_covariance=False)
         return kernel_logits
@@ -3155,7 +3185,7 @@ def _decode_full_chunked(
         a_v, per_pos, tau_eff, mu_q.dtype, evidence_delta=evidence_delta,
         a_error_bound=a_bound, evidence_error_bound=evidence_bound,
         unigram_bias=unigram, return_error_bound=True)
-    if _final_ranking_uncertain(ranking_logits, ranking_bound):
+    if pb.decode_ranking_fp64_escalation and _final_ranking_uncertain(ranking_logits, ranking_bound):
         logits, _ = _promoted_expanded_decode(
             pb, mu_q, sigma_q, tau_eff, full_covariance=True)
     else:

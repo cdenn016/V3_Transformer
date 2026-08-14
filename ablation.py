@@ -663,8 +663,13 @@ BASELINE_CONFIG: Dict[str, Any] = dict(
                                               # True: strict second spectral certificate over the
                                               # complete pair grid; use only for accuracy-focused
                                               # full-covariance ablations because it is expensive.
+    decode_ranking_fp64_escalation = False,    # False: bounded streamed fp32 CE. True: strict
+                                               # score-interval audit with whole-vocabulary fp64
+                                               # recompute on any uncertain winner.
 
     full_cov_congruence_precision = "fp32_escalate",      # "fp64" | "fp32_escalate"   
+    full_cov_congruence_certification = False, # True: strict per-pair SPD certificate and
+                                                # whole-field fp64 retry; expensive at production shape.
     
     congruence_cond_escalation           = False,     # True -> slow ...escalate on the conditioning proxy
     emit_expensive_diagnostics           = True,    
