@@ -31,7 +31,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 
 _CHILD_TIMEOUT_SECONDS = 3600      # bound the isolated worker; see run_process_tree

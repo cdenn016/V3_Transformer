@@ -86,7 +86,7 @@ if os.environ.get(_CHILD_SENTINEL) == "1":
 
 import numpy as np
 
-from vfe3.metric_contracts import perplexity_matches_ce
+from vfe3.metric_contracts import perplexity_matches_ce  # noqa: E402
 from vfe3.path_utils import portable_path_component_key
 from vfe3.viz.sweep_adapters import aggregate_validation_points, capacity_scaling_kwargs, pareto_frontier_kwargs
 from vfe3.run_artifacts import _write_json_atomic
