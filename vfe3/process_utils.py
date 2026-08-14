@@ -155,6 +155,10 @@ def _kill_process_tree(
         if returncode != 0:
             raise OSError(f"taskkill failed with exit code {returncode}")
         return True
+    if process.poll() is not None:
+        raise OSError(
+            "process-group ownership unavailable after root exit; killpg skipped"
+        )
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:

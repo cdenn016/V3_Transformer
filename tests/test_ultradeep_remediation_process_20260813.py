@@ -272,3 +272,91 @@ def test_close_racing_timeout_is_once_only_and_bounded(monkeypatch):
     assert errors == []
     retired_pids = [status["pid"] for status in worker.cleanup_statuses if status.get("pid")]
     assert len(retired_pids) == len(set(retired_pids))
+
+
+def test_close_racing_blocked_submit_flush_is_bounded_and_once_only(monkeypatch):
+    flush_entered = Event()
+    release_flush = Event()
+    lifecycle_events = []
+
+    class _BlockedStdin:
+        def write(self, _payload):
+            return None
+
+        def flush(self):
+            flush_entered.set()
+            release_flush.wait(5.0)
+
+        def close(self):
+            lifecycle_events.append("stdin_close")
+            release_flush.wait(5.0)
+
+        def fileno(self):
+            raise OSError("synthetic stream has no file descriptor")
+
+    class _Process:
+        pid = 43210
+
+        def __init__(self):
+            self.stdin = _BlockedStdin()
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+    class _Tree:
+        def __init__(self):
+            self.process = _Process()
+
+        def terminate(self, *, reason, timeout):
+            lifecycle_events.append("tree_terminate")
+            self.process.returncode = -9
+            return {
+                "pid": self.process.pid,
+                "reason": reason,
+                "terminated": True,
+                "reaped": True,
+                "root_reaped": True,
+                "tree_termination_confirmed": True,
+                "returncode": -9,
+                "cleanup_error": None,
+                "elapsed_s": min(timeout, 0.001),
+            }
+
+    monkeypatch.setattr(figures, "spawn_process_tree", lambda *_a, **_k: _Tree())
+    worker = figures.UMAPWorker(timeout=0.05, cleanup_timeout=0.10, max_workers=1)
+    errors = []
+
+    def _embed():
+        try:
+            worker.embed(
+                np.zeros((2, 3), dtype=np.float32), n_neighbors=2,
+                min_dist=0.1, n_components=2, seed=1,
+            )
+        except (TimeoutError, OSError):
+            pass
+        except BaseException as exc:
+            errors.append(exc)
+
+    embed_thread = Thread(target=_embed)
+    close_thread = Thread(target=worker.close)
+    started = time.monotonic()
+    try:
+        embed_thread.start()
+        assert flush_entered.wait(0.25)
+        close_thread.start()
+        embed_thread.join(timeout=0.60)
+        close_thread.join(timeout=0.60)
+
+        assert time.monotonic() - started < 0.75
+        assert not embed_thread.is_alive() and not close_thread.is_alive()
+        assert errors == []
+        assert "stdin_close" in lifecycle_events
+        assert lifecycle_events.index("tree_terminate") < lifecycle_events.index("stdin_close")
+        statuses = [status for status in worker.cleanup_statuses if status.get("pid")]
+        assert len(statuses) == 1
+        assert statuses[0]["pid"] == 43210
+    finally:
+        release_flush.set()
+        embed_thread.join(timeout=0.25)
+        close_thread.join(timeout=0.25)

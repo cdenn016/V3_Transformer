@@ -383,3 +383,23 @@ def test_taskkill_timeout_with_exited_root_is_never_clean(monkeypatch):
     assert status["root_reaped"] is True
     assert status["tree_termination_confirmed"] is False
     assert status["cleanup_error"]
+
+
+def test_posix_exited_root_never_signals_stale_process_group(monkeypatch):
+    root = _ExitedRoot()
+    signaled = []
+    monkeypatch.setattr(process_utils.os, "name", "posix")
+    monkeypatch.setattr(
+        process_utils.os,
+        "killpg",
+        lambda pid, sig: signaled.append((pid, sig)),
+        raising=False,
+    )
+    monkeypatch.setattr(process_utils.signal, "SIGKILL", 9, raising=False)
+
+    status = process_utils.ProcessTree(root).terminate(reason="close", timeout=0.05)
+
+    assert signaled == []
+    assert status["root_reaped"] is True
+    assert status["tree_termination_confirmed"] is False
+    assert "ownership" in status["cleanup_error"]

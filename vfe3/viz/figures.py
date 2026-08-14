@@ -353,70 +353,152 @@ class UMAPWorker:
             record.retired_event.wait(self.cleanup_timeout * 2.0 + 0.1)
             return record.cleanup_status
 
+        from time import monotonic
+        retirement_started = monotonic()
+
         proc = record.process
         handle = record.stderr_handle
-        cleanup_errors = []
-        status: Dict[str, object]
+        cleanup_errors: List[str] = []
+        returncode = proc.poll()
+        status: Dict[str, object] = {
+            "pid": int(proc.pid),
+            "reason": reason,
+            "terminated": True,
+            "reaped": returncode is not None,
+            "root_reaped": returncode is not None,
+            "tree_termination_confirmed": False,
+            "returncode": returncode,
+            "cleanup_error": None,
+            "elapsed_s": 0.0,
+        }
         try:
-            if proc.stdin is not None:
-                proc.stdin.close()
-        except OSError as exc:
-            cleanup_errors.append(f"{type(exc).__name__}: {exc}")
-        try:
-            status = record.tree.terminate(reason=reason, timeout=self.cleanup_timeout)
-        except BaseException as exc:
-            cleanup_errors.append(f"{type(exc).__name__}: {exc}")
-            returncode = proc.poll()
-            status = {
-                "pid": int(proc.pid),
-                "reason": reason,
-                "terminated": True,
-                "reaped": returncode is not None,
-                "root_reaped": returncode is not None,
-                "tree_termination_confirmed": False,
-                "returncode": returncode,
-                "cleanup_error": None,
-                "elapsed_s": 0.0,
-            }
-        stderr_path = handle.name
-        try:
-            handle.close()
-        except OSError as exc:
-            cleanup_errors.append(f"{type(exc).__name__}: {exc}")
-        try:
-            os.remove(stderr_path)
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            cleanup_errors.append(f"{type(exc).__name__}: {exc}")
-        status["cleanup_error"] = " | ".join(
-            part for part in (status.get("cleanup_error"), *cleanup_errors) if part
-        ) or None
-        with self._lifecycle_lock:
-            self._workers[:] = [
-                active for active in self._workers if active.identity != record.identity
-            ]
-            record.cleanup_status = status
-            record.retired = True
-            record.retiring = False
-            self.cleanup_statuses.append(status)
-            record.retired_event.set()
+            try:
+                status = record.tree.terminate(reason=reason, timeout=self.cleanup_timeout)
+            except BaseException as exc:
+                cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+                returncode = proc.poll()
+                status.update(
+                    reaped=returncode is not None,
+                    root_reaped=returncode is not None,
+                    returncode=returncode,
+                )
+
+            # Only after bounded tree termination: close streams on daemon helpers sharing the
+            # remaining cleanup budget. TextIOWrapper.close() may flush behind a concurrent submit.
+            stdin = proc.stdin
+            proc.stdin = None
+            try:
+                stderr_path = handle.name
+            except BaseException as exc:
+                cleanup_errors.append(f"stderr path: {type(exc).__name__}: {exc}")
+                stderr_path = None
+
+            from threading import Thread
+            close_deadline = monotonic() + max(
+                0.0,
+                self.cleanup_timeout - float(status.get("elapsed_s", 0.0)),
+            )
+            pending_closes = []
+            for label, stream in (("stdin", stdin), ("stderr", handle)):
+                if stream is None:
+                    continue
+                completed = Event()
+                close_errors: List[BaseException] = []
+
+                def _close_stream(
+                    owned_stream=stream,
+                    errors=close_errors,
+                    done=completed,
+                ) -> None:
+                    try:
+                        owned_stream.close()
+                    except BaseException as exc:
+                        errors.append(exc)
+                    finally:
+                        done.set()
+
+                closer = Thread(
+                    target=_close_stream,
+                    name=f"umap-{label}-close-{proc.pid}",
+                    daemon=True,
+                )
+                try:
+                    closer.start()
+                except BaseException as exc:
+                    cleanup_errors.append(f"{label} close start: {type(exc).__name__}: {exc}")
+                    continue
+                pending_closes.append((label, completed, close_errors))
+
+            for label, completed, close_errors in pending_closes:
+                remaining = max(0.0, close_deadline - monotonic())
+                if not completed.wait(remaining):
+                    cleanup_errors.append(f"{label} close exceeded cleanup budget")
+                elif close_errors:
+                    exc = close_errors[0]
+                    cleanup_errors.append(f"{label} close: {type(exc).__name__}: {exc}")
+
+            if stderr_path is not None:
+                try:
+                    os.remove(stderr_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+        finally:
+            status["elapsed_s"] = monotonic() - retirement_started
+            existing_error = status.get("cleanup_error")
+            status["cleanup_error"] = " | ".join(
+                part for part in (existing_error, *cleanup_errors) if part
+            ) or None
+            with self._lifecycle_lock:
+                self._workers[:] = [
+                    active for active in self._workers if active.identity != record.identity
+                ]
+                record.cleanup_status = status
+                record.retired = True
+                record.retiring = False
+                self.cleanup_statuses.append(status)
+                record.retired_event.set()
         return status
 
     def _submit(self, record: _UMAPWorkerRecord, request: Dict[str, object]) -> None:
         import json
+        from threading import Thread
         proc = record.process
-        try:
-            proc.stdin.write(json.dumps(request) + "\n")
-            proc.stdin.flush()
-            with self._lifecycle_lock:
-                record.requests_submitted += 1
-        except (BrokenPipeError, OSError, ValueError) as exc:
+        stream = proc.stdin
+        if stream is None:
+            raise OSError("UMAP worker input is unavailable")
+        payload = json.dumps(request) + "\n"
+        completed = Event()
+        outcome: List[BaseException] = []
+
+        def _write_request() -> None:
+            try:
+                stream.write(payload)
+                stream.flush()
+            except BaseException as exc:
+                outcome.append(exc)
+            finally:
+                completed.set()
+
+        writer = Thread(target=_write_request, name=f"umap-submit-{proc.pid}", daemon=True)
+        writer.start()
+        if not completed.wait(self.timeout):
+            self._retire(record, reason="submit_timeout")
+            raise TimeoutError(f"UMAP worker request submission exceeded {self.timeout:g} seconds")
+        if outcome:
+            exc = outcome[0]
             tail = self._error_tail(record)
             self._retire(record, reason="pipe_closed")
             if "ModuleNotFoundError" in tail and "umap" in tail:
                 raise ImportError("umap_embed needs umap-learn (pip install umap-learn)") from exc
-            raise OSError(f"UMAP worker pipe closed: {tail[-500:]}") from exc
+            if isinstance(exc, (BrokenPipeError, OSError, ValueError)):
+                raise OSError(f"UMAP worker pipe closed: {tail[-500:]}") from exc
+            raise exc
+        with self._lifecycle_lock:
+            if record.retired or record.retiring:
+                raise OSError("UMAP worker retired during request submission")
+            record.requests_submitted += 1
 
     def _collect(self, record: _UMAPWorkerRecord, status: str, fout: str) -> np.ndarray:
         r"""Block on one submitted request. The timeout starts HERE, matching the serial contract.
