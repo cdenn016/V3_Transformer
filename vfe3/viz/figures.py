@@ -10,8 +10,10 @@ Tensors are accepted as torch or numpy; everything is detached to numpy for plot
 A registry (``register_figure``) lets a new figure slot in by name.
 """
 
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
+from threading import Event, RLock
 from types import TracebackType
 from typing import Callable, Dict, List, Mapping, Optional, Sequence
 from uuid import uuid4
@@ -194,6 +196,24 @@ def _numba_cache_dir() -> Optional[str]:
     return None
 
 
+@dataclass(eq=False)
+class _UMAPWorkerRecord:
+    """Identity-bearing lifecycle state for one owned worker process."""
+
+    tree: ProcessTree
+    stderr_handle: object
+    identity: str = field(default_factory=lambda: uuid4().hex)
+    retiring: bool = False
+    retired: bool = False
+    requests_submitted: int = 0
+    retired_event: Event = field(default_factory=Event)
+    cleanup_status: Optional[Dict[str, object]] = None
+
+    @property
+    def process(self):
+        return self.tree.process
+
+
 class UMAPWorker:
     r"""A lazily started, crash-isolated POOL of UMAP interpreters reusable within a report.
 
@@ -222,112 +242,191 @@ class UMAPWorker:
         self.max_workers = (max(1, min(_UMAP_MAX_WORKERS, cores - 1)) if max_workers is None
                             else max(1, int(max_workers)))
         self._counter = 0
-        self._procs: List[object] = []
-        self._trees: List[ProcessTree] = []
-        self._stderr_handles: List[object] = []
+        self._workers: List[_UMAPWorkerRecord] = []
+        self._lifecycle_lock = RLock()
+        self._closing = False
+        self._request_paths: set[str] = set()
         self.cleanup_statuses: List[Dict[str, object]] = []
         self._workdir = None
+
+    @property
+    def _procs(self) -> List[object]:
+        with self._lifecycle_lock:
+            return [record.process for record in self._workers]
+
+    @property
+    def _stderr_handles(self) -> List[object]:
+        with self._lifecycle_lock:
+            return [record.stderr_handle for record in self._workers]
+
+    def _record_cleanup_failure(self, *, reason: str, path: str, exc: BaseException) -> dict:
+        status: Dict[str, object] = {
+            "pid": None,
+            "reason": reason,
+            "terminated": False,
+            "reaped": False,
+            "root_reaped": False,
+            "tree_termination_confirmed": False,
+            "returncode": None,
+            "cleanup_error": f"{type(exc).__name__}: {exc}",
+            "elapsed_s": 0.0,
+            "path": path,
+        }
+        with self._lifecycle_lock:
+            self.cleanup_statuses.append(status)
+        return status
+
+    def _cleanup_request_path(self, path: str) -> None:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            with self._lifecycle_lock:
+                self._request_paths.discard(path)
+        except OSError as exc:
+            self._record_cleanup_failure(reason="request_cleanup", path=path, exc=exc)
+        else:
+            with self._lifecycle_lock:
+                self._request_paths.discard(path)
 
     def _ensure(self, count: int) -> None:
         r"""Guarantee at least ``count`` live interpreters (never more than ``max_workers``)."""
         import subprocess
         import sys
         import tempfile
-        if self._workdir is None:
-            self._workdir = tempfile.mkdtemp(prefix="vfe3_umap_")
-        cache_dir = _numba_cache_dir()
-        while len(self._procs) < min(count, self.max_workers):
-            worker_env = os.environ.copy()
-            if cache_dir is None:
-                worker_env.pop("NUMBA_CACHE_DIR", None)
-            else:
-                worker_env["NUMBA_CACHE_DIR"] = cache_dir
-            handle = open(os.path.join(self._workdir, f"stderr_{uuid4().hex}.log"), "w+b")
-            try:
-                tree = spawn_process_tree(
-                    [sys.executable, "-c", _UMAP_WORKER_SRC],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                    stderr=handle,
-                    text=True,
-                    env=worker_env,
-                )
-            except BaseException:
-                handle.close()
-                raise
-            self._trees.append(tree)
-            self._procs.append(tree.process)
-            self._stderr_handles.append(handle)
+        with self._lifecycle_lock:
+            if self._closing:
+                raise RuntimeError("UMAP worker pool is closing")
+            if self._workdir is None:
+                self._workdir = tempfile.mkdtemp(prefix="vfe3_umap_")
+            cache_dir = _numba_cache_dir()
+            while len(self._workers) < min(count, self.max_workers):
+                worker_env = os.environ.copy()
+                if cache_dir is None:
+                    worker_env.pop("NUMBA_CACHE_DIR", None)
+                else:
+                    worker_env["NUMBA_CACHE_DIR"] = cache_dir
+                handle = open(os.path.join(self._workdir, f"stderr_{uuid4().hex}.log"), "w+b")
+                try:
+                    tree = spawn_process_tree(
+                        [sys.executable, "-c", _UMAP_WORKER_SRC],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
+                        stderr=handle,
+                        text=True,
+                        env=worker_env,
+                    )
+                except BaseException:
+                    handle.close()
+                    raise
+                self._workers.append(_UMAPWorkerRecord(tree=tree, stderr_handle=handle))
 
-    def _error_tail(self, index: int) -> str:
-        if self._workdir is None or index >= len(self._stderr_handles):
+    def _error_tail(self, record: _UMAPWorkerRecord) -> str:
+        stderr_handle = record.stderr_handle
+        try:
+            stderr_handle.flush()
+        except (OSError, ValueError):
             return ""
-        stderr_handle = self._stderr_handles[index]
-        stderr_handle.flush()
         try:
             with open(stderr_handle.name, "rb") as handle:
                 handle.seek(0, os.SEEK_END)
                 handle.seek(max(0, handle.tell() - 1000), os.SEEK_SET)
                 return handle.read().decode(errors="replace")
-        except OSError:
+        except (OSError, ValueError):
             return ""
 
-    def _retire(self, index: int, *, reason: str) -> Dict[str, object]:
-        """Remove exactly one owned worker after bounded process-tree cleanup."""
-        proc = self._procs[index]
-        tree = self._trees[index]
-        handle = self._stderr_handles[index]
+    def _retire(
+        self,
+        record: _UMAPWorkerRecord,
+        *,
+        reason: str,
+    ) -> Optional[Dict[str, object]]:
+        """Retire one identity exactly once, without holding the lock while waiting."""
+        with self._lifecycle_lock:
+            if record.retired:
+                return record.cleanup_status
+            if record.retiring:
+                owner = False
+            else:
+                record.retiring = True
+                owner = True
+        if not owner:
+            record.retired_event.wait(self.cleanup_timeout * 2.0 + 0.1)
+            return record.cleanup_status
+
+        proc = record.process
+        handle = record.stderr_handle
+        cleanup_errors = []
+        status: Dict[str, object]
         try:
             if proc.stdin is not None:
                 proc.stdin.close()
-        except OSError:
-            pass
-        status = tree.terminate(reason=reason, timeout=self.cleanup_timeout)
+        except OSError as exc:
+            cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+        try:
+            status = record.tree.terminate(reason=reason, timeout=self.cleanup_timeout)
+        except BaseException as exc:
+            cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+            returncode = proc.poll()
+            status = {
+                "pid": int(proc.pid),
+                "reason": reason,
+                "terminated": True,
+                "reaped": returncode is not None,
+                "root_reaped": returncode is not None,
+                "tree_termination_confirmed": False,
+                "returncode": returncode,
+                "cleanup_error": None,
+                "elapsed_s": 0.0,
+            }
         stderr_path = handle.name
         try:
             handle.close()
         except OSError as exc:
-            detail = f"{type(exc).__name__}: {exc}"
-            status["cleanup_error"] = " | ".join(
-                part for part in (status.get("cleanup_error"), detail) if part
-            )
-        del self._procs[index]
-        del self._trees[index]
-        del self._stderr_handles[index]
+            cleanup_errors.append(f"{type(exc).__name__}: {exc}")
         try:
             os.remove(stderr_path)
         except FileNotFoundError:
             pass
         except OSError as exc:
-            detail = f"{type(exc).__name__}: {exc}"
-            status["cleanup_error"] = " | ".join(
-                part for part in (status.get("cleanup_error"), detail) if part
-            )
-        self.cleanup_statuses.append(status)
+            cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+        status["cleanup_error"] = " | ".join(
+            part for part in (status.get("cleanup_error"), *cleanup_errors) if part
+        ) or None
+        with self._lifecycle_lock:
+            self._workers[:] = [
+                active for active in self._workers if active.identity != record.identity
+            ]
+            record.cleanup_status = status
+            record.retired = True
+            record.retiring = False
+            self.cleanup_statuses.append(status)
+            record.retired_event.set()
         return status
 
-    def _submit(self, index: int, request: Dict[str, object]) -> None:
+    def _submit(self, record: _UMAPWorkerRecord, request: Dict[str, object]) -> None:
         import json
-        proc = self._procs[index]
+        proc = record.process
         try:
             proc.stdin.write(json.dumps(request) + "\n")
             proc.stdin.flush()
-        except BrokenPipeError as exc:
-            tail = self._error_tail(index)
-            self._retire(index, reason="pipe_closed")
+            with self._lifecycle_lock:
+                record.requests_submitted += 1
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            tail = self._error_tail(record)
+            self._retire(record, reason="pipe_closed")
             if "ModuleNotFoundError" in tail and "umap" in tail:
                 raise ImportError("umap_embed needs umap-learn (pip install umap-learn)") from exc
             raise OSError(f"UMAP worker pipe closed: {tail[-500:]}") from exc
 
-    def _collect(self, index: int, status: str, fout: str) -> np.ndarray:
+    def _collect(self, record: _UMAPWorkerRecord, status: str, fout: str) -> np.ndarray:
         r"""Block on one submitted request. The timeout starts HERE, matching the serial contract.
 
         A queued request (more seeds than workers) therefore gets its full timeout from the moment
         it is awaited rather than sharing one budget with the whole batch.
         """
         import json
-        from threading import Event, Thread
-        proc = self._procs[index]
+        from threading import Thread
+        proc = record.process
         ready = Event()
         cancelled = Event()
 
@@ -340,16 +439,19 @@ class UMAPWorker:
 
         watcher = Thread(target=_watch, name=f"umap-status-{proc.pid}", daemon=True)
         watcher.start()
-        finished = ready.wait(self.timeout)
+        with self._lifecycle_lock:
+            first_request = record.requests_submitted == 1
+        startup_grace = min(0.25, self.cleanup_timeout) if first_request else 0.0
+        finished = ready.wait(self.timeout + startup_grace)
         cancelled.set()
         watcher.join(timeout=self.cleanup_timeout)
         if not finished and not os.path.exists(status):
-            self._retire(index, reason="timeout")
+            self._retire(record, reason="timeout")
             raise TimeoutError(f"UMAP worker exceeded {self.timeout:g} seconds")
         if not os.path.exists(status):
             returncode = proc.poll()
-            tail = self._error_tail(index)
-            self._retire(index, reason="worker_exit")
+            tail = self._error_tail(record)
+            self._retire(record, reason="worker_exit")
             if "ModuleNotFoundError" in tail and "umap" in tail:
                 raise ImportError("umap_embed needs umap-learn (pip install umap-learn)")
             raise OSError(f"UMAP worker exited (rc={returncode}): {tail[-500:]}")
@@ -397,40 +499,62 @@ class UMAPWorker:
         if len(set(ordered)) != len(ordered):
             raise ValueError(f"embed_many needs distinct seeds, got {ordered!r}")
         self._ensure(len(ordered))
-        assert self._workdir is not None
-        self._counter += 1
-        stem = os.path.join(self._workdir, f"request_{self._counter}")
+        with self._lifecycle_lock:
+            assert self._workdir is not None
+            self._counter += 1
+            stem = os.path.join(self._workdir, f"request_{self._counter}")
+            workers = tuple(self._workers)
         fin = f"{stem}_in.npy"
         np.save(fin, features)
         paths = [fin]
         jobs = []
         try:
             for position, seed in enumerate(ordered):
-                index = position % len(self._procs)
+                record = workers[position % len(workers)]
                 fout, status = f"{stem}_{seed}_out.npy", f"{stem}_{seed}_status.json"
                 paths += [fout, status, f"{status}.tmp"]
-                self._submit(index, dict(input=fin, output=fout, status=status,
-                                         n_neighbors=n_neighbors, min_dist=min_dist,
-                                         n_components=n_components, seed=seed))
-                jobs.append((index, seed, fout, status))
-            return {seed: self._collect(index, status, fout)
-                    for index, seed, fout, status in jobs}
+                with self._lifecycle_lock:
+                    self._request_paths.update((fout, status, f"{status}.tmp"))
+                self._submit(record, dict(input=fin, output=fout, status=status,
+                                          n_neighbors=n_neighbors, min_dist=min_dist,
+                                          n_components=n_components, seed=seed))
+                jobs.append((record, seed, fout, status))
+            with self._lifecycle_lock:
+                self._request_paths.add(fin)
+            return {seed: self._collect(record, status, fout)
+                    for record, seed, fout, status in jobs}
         finally:
             for path in paths:
-                try:
-                    os.remove(path)
-                except FileNotFoundError:
-                    pass
+                self._cleanup_request_path(path)
 
     def close(self) -> List[Dict[str, object]]:
         import shutil
         statuses: List[Dict[str, object]] = []
-        while self._procs:
-            statuses.append(self._retire(len(self._procs) - 1, reason="close"))
-        if self._workdir is not None:
-            # The numba cache lives OUTSIDE this tree on purpose; only the request scratch goes.
-            shutil.rmtree(self._workdir, ignore_errors=True)
+        with self._lifecycle_lock:
+            self._closing = True
+            workers = tuple(reversed(self._workers))
+            workdir = self._workdir
             self._workdir = None
+        for record in workers:
+            status = self._retire(record, reason="close")
+            if status is not None:
+                statuses.append(status)
+        with self._lifecycle_lock:
+            request_paths = tuple(self._request_paths)
+        for path in request_paths:
+            self._cleanup_request_path(path)
+        if workdir is not None:
+            # The numba cache lives OUTSIDE this tree on purpose; only the request scratch goes.
+            try:
+                shutil.rmtree(workdir)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                statuses.append(self._record_cleanup_failure(
+                    reason="workdir_cleanup", path=workdir, exc=exc,
+                ))
+        with self._lifecycle_lock:
+            self._closing = False
         return statuses
 
     def __enter__(self) -> "UMAPWorker":

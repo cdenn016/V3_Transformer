@@ -18,8 +18,8 @@ _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _PROCESS_REAP_TIMEOUT_SECONDS = 10.0
 _TASKKILL_TIMEOUT_SECONDS = 10.0
 _WINDOWS_GATED_LAUNCHER = (
-    "import subprocess,sys; "
-    "gate=sys.stdin.buffer.read(1); "
+    "import os,subprocess,sys; "
+    "gate=os.read(sys.stdin.fileno(),1); "
     "sys.exit(125) if gate != b'1' else None; "
     "sys.exit(126) if len(sys.argv) < 3 or sys.argv[1] != 'vfe3-process-gate' else None; "
     "child=subprocess.Popen(sys.argv[2:]); "
@@ -111,8 +111,10 @@ class _WindowsJob:
 
     def close(self) -> None:
         if self._handle:
-            self._kernel32.CloseHandle(self._handle)
+            handle = self._handle
             self._handle = None
+            if not self._kernel32.CloseHandle(handle):
+                raise ctypes.WinError(ctypes.get_last_error())
 
 
 def _kill_process_tree(
@@ -121,15 +123,15 @@ def _kill_process_tree(
 
     *,
     timeout: float = _TASKKILL_TIMEOUT_SECONDS,
-) -> None:
-    """Terminate a child and every descendant without trusting the child to cooperate."""
+) -> bool:
+    """Terminate a child tree and return only after platform confirmation."""
     if timeout <= 0.0:
         raise ValueError("process-tree termination timeout must be positive")
     if os.name == "nt":
         if job is not None:
             try:
                 job.terminate()
-                return
+                return True
             except OSError:
                 pass
         deadline = monotonic() + timeout
@@ -150,13 +152,14 @@ def _kill_process_tree(
             except BaseException:
                 pass
             raise TimeoutError("taskkill did not finish within its bounded timeout") from exc
-        if returncode != 0 and process.poll() is None:
+        if returncode != 0:
             raise OSError(f"taskkill failed with exit code {returncode}")
-        return
+        return True
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    return True
 
 
 def _terminate_and_reap_after_interruption(
@@ -200,24 +203,25 @@ class ProcessTree:
         status: dict[str, object] = {
             "pid": int(process.pid),
             "reason": str(reason),
-            "terminated": False,
+            "terminated": True,
             "reaped": False,
+            "root_reaped": False,
+            "tree_termination_confirmed": False,
             "returncode": process.poll(),
             "cleanup_error": None,
             "elapsed_s": 0.0,
         }
         cleanup_errors: list[str] = []
         try:
-            if process.poll() is None:
-                status["terminated"] = True
-                try:
-                    _kill_process_tree(
-                        process,
-                        self._job,
-                        timeout=max(0.001, deadline - monotonic()),
-                    )
-                except BaseException as exc:
-                    cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+            try:
+                status["tree_termination_confirmed"] = bool(_kill_process_tree(
+                    process,
+                    self._job,
+                    timeout=max(0.001, deadline - monotonic()),
+                ))
+            except BaseException as exc:
+                cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+                if process.poll() is None:
                     try:
                         process.kill()
                     except BaseException as kill_exc:
@@ -233,7 +237,8 @@ class ProcessTree:
             elif process.poll() is None:
                 cleanup_errors.append("post-kill wait budget exhausted")
             status["returncode"] = process.poll()
-            status["reaped"] = status["returncode"] is not None
+            status["root_reaped"] = status["returncode"] is not None
+            status["reaped"] = status["root_reaped"]
         finally:
             if self._job is not None:
                 try:
@@ -251,7 +256,7 @@ def spawn_process_tree(
 
     **popen_kwargs: object,
 ) -> ProcessTree:
-    """Start a persistent subprocess in its own owned process tree."""
+    """Start a persistent subprocess behind the Windows pre-containment gate."""
     if isinstance(command, (str, bytes)) or not isinstance(command, Sequence):
         raise TypeError("command must be a nonempty sequence of strings")
     if not command:
@@ -260,13 +265,25 @@ def spawn_process_tree(
         raise ValueError("command must contain only nonempty strings")
     kwargs = dict(popen_kwargs)
     if os.name == "nt":
+        if kwargs.get("stdin") is not subprocess.PIPE:
+            raise ValueError("persistent Windows process trees require stdin=subprocess.PIPE")
         kwargs["creationflags"] = (
             int(kwargs.get("creationflags", 0))
             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         )
+        launch_command = [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            _WINDOWS_GATED_LAUNCHER,
+            "vfe3-process-gate",
+            *command,
+        ]
     else:
         kwargs["start_new_session"] = True
-    process = subprocess.Popen(list(command), **kwargs)
+        launch_command = list(command)
+    process = subprocess.Popen(launch_command, **kwargs)
     job: Optional[_WindowsJob] = None
     if os.name == "nt":
         try:
@@ -274,9 +291,22 @@ def spawn_process_tree(
             job.assign(process)
         except OSError as exc:
             if job is not None:
-                job.close()
+                try:
+                    job.close()
+                except BaseException:
+                    pass
             _terminate_and_reap_after_interruption(process, None)
             raise OSError("could not contain the persistent child in a Windows Job Object") from exc
+        gate = process.stdin
+        if gate is None:
+            _terminate_and_reap_after_interruption(process, job)
+            raise OSError("persistent Windows process gate was not created")
+        try:
+            gate.write("1" if kwargs.get("text") else b"1")
+            gate.flush()
+        except BaseException:
+            _terminate_and_reap_after_interruption(process, job)
+            raise
     return ProcessTree(process=process, _job=job)
 
 

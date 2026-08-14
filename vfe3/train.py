@@ -585,6 +585,10 @@ def _default_sample_decoder(
     return lambda ids: enc.decode([int(t) for t in ids])
 
 
+class PeriodicGenerationRestorationError(RuntimeError):
+    """Periodic sampling changed state that could not be restored exactly."""
+
+
 def _periodic_generation(
     model:      torch.nn.Module,
     prompt:     torch.Tensor,
@@ -607,13 +611,29 @@ def _periodic_generation(
         continuation_text = decode(generated[prompt.shape[1]:].tolist())
         return prompt_text, continuation_text
     finally:
+        restoration_errors = []
         for module, was_training in zip(modules, training_flags):
-            module.training = was_training
+            try:
+                module.training = was_training
+            except BaseException as exc:
+                restoration_errors.append(("module mode", exc))
         try:
             torch.set_rng_state(cpu_rng)
-        finally:
-            if cuda_rng is not None:
+        except BaseException as exc:
+            restoration_errors.append(("CPU RNG", exc))
+        if cuda_rng is not None:
+            try:
                 torch.cuda.set_rng_state_all(list(cuda_rng))
+            except BaseException as exc:
+                restoration_errors.append(("CUDA RNG", exc))
+        if restoration_errors:
+            detail = "; ".join(
+                f"{label}: {type(exc).__name__}: {exc}"
+                for label, exc in restoration_errors
+            )
+            raise PeriodicGenerationRestorationError(
+                f"periodic generation restoration failed ({detail})"
+            ) from restoration_errors[0][1]
 
 
 def train_step(
@@ -2080,6 +2100,8 @@ def train(
                         model, prompt, sample_new_tokens, decode,
                     )
                     logger.info("       Sample: %r  ->  %r\n", p_txt, c_txt)
+                except PeriodicGenerationRestorationError:
+                    raise
                 except Exception as exc:                                          # never let sampling kill training
                     logger.warning("       (sample generation failed: %s)", exc)
             last_val = {

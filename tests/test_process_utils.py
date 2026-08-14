@@ -245,3 +245,141 @@ def test_windows_gate_failure_uses_bounded_cleanup(monkeypatch):
         process_utils.run_process_tree(["worker"])
 
     assert cleaned == [(process, job)]
+
+
+def test_persistent_windows_worker_is_released_only_after_job_assignment(monkeypatch):
+    events = []
+
+    class _OrderedGate(_Gate):
+        def write(self, value):
+            events.append(("released", value))
+            super().write(value)
+
+    process = _FakeProcess()
+    process.stdin = _OrderedGate()
+    captured = {}
+
+    class _Job:
+        def assign(self, child):
+            events.append(("assigned", child.stdin.value))
+
+        def close(self):
+            return None
+
+    def _popen(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return process
+
+    monkeypatch.setattr(process_utils.os, "name", "nt")
+    monkeypatch.setattr(process_utils.subprocess, "Popen", _popen)
+    monkeypatch.setattr(process_utils, "_WindowsJob", _Job)
+
+    tree = process_utils.spawn_process_tree(
+        ["worker", "argument"], stdin=subprocess.PIPE, text=True,
+    )
+
+    assert captured["command"][-3:] == ["vfe3-process-gate", "worker", "argument"]
+    assert events == [("assigned", None), ("released", "1")]
+    assert process.stdin.closed is False
+    assert tree.process is process
+
+
+def test_persistent_windows_assignment_failure_never_releases_workload(monkeypatch):
+    process = _FakeProcess()
+    process.stdin = _Gate()
+    cleaned = []
+    captured = {}
+
+    class _Job:
+        def assign(self, _child):
+            raise OSError("assignment failed")
+
+        def close(self):
+            return None
+
+    def _popen(command, **kwargs):
+        captured["command"] = command
+        return process
+
+    monkeypatch.setattr(process_utils.os, "name", "nt")
+    monkeypatch.setattr(process_utils.subprocess, "Popen", _popen)
+    monkeypatch.setattr(process_utils, "_WindowsJob", _Job)
+    monkeypatch.setattr(
+        process_utils,
+        "_terminate_and_reap_after_interruption",
+        lambda child, owner: cleaned.append((child, owner)),
+    )
+
+    with pytest.raises(OSError, match="contain the persistent child"):
+        process_utils.spawn_process_tree(
+            ["worker"], stdin=subprocess.PIPE, text=True,
+        )
+
+    assert "vfe3-process-gate" in captured["command"]
+    assert process.stdin.value is None
+    assert cleaned == [(process, None)]
+
+
+class _ExitedRoot:
+    pid = 321
+
+    def __init__(self):
+        self.kills = 0
+
+    def poll(self):
+        return 0
+
+    def kill(self):
+        self.kills += 1
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def test_nonzero_taskkill_with_exited_root_is_never_clean(monkeypatch):
+    root = _ExitedRoot()
+
+    class _Taskkill:
+        def wait(self, timeout=None):
+            return 5
+
+    class _Job:
+        def terminate(self):
+            raise OSError("job terminate failed")
+
+        def close(self):
+            raise OSError("job close failed")
+
+    monkeypatch.setattr(process_utils.os, "name", "nt")
+    monkeypatch.setattr(process_utils.subprocess, "Popen", lambda *_a, **_k: _Taskkill())
+
+    status = process_utils.ProcessTree(root, _Job()).terminate(reason="timeout", timeout=0.1)
+
+    assert status["root_reaped"] is True
+    assert status["tree_termination_confirmed"] is False
+    assert "taskkill failed with exit code 5" in status["cleanup_error"]
+    assert "job close failed" in status["cleanup_error"]
+
+
+def test_taskkill_timeout_with_exited_root_is_never_clean(monkeypatch):
+    root = _ExitedRoot()
+
+    class _Taskkill:
+        def __init__(self):
+            self.killed = False
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(["taskkill"], timeout)
+
+        def kill(self):
+            self.killed = True
+
+    monkeypatch.setattr(process_utils.os, "name", "nt")
+    monkeypatch.setattr(process_utils.subprocess, "Popen", lambda *_a, **_k: _Taskkill())
+
+    status = process_utils.ProcessTree(root).terminate(reason="timeout", timeout=0.05)
+
+    assert status["root_reaped"] is True
+    assert status["tree_termination_confirmed"] is False
+    assert status["cleanup_error"]

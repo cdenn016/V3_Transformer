@@ -920,7 +920,11 @@ def generate_figures(
                                     if controlled_bank else None)),
                   f"model_umap_{ch}.png" in planned_figures)
     for cleanup_status in umap_worker.cleanup_statuses:
-        if cleanup_status.get("cleanup_error") or not cleanup_status.get("reaped"):
+        if (
+            cleanup_status.get("cleanup_error")
+            or cleanup_status.get("root_reaped") is False
+            or cleanup_status.get("tree_termination_confirmed") is False
+        ):
             logger.warning(
                 "UMAP worker cleanup incomplete: %s", cleanup_status,
             )

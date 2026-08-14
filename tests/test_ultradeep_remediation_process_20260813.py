@@ -1,5 +1,7 @@
 """Task 7: bounded UMAP recovery and periodic-generation isolation."""
 
+import shutil
+from threading import Event, Thread
 import time
 
 import numpy as np
@@ -100,3 +102,173 @@ def test_periodic_generation_restores_mixed_modes_and_rng_when_it_raises(monkeyp
     assert torch.equal(torch.get_rng_state(), original_cpu)
     assert len(restored_cuda) == 1
     assert [state.tolist() for state in restored_cuda[0]] == [state.tolist() for state in fake_cuda]
+
+
+def test_periodic_generation_cpu_restore_failure_is_fail_closed(monkeypatch):
+    model = _ExplodingGenerator()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        torch,
+        "set_rng_state",
+        lambda _state: (_ for _ in ()).throw(RuntimeError("cpu restore failed")),
+    )
+
+    with pytest.raises(train_module.PeriodicGenerationRestorationError, match="cpu restore failed"):
+        train_module._periodic_generation(
+            model, torch.tensor([[1, 2]]), 3, lambda ids: str(list(ids)),
+        )
+
+
+def test_periodic_generation_partial_cuda_restore_failure_is_fail_closed(monkeypatch):
+    model = _ExplodingGenerator()
+    fake_cuda = [torch.tensor([1], dtype=torch.uint8), torch.tensor([2], dtype=torch.uint8)]
+    partial = []
+
+    def _partial_then_raise(states):
+        partial.append(states[0].clone())
+        raise RuntimeError("cuda restore failed after device zero")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_rng_state_all", lambda: [state.clone() for state in fake_cuda])
+    monkeypatch.setattr(torch.cuda, "set_rng_state_all", _partial_then_raise)
+
+    with pytest.raises(train_module.PeriodicGenerationRestorationError, match="cuda restore failed"):
+        train_module._periodic_generation(
+            model, torch.tensor([[1, 2]]), 3, lambda ids: str(list(ids)),
+        )
+
+    assert [state.tolist() for state in partial] == [[1]]
+
+
+def test_multiworker_timeout_cleanup_is_removed_or_structured(monkeypatch):
+    controlled_worker = (
+        "import json, os, sys, time\n"
+        "import numpy as np\n"
+        "for line in sys.stdin:\n"
+        "    request = json.loads(line)\n"
+        "    if int(request['seed']) == 1:\n"
+        "        while True: time.sleep(0.01)\n"
+        "    time.sleep(0.20)\n"
+        "    np.save(request['output'], np.zeros((2, 2), dtype=np.float32))\n"
+        "    tmp = request['status'] + '.tmp'\n"
+        "    with open(tmp, 'w', encoding='utf-8') as h: json.dump({'ok': True}, h)\n"
+        "    os.replace(tmp, request['status'])\n"
+    )
+    monkeypatch.setattr(figures, "_UMAP_WORKER_SRC", controlled_worker)
+    worker = figures.UMAPWorker(timeout=0.05, cleanup_timeout=0.25, max_workers=2)
+    real_remove = figures.os.remove
+    injected = {"done": False}
+
+    def _sharing_violation_once(path):
+        if not injected["done"] and str(path).endswith("_out.npy"):
+            injected["done"] = True
+            raise PermissionError("controlled sharing violation")
+        return real_remove(path)
+
+    monkeypatch.setattr(figures.os, "remove", _sharing_violation_once)
+    try:
+        with pytest.raises(TimeoutError, match="exceeded"):
+            worker.embed_many(
+                np.zeros((2, 3), dtype=np.float32), seeds=(1, 2),
+                n_neighbors=2, min_dist=0.1, n_components=2,
+            )
+        workdir = worker._workdir
+    finally:
+        worker.close()
+
+    assert injected["done"] is True
+    assert any(
+        status["reason"] == "request_cleanup" and "sharing violation" in status["cleanup_error"]
+        for status in worker.cleanup_statuses
+    )
+    assert workdir is not None and not figures.os.path.exists(workdir)
+
+
+def test_workdir_cleanup_failure_is_structured_and_not_raised(monkeypatch):
+    controlled_worker = "import sys\nfor _line in sys.stdin:\n    pass\n"
+    monkeypatch.setattr(figures, "_UMAP_WORKER_SRC", controlled_worker)
+    worker = figures.UMAPWorker(timeout=0.10, cleanup_timeout=0.25, max_workers=1)
+    worker._ensure(1)
+    monkeypatch.setattr(
+        shutil,
+        "rmtree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("workdir busy")),
+    )
+
+    statuses = worker.close()
+
+    assert any(
+        status["reason"] == "workdir_cleanup" and "workdir busy" in status["cleanup_error"]
+        for status in statuses
+    )
+
+
+def test_concurrent_double_close_retires_each_worker_once(monkeypatch):
+    controlled_worker = "import time\nwhile True: time.sleep(0.01)\n"
+    monkeypatch.setattr(figures, "_UMAP_WORKER_SRC", controlled_worker)
+    worker = figures.UMAPWorker(timeout=0.10, cleanup_timeout=0.25, max_workers=2)
+    worker._ensure(2)
+    pids = [proc.pid for proc in worker._procs]
+    release = Event()
+    errors = []
+
+    def _close():
+        release.wait()
+        try:
+            worker.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [Thread(target=_close), Thread(target=_close)]
+    for thread in threads:
+        thread.start()
+    release.set()
+    for thread in threads:
+        thread.join(timeout=1.0)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    retired_pids = [status["pid"] for status in worker.cleanup_statuses if status.get("pid")]
+    assert sorted(retired_pids) == sorted(pids)
+    assert len(retired_pids) == len(set(retired_pids))
+
+
+def test_close_racing_timeout_is_once_only_and_bounded(monkeypatch):
+    controlled_worker = (
+        "import json, sys, time\n"
+        "for line in sys.stdin:\n"
+        "    json.loads(line)\n"
+        "    while True: time.sleep(0.01)\n"
+    )
+    monkeypatch.setattr(figures, "_UMAP_WORKER_SRC", controlled_worker)
+    worker = figures.UMAPWorker(timeout=0.08, cleanup_timeout=0.25, max_workers=1)
+    started = Event()
+    errors = []
+
+    def _embed():
+        started.set()
+        try:
+            worker.embed(
+                np.zeros((2, 3), dtype=np.float32), n_neighbors=2,
+                min_dist=0.1, n_components=2, seed=1,
+            )
+        except (TimeoutError, OSError):
+            pass
+        except BaseException as exc:
+            errors.append(exc)
+
+    embed_thread = Thread(target=_embed)
+    embed_thread.start()
+    started.wait(timeout=0.25)
+    deadline = time.monotonic() + 0.25
+    while not worker._procs and time.monotonic() < deadline:
+        Event().wait(0.005)
+    close_thread = Thread(target=worker.close)
+    close_thread.start()
+    embed_thread.join(timeout=1.0)
+    close_thread.join(timeout=1.0)
+
+    assert not embed_thread.is_alive() and not close_thread.is_alive()
+    assert errors == []
+    retired_pids = [status["pid"] for status in worker.cleanup_statuses if status.get("pid")]
+    assert len(retired_pids) == len(set(retired_pids))
