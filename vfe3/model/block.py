@@ -206,6 +206,8 @@ def vfe_block(
             out = out._replace(mu=mu_cg, sigma=sigma_cg)   # _replace preserves phi/omega/reflection
     if block_norm is not None:               # cached parameter-free norm (audit 2d/4f)
         out = out._replace(mu=block_norm(out.mu, out.sigma))   # _replace preserves phi/omega/reflection
+    if capture is not None:
+        capture["block_mlp_input"] = out     # exact immediate seam after mixer/CG/norm
     if block_mlp is not None:                # default-off residual moment transform, after norm before handoff
         if hasattr(block_mlp, "forward_moments"):
             result = block_mlp.forward_moments(
@@ -213,4 +215,6 @@ def vfe_block(
             out = out._replace(mu=result.mu, sigma=result.sigma)
         else:                                # legacy callable compatibility: coordinate mean only
             out = out._replace(mu=block_mlp(out.mu))
+    if capture is not None:
+        capture["block_mlp_output"] = out
     return out

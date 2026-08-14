@@ -466,6 +466,6 @@ def test_finalize_writes_tier3_research_and_provenance() -> None:
         assert math.isfinite(rj["ece"]) and "corpus_freq_strata_ce" in rj
         assert math.isfinite(rj["fd_gradient_worst_rel_error"]) and rj["fd_gradient_worst_rel_error"] >= 0.0
         # history-only trend figures
-        for fig in ("grad_norm.png", "belief_condition.png", "estep_convergence_trend.png"):
+        for fig in ("grad_norm.png", "belief_condition.png", "estep_endpoint_delta.png"):
             assert (root / fig).exists(), f"missing trend figure {fig}"
     seed_everything(cfg.seed, deterministic=False)

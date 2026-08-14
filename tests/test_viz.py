@@ -893,7 +893,7 @@ def test_phi_extractors_remain_unchanged(monkeypatch):
         calls = diagnostic_calls[before:]
         # diagnostics now scores separately captured pre/post BlockMLP states; the sibling replays
         # retain one state. Every state-specific transport must carry the same active reflection.
-        assert len(calls) == (2 if name == "diagnostics" else 1), (name, calls)
+        assert len(calls) == 1, (name, calls)
         for call in calls:
             assert call["gauge_parameterization"] == "phi", name
             assert call["omega"] is None, name

@@ -93,6 +93,8 @@ def vfe_stack(
         diagnostic_capture.setdefault("layer_priors", [])
         diagnostic_capture.setdefault("layer_converged", [])
         diagnostic_capture.setdefault("layer_outputs", [])
+        diagnostic_capture.setdefault("layer_block_mlp_inputs", [])
+        diagnostic_capture.setdefault("layer_block_mlp_outputs", [])
     # Hoist the loop-invariant temperature computation out of the per-layer vfe_block call.
     # attention_tau depends only on the kappa, group.irrep_dims, and device -- all constant across
     # layers -- so computing it once here and passing it as tau avoids L redundant calls.
@@ -155,6 +157,8 @@ def vfe_stack(
         if diagnostic_capture is not None:
             diagnostic_capture["layer_converged"].append(capture["converged"])
             diagnostic_capture["layer_outputs"].append(belief)
+            diagnostic_capture["layer_block_mlp_inputs"].append(capture["block_mlp_input"])
+            diagnostic_capture["layer_block_mlp_outputs"].append(capture["block_mlp_output"])
         mu_p = (1.0 - rho) * mu_p + rho * belief.mu
         sigma_p = (1.0 - rho_s) * sigma_p + rho_s * belief.sigma
         if detach_capture and layer_index < cfg.n_layers - 1:

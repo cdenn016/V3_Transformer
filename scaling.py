@@ -56,6 +56,7 @@ from vfe3.data.datasets import (
     make_dataloader,
     tokens_per_char as _tokens_per_char,
 )
+from vfe3.metric_contracts import perplexity_matches_ce
 from vfe3.model.block_mlp import get_block_mlp_registration
 from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.model import VFEModel, build_group
@@ -1611,13 +1612,15 @@ def _scaling_result_status(result: Mapping[str, Any]) -> str:
     test_ppl = result["test_ppl"]
     test_bits = result["test_bits_per_token"]
     test_bpc = result["test_bpc"]
-    if not all(_finite_positive(value) for value in (test_ce, test_ppl, test_bits)):
+    if not all(_finite_positive(value) for value in (test_ce, test_bits)):
+        return "nonfinite"
+    if not (isinstance(test_ppl, (int, float)) and not isinstance(test_ppl, bool)
+            and float(test_ppl) > 0.0 and not math.isnan(float(test_ppl))):
         return "nonfinite"
     if test_bpc is not None and not _finite_positive(test_bpc):
         return "nonfinite"
-    expected_ppl = math.exp(min(float(test_ce), 20.0))
     expected_bits = float(test_ce) / math.log(2.0)
-    if (not math.isclose(float(test_ppl), expected_ppl, rel_tol=1e-9, abs_tol=1e-12)
+    if (not perplexity_matches_ce(test_ce, test_ppl)
             or not math.isclose(float(test_bits), expected_bits, rel_tol=1e-9, abs_tol=1e-12)):
         return "nonfinite"
     return "complete"

@@ -21,7 +21,7 @@ import matplotlib
 matplotlib.use("Agg")                                            # non-interactive (headless / tests)
 import matplotlib.pyplot as plt
 
-from vfe3.families.base import get_functional
+from vfe3.families.base import get_functional_display
 import numpy as np
 from matplotlib.colors import LogNorm
 from matplotlib.ticker import FuncFormatter, MaxNLocator
@@ -975,16 +975,18 @@ def _fe_terms(history: Dict, lambda_beta, *, lambda_gamma=0.0, include_attention
 
 
 @register_figure("free_energy_codescent")
-def plot_free_energy_codescent(
+@register_figure("free_energy_relationship")
+def plot_free_energy_relationship(
     history: Dict,                       # step, self_coupling, belief_coupling, attention_entropy, val_ce, [hyper_prior_weighted, gamma_*]
 
     *,
     lambda_beta:               'float | np.ndarray' = 1.0,
     lambda_gamma:              float = 0.0,
     include_attention_entropy: bool  = True,
+    divergence_family:         str = "renyi",
     path:                      Optional[str] = None,
 ):
-    r"""Inner-energy-vs-CE co-descent for the per-token alignment terms and held-out loss.
+    r"""Descriptive relationship between the target-blind objective and held-out loss.
 
     Twin y-axes over the real training step -- the inner alignment energy (self-coupling +
     the lambda_beta-scaled belief-coupling and attention-entropy + the weighted hyper-prior and gamma
@@ -997,6 +999,7 @@ def plot_free_energy_codescent(
     """
     step, _comps, total, ce = _fe_terms(history, lambda_beta, lambda_gamma=lambda_gamma,
                                         include_attention_entropy=include_attention_entropy)
+    objective_label, objective_units = _registered_divergence_axis(divergence_family)
     keep = np.isfinite(total) & np.isfinite(ce)
     step, total, ce = step[keep], total[keep], ce[keep]
     w = max(5, total.size // 80)
@@ -1006,7 +1009,8 @@ def plot_free_energy_codescent(
     # of the opposite (twin) axis tick labels -- the left energy tag overlaps the right CE ticks.
     flab = f"inner energy (left) = {total[-1]:.1f}" if step.size else "inner energy (left)"
     ln1, = ax.plot(step, _rolling_mean(total, w), lw=2.0, color=_CB[0], label=flab)
-    ax.set(xlabel="training step", ylabel="inner alignment energy (nats/token)")
+    ax.set(xlabel="training step", ylabel=_objective_axis_text(
+        f"inner {objective_label}", objective_units, per_token=True))
     ax.yaxis.label.set_color(_CB[0]); ax.tick_params(axis="y", colors=_CB[0])
     if step.size and _set_finite_xlim(ax, step):
         _step_xaxis(ax)
@@ -1018,20 +1022,29 @@ def plot_free_energy_codescent(
     ax2.set_ylabel("validation CE (nats/token)", color=_CB[1]); ax2.tick_params(axis="y", colors=_CB[1])
     if total.size > 2:
         r = float(np.corrcoef(total, ce)[0, 1])
-        ax.set_title(rf"Inner-energy / CE co-descent (Pearson $r={r:+.2f}$)")
+        ax.set_title(rf"Inner-objective / CE relationship (Pearson $r={r:+.2f}$)")
     else:
-        ax.set_title("Inner-energy / CE co-descent")
+        ax.set_title("Inner-objective / CE relationship")
     ax.legend([ln1, ln2], [ln1.get_label(), ln2.get_label()], loc="upper right", fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
 
 
-def _registered_divergence_axis(name: str) -> tuple[str, str]:
-    """Return diagnostic display metadata from the active registered functional."""
-    functional = get_functional(name)
-    label = getattr(functional, "diagnostic_label", name.replace("_", " "))
-    units = getattr(functional, "diagnostic_units", "registered objective units")
-    return str(label), str(units)
+plot_free_energy_codescent = plot_free_energy_relationship
+
+
+def _registered_divergence_axis(name: str) -> tuple[str, Optional[str]]:
+    """Return typed display metadata, or a unit-free generic divergence fallback."""
+    try:
+        display = get_functional_display(name)
+    except KeyError:
+        return "divergence", None
+    return display.label, display.units
+
+
+def _objective_axis_text(label: str, units: Optional[str], *, per_token: bool = False) -> str:
+    suffix = "/token" if per_token else ""
+    return f"{label} ({units}{suffix})" if units else f"{label}{suffix}"
 
 
 @register_figure("free_energy_decomposition")
@@ -1079,7 +1092,8 @@ def plot_free_energy_decomposition(
         axes[0].annotate(f"{val:.1f}", xy=(val, yi), xytext=(4, 0), textcoords="offset points",
                          va="center", ha="left", fontsize=9)
     axes[0].set_xlim(float(last.min()) * 0.5, float(last.max()) * 3.0)
-    axes[0].set(xlabel=f"inner-energy contribution ({objective_units}/token, log scale)",
+    axes[0].set(xlabel=_objective_axis_text(
+                    "inner-objective contribution", objective_units, per_token=True) + " (log scale)",
                 title=f"Budget at step {int(step[-1]):,}")
     # Panel B -- early/mid/late medians, log y so the flat dominant term and the moving terms coexist.
     thirds  = np.array_split(np.arange(step.size), 3)
@@ -1094,8 +1108,9 @@ def plot_free_energy_decomposition(
     axes[1].set_ylim(top=axes[1].get_ylim()[1] * 2.2)            # headroom for the legend above the bars
     axes[1].set_xticks(centers); axes[1].set_xticklabels(["early", "mid", "late"])
     axes[1].set(xlabel="training third",
-                ylabel=f"inner term (median, {objective_units}/token, log scale)",
-                title="Self-coupling flat; other terms descend")
+                ylabel=_objective_axis_text(
+                    "inner term (median)", objective_units, per_token=True) + " (log scale)",
+                title="Inner-objective terms across training thirds")
     axes[1].legend(fontsize=7.5, frameon=False, ncol=2, loc="upper right")
     fig.tight_layout()
     return _save(fig, path)
@@ -1259,27 +1274,38 @@ def plot_estep_grad_norm_decomposition(
 
 
 @register_figure("estep_convergence")
-def plot_estep_convergence(
+@register_figure("iterate_trajectory")
+def plot_iterate_trajectory(
     trace:    Dict,                      # e_step_belief_trace output: mu, sigma, phi, free_energy
 
     *,
-    diagonal: Optional[bool] = None,
-    path:     Optional[str]  = None,
+    diagonal:          Optional[bool] = None,
+    divergence_family: str = "renyi",
+    evidence:           Optional[Mapping[str, object]] = None,
+    path:               Optional[str] = None,
 ):
-    r"""F2: E-step convergence -- free energy and belief motion across inner iterations.
+    r"""Free energy and belief motion across the configured E-step iterate trajectory.
 
     Panel A is the global F(t) over inner iterations with the trained budget marked. Panel B is the
-    belief-motion residuals on a log axis -- the mean step, the affine-invariant SPD covariance step,
-    and the gauge step -- each median + 10-90 band over tokens, shrinking toward a fixed point.
+    Step lengths are shown without treating small final movement as convergence unless structured
+    evidence establishes it.
     """
     from vfe3 import metrics
+    objective_label, objective_units = _registered_divergence_axis(divergence_family)
+    evidence = dict(evidence or {})
     fe = _np(trace["free_energy"])
     res = metrics.estep_residuals(trace["mu"], trace["sigma"], trace["phi"], diagonal=diagonal)
     fig, axes = plt.subplots(1, 2, figsize=(9, 3.6))
     axes[0].plot(np.arange(fe.size), fe, "o-", color=_CB[0], ms=4, lw=1.6)
     axes[0].axhline(fe[-1], color="#888888", ls=":", lw=1)
-    axes[0].set(xlabel="E-step inner iteration", ylabel="free energy (registered objective units)",
-                title="E-step iterate trajectory")
+    trajectory_title = "E-step iterate trajectory"
+    if evidence.get("fixed_point_evidence"):
+        trajectory_title += " (fixed point established)"
+    elif evidence.get("descent_evidence"):
+        trajectory_title += " (descent established)"
+    axes[0].set(xlabel="E-step inner iteration",
+                ylabel=_objective_axis_text(objective_label, objective_units),
+                title=trajectory_title)
     t = np.arange(1, _np(res["r_mu"]).shape[0] + 1)
     _median_band(axes[1], t, _np(res["r_mu"]), _CB[0], r"$r_\mu$")
     _median_band(axes[1], t, _np(res["r_sigma"]), _CB[1], r"$r_\Sigma$ (SPD)")
@@ -1290,6 +1316,9 @@ def plot_estep_convergence(
     axes[1].legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
+
+
+plot_estep_convergence = plot_iterate_trajectory
 
 
 @register_figure("estep_depth_sensitivity")
@@ -3211,28 +3240,35 @@ def plot_capacity_scaling(
 def plot_estep_capacity(
     n_e_steps:    object,                # (T,) E-step iteration counts
     bpc:          object,                # (T,) val BPC
-    free_energy:  object,                # (T,) converged free energy
+    free_energy:  object,                # (T,) final-iterate objective
 
     *,
-    n_params:     Optional[int]   = None,
-    wall_time:    Optional[object] = None,
-    path:         Optional[str]   = None,
+    n_params:          Optional[int] = None,
+    wall_time:         Optional[object] = None,
+    divergence_family: str = "renyi",
+    evidence:          Optional[Mapping[str, object]] = None,
+    path:              Optional[str] = None,
 ):
-    r"""F11 Panel B: E-step-as-capacity -- more inner free-energy minimization lowers loss at flat params.
+    r"""E-step inference depth versus validation BPC and the final-iterate objective.
 
-    val BPC and converged F vs the number of E-step iterations on a twin axis (the controlled
-    intervention: parameters are constant, only inference depth changes). An optional wall-time inset
+    Parameters stay flat while inference depth changes. This displays the observed relationship;
+    it does not presume monotonic improvement or convergence. An optional wall-time inset
     shows the compute cost.
     """
     x = _np(n_e_steps)
+    objective_label, objective_units = _registered_divergence_axis(divergence_family)
+    evidence = dict(evidence or {})
     fig, ax = plt.subplots(figsize=(5.4, 4.0))
     ax.plot(x, _np(bpc), "o-", color=_CB[0], lw=2, label="val BPC")
     ax.set(xlabel="E-step iterations (n_e_steps)", ylabel="val BPC")
     ax2 = ax.twinx()
     ax2.plot(x, _np(free_energy), "s--", color=_CB[1], lw=2)
-    ax2.set_ylabel("converged F (nats)", color=_CB[1])
-    note = "capacity from inference" + (f"; params flat at {n_params:,}" if n_params else "")
-    ax.set_title(f"E-step-as-capacity ({note})")
+    ax2.set_ylabel(_objective_axis_text(
+        f"final-iterate {objective_label}", objective_units), color=_CB[1])
+    note = "inference-depth relationship" + (f"; params flat at {n_params:,}" if n_params else "")
+    if evidence.get("fixed_point_evidence"):
+        note += "; fixed point established"
+    ax.set_title(f"E-step capacity ({note})")
     if wall_time is not None:
         ins = ax.inset_axes([0.6, 0.6, 0.36, 0.34])
         ins.plot(x, _np(wall_time), "o-", color="#888888", ms=3)
@@ -4022,14 +4058,16 @@ def plot_rank_residual_by_depth(
 
 
 # ===========================================================================
-# C2 / EXP-5  --  structural non-Neal-Hinton EM: F-vs-CE decorrelation
+# C2 / EXP-5  --  structural non-Neal-Hinton EM: final-iterate objective / CE relationship
 # ===========================================================================
 
 @register_figure("f_ce_decorrelation")
-def plot_f_ce_decorrelation(
+@register_figure("f_ce_relationship")
+def plot_f_ce_relationship(
     arms,                                # list of {n_e_steps, final_f, ce, [label]} (one per n_e_steps cell)
 
     *,
+    divergence_family: str = "renyi",
     path: Optional[str] = None,
 ):
     r"""Final-iterate target-blind objective per token versus held-out CE.
@@ -4037,6 +4075,7 @@ def plot_f_ce_decorrelation(
     Target blindness establishes structural separation from the prediction objective. It does not
     imply any correlation sign across a finite depth sweep; the displayed correlations are descriptive.
     Points are ordered and annotated by n_e_steps."""
+    objective_label, objective_units = _registered_divergence_axis(divergence_family)
     pts = sorted(arms, key=lambda a: float(a["n_e_steps"]))
     ne = np.array([float(a["n_e_steps"]) for a in pts])
     ff = np.array([float(a["final_f"]) for a in pts])
@@ -4054,11 +4093,15 @@ def plot_f_ce_decorrelation(
             ax.annotate(f"T={int(float(a['n_e_steps']))}", (float(a["final_f"]), float(a["ce"])),
                         textcoords="offset points", xytext=(6, 4), fontsize=8)
         fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02, label="n_e_steps")
-    ax.set(xlabel="final-iterate E-step objective / token (registered objective units)",
+    ax.set(xlabel=_objective_axis_text(
+               f"final-iterate {objective_label}", objective_units, per_token=True),
            ylabel="held-out CE (nats)")
-    ax.set_title(rf"E-step F vs CE  (Pearson$(F,CE)$={r_fce:+.3f}, Pearson$(T,F)$={r_nef:+.3f})")
+    ax.set_title(rf"E-step objective / CE relationship  (Pearson$(F,CE)$={r_fce:+.3f}, Pearson$(T,F)$={r_nef:+.3f})")
     fig.tight_layout()
     return _save(fig, path)
+
+
+plot_f_ce_decorrelation = plot_f_ce_relationship
 
 
 # ===========================================================================

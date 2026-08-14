@@ -44,6 +44,7 @@ from vfe3.gauge_optim import (
     phi_projection_chunk_rows,
     project_phi_parameter_rows_,
 )
+from vfe3.metric_contracts import perplexity_from_ce
 from vfe3.model.block import _as_coeff
 from vfe3.model.model import DiagnosticSnapshot, VFEModel
 from vfe3.run_artifacts import RunArtifacts          # top-level safe: run_artifacts imports evaluate
@@ -652,7 +653,7 @@ def train_step(
         ce = decode_stats.ce
         _scored_det = decode_stats.scored_tokens.detach()
         _excluded_det = decode_stats.excluded_tokens.detach()
-        _expected_det = _scored_det + _excluded_det
+        _expected_det = torch.tensor(targets.numel(), dtype=torch.int64, device=targets.device)
         _scaler.scale(loss).backward()
         _loss_det = loss.detach()                               # host read DEFERRED: fused with the grad-finite
         step_loss = None                                        # flag at the gate below (audit 2026-07-01 round-3)
@@ -670,6 +671,7 @@ def train_step(
         tgt_chunks = torch.chunk(targets, grad_accum_steps, dim=0)
         count_tensors = []
         excluded_count_tensors = []
+        expected_count_tensors = []
         loss_numerator = torch.zeros((), dtype=torch.float64, device=tokens.device)
         ce_numerator = torch.zeros((), dtype=torch.float64, device=tokens.device)
         for tok_mb, tgt_mb in zip(tok_chunks, tgt_chunks):
@@ -680,6 +682,8 @@ def train_step(
             count_mb = decode_stats_mb.scored_tokens.detach()
             count_tensors.append(count_mb)
             excluded_count_tensors.append(decode_stats_mb.excluded_tokens.detach())
+            expected_count_tensors.append(torch.tensor(
+                tgt_mb.numel(), dtype=torch.int64, device=tgt_mb.device))
             if _egrad_mb is not None:
                 for _name, _value in _egrad_mb.items():
                     if isinstance(_value, Real):
@@ -694,7 +698,7 @@ def train_step(
         _counts = torch.stack(count_tensors)
         _scored_det = _counts.sum(dtype=torch.int64)
         _excluded_det = torch.stack(excluded_count_tensors).sum(dtype=torch.int64)
-        _expected_det = _scored_det + _excluded_det
+        _expected_det = torch.stack(expected_count_tensors).sum(dtype=torch.int64)
         _denominator = _scored_det.clamp_min(1).to(dtype=torch.float64)
         _loss_det = loss_numerator / _denominator
         _ce_det = ce_numerator / _denominator
@@ -713,6 +717,8 @@ def train_step(
                 "exact objective.",
                 RuntimeWarning, stacklevel=2,
             )
+    _target_partition = _target_accounting_from_device(
+        _expected_det, _scored_det, _excluded_det)
     _scaler_enabled = scaler is not None and scaler.is_enabled()
     scored_tokens_value = None
     # The enabled scaler's ordinary finite-loss path delegates overflow detection to GradScaler.
@@ -826,8 +832,7 @@ def train_step(
                 _total / _egrad_counts[_name])
         metrics_out["loss_finite"] = float(loss_finite)
         metrics_out["train_ce"] = step_ce            # pre-step CE (matches step_loss; not a post-update re-forward)
-        metrics_out.update(_target_accounting_from_device(
-            _expected_det, _scored_det, _excluded_det))
+        metrics_out.update(_target_partition)
         if _mb_tok:                                             # grad_accum_steps>1: token-spread bias check
             metrics_out["grad_accum_tok_spread"] = float(max(_mb_tok) - min(_mb_tok))
         if scaler is not None and scaler.is_enabled():          # fp16: surface the loss-scale (Tier-2 health)
@@ -965,11 +970,8 @@ def _maybe_metropolis_omega(
 
 
 def _perplexity_from_ce(ce: float) -> float:
-    """Return exact ``exp(CE)``; mathematical overflow is represented as infinity."""
-    try:
-        return math.exp(float(ce))
-    except OverflowError:
-        return float("inf")
+    """Compatibility wrapper around the shared exact CE/PPL contract."""
+    return perplexity_from_ce(ce)
 
 
 def _target_accounting(expected: int, scored: int, excluded: int) -> Dict[str, int]:
@@ -991,9 +993,41 @@ def _target_accounting_from_device(
     scored: torch.Tensor,
     excluded: torch.Tensor,
 ) -> Dict[str, int]:
-    """Transfer Task 5's device-side counts together, then validate their partition."""
-    values = torch.stack((expected, scored, excluded)).to(dtype=torch.int64).cpu().tolist()
+    """Transfer exact device-side int64 counts together, then validate their partition."""
+    tensors = (expected, scored, excluded)
+    if any(not isinstance(value, torch.Tensor) or value.dtype != torch.int64
+           for value in tensors):
+        raise TypeError("target accounting device counts must all be torch.int64 tensors")
+    if any(value.numel() != 1 for value in tensors):
+        raise ValueError("target accounting device counts must all be scalar tensors")
+    if len({value.device for value in tensors}) != 1:
+        raise ValueError("target accounting device counts must share one device")
+    values = torch.stack(tensors).cpu().tolist()
     return _target_accounting(*values)
+
+
+def _target_accounting_for_targets(
+    targets: torch.Tensor,
+    scored: torch.Tensor,
+    excluded: torch.Tensor,
+) -> Dict[str, int]:
+    """Validate decoder counts against the independent target-tensor cardinality."""
+    expected = torch.tensor(targets.numel(), dtype=torch.int64, device=targets.device)
+    return _target_accounting_from_device(expected, scored, excluded)
+
+
+def _evaluation_totals_from_device(
+    total_nats: torch.Tensor,
+    expected: torch.Tensor,
+    scored: torch.Tensor,
+    excluded: torch.Tensor,
+) -> Tuple[float, Dict[str, int]]:
+    """Transfer floating nats separately from the exact int64 target partition."""
+    if not isinstance(total_nats, torch.Tensor) or total_nats.numel() != 1:
+        raise TypeError("evaluation total_nats must be a scalar tensor")
+    total_nats_value = float(total_nats.to(dtype=torch.float64).cpu())
+    accounting = _target_accounting_from_device(expected, scored, excluded)
+    return total_nats_value, accounting
 
 
 @torch.no_grad()
@@ -1069,15 +1103,10 @@ def evaluate(
                 total_excluded.add_(decode_stats.excluded_tokens)
             if max_batches is not None and i + 1 >= max_batches:
                 break               # draw exactly max_batches (process-then-break; no extra pull)
-        values = torch.stack((
-            total_nats,
-            total_expected.to(dtype=torch.float64),
-            total_tok.to(dtype=torch.float64),
-            total_excluded.to(dtype=torch.float64),
-        )).cpu().tolist()
-        total_nats_value, expected_value, total_tok_value, excluded_value = values
-        accounting = _target_accounting(expected_value, total_tok_value, excluded_value)
-        if total_tok_value == 0.0:
+        total_nats_value, accounting = _evaluation_totals_from_device(
+            total_nats, total_expected, total_tok, total_excluded)
+        total_tok_value = accounting["scored_targets"]
+        if total_tok_value == 0:
             raise ValueError(
                 "evaluation produced no scored target tokens; no non-ignored target tokens "
                 "remain scored, so metrics are undefined"
@@ -1617,6 +1646,13 @@ def train(
     # this is exactly the pure half-cosine-to-zero (the theoretically pure path). base_lrs are the
     # CONFIGURED per-group LRs, captured before any scheduler multiplier or resume-load mutates group['lr'].
     base_lrs = [g["lr"] for g in optimizer.param_groups]
+    if artifacts is not None:
+        artifacts.scheduler_base_lrs = [float(value) for value in base_lrs]
+        artifacts.scheduler_group_roles = [
+            str(group.get("lr_report_role") or group.get("lr_aux_role")
+                or group.get("role") or f"group_{index}")
+            for index, group in enumerate(optimizer.param_groups)
+        ]
     s_phi_parameter = getattr(model.prior_bank, "s_phi_embed", None)
     s_phi_group_index = (
         next(index for index, group in enumerate(optimizer.param_groups)

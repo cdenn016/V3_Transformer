@@ -11,6 +11,7 @@ family slots in behind -- by writing-and-registering a subclass, never editing c
 
 import warnings
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Callable, ClassVar, Dict, List, Optional, Tuple, Type
 
 import torch
@@ -460,10 +461,30 @@ def divergence_families() -> Tuple[str, ...]:
     return tuple(sorted(_FAMILIES))
 
 
+@dataclass(frozen=True)
+class FunctionalDisplayMetadata:
+    """Human-readable metadata carried by a divergence registration."""
+
+    label: str
+    units: Optional[str]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.label, str) or not self.label.strip():
+            raise ValueError("functional display label must be a nonempty string")
+        if self.units is not None and (not isinstance(self.units, str) or not self.units.strip()):
+            raise ValueError("functional display units must be a nonempty string or None")
+
+
 _FUNCTIONALS: Dict[str, Callable[..., torch.Tensor]] = {}
+_FUNCTIONAL_DISPLAYS: Dict[str, FunctionalDisplayMetadata] = {}
 
 
-def register_functional(name: str, *, override: bool = False) -> Callable[[Callable[..., torch.Tensor]], Callable[..., torch.Tensor]]:
+def register_functional(
+    name: str,
+    *,
+    display: Optional[FunctionalDisplayMetadata] = None,
+    override: bool = False,
+) -> Callable[[Callable[..., torch.Tensor]], Callable[..., torch.Tensor]]:
     r"""Register a divergence functional (renyi, ...) under ``name`` (the ``divergence_family``).
 
     Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
@@ -472,6 +493,10 @@ def register_functional(name: str, *, override: bool = False) -> Callable[[Calla
     def _wrap(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
         if name in _FUNCTIONALS and not override:
             raise KeyError(f"divergence functional {name!r} already registered; pass override=True to replace")
+        if display is not None:
+            _FUNCTIONAL_DISPLAYS[name] = display
+        elif name not in _FUNCTIONAL_DISPLAYS:
+            _FUNCTIONAL_DISPLAYS[name] = FunctionalDisplayMetadata("divergence", None)
         _FUNCTIONALS[name] = fn
         return fn
     return _wrap
@@ -482,6 +507,12 @@ def get_functional(name: str) -> Callable[..., torch.Tensor]:
     if name not in _FUNCTIONALS:
         raise KeyError(f"no functional registered under {name!r}; available: {sorted(_FUNCTIONALS)}")
     return _FUNCTIONALS[name]
+
+
+def get_functional_display(name: str) -> FunctionalDisplayMetadata:
+    """Display metadata for one registered divergence functional."""
+    get_functional(name)
+    return _FUNCTIONAL_DISPLAYS[name]
 
 
 def divergence_functionals() -> Tuple[str, ...]:
@@ -761,10 +792,18 @@ def jeffreys_per_coord(
             + p.renyi_per_coord(q, alpha=1.0, kl_max=kl_max, eps=eps))
 
 
-register_functional("renyi")(renyi)
-register_functional("squared_hellinger")(squared_hellinger)
-register_functional("bhattacharyya")(bhattacharyya)
-register_functional("jeffreys")(jeffreys)
+register_functional(
+    "renyi", display=FunctionalDisplayMetadata("Renyi divergence", "dimensionless"))(renyi)
+register_functional(
+    "squared_hellinger",
+    display=FunctionalDisplayMetadata("squared Hellinger divergence", "dimensionless"),
+)(squared_hellinger)
+register_functional(
+    "bhattacharyya",
+    display=FunctionalDisplayMetadata("Bhattacharyya divergence", "dimensionless"),
+)(bhattacharyya)
+register_functional(
+    "jeffreys", display=FunctionalDisplayMetadata("Jeffreys divergence", "dimensionless"))(jeffreys)
 
 # Per-coordinate forms for the divergences that decompose coordinate-wise (see _FUNCTIONALS_PER_COORD).
 # squared_hellinger is intentionally NOT registered here (non-additive outer transform).

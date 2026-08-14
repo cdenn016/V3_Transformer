@@ -201,6 +201,8 @@ class DiagnosticSnapshot:
     layer_priors:      'Tuple[Tuple[torch.Tensor, torch.Tensor], ...]'
     layer_converged:   'Tuple[BeliefState, ...]'
     layer_outputs:     'Tuple[BeliefState, ...]'
+    layer_block_mlp_inputs:  'Tuple[BeliefState, ...]'
+    layer_block_mlp_outputs: 'Tuple[BeliefState, ...]'
     stack_output:      BeliefState
     final_belief:      BeliefState
     logits:            torch.Tensor
@@ -262,6 +264,27 @@ def _sequence_belief(belief: BeliefState, index: int = 0) -> BeliefState:
     )
 
 
+def _belief_states_mechanically_equal(left: BeliefState, right: BeliefState) -> bool:
+    """Prove exact state equality from the actual belief seam, not derived mappings."""
+    if left is right:
+        return True
+    for name in left._fields:
+        lhs, rhs = getattr(left, name), getattr(right, name)
+        if lhs is rhs:
+            continue
+        if lhs is None or rhs is None:
+            return False
+        if isinstance(lhs, CompactBlockElement) and isinstance(rhs, CompactBlockElement):
+            if lhs.K != rhs.K or lhs.tied != rhs.tied or not torch.equal(lhs.blocks, rhs.blocks):
+                return False
+        elif isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor):
+            if not torch.equal(lhs, rhs):
+                return False
+        elif lhs != rhs:
+            return False
+    return True
+
+
 def _state_specific_free_energy_diagnostics(
     pre_block_mlp: Mapping[str, float],
     post_block_mlp: Mapping[str, float],
@@ -273,11 +296,19 @@ def _state_specific_free_energy_diagnostics(
         raise RuntimeError(
             "pre/post BlockMLP diagnostics require separate component evaluations unless "
             "state equality is mechanically established")
-    components = ("self_coupling", "belief_coupling", "attention_entropy")
+    components = (
+        "self_coupling", "belief_coupling", "attention_entropy", "twohop_coupling",
+        "hyper_prior", "model_coupling", "meta_entropy", "observation_nll",
+    )
+    raw_components = (
+        "self_divergence", "observation_likelihood", "hyper_prior_raw",
+        "gamma_coupling_raw", "gamma_meta_entropy_raw",
+    )
 
     def normalized(source: Mapping[str, float]) -> Dict[str, float]:
-        values = {name: float(source[name]) for name in components}
-        values["total"] = float(source.get("total", sum(values.values())))
+        values = {name: float(source.get(name, 0.0)) for name in components}
+        values.update({name: float(source.get(name, 0.0)) for name in raw_components})
+        values["total"] = float(sum(values[name] for name in components))
         return values
 
     pre = normalized(pre_block_mlp)
@@ -3078,6 +3109,10 @@ class VFEModel(nn.Module):
             layer_converged=tuple(
                 _freeze_belief(belief) for belief in diagnostic["layer_converged"]),
             layer_outputs=layer_outputs,
+            layer_block_mlp_inputs=tuple(
+                _freeze_belief(layer) for layer in diagnostic["layer_block_mlp_inputs"]),
+            layer_block_mlp_outputs=tuple(
+                _freeze_belief(layer) for layer in diagnostic["layer_block_mlp_outputs"]),
             stack_output=stack_output,
             final_belief=_freeze_belief(final_belief),
             logits=_freeze_tensor(logits),
@@ -3190,7 +3225,11 @@ class VFEModel(nn.Module):
             log_prior = self._first_sequence_log_prior(snapshot.log_prior, token_ids.shape[0])
             rope = snapshot.rope
             out = _sequence_belief(snapshot.stack_output)
-            cap = {"converged": _sequence_belief(snapshot.layer_converged[-1])}
+            cap = {
+                "converged": _sequence_belief(snapshot.layer_converged[-1]),
+                "block_mlp_input": _sequence_belief(snapshot.layer_block_mlp_inputs[-1]),
+                "block_mlp_output": _sequence_belief(snapshot.layer_block_mlp_outputs[-1]),
+            }
 
         rho = cfg.prior_handoff_rho                                  # rebuild last-block prior
         rho_s = cfg.prior_handoff_sigma
@@ -3244,8 +3283,10 @@ class VFEModel(nn.Module):
             beta = snapshot.beta_maps[-1]
             if energy.dim() == 2:
                 beta = beta[0]
-        _q_pre_block_mlp = cap["converged"]                        # compatibility raw pre-transform state
-        _q_conv = out                                                   # every term in the headline F uses this state
+        _q_pre_block_mlp = cap["block_mlp_input"]                 # immediate input after mixer/CG/norm
+        _q_conv = cap["block_mlp_output"]                         # immediate BlockMLP output
+        _block_mlp_states_equal = _belief_states_mechanically_equal(
+            _q_pre_block_mlp, _q_conv)
         self_div = self_divergence_for_alpha(                            # coherent post-BlockMLP belief state
             self._family_instance(fam, _q_conv.mu, _q_conv.sigma),
             self._family_instance(fam, mu_p, sigma_p),                # (matches the M-step term; F19)
@@ -3288,62 +3329,65 @@ class VFEModel(nn.Module):
         }
         registered = metrics.compute_metrics(list(metrics.DIAGNOSTIC_METRIC_NAMES), **metric_context)
 
-        # Independently score the captured pre-BlockMLP belief. This repeats the active family,
-        # transport, temperature, prior, entropy, and alpha policies at that state; no component is
-        # borrowed from the post-BlockMLP evaluation above.
-        pre_omega = self._diagnostic_transport(_q_pre_block_mlp)
-        pre_base_omega = None
-        if rope is not None:
-            pre_effective = RopeTransport(
-                base=pre_omega, rope=rope, on_cov=cfg.rope_full_gauge,
-                on_value=cfg.rope_on_value, insertion=cfg.rope_insertion,
-                same_frame_flat_cocycle=getattr(pre_omega, "same_frame_flat_cocycle", False),
-            )
-            pre_mu, pre_sigma = _q_pre_block_mlp.mu, _q_pre_block_mlp.sigma
-            pre_batched = False
-            if not cfg.rope_on_value:
-                pre_base_omega = pre_omega
+        # A distinct immediate MLP input needs its own complete evaluation. When actual belief
+        # tensors prove equality, reuse the post-state result and avoid duplicate pair-energy work.
+        if _block_mlp_states_equal:
+            pre_self_div = self_div
+            pre_terms = registered["free_energy_terms"]
         else:
-            pre_effective = pre_omega.unsqueeze(0)
-            pre_mu = _q_pre_block_mlp.mu.unsqueeze(0)
-            pre_sigma = _q_pre_block_mlp.sigma.unsqueeze(0)
-            pre_batched = True
-        pre_energy = self._coupling_energy(
-            fam, pre_mu, pre_sigma, pre_mu, pre_sigma, pre_effective,
-            alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
-            divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
-        )
-        pre_coupling_energy = None
-        if pre_base_omega is not None:
-            pre_coupling_energy = self._coupling_energy(
-                fam, pre_mu, pre_sigma, pre_mu, pre_sigma, pre_base_omega,
+            pre_omega = self._diagnostic_transport(_q_pre_block_mlp)
+            pre_base_omega = None
+            if rope is not None:
+                pre_effective = RopeTransport(
+                    base=pre_omega, rope=rope, on_cov=cfg.rope_full_gauge,
+                    on_value=cfg.rope_on_value, insertion=cfg.rope_insertion,
+                    same_frame_flat_cocycle=getattr(pre_omega, "same_frame_flat_cocycle", False),
+                )
+                pre_mu, pre_sigma = _q_pre_block_mlp.mu, _q_pre_block_mlp.sigma
+                pre_batched = False
+                if not cfg.rope_on_value:
+                    pre_base_omega = pre_omega
+            else:
+                pre_effective = pre_omega.unsqueeze(0)
+                pre_mu = _q_pre_block_mlp.mu.unsqueeze(0)
+                pre_sigma = _q_pre_block_mlp.sigma.unsqueeze(0)
+                pre_batched = True
+            pre_energy = self._coupling_energy(
+                fam, pre_mu, pre_sigma, pre_mu, pre_sigma, pre_effective,
                 alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
                 divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
             )
-        if pre_batched:
-            pre_energy = pre_energy[0]
-        pre_tau = self._beta_tau(
-            _q_pre_block_mlp.sigma, _q_pre_block_mlp.mu,
-            attention_tau(self.effective_kappa_beta(out.mu.device), self.group.irrep_dims),
-        )
-        pre_beta = attention_weights(pre_energy, tau=pre_tau, log_prior=log_prior)
-        pre_self_div = self_divergence_for_alpha(
-            self._family_instance(fam, _q_pre_block_mlp.mu, _q_pre_block_mlp.sigma),
-            self._family_instance(fam, mu_p, sigma_p),
-            alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
-            divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
-        )
-        pre_alpha, pre_alpha_reg = self_coupling_alpha(
-            pre_self_div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha,
-            b0=_as_coeff(cfg.b0, out.mu.device), c0=_as_coeff(cfg.c0, out.mu.device),
-        )
-        pre_terms = metrics.free_energy_terms(
-            pre_self_div, pre_energy, pre_beta, pre_alpha, tau=pre_tau,
-            lambda_beta=_lb, lambda_twohop=cfg.lambda_twohop,
-            include_attention_entropy=cfg.include_attention_entropy, log_prior=log_prior,
-            alpha_reg=(pre_alpha_reg if cfg.lambda_alpha_mode != "constant" else None),
-            coupling_energy=pre_coupling_energy, log_likelihood=log_likelihood,
-        )
+            pre_coupling_energy = None
+            if pre_base_omega is not None:
+                pre_coupling_energy = self._coupling_energy(
+                    fam, pre_mu, pre_sigma, pre_mu, pre_sigma, pre_base_omega,
+                    alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+                    divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
+                )
+            if pre_batched:
+                pre_energy = pre_energy[0]
+            pre_tau = self._beta_tau(
+                _q_pre_block_mlp.sigma, _q_pre_block_mlp.mu,
+                attention_tau(self.effective_kappa_beta(out.mu.device), self.group.irrep_dims),
+            )
+            pre_beta = attention_weights(pre_energy, tau=pre_tau, log_prior=log_prior)
+            pre_self_div = self_divergence_for_alpha(
+                self._family_instance(fam, _q_pre_block_mlp.mu, _q_pre_block_mlp.sigma),
+                self._family_instance(fam, mu_p, sigma_p),
+                alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+                divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
+            )
+            pre_alpha, pre_alpha_reg = self_coupling_alpha(
+                pre_self_div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha,
+                b0=_as_coeff(cfg.b0, out.mu.device), c0=_as_coeff(cfg.c0, out.mu.device),
+            )
+            pre_terms = metrics.free_energy_terms(
+                pre_self_div, pre_energy, pre_beta, pre_alpha, tau=pre_tau,
+                lambda_beta=_lb, lambda_twohop=cfg.lambda_twohop,
+                include_attention_entropy=cfg.include_attention_entropy, log_prior=log_prior,
+                alpha_reg=(pre_alpha_reg if cfg.lambda_alpha_mode != "constant" else None),
+                coupling_energy=pre_coupling_energy, log_likelihood=log_likelihood,
+            )
         d: Dict[str, float] = {}
         for metric_name, output_name, flatten in metrics.DIAGNOSTIC_METRIC_OUTPUTS:
             value = registered[metric_name]
@@ -3433,19 +3477,42 @@ class VFEModel(nn.Module):
                 hyper_prior_rows, model_coupling_rows, meta_entropy_rows,
                 belief_rows.observation_nll,
                 q_reduction="sum", model_reduction="sum").total)
-        post_components = {
-            name: d[name] for name in ("self_coupling", "belief_coupling", "attention_entropy", "total")
+        model_components = {
+            "hyper_prior": float(d.get("hyper_prior_weighted", 0.0)),
+            "model_coupling": float(cfg.lambda_gamma) * float(d.get("gamma_coupling", 0.0)),
+            "meta_entropy": (
+                float(cfg.lambda_gamma) * float(d.get("gamma_meta_entropy", 0.0))
+                if cfg.include_attention_entropy else 0.0
+            ),
+            "hyper_prior_raw": float(d.get("hyper_prior", 0.0)),
+            "gamma_coupling_raw": float(d.get("gamma_coupling", 0.0)),
+            "gamma_meta_entropy_raw": float(d.get("gamma_meta_entropy", 0.0)),
         }
-        pre_components = {
-            name: float(pre_terms[name])
-            for name in ("self_coupling", "belief_coupling", "attention_entropy", "total")
-        }
-        # Model-channel rows are independent of the BlockMLP mean/covariance transform on this
-        # diagnostic path. Add their already-assembled contribution to each separately evaluated
-        # belief-channel total so both named totals retain the same declared hierarchical scope.
-        model_channel_contribution = d["total"] - float(registered["free_energy_terms"]["total"])
-        pre_components["total"] += model_channel_contribution
-        d.update(_state_specific_free_energy_diagnostics(pre_components, post_components))
+
+        def state_components(terms: Mapping[str, float], raw_self: torch.Tensor) -> Dict[str, float]:
+            return {
+                "self_coupling": float(terms["self_coupling"]),
+                "belief_coupling": float(_lb) * float(terms["belief_coupling"]),
+                "attention_entropy": (
+                    float(_lb) * float(terms["attention_entropy"])
+                    if cfg.include_attention_entropy else 0.0
+                ),
+                "twohop_coupling": (
+                    float(cfg.lambda_twohop) * float(terms.get("twohop_coupling", 0.0))
+                ),
+                "observation_nll": -float(terms.get("observation_likelihood", 0.0)),
+                "self_divergence": float(raw_self.sum()),
+                "observation_likelihood": float(terms.get("observation_likelihood", 0.0)),
+                **model_components,
+            }
+
+        post_components = state_components(registered["free_energy_terms"], self_div)
+        pre_components = state_components(pre_terms, pre_self_div)
+        d.update(_state_specific_free_energy_diagnostics(
+            pre_components, post_components,
+            states_equal_proven=_block_mlp_states_equal,
+        ))
+        d["block_mlp_state_equality_proven"] = _block_mlp_states_equal
         d.update(_numerical_policy_diagnostics(
             m_phi_group_trust_radius=cfg.m_phi_group_trust_radius,
             phi_mstep_max_matrix_norm=cfg.phi_mstep_max_matrix_norm,

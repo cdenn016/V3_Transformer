@@ -65,18 +65,26 @@ def test_target_blindness_has_no_correlation_sign_expectation() -> None:
     assert "correlation" not in text.lower()
 
 
-def test_registered_divergence_label_is_not_hardcoded_kl(monkeypatch) -> None:
+def test_registered_divergence_label_is_not_hardcoded_kl() -> None:
+    from vfe3.families import base
     from vfe3.viz import figures
 
-    class Functional:
-        diagnostic_label = "registered alpha objective"
-        diagnostic_units = "registered-units"
+    name = "reporting_non_kl"
+    display = base.FunctionalDisplayMetadata(
+        "registered alpha objective", "registered-units")
 
-    monkeypatch.setattr(figures, "get_functional", lambda _name: Functional())
-    assert figures._registered_divergence_axis("non_kl") == (
-        "registered alpha objective",
-        "registered-units",
-    )
+    def functional(*_args, **_kwargs):
+        return torch.tensor(0.0)
+
+    try:
+        base.register_functional(name, display=display)(functional)
+        assert figures._registered_divergence_axis(name) == (
+            "registered alpha objective",
+            "registered-units",
+        )
+    finally:
+        base._FUNCTIONALS.pop(name, None)
+        base._FUNCTIONAL_DISPLAYS.pop(name, None)
 
 
 def test_data_seed_none_is_nonshared_unspecified() -> None:
@@ -94,7 +102,9 @@ def test_scheduler_metadata_matches_one_percent_floor() -> None:
         "kind": "warmup_half_cosine_with_floor",
         "absolute_floor": 0.0,
         "fractional_floor": 0.01,
-        "floor_description": "max(absolute_floor, fractional_floor * group_base_lr)",
+        "floor_description": "0 for group_base_lr == 0; otherwise max(absolute_floor, fractional_floor * group_base_lr)",
+        "zero_base_groups_remain_frozen": True,
+        "groups": [],
     }
 
 

@@ -14,7 +14,7 @@ A training run produces a self-contained directory::
       val_ppl.png        validation perplexity trajectory (log-y, best marked)
       holonomy.png / gauge_trace_spread.png   gauge-geometry diagnostics
       free_energy_decomposition.png   per-token F budget snapshot + early/mid/late evolution
-      free_energy_codescent.png       F-vs-validation-CE co-descent (twin axis)
+      free_energy_relationship.png     final-iterate objective vs validation CE
 
 ``RunArtifacts`` is OPT-IN: ``train`` only touches it when an instance is passed, so the silent
 path (``artifacts=None``) writes nothing and is unchanged. ``finalize_run`` reloads the best-val
@@ -1615,6 +1615,8 @@ class RunArtifacts:
         self.code_identity_sha256 = _verified_process_code_identity()
         self.run_start_git_identity = dict(_git_code_identity())
         self.selection_data_identity: Optional[Dict[str, object]] = None
+        self.scheduler_base_lrs: List[float] = []
+        self.scheduler_group_roles: List[str] = []
 
         self.best_val_ppl: float = float("inf")
         self.best_step: Optional[int] = None
@@ -3137,17 +3139,57 @@ def _estep_iterate_evidence(
     }
 
 
+def _estep_endpoint_artifact(evidence: Mapping[str, object]) -> Dict[str, str]:
+    """Name the endpoint-delta artifact without claiming unproven iterate behavior."""
+    title = "E-step endpoint delta"
+    if evidence.get("descent_evidence"):
+        title += " (descent established)"
+    return {"filename": "estep_endpoint_delta.png", "title": title}
+
+
 def _target_blind_objective_interpretation() -> str:
     """State only the justified structural conclusion of a target-blind E-step."""
     return "The target-blind latent objective is structurally separate from held-out prediction."
 
 
-def _scheduler_metadata(*, min_lr: float, min_lr_frac: float) -> Dict[str, object]:
+def _scheduler_metadata(
+    *,
+    min_lr: float,
+    min_lr_frac: float,
+    base_lrs: Iterable[float] = (),
+    group_roles: Iterable[str] = (),
+) -> Dict[str, object]:
+    """Describe the executable per-group floor, including frozen zero-base groups."""
+    bases = [float(value) for value in base_lrs]
+    roles = [str(value) for value in group_roles]
+    if roles and len(roles) != len(bases):
+        raise ValueError("scheduler group roles and base learning rates must have equal length")
+    if not roles:
+        roles = [f"group_{index}" for index in range(len(bases))]
+    groups = []
+    for index, (role, base) in enumerate(zip(roles, bases)):
+        if base < 0.0 or not math.isfinite(base):
+            raise ValueError(f"scheduler group {index} base LR must be finite and nonnegative")
+        frozen = base == 0.0
+        groups.append({
+            "index": index,
+            "role": role,
+            "base_lr": base,
+            "frozen": frozen,
+            "absolute_floor": 0.0 if frozen else float(min_lr),
+            "fractional_floor": 0.0 if frozen else float(min_lr_frac) * base,
+            "effective_floor": (0.0 if frozen else max(float(min_lr), float(min_lr_frac) * base)),
+        })
     return {
         "kind": "warmup_half_cosine_with_floor",
         "absolute_floor": float(min_lr),
         "fractional_floor": float(min_lr_frac),
-        "floor_description": "max(absolute_floor, fractional_floor * group_base_lr)",
+        "zero_base_groups_remain_frozen": True,
+        "floor_description": (
+            "0 for group_base_lr == 0; otherwise "
+            "max(absolute_floor, fractional_floor * group_base_lr)"
+        ),
+        "groups": groups,
     }
 
 
@@ -3266,7 +3308,7 @@ def finalize_run(
 
     # EXP-5 (C2): the converged final E-step free energy PER TOKEN -- the E-step's OWN target-blind
     # functional value (free_energy_value sums F over the N tokens; divide by N). Persisted so a
-    # cross-arm reader (scaling_analysis) can test whether final F DECORRELATES from CE across an
+    # cross-arm reader (scaling_analysis) can describe the final-F/CE relationship across an
     # n_e_steps sweep -- the structural non-Neal-Hinton EM prediction (the E-step serves a distinct
     # functional, not the likelihood). Off-graph, best-effort, on a fixed test batch (sequence 0).
     if test_loader is not None:
@@ -3414,7 +3456,12 @@ def finalize_run(
         "estep_final_iterate_f_per_token": results.get("estep_final_iterate_f_per_token"),
         "estep_final_f_per_token": results.get("estep_final_f_per_token"),
         "estep_iterate_evidence": results.get("estep_iterate_evidence"),
-        "scheduler": _scheduler_metadata(min_lr=cfg.min_lr, min_lr_frac=cfg.min_lr_frac),
+        "scheduler": _scheduler_metadata(
+            min_lr=cfg.min_lr,
+            min_lr_frac=cfg.min_lr_frac,
+            base_lrs=getattr(artifacts, "scheduler_base_lrs", ()),
+            group_roles=getattr(artifacts, "scheduler_group_roles", ()),
+        ),
         "final_train_loss": (losses[-1] if losses else None),
         "wall_time_s":  wall_time,
         "use_prior_bank":  cfg.use_prior_bank,
@@ -4976,9 +5023,8 @@ def _save_figures(
                 fig = figs.plot_kappa_block_trajectory(
                     _hist_kb, path=str(run / "kappa_block_trajectory.png"))
                 figs.plt.close(fig)
-        # Optimization + convergence trends (history-only; no model re-run): the pre-clip gradient
-        # norm (THE optimization-health curve, previously discarded), the belief-covariance
-        # conditioning, and the per-eval E-step F-descent (negative = the inner loop reduced F).
+        # Optimization and endpoint trends (history-only; no model re-run): the pre-clip gradient
+        # norm, belief-covariance conditioning, and the per-eval E-step endpoint delta.
         nx, ny = _aligned("grad_norm")
         if ny:
             fig = figs.plot_trajectory(
@@ -5035,13 +5081,14 @@ def _save_figures(
             figs.plt.close(fig)
         ex, ey = _aligned("estep_f_drop")
         if ey:
+            _endpoint_artifact = _estep_endpoint_artifact({})
             fig = figs.plot_trajectory(
                 ey, ex, ylabel=r"$F_{\mathrm{end}}-F_{\mathrm{start}}$ (inner E-step)",
-                title="E-step free-energy descent", color=figs._CB[2 % len(figs._CB)],
-                median_line=True, path=str(run / "estep_convergence_trend.png"))
+                title=_endpoint_artifact["title"], color=figs._CB[2 % len(figs._CB)],
+                median_line=True, path=str(run / _endpoint_artifact["filename"]))
             figs.plt.close(fig)
-        # Free-energy figures: the per-token budget DECOMPOSITION (snapshot + early/mid/late evolution)
-        # and, as a SEPARATE figure, the F-vs-CE CO-DESCENT over training. Both need every plotted term
+        # Free-energy figures: the per-token budget decomposition (snapshot + early/mid/late evolution)
+        # and, separately, the final-iterate objective/CE relationship over training. Both need every plotted term
         # finite, so rows before the first eval (NaN val_*) are dropped.
         fe_keys = ("self_coupling", "belief_coupling", "attention_entropy", "val_ce")
         fe_rows = [r for r in artifacts.history
@@ -5066,9 +5113,10 @@ def _save_figures(
                 divergence_family=getattr(cfg, "divergence_family", "renyi"),
                 path=str(run / "free_energy_decomposition.png"))
             figs.plt.close(fig)
-            fig = figs.plot_free_energy_codescent(
+            fig = figs.plot_free_energy_relationship(
                 hist, lambda_beta=lam, lambda_gamma=gam, include_attention_entropy=iae,
-                path=str(run / "free_energy_codescent.png"))
+                divergence_family=getattr(cfg, "divergence_family", "renyi"),
+                path=str(run / "free_energy_relationship.png"))
             figs.plt.close(fig)
         # Model-channel free-energy blocks (s-channel): the hyper-prior KL(s||r), the gamma
         # model-coupling, and its meta-entropy over training. Present only when the model channel

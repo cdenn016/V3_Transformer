@@ -59,7 +59,7 @@ _FULL_PAIR_MATRIX_WORKSETS = 8
 _COORDINATE_WORKSETS = 12
 
 _SINGLE_RUN_FIGURE_INVENTORY = (
-    "estep_convergence.png",
+    "iterate_trajectory.png",
     "belief_trajectories.png",
     "belief_category_separation.png",
     "attention_structure.png",
@@ -751,7 +751,7 @@ def generate_figures(
         or (mc_bank is not None and mc_bank["token_ids"].shape[0] == max_tokens)
     )
     availability = {
-        "estep_convergence":          trace is not None,
+        "iterate_trajectory":         trace is not None,
         "belief_trajectories":        trace is not None,
         "belief_category_separation": bank is not None,
         "attention_structure":        amaps is not None,
@@ -816,9 +816,9 @@ def generate_figures(
                 figs.plt.close(num)
             logger.warning("figure %r failed (%s); continuing", name, exc)
 
-    _emit("estep_convergence",
-          lambda p: figs.plot_estep_convergence(trace, path=p),
-          "estep_convergence.png" in planned_figures)
+    _emit("iterate_trajectory",
+          lambda p: figs.plot_iterate_trajectory(trace, divergence_family=cfg.divergence_family, path=p),
+          "iterate_trajectory.png" in planned_figures)
     _emit("belief_trajectories",
           lambda p: figs.plot_belief_trajectories(trace, layer_trace, path=p),
           "belief_trajectories.png" in planned_figures)

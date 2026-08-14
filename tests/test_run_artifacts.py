@@ -310,7 +310,7 @@ def test_history_figures_run_in_disposable_process_without_mutating_parent_openm
     assert completed is True
     assert "KMP_DUPLICATE_LIB_OK" not in os.environ
     assert (art.run_dir / "loss_curve.png").is_file()
-    assert (art.run_dir / "free_energy_codescent.png").is_file()
+    assert (art.run_dir / "free_energy_relationship.png").is_file()
 
 
 def test_maybe_save_best_only_on_improvement(tmp_path):
