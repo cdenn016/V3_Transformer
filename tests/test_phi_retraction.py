@@ -126,6 +126,25 @@ def test_clamp_phi_trace_bounds_block_trace_under_tied_gauge():
     assert (_block_traces(out, G, irrep).abs() <= T + 1e-4).all()
 
 
+def test_trace_projection_survives_bf16_autocast():
+    # Under AMP the (V V^T) matmul is downcast and linalg.pinv has no bf16 kernel: both trace
+    # solves must run in their own fp32 island (amp_dtype='bf16' + pos_phi_project_slk=True).
+    G = generate_glk_multihead(6, 2)
+    irrep = [3, 3]
+    torch.manual_seed(0)
+    phi = 0.5 * torch.randn(5, G.shape[0])
+    T = 0.1
+    with torch.amp.autocast("cpu", dtype=torch.bfloat16):
+        projected = project_phi_to_slk(phi, G, irrep)
+        clamped = clamp_phi_trace(phi, G, irrep, trace_max=T)
+    assert projected.dtype == phi.dtype and clamped.dtype == phi.dtype
+    assert torch.allclose(_block_traces(projected, G, irrep), torch.zeros(5, 2), atol=1e-5)
+    assert (_block_traces(clamped, G, irrep).abs() <= T + 1e-4).all()
+    # fp32-exact: the island must not have let bf16 leak into the trace solve
+    assert torch.allclose(projected, project_phi_to_slk(phi, G, irrep))
+    assert torch.allclose(clamped, clamp_phi_trace(phi, G, irrep, trace_max=T))
+
+
 from vfe3.geometry.groups import get_group
 from vfe3.geometry.retraction import retract_phi
 
