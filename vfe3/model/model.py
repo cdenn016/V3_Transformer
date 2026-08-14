@@ -34,6 +34,7 @@ from vfe3.config import VFE3Config
 from vfe3.emission import bohning_emission_terms
 from vfe3.contracts import (
     CanonicalFrameContext,
+    ExecutableBuildMetadata,
     EffectiveBetaPriorContext,
     EStepGradientOutput,
     EStepGradientRecord,
@@ -56,7 +57,11 @@ from vfe3.geometry.transport import (
 )
 from vfe3.model.canonical_content import project_canonical_diagonal
 from vfe3.model.head_mixer import HeadMixer
-from vfe3.model.block_mlp import build_block_mlp
+from vfe3.model.block_mlp import (
+    block_mlp_build_metadata,
+    build_block_mlp,
+    get_block_mlp_registration,
+)
 from vfe3.model.block import _as_coeff, vfe_block
 from vfe3.model.model_frame import resolve_model_frame
 from vfe3.model.positional_phi import apply_positional_phi, positional_phi_coords
@@ -196,6 +201,8 @@ class DiagnosticSnapshot:
     layer_priors:      'Tuple[Tuple[torch.Tensor, torch.Tensor], ...]'
     layer_converged:   'Tuple[BeliefState, ...]'
     layer_outputs:     'Tuple[BeliefState, ...]'
+    layer_block_mlp_inputs:  'Tuple[BeliefState, ...]'
+    layer_block_mlp_outputs: 'Tuple[BeliefState, ...]'
     stack_output:      BeliefState
     final_belief:      BeliefState
     logits:            torch.Tensor
@@ -255,6 +262,78 @@ def _sequence_belief(belief: BeliefState, index: int = 0) -> BeliefState:
                    if belief.right_phi is not None and belief.right_phi.dim() == belief.phi.dim()
                    else belief.right_phi),
     )
+
+
+def _belief_states_mechanically_equal(left: BeliefState, right: BeliefState) -> bool:
+    """Prove exact state equality from the actual belief seam, not derived mappings."""
+    if left is right:
+        return True
+    for name in left._fields:
+        lhs, rhs = getattr(left, name), getattr(right, name)
+        if lhs is rhs:
+            continue
+        if lhs is None or rhs is None:
+            return False
+        if isinstance(lhs, CompactBlockElement) and isinstance(rhs, CompactBlockElement):
+            if lhs.K != rhs.K or lhs.tied != rhs.tied or not torch.equal(lhs.blocks, rhs.blocks):
+                return False
+        elif isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor):
+            if not torch.equal(lhs, rhs):
+                return False
+        elif lhs != rhs:
+            return False
+    return True
+
+
+def _state_specific_free_energy_diagnostics(
+    pre_block_mlp: Mapping[str, float],
+    post_block_mlp: Mapping[str, float],
+    *,
+    states_equal_proven: bool = False,
+) -> Dict[str, float]:
+    """Serialize separately evaluated states; reject an accidental same-object alias."""
+    if pre_block_mlp is post_block_mlp and not states_equal_proven:
+        raise RuntimeError(
+            "pre/post BlockMLP diagnostics require separate component evaluations unless "
+            "state equality is mechanically established")
+    components = (
+        "self_coupling", "belief_coupling", "attention_entropy", "twohop_coupling",
+        "hyper_prior", "model_coupling", "meta_entropy", "observation_nll",
+    )
+    raw_components = (
+        "self_divergence", "observation_likelihood", "hyper_prior_raw",
+        "gamma_coupling_raw", "gamma_meta_entropy_raw",
+    )
+
+    def normalized(source: Mapping[str, float]) -> Dict[str, float]:
+        values = {name: float(source.get(name, 0.0)) for name in components}
+        values.update({name: float(source.get(name, 0.0)) for name in raw_components})
+        values["total"] = float(sum(values[name] for name in components))
+        return values
+
+    pre = normalized(pre_block_mlp)
+    post = normalized(post_block_mlp)
+    out = {f"pre_block_mlp_{name}": value for name, value in pre.items()}
+    out.update({f"post_block_mlp_{name}": value for name, value in post.items()})
+    # Compatibility alias: the unqualified total now means one coherent post-BlockMLP state.
+    out["total"] = post["total"]
+    return out
+
+
+def _numerical_policy_diagnostics(
+    *,
+    m_phi_group_trust_radius: Optional[float],
+    phi_mstep_max_matrix_norm: Optional[float],
+    transport_chart_max_norm: Optional[float],
+    exp_fp64_norm_threshold: Optional[float],
+) -> Dict[str, Optional[float]]:
+    """Return the exact active production numerical policy, including disabled bounds."""
+    return {
+        "m_phi_group_trust_radius": m_phi_group_trust_radius,
+        "phi_mstep_max_matrix_norm": phi_mstep_max_matrix_norm,
+        "transport_chart_max_norm": transport_chart_max_norm,
+        "exp_fp64_norm_threshold": exp_fp64_norm_threshold,
+    }
 
 
 class VFEModel(nn.Module):
@@ -377,6 +456,21 @@ class VFEModel(nn.Module):
                 for _ in range(cfg.n_layers)
             ]) if cfg.use_block_mlp else None
         )
+        self._block_mlp_registration = get_block_mlp_registration(cfg.block_mlp_mode)
+        self.executable_build = ExecutableBuildMetadata(
+            block_mlp=block_mlp_build_metadata(
+                enabled=cfg.use_block_mlp,
+                mode=cfg.block_mlp_mode,
+                covariance=cfg.block_mlp_covariance,
+                expansion=cfg.block_mlp_expansion,
+                activation=cfg.block_mlp_activation,
+                dropout=cfg.block_mlp_dropout,
+                covariance_floor=cfg.block_mlp_covariance_floor,
+                embed_dim=cfg.embed_dim,
+                irrep_dims=self.group.irrep_dims,
+                n_layers=cfg.n_layers,
+            )
+        )
         self.final_norm = get_norm(cfg.norm_type_final)(cfg.embed_dim, eps=cfg.eps,
                                                          family=cfg.family,
                                                          affine=cfg.layernorm_affine) \
@@ -428,7 +522,8 @@ class VFEModel(nn.Module):
             self.cg_coupling = CGCoupling(
                 cfg.group_n, self.group.algebra,
                 self.group.irrep_dims, self.group.irrep_labels,
-                cg_covariance_mode=cfg.cg_covariance_mode)
+                cg_covariance_mode=cfg.cg_covariance_mode,
+                cg_covariance_floor=cfg.cg_covariance_floor)
         else:
             self.cg_coupling = None
         if (cfg.use_head_mixer
@@ -887,9 +982,10 @@ class VFEModel(nn.Module):
         beliefs: BeliefState,
         rope: Optional[torch.Tensor],
     ) -> 'tuple[Optional[object], Optional[CanonicalFrameContext]]':
+        block_mlp_build = self.executable_build.block_mlp
         if not (
-            self.cfg.use_block_mlp
-            and self.cfg.block_mlp_mode == "canonical_frame"
+            block_mlp_build.enabled
+            and self._block_mlp_registration.requires_frame_context
         ):
             return None, None
         transport = self._build_shared_flat_transport(
@@ -987,16 +1083,13 @@ class VFEModel(nn.Module):
         decode_last:     bool = False,
     ) -> torch.Tensor:
         r"""Decode one realized belief through the model-owned frame/context boundary."""
-        if decode_last:
-            mu_q = mu_q[:, -1:]
-            sigma_q = sigma_q[:, -1:]
-            canonical_frame = self._slice_canonical_frame(canonical_frame, slice(-1, None))
         with self._amp_off_context(mu_q.device):
-            return self.prior_bank.decode(
+            logits = self.prior_bank.decode(
                 mu_q.float(),
                 sigma_q.float(),
                 canonical_frame=canonical_frame,
             )
+        return logits[:, -1:] if decode_last else logits
 
     def _resolve_model_frame(
         self,
@@ -1328,7 +1421,10 @@ class VFEModel(nn.Module):
                     rope=rope, prebuilt_transport=shared_omega)
                 s_belief = (s_mu1, s_sigma1)
                 beliefs = beliefs._replace(mu=s_mu1, sigma=s_sigma1)
-            if self.cfg.use_block_mlp and self.cfg.block_mlp_mode == "canonical_frame":
+            if (
+                self.executable_build.block_mlp.enabled
+                and self._block_mlp_registration.requires_frame_context
+            ):
                 if shared_omega is None:
                     shared_omega, block_mlp_frame = self._block_mlp_frame_transport(
                         beliefs, rope)
@@ -1835,6 +1931,7 @@ class VFEModel(nn.Module):
             and decode_registration.supports_chunked
         )
         scored_tokens = None
+        excluded_tokens = None
         if fused_chunked:
             with self._amp_off_context(token_ids.device):
                 fused_kwargs = {"z_loss_weight": self.cfg.z_loss_weight}
@@ -1864,12 +1961,14 @@ class VFEModel(nn.Module):
                             f"but returned {type(fused_result).__name__}"
                         )
                     ce = fused_result.ce
+                    excluded_tokens = fused_result.excluded_tokens
                     scored_tokens = fused_result.scored_tokens
                 else:
                     ce = fused_result
                     if return_decode_stats:
                         # Legacy custom fused decoders have no exclusion channel beyond ignore_index.
                         scored_tokens = (targets != -100).sum(dtype=torch.int64)
+                        excluded_tokens = scored_tokens.new_tensor(targets.numel()) - scored_tokens
             logits = None                                        # no (B, N, V) tensor on the fused path
         else:
             logits = self._decode_belief_with_context(
@@ -1901,6 +2000,7 @@ class VFEModel(nn.Module):
                 # gives 0/1 = a finite grad-connected 0; F.cross_entropy's default mean would be
                 # 0/0 = NaN there, poisoning logging / NaN-guards / grad-accum means.
                 scored_tokens = (flat_targets != -100).sum(dtype=torch.int64)
+                excluded_tokens = scored_tokens.new_tensor(flat_targets.numel()) - scored_tokens
                 n_valid = scored_tokens.clamp_min(1)
                 ce = F.cross_entropy(flat_logits, flat_targets, ignore_index=-100,
                                      reduction="sum") / n_valid
@@ -2060,9 +2160,10 @@ class VFEModel(nn.Module):
         # beta/gamma are frozen or envelope-eliminated, and keep the optimizer objective-agnostic.
         ce_detached = ce.detach()
         if return_decode_stats:
-            if scored_tokens is None:
-                raise RuntimeError("decoder stats requested without a scored-token count")
-            return logits, loss, DecodeCEResult(ce_detached, scored_tokens)
+            if scored_tokens is None or excluded_tokens is None:
+                raise RuntimeError("decoder stats requested without scored/excluded-token counts")
+            return logits, loss, DecodeCEResult(
+                ce_detached, scored_tokens, excluded_tokens)
         return logits, loss, ce_detached
 
     @property
@@ -3008,6 +3109,10 @@ class VFEModel(nn.Module):
             layer_converged=tuple(
                 _freeze_belief(belief) for belief in diagnostic["layer_converged"]),
             layer_outputs=layer_outputs,
+            layer_block_mlp_inputs=tuple(
+                _freeze_belief(layer) for layer in diagnostic["layer_block_mlp_inputs"]),
+            layer_block_mlp_outputs=tuple(
+                _freeze_belief(layer) for layer in diagnostic["layer_block_mlp_outputs"]),
             stack_output=stack_output,
             final_belief=_freeze_belief(final_belief),
             logits=_freeze_tensor(logits),
@@ -3120,7 +3225,11 @@ class VFEModel(nn.Module):
             log_prior = self._first_sequence_log_prior(snapshot.log_prior, token_ids.shape[0])
             rope = snapshot.rope
             out = _sequence_belief(snapshot.stack_output)
-            cap = {"converged": _sequence_belief(snapshot.layer_converged[-1])}
+            cap = {
+                "converged": _sequence_belief(snapshot.layer_converged[-1]),
+                "block_mlp_input": _sequence_belief(snapshot.layer_block_mlp_inputs[-1]),
+                "block_mlp_output": _sequence_belief(snapshot.layer_block_mlp_outputs[-1]),
+            }
 
         rho = cfg.prior_handoff_rho                                  # rebuild last-block prior
         rho_s = cfg.prior_handoff_sigma
@@ -3174,8 +3283,11 @@ class VFEModel(nn.Module):
             beta = snapshot.beta_maps[-1]
             if energy.dim() == 2:
                 beta = beta[0]
-        _q_conv = cap["converged"]                                   # q*: the F self-term reads the
-        self_div = self_divergence_for_alpha(                        # pre-transform converged belief
+        _q_pre_block_mlp = cap["block_mlp_input"]                 # immediate input after mixer/CG/norm
+        _q_conv = cap["block_mlp_output"]                         # immediate BlockMLP output
+        _block_mlp_states_equal = _belief_states_mechanically_equal(
+            _q_pre_block_mlp, _q_conv)
+        self_div = self_divergence_for_alpha(                            # coherent post-BlockMLP belief state
             self._family_instance(fam, _q_conv.mu, _q_conv.sigma),
             self._family_instance(fam, mu_p, sigma_p),                # (matches the M-step term; F19)
             alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
@@ -3216,6 +3328,66 @@ class VFEModel(nn.Module):
             "log_likelihood":            log_likelihood,
         }
         registered = metrics.compute_metrics(list(metrics.DIAGNOSTIC_METRIC_NAMES), **metric_context)
+
+        # A distinct immediate MLP input needs its own complete evaluation. When actual belief
+        # tensors prove equality, reuse the post-state result and avoid duplicate pair-energy work.
+        if _block_mlp_states_equal:
+            pre_self_div = self_div
+            pre_terms = registered["free_energy_terms"]
+        else:
+            pre_omega = self._diagnostic_transport(_q_pre_block_mlp)
+            pre_base_omega = None
+            if rope is not None:
+                pre_effective = RopeTransport(
+                    base=pre_omega, rope=rope, on_cov=cfg.rope_full_gauge,
+                    on_value=cfg.rope_on_value, insertion=cfg.rope_insertion,
+                    same_frame_flat_cocycle=getattr(pre_omega, "same_frame_flat_cocycle", False),
+                )
+                pre_mu, pre_sigma = _q_pre_block_mlp.mu, _q_pre_block_mlp.sigma
+                pre_batched = False
+                if not cfg.rope_on_value:
+                    pre_base_omega = pre_omega
+            else:
+                pre_effective = pre_omega.unsqueeze(0)
+                pre_mu = _q_pre_block_mlp.mu.unsqueeze(0)
+                pre_sigma = _q_pre_block_mlp.sigma.unsqueeze(0)
+                pre_batched = True
+            pre_energy = self._coupling_energy(
+                fam, pre_mu, pre_sigma, pre_mu, pre_sigma, pre_effective,
+                alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+                divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
+            )
+            pre_coupling_energy = None
+            if pre_base_omega is not None:
+                pre_coupling_energy = self._coupling_energy(
+                    fam, pre_mu, pre_sigma, pre_mu, pre_sigma, pre_base_omega,
+                    alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+                    divergence_family=cfg.divergence_family, irrep_dims=self.group.irrep_dims,
+                )
+            if pre_batched:
+                pre_energy = pre_energy[0]
+            pre_tau = self._beta_tau(
+                _q_pre_block_mlp.sigma, _q_pre_block_mlp.mu,
+                attention_tau(self.effective_kappa_beta(out.mu.device), self.group.irrep_dims),
+            )
+            pre_beta = attention_weights(pre_energy, tau=pre_tau, log_prior=log_prior)
+            pre_self_div = self_divergence_for_alpha(
+                self._family_instance(fam, _q_pre_block_mlp.mu, _q_pre_block_mlp.sigma),
+                self._family_instance(fam, mu_p, sigma_p),
+                alpha=cfg.renyi_order, kl_max=cfg.kl_max, eps=cfg.eps,
+                divergence_family=cfg.divergence_family, lambda_alpha_mode=cfg.lambda_alpha_mode,
+            )
+            pre_alpha, pre_alpha_reg = self_coupling_alpha(
+                pre_self_div, mode=cfg.lambda_alpha_mode, value=cfg.lambda_alpha,
+                b0=_as_coeff(cfg.b0, out.mu.device), c0=_as_coeff(cfg.c0, out.mu.device),
+            )
+            pre_terms = metrics.free_energy_terms(
+                pre_self_div, pre_energy, pre_beta, pre_alpha, tau=pre_tau,
+                lambda_beta=_lb, lambda_twohop=cfg.lambda_twohop,
+                include_attention_entropy=cfg.include_attention_entropy, log_prior=log_prior,
+                alpha_reg=(pre_alpha_reg if cfg.lambda_alpha_mode != "constant" else None),
+                coupling_energy=pre_coupling_energy, log_likelihood=log_likelihood,
+            )
         d: Dict[str, float] = {}
         for metric_name, output_name, flatten in metrics.DIAGNOSTIC_METRIC_OUTPUTS:
             value = registered[metric_name]
@@ -3234,6 +3406,8 @@ class VFEModel(nn.Module):
         # state-dependent envelope self_coupling is pinned near the K*c0 regularizer floor (alpha_i*
         # D + R = c0[1 + log((b0+D)/c0)] per coord), so this raw term is the informative drift signal.
         d["self_divergence"] = float(self_div.sum())            # sum over tokens (and coords if per-coord)
+        d["post_block_mlp_self_divergence"] = d["self_divergence"]
+        d["pre_block_mlp_self_divergence"] = float(pre_self_div.sum())
         # Model-channel F blocks (audit obs 18497 + the s/r/h/gamma figures): surface the hyper-prior
         # and the gamma model-coupling block whenever their tables exist, INDEPENDENT of the loss
         # gating. The loss folds these into the s-refinement under s_e_step to avoid a double GRADIENT,
@@ -3303,6 +3477,48 @@ class VFEModel(nn.Module):
                 hyper_prior_rows, model_coupling_rows, meta_entropy_rows,
                 belief_rows.observation_nll,
                 q_reduction="sum", model_reduction="sum").total)
+        model_components = {
+            "hyper_prior": float(d.get("hyper_prior_weighted", 0.0)),
+            "model_coupling": float(cfg.lambda_gamma) * float(d.get("gamma_coupling", 0.0)),
+            "meta_entropy": (
+                float(cfg.lambda_gamma) * float(d.get("gamma_meta_entropy", 0.0))
+                if cfg.include_attention_entropy else 0.0
+            ),
+            "hyper_prior_raw": float(d.get("hyper_prior", 0.0)),
+            "gamma_coupling_raw": float(d.get("gamma_coupling", 0.0)),
+            "gamma_meta_entropy_raw": float(d.get("gamma_meta_entropy", 0.0)),
+        }
+
+        def state_components(terms: Mapping[str, float], raw_self: torch.Tensor) -> Dict[str, float]:
+            return {
+                "self_coupling": float(terms["self_coupling"]),
+                "belief_coupling": float(_lb) * float(terms["belief_coupling"]),
+                "attention_entropy": (
+                    float(_lb) * float(terms["attention_entropy"])
+                    if cfg.include_attention_entropy else 0.0
+                ),
+                "twohop_coupling": (
+                    float(cfg.lambda_twohop) * float(terms.get("twohop_coupling", 0.0))
+                ),
+                "observation_nll": -float(terms.get("observation_likelihood", 0.0)),
+                "self_divergence": float(raw_self.sum()),
+                "observation_likelihood": float(terms.get("observation_likelihood", 0.0)),
+                **model_components,
+            }
+
+        post_components = state_components(registered["free_energy_terms"], self_div)
+        pre_components = state_components(pre_terms, pre_self_div)
+        d.update(_state_specific_free_energy_diagnostics(
+            pre_components, post_components,
+            states_equal_proven=_block_mlp_states_equal,
+        ))
+        d["block_mlp_state_equality_proven"] = _block_mlp_states_equal
+        d.update(_numerical_policy_diagnostics(
+            m_phi_group_trust_radius=cfg.m_phi_group_trust_radius,
+            phi_mstep_max_matrix_norm=cfg.phi_mstep_max_matrix_norm,
+            transport_chart_max_norm=cfg.transport_chart_max_norm,
+            exp_fp64_norm_threshold=cfg.exp_fp64_norm_threshold,
+        ))
         # Gauge-geometry probes (diagnostics tier): the curvature proxy -- mean Frobenius departure
         # of the triangle holonomy Omega_ij Omega_jk Omega_ki from I (0 for the flat phi-cocycle) --
         # and the spread of log|det Omega| = tr(embed(phi)) across tokens (0 at phi=0). Pure

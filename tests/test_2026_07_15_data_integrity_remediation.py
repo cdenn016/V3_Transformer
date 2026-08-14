@@ -292,6 +292,9 @@ def test_evaluate_marks_bpc_unavailable_and_names_bits_per_token() -> None:
         "ppl":            pytest.approx(2.0),
         "bits_per_token": pytest.approx(1.0),
         "bpc":            None,
+        "expected_targets": 3,
+        "scored_targets":   3,
+        "excluded_targets": 0,
     }
 
 
@@ -410,6 +413,9 @@ def test_scaling_preserves_unavailable_character_normalization(
         "ppl":            pytest.approx(2.0),
         "bits_per_token": pytest.approx(1.0),
         "bpc":            None,
+        "expected_targets": 3,
+        "scored_targets":   3,
+        "excluded_targets": 0,
     }
 
 

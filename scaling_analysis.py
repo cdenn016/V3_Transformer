@@ -86,9 +86,13 @@ if os.environ.get(_CHILD_SENTINEL) == "1":
 
 import numpy as np
 
+from vfe3.metric_contracts import perplexity_matches_ce  # noqa: E402
 from vfe3.path_utils import portable_path_component_key
 from vfe3.viz.sweep_adapters import aggregate_validation_points, capacity_scaling_kwargs, pareto_frontier_kwargs
 from vfe3.run_artifacts import _write_json_atomic
+
+
+F_CE_RELATIONSHIP_FILENAME = "f_ce_relationship.png"
 
 logger = logging.getLogger("scaling_analysis")
 
@@ -111,7 +115,10 @@ CONFIG: Dict[str, Any] = {
 
 _CSV_COLUMNS = [
     "route", "scale_knob", "label", "seed", "n_params", "n_learnable_params", "embed_dim", "n_heads",
-    "n_gen", "gauge_group", "n_layers", "n_e_steps", "family", "tokens_seen", "est_flops_6ND",
+    "n_gen", "gauge_group", "n_layers", "n_e_steps", "family",
+    "use_block_mlp", "block_mlp_mode", "block_mlp_covariance", "block_mlp_expansion",
+    "block_mlp_activation", "block_mlp_dropout", "block_mlp_covariance_floor",
+    "tokens_seen", "est_flops_6ND",
     "est_flops_analytic", "active_params_per_token", "test_ce", "test_ppl",
     "test_bits_per_token", "test_bpc",
     "estep_final_f_per_token", "best_val_ppl",
@@ -131,7 +138,10 @@ _SCALING_SUMMARY_DIGEST_FIELD = "scaling_reuse_contract_sha256"
 _SCALING_SOURCE_SPLITS = ("train", "validation", "test")
 _SCALING_STRUCTURAL_FIELDS = (
     "n_params", "scale_knob", "embed_dim", "n_heads", "n_layers", "n_e_steps",
-    "n_gen", "gauge_group", "family", "tokens_seen",
+    "n_gen", "gauge_group", "family", "divergence_family", "tokens_seen",
+    "use_block_mlp", "block_mlp_mode", "block_mlp_covariance",
+    "block_mlp_expansion", "block_mlp_activation", "block_mlp_dropout",
+    "block_mlp_covariance_floor",
     "git_sha", "git_dirty", "git_dirty_fingerprint",
     "train_source_identity", "validation_source_identity", "test_source_identity",
 )
@@ -199,12 +209,14 @@ def _validated_scaling_metrics(summary: Mapping[str, object]) -> Optional[Dict[s
 
     if type(n_params) is not int or n_params <= 0:
         return None
-    if not all(_finite_positive(value) for value in (test_ce, test_ppl, test_bits)):
+    if not all(_finite_positive(value) for value in (test_ce, test_bits)):
+        return None
+    if not (isinstance(test_ppl, (int, float)) and not isinstance(test_ppl, bool)
+            and float(test_ppl) > 0.0 and not math.isnan(float(test_ppl))):
         return None
     if test_bpc is not None and not _finite_positive(test_bpc):
         return None
-    if (not math.isclose(
-            float(test_ppl), math.exp(min(float(test_ce), 20.0)), rel_tol=1e-9, abs_tol=1e-12)
+    if (not perplexity_matches_ce(test_ce, test_ppl)
             or not math.isclose(
                 float(test_bits), float(test_ce) / math.log(2.0), rel_tol=1e-9, abs_tol=1e-12)):
         return None
@@ -343,6 +355,35 @@ def _validated_bound_scaling_run(
     }
 
 
+_BLOCK_MLP_STRUCTURAL_METADATA_FIELDS = {
+    "use_block_mlp": "enabled",
+    "block_mlp_mode": "mode",
+    "block_mlp_covariance": "covariance",
+    "block_mlp_expansion": "expansion",
+    "block_mlp_activation": "activation",
+    "block_mlp_dropout": "dropout",
+    "block_mlp_covariance_floor": "covariance_floor",
+}
+
+
+def _block_mlp_structural_values(
+    config_json: Mapping[str, Any],
+    serialized_config: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Prefer what the executable built; retain serialized-config fallback for old runs."""
+    executable = config_json.get("executable_build")
+    block_mlp = executable.get("block_mlp") if isinstance(executable, Mapping) else None
+    if not isinstance(block_mlp, Mapping):
+        return {
+            field: serialized_config.get(field)
+            for field in _BLOCK_MLP_STRUCTURAL_METADATA_FIELDS
+        }
+    return {
+        field: block_mlp.get(metadata_field, serialized_config.get(field))
+        for field, metadata_field in _BLOCK_MLP_STRUCTURAL_METADATA_FIELDS.items()
+    }
+
+
 def _structural_signature(row: Mapping[str, Any]) -> tuple:
     """Exact typed identity of fields that must not vary among seeds of one scaling cell."""
     return tuple(
@@ -433,6 +474,7 @@ def harvest(
         )
         if verified is None or not isinstance(sp, Mapping) or not isinstance(cfg, Mapping):
             continue
+        block_mlp_structure = _block_mlp_structural_values(cfgj, cfg)
         rows.append({
             "run_dir":     str(run.resolve()),
             "route":       cell["route"],
@@ -449,6 +491,8 @@ def harvest(
             "n_layers":    sp.get("n_layers", cfg.get("n_layers")),
             "n_e_steps":   sp.get("n_e_steps", cfg.get("n_e_steps")),
             "family":      cfg.get("family"),
+            "divergence_family": cfg.get("divergence_family", "renyi"),
+            **block_mlp_structure,
             "tokens_seen": sp.get("tokens_seen"),
             "est_flops_6ND":           sp.get("est_flops_6ND"),
             "est_flops_analytic":      sp.get("est_flops_analytic"),
@@ -874,6 +918,7 @@ def aggregate_points(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "est_flops_analytic": _as_float(grp[0].get("est_flops_analytic")),
             "n_e_steps": _as_float(grp[0].get("n_e_steps")),
             "n_layers": _as_float(grp[0].get("n_layers")),
+            "divergence_family": str(grp[0].get("divergence_family", "renyi")),
             "ce_seeds": ce, "n_seeds": len(ce),
             "ce_mean": float(np.mean(ce)),
             "ce_sem": float(np.std(ce, ddof=1) / np.sqrt(len(ce))) if len(ce) > 1 else 0.0,
@@ -1494,23 +1539,26 @@ def _make_figures(
         _try("inference_capacity.png", lambda: figs.plot_inference_capacity(
             series, n_params=n_flat, path=str(fig_dir / "inference_capacity.png")))
 
-        # C2/EXP-5: the n_e_steps arms -> the F-vs-CE decorrelation scatter (needs f_mean + ce_mean)
-        # and E-step-as-capacity (BPC + converged F vs T; additionally needs bpc_mean -- gated
-        # separately so a heterogeneous run set missing test_bpc on some cells still gets the
-        # decorrelation figure rather than a NaN BPC point).
+        # C2/EXP-5: the n_e_steps arms -> the final-iterate objective/CE relationship
+        # (needs f_mean + ce_mean) and E-step-as-capacity (BPC + final-iterate F vs T; additionally
+        # needs bpc_mean, gated separately, so a heterogeneous run set missing test_bpc still gets
+        # the relationship figure rather than a NaN BPC point).
         estep = sorted([p for p in infer_points if p["scale_knob"] == "n_e_steps"
                         and np.isfinite(p.get("f_mean", float("nan")))],
                        key=lambda q: q["n_e_steps"])
         if len(estep) >= 2:
             arms = [{"n_e_steps": p["n_e_steps"], "final_f": p["f_mean"], "ce": p["ce_mean"]}
                     for p in estep]
-            _try("f_ce_decorrelation.png", lambda: figs.plot_f_ce_decorrelation(
-                arms, path=str(fig_dir / "f_ce_decorrelation.png")))
+            divergence_family = str(estep[0].get("divergence_family", "renyi"))
+            _try(F_CE_RELATIONSHIP_FILENAME, lambda: figs.plot_f_ce_relationship(
+                arms, divergence_family=divergence_family,
+                path=str(fig_dir / F_CE_RELATIONSHIP_FILENAME)))
             cap = [p for p in estep if np.isfinite(p.get("bpc_mean", float("nan")))]
             if len(cap) >= 2:
                 _try("estep_capacity.png", lambda: figs.plot_estep_capacity(
                     [p["n_e_steps"] for p in cap], [p["bpc_mean"] for p in cap],
                     [p["f_mean"] for p in cap], n_params=n_flat,
+                    divergence_family=divergence_family,
                     path=str(fig_dir / "estep_capacity.png")))
 
 

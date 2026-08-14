@@ -42,6 +42,8 @@ def _cfg(
         decode_mode=decode_mode,
         evaluate_zero_e_steps_counterfactual=enabled,
         generate_figures=False,
+        min_lr=0.0,
+        min_lr_frac=0.0,
         max_seq_len=4,
         max_steps=11,
         n_e_steps=n_e_steps,
@@ -81,7 +83,8 @@ def test_zero_estep_counterfactual_defaults_to_one_headline_evaluation(
 
     def _evaluate(*args, **kwargs):
         observed.append((model.cfg.decode_mode, model.cfg.n_e_steps))
-        return {"ce": 1.25, "ppl": 3.5, "bits_per_token": 1.8, "bpc": 1.4}
+        return {"ce": 1.25, "ppl": 3.5, "bits_per_token": 1.8, "bpc": 1.4,
+                "expected_targets": 4, "scored_targets": 4, "excluded_targets": 0}
 
     _patch_unrelated_finalization_probes(monkeypatch)
     monkeypatch.setattr("vfe3.train.evaluate", _evaluate)
@@ -115,8 +118,10 @@ def test_zero_estep_counterfactual_is_nested_and_preserves_headline_artifacts(
     artifacts = _Artifacts(tmp_path)
     observed_depths: list[int] = []
     metrics = [
-        {"ce": 1.0, "ppl": 2.0, "bits_per_token": 1.5, "bpc": 1.2},
-        {"ce": 1.75, "ppl": 99.0, "bits_per_token": 88.0, "bpc": 77.0},
+        {"ce": 1.0, "ppl": 2.0, "bits_per_token": 1.5, "bpc": 1.2,
+         "expected_targets": 4, "scored_targets": 4, "excluded_targets": 0},
+        {"ce": 1.75, "ppl": 99.0, "bits_per_token": 88.0, "bpc": 77.0,
+         "expected_targets": 4, "scored_targets": 4, "excluded_targets": 0},
     ]
 
     def _evaluate(*args, **kwargs):
@@ -179,7 +184,8 @@ def test_zero_estep_counterfactual_failure_restores_depth_without_partial_record
         observed_depths.append(model.cfg.n_e_steps)
         if len(observed_depths) == 2:
             raise RuntimeError("counterfactual failed")
-        return {"ce": 0.9, "ppl": 2.1, "bits_per_token": 1.3, "bpc": None}
+        return {"ce": 0.9, "ppl": 2.1, "bits_per_token": 1.3, "bpc": None,
+                "expected_targets": 4, "scored_targets": 4, "excluded_targets": 0}
 
     _patch_unrelated_finalization_probes(monkeypatch)
     monkeypatch.setattr("vfe3.train.evaluate", _evaluate)

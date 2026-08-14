@@ -138,18 +138,7 @@ def test_override_parameter_is_keyword_only(reg):
 
 
 def _restore_decode(name, registration):
-    prior_bank_mod.register_decode(
-        name,
-        supports_full=registration.supports_full,
-        supports_chunked=registration.supports_chunked,
-        fused_ce=registration.fused_ce,
-        family_consistent=registration.family_consistent,
-        covariance_kinds=registration.covariance_kinds,
-        can_omit_base_mean=registration.can_omit_base_mean,
-        can_omit_base_variance=registration.can_omit_base_variance,
-        fused_ce_supports_stats=registration.fused_ce_supports_stats,
-        override=True,
-    )(registration.callable)
+    prior_bank_mod._DECODERS[name] = registration
 
 
 def test_decode_override_replaces_capabilities_atomically():

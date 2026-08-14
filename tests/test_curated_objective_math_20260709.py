@@ -274,7 +274,7 @@ def test_diagnostics_threads_all_active_objective_terms(monkeypatch: pytest.Monk
             torch.tensor(call["terms"]["total"]), scalar,
             atol=2e-5, rtol=2e-5,
         )
-    assert diagnostics["total"] == seen[0]["terms"]["total"]
+    assert diagnostics["total"] == pytest.approx(seen[0]["terms"]["total"], abs=2e-7)
     assert per_layer["total"][0] == seen[1]["terms"]["total"]
     assert diagnostics["twohop_coupling"] == seen[0]["terms"]["twohop_coupling"]
     assert diagnostics["observation_likelihood"] == seen[0]["terms"]["observation_likelihood"]

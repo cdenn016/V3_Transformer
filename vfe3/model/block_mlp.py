@@ -1,9 +1,12 @@
-from typing import NamedTuple, Optional, Sequence
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Callable, Mapping, NamedTuple, Optional, Sequence
 
 import torch
 from torch import nn
 
-from vfe3.contracts import CanonicalFrameContext
+from vfe3.contracts import BlockMLPBuildMetadata, CanonicalFrameContext
+from vfe3.numerics import validated_cholesky_solve
 
 
 _ACTIVATIONS = {
@@ -109,9 +112,9 @@ class BlockMLP(nn.Module):
         mu: torch.Tensor,
         sigma: torch.Tensor,
         *,
-        frame: Optional[CanonicalFrameContext] = None,
+        frame_context: Optional[CanonicalFrameContext] = None,
     ) -> BlockMLPMomentResult:
-        del frame
+        del frame_context
         if self.covariance_contract == "passthrough":
             return BlockMLPMomentResult(self.forward(mu), sigma, None)
         mu_out, jacobian = self._coordinate_update_with_jacobian(mu)
@@ -183,10 +186,28 @@ class GaugeGateBlockMLP(nn.Module):
             stop = start + dim
             mu_h = mu[..., start:stop]
             sigma_hh = sigma[..., start:stop, start:stop]
-            solved = torch.linalg.solve(sigma_hh, mu_h.unsqueeze(-1)).squeeze(-1)
+            rhs = mu_h.unsqueeze(-1)
+            checked = validated_cholesky_solve(sigma_hh, rhs)
+            if bool(checked.certified.all()):
+                assert checked.solution is not None
+                solved = checked.solution.squeeze(-1)
+            elif sigma_hh.dtype is torch.float64:
+                raise FloatingPointError(
+                    "GaugeGate Mahalanobis system could not be certified in float64")
+            else:
+                high = validated_cholesky_solve(sigma_hh.double(), rhs.double())
+                if not bool(high.certified.all()):
+                    raise FloatingPointError(
+                        "GaugeGate Mahalanobis system could not be certified after float64 "
+                        "escalation")
+                assert checked.solution is not None and high.solution is not None
+                solved = torch.where(
+                    checked.certified.unsqueeze(-1).unsqueeze(-1),
+                    checked.solution.double(), high.solution,
+                ).squeeze(-1)
             mu_blocks.append(mu_h)
             sigma_solutions.append(solved)
-            invariants.append((mu_h * solved).sum(dim=-1))
+            invariants.append((mu_h.to(solved.dtype) * solved).sum(dim=-1))
             start = stop
         return torch.stack(invariants, dim=-1), mu_blocks, sigma_solutions
 
@@ -196,16 +217,24 @@ class GaugeGateBlockMLP(nn.Module):
         *,
         need_jacobian: bool,
     ) -> 'tuple[torch.Tensor, Optional[torch.Tensor]]':
-        hidden_pre = self.fc1(invariants)
-        raw_gates = self.fc2(self.activation(hidden_pre))
+        hidden_pre = torch.nn.functional.linear(
+            invariants,
+            self.fc1.weight.to(invariants.dtype),
+            self.fc1.bias.to(invariants.dtype),
+        )
+        raw_gates = torch.nn.functional.linear(
+            self.activation(hidden_pre),
+            self.fc2.weight.to(hidden_pre.dtype),
+            self.fc2.bias.to(hidden_pre.dtype),
+        )
         if not need_jacobian:
             return self.dropout(raw_gates), None
         dropout_scale = _dropout_scale(self.dropout, raw_gates)
         dgate_ds = torch.einsum(
             "oh,...h,hi->...oi",
-            self.fc2.weight,
+            self.fc2.weight.to(hidden_pre.dtype),
             _activation_derivative(self.activation_name, hidden_pre),
-            self.fc1.weight,
+            self.fc1.weight.to(hidden_pre.dtype),
         )
         return dropout_scale * raw_gates, dropout_scale.unsqueeze(-1) * dgate_ds
 
@@ -222,9 +251,9 @@ class GaugeGateBlockMLP(nn.Module):
         mu: torch.Tensor,
         sigma: torch.Tensor,
         *,
-        frame: Optional[CanonicalFrameContext] = None,
+        frame_context: Optional[CanonicalFrameContext] = None,
     ) -> BlockMLPMomentResult:
-        del frame
+        del frame_context
         invariants, mu_blocks, sigma_solutions = self._invariants(mu, sigma)
         need_jacobian = self.covariance_contract == "delta_full"
         gates, dgate_ds = self._gate_values(invariants, need_jacobian=need_jacobian)
@@ -236,20 +265,21 @@ class GaugeGateBlockMLP(nn.Module):
             return BlockMLPMomentResult(mu_out, sigma, None)
 
         K = mu.shape[-1]
-        jacobian = torch.zeros(*mu.shape[:-1], K, K, dtype=mu.dtype, device=mu.device)
+        jacobian = torch.zeros(
+            *mu.shape[:-1], K, K, dtype=gates.dtype, device=mu.device)
         row_start = 0
         for out_index, (out_dim, mu_h) in enumerate(zip(self.irrep_dims, mu_blocks)):
             row_stop = row_start + out_dim
             jacobian[..., row_start:row_stop, row_start:row_stop] = \
                 (1.0 + gates[..., out_index]).unsqueeze(-1).unsqueeze(-1) \
-                * torch.eye(out_dim, dtype=mu.dtype, device=mu.device)
+                * torch.eye(out_dim, dtype=gates.dtype, device=mu.device)
             col_start = 0
             for in_index, (in_dim, solved) in enumerate(
                     zip(self.irrep_dims, sigma_solutions)):
                 col_stop = col_start + in_dim
                 cross = torch.einsum(
                     "...i,...,...j->...ij",
-                    mu_h,
+                    mu_h.to(jacobian.dtype),
                     dgate_ds[..., out_index, in_index],
                     2.0 * solved,
                 )
@@ -258,7 +288,10 @@ class GaugeGateBlockMLP(nn.Module):
                 col_start = col_stop
             row_start = row_stop
         return BlockMLPMomentResult(
-            mu_out, _delta_covariance(jacobian, sigma, self.covariance_floor), jacobian)
+            mu_out,
+            _delta_covariance(jacobian, sigma.to(jacobian.dtype), self.covariance_floor),
+            jacobian,
+        )
 
 
 class CanonicalFrameBlockMLP(BlockMLP):
@@ -278,23 +311,194 @@ class CanonicalFrameBlockMLP(BlockMLP):
         mu: torch.Tensor,
         sigma: torch.Tensor,
         *,
-        frame: Optional[CanonicalFrameContext] = None,
+        frame_context: Optional[CanonicalFrameContext] = None,
     ) -> BlockMLPMomentResult:
-        if frame is None:
+        if frame_context is None:
             raise ValueError("canonical_frame block MLP requires a realized canonical frame")
-        canonical_mu = torch.einsum("...ij,...j->...i", frame.inverse, mu)
+        canonical_mu = torch.einsum("...ij,...j->...i", frame_context.inverse, mu)
         if self.covariance_contract == "passthrough":
             canonical_out = super().forward(canonical_mu)
-            mu_out = torch.einsum("...ij,...j->...i", frame.forward, canonical_out)
+            mu_out = torch.einsum("...ij,...j->...i", frame_context.forward, canonical_out)
             return BlockMLPMomentResult(mu_out, sigma, None)
         canonical_out, canonical_jacobian = self._coordinate_update_with_jacobian(canonical_mu)
-        mu_out = torch.einsum("...ij,...j->...i", frame.forward, canonical_out)
-        realized_jacobian = frame.forward @ canonical_jacobian @ frame.inverse
+        mu_out = torch.einsum("...ij,...j->...i", frame_context.forward, canonical_out)
+        realized_jacobian = (
+            frame_context.forward @ canonical_jacobian @ frame_context.inverse
+        )
         return BlockMLPMomentResult(
             mu_out,
             _delta_covariance(realized_jacobian, sigma, self.covariance_floor),
             realized_jacobian,
         )
+
+BlockMLPFactory = Callable[..., nn.Module]
+BlockMLPReportLabel = Callable[[str], str]
+BlockMLPWidth = Callable[[int, Sequence[int]], int]
+BlockMLPExtraFlops = Callable[[int, Sequence[int]], float]
+
+
+@dataclass(frozen=True)
+class BlockMLPRegistration:
+    """Factory and every structural capability owned by one BlockMLP mode."""
+
+    factory: BlockMLPFactory
+    requires_frame_context: bool
+    covariance_kinds: frozenset[str]
+    gauge_class: str
+    intertwiner_compatible: bool
+    width: BlockMLPWidth
+    extra_flops_per_layer: BlockMLPExtraFlops
+    report_label: BlockMLPReportLabel
+
+    def parameter_count(
+        self,
+        *,
+        embed_dim: int,
+        irrep_dims: Sequence[int],
+        expansion: int,
+        n_layers: int = 1,
+    ) -> int:
+        width = self.width(embed_dim, irrep_dims)
+        per_layer = 2 * expansion * width * width + (expansion + 1) * width
+        return int(n_layers) * per_layer
+
+    def flops_per_token(
+        self,
+        *,
+        embed_dim: int,
+        irrep_dims: Sequence[int],
+        expansion: int,
+        covariance_contract: str,
+        n_layers: int,
+    ) -> float:
+        width = self.width(embed_dim, irrep_dims)
+        per_layer = 4.0 * expansion * width * width
+        per_layer += self.extra_flops_per_layer(embed_dim, irrep_dims)
+        if covariance_contract == "delta_full":
+            per_layer += 4.0 * embed_dim ** 3
+        return float(n_layers) * per_layer
+
+
+def _coordinate_factory(**kwargs) -> nn.Module:
+    kwargs.pop("irrep_dims")
+    return BlockMLP(**kwargs)
+
+
+def _gauge_gate_factory(**kwargs) -> nn.Module:
+    kwargs.pop("embed_dim")
+    return GaugeGateBlockMLP(**kwargs)
+
+
+def _canonical_frame_factory(**kwargs) -> nn.Module:
+    kwargs.pop("irrep_dims")
+    return CanonicalFrameBlockMLP(**kwargs)
+
+
+def _coordinate_report_label(covariance: str) -> str:
+    return (
+        "coordinate_mean_only_nonintertwiner"
+        if covariance == "passthrough"
+        else "coordinate_delta_full_covariant_floor_nonintertwiner"
+    )
+
+
+BLOCK_MLP_REGISTRATIONS: Mapping[str, BlockMLPRegistration] = MappingProxyType({
+    "coordinate": BlockMLPRegistration(
+        factory=_coordinate_factory,
+        requires_frame_context=False,
+        covariance_kinds=frozenset({"passthrough", "delta_full"}),
+        gauge_class="coordinate_nonintertwiner",
+        intertwiner_compatible=False,
+        width=lambda embed_dim, _irrep_dims: embed_dim,
+        extra_flops_per_layer=lambda _embed_dim, _irrep_dims: 0.0,
+        report_label=_coordinate_report_label,
+    ),
+    "gauge_gate": BlockMLPRegistration(
+        factory=_gauge_gate_factory,
+        requires_frame_context=False,
+        covariance_kinds=frozenset({"passthrough", "delta_full"}),
+        gauge_class="invariant_scalar_intertwiner",
+        intertwiner_compatible=True,
+        width=lambda _embed_dim, irrep_dims: len(irrep_dims),
+        extra_flops_per_layer=lambda _embed_dim, irrep_dims: float(sum(
+            2.0 * dim ** 3 + 2.0 * dim ** 2 for dim in irrep_dims
+        )),
+        report_label=lambda _covariance: "invariant_scalar_gate",
+    ),
+    "canonical_frame": BlockMLPRegistration(
+        factory=_canonical_frame_factory,
+        requires_frame_context=True,
+        covariance_kinds=frozenset({"passthrough", "delta_full"}),
+        gauge_class="left_equivariant_right_fixed",
+        intertwiner_compatible=False,
+        width=lambda embed_dim, _irrep_dims: embed_dim,
+        extra_flops_per_layer=lambda embed_dim, _irrep_dims: float(4 * embed_dim ** 2),
+        report_label=lambda _covariance: "canonical_frame_left_equivariant_right_fixed",
+    ),
+})
+
+
+def get_block_mlp_registration(mode: str) -> BlockMLPRegistration:
+    try:
+        return BLOCK_MLP_REGISTRATIONS[mode]
+    except KeyError as exc:
+        raise ValueError(
+            f"unknown block_mlp_mode {mode!r}; available: {sorted(BLOCK_MLP_REGISTRATIONS)}"
+        ) from exc
+
+
+def block_mlp_build_metadata(
+    *,
+    enabled: bool,
+    mode: str,
+    covariance: str,
+    expansion: int,
+    activation: str,
+    dropout: float,
+    covariance_floor: float,
+    embed_dim: int,
+    irrep_dims: Sequence[int],
+    n_layers: int,
+) -> BlockMLPBuildMetadata:
+    registration = get_block_mlp_registration(mode)
+    if covariance not in registration.covariance_kinds:
+        raise ValueError(f"unknown BlockMLP covariance contract {covariance!r}")
+    realized_irrep_dims = tuple(int(dim) for dim in irrep_dims)
+    realized_parameter_count = registration.parameter_count(
+        embed_dim=embed_dim,
+        irrep_dims=realized_irrep_dims,
+        expansion=expansion,
+        n_layers=n_layers,
+    )
+    realized_flops_per_token = registration.flops_per_token(
+        embed_dim=embed_dim,
+        irrep_dims=realized_irrep_dims,
+        expansion=expansion,
+        covariance_contract=covariance,
+        n_layers=n_layers,
+    )
+    covariance_report = (
+        "not_applicable" if not enabled else
+        "delta_full_plus_covariant_floor" if covariance == "delta_full" else covariance
+    )
+    return BlockMLPBuildMetadata(
+        enabled=bool(enabled),
+        mode=mode,
+        covariance=covariance,
+        expansion=int(expansion),
+        activation=activation,
+        dropout=float(dropout),
+        covariance_floor=float(covariance_floor),
+        embed_dim=int(embed_dim),
+        irrep_dims=realized_irrep_dims,
+        n_layers=int(n_layers),
+        parameter_count=(realized_parameter_count if enabled else 0),
+        flops_per_token=(realized_flops_per_token if enabled else 0.0),
+        report_label=(registration.report_label(covariance) if enabled else "disabled"),
+        covariance_report_label=covariance_report,
+        gauge_class=(registration.gauge_class if enabled else "disabled"),
+        intertwiner_compatible=(registration.intertwiner_compatible if enabled else True),
+    )
 
 
 def build_block_mlp(
@@ -308,22 +512,15 @@ def build_block_mlp(
     covariance_contract: str,
     covariance_floor: float,
 ) -> nn.Module:
-    if mode == "coordinate":
-        return BlockMLP(
-            embed_dim, expansion, activation, dropout,
-            covariance_contract=covariance_contract,
-            covariance_floor=covariance_floor,
-        )
-    if mode == "gauge_gate":
-        return GaugeGateBlockMLP(
-            irrep_dims, expansion, activation, dropout,
-            covariance_contract=covariance_contract,
-            covariance_floor=covariance_floor,
-        )
-    if mode == "canonical_frame":
-        return CanonicalFrameBlockMLP(
-            embed_dim, expansion, activation, dropout,
-            covariance_contract=covariance_contract,
-            covariance_floor=covariance_floor,
-        )
-    raise ValueError(f"unknown block MLP mode {mode!r}")
+    registration = get_block_mlp_registration(mode)
+    if covariance_contract not in registration.covariance_kinds:
+        raise ValueError(f"unknown BlockMLP covariance contract {covariance_contract!r}")
+    return registration.factory(
+        embed_dim=embed_dim,
+        irrep_dims=irrep_dims,
+        expansion=expansion,
+        activation=activation,
+        dropout=dropout,
+        covariance_contract=covariance_contract,
+        covariance_floor=covariance_floor,
+    )

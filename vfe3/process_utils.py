@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import ctypes
+from dataclasses import dataclass
 import os
 import signal
 import subprocess
 import sys
+from time import monotonic
 from ctypes import wintypes
 from typing import Mapping, Optional, Sequence
 
@@ -16,8 +18,8 @@ _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _PROCESS_REAP_TIMEOUT_SECONDS = 10.0
 _TASKKILL_TIMEOUT_SECONDS = 10.0
 _WINDOWS_GATED_LAUNCHER = (
-    "import subprocess,sys; "
-    "gate=sys.stdin.buffer.read(1); "
+    "import os,subprocess,sys; "
+    "gate=os.read(sys.stdin.fileno(),1); "
     "sys.exit(125) if gate != b'1' else None; "
     "sys.exit(126) if len(sys.argv) < 3 or sys.argv[1] != 'vfe3-process-gate' else None; "
     "child=subprocess.Popen(sys.argv[2:]); "
@@ -109,22 +111,30 @@ class _WindowsJob:
 
     def close(self) -> None:
         if self._handle:
-            self._kernel32.CloseHandle(self._handle)
+            handle = self._handle
             self._handle = None
+            if not self._kernel32.CloseHandle(handle):
+                raise ctypes.WinError(ctypes.get_last_error())
 
 
 def _kill_process_tree(
     process: subprocess.Popen[str],
     job:     Optional[_WindowsJob],
-) -> None:
-    """Terminate a child and every descendant without trusting the child to cooperate."""
+
+    *,
+    timeout: float = _TASKKILL_TIMEOUT_SECONDS,
+) -> bool:
+    """Terminate a child tree and return only after platform confirmation."""
+    if timeout <= 0.0:
+        raise ValueError("process-tree termination timeout must be positive")
     if os.name == "nt":
         if job is not None:
             try:
                 job.terminate()
-                return
+                return True
             except OSError:
                 pass
+        deadline = monotonic() + timeout
         taskkill = subprocess.Popen(
             ["taskkill", "/PID", str(process.pid), "/T", "/F"],
             stdout=subprocess.DEVNULL,
@@ -132,21 +142,28 @@ def _kill_process_tree(
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         try:
-            returncode = taskkill.wait(timeout=_TASKKILL_TIMEOUT_SECONDS)
+            returncode = taskkill.wait(timeout=max(0.001, deadline - monotonic()))
         except subprocess.TimeoutExpired as exc:
             try:
                 taskkill.kill()
-                taskkill.wait(timeout=_PROCESS_REAP_TIMEOUT_SECONDS)
+                remaining = deadline - monotonic()
+                if remaining > 0.0:
+                    taskkill.wait(timeout=remaining)
             except BaseException:
                 pass
             raise TimeoutError("taskkill did not finish within its bounded timeout") from exc
-        if returncode != 0 and process.poll() is None:
+        if returncode != 0:
             raise OSError(f"taskkill failed with exit code {returncode}")
-        return
+        return True
+    if process.poll() is not None:
+        raise OSError(
+            "process-group ownership unavailable after root exit; killpg skipped"
+        )
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+    return True
 
 
 def _terminate_and_reap_after_interruption(
@@ -173,6 +190,130 @@ def _terminate_and_reap_after_interruption(
         pass
 
 
+@dataclass
+class ProcessTree:
+    """One subprocess and the platform containment primitive that owns its descendants."""
+
+    process: subprocess.Popen
+    _job: Optional[_WindowsJob] = None
+
+    def terminate(self, *, reason: str, timeout: float) -> dict[str, object]:
+        """Terminate only this tree and return bounded, structured cleanup diagnostics."""
+        if timeout <= 0.0:
+            raise ValueError("process-tree cleanup timeout must be positive")
+        started = monotonic()
+        deadline = started + timeout
+        process = self.process
+        status: dict[str, object] = {
+            "pid": int(process.pid),
+            "reason": str(reason),
+            "terminated": True,
+            "reaped": False,
+            "root_reaped": False,
+            "tree_termination_confirmed": False,
+            "returncode": process.poll(),
+            "cleanup_error": None,
+            "elapsed_s": 0.0,
+        }
+        cleanup_errors: list[str] = []
+        try:
+            try:
+                status["tree_termination_confirmed"] = bool(_kill_process_tree(
+                    process,
+                    self._job,
+                    timeout=max(0.001, deadline - monotonic()),
+                ))
+            except BaseException as exc:
+                cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                    except BaseException as kill_exc:
+                        cleanup_errors.append(f"{type(kill_exc).__name__}: {kill_exc}")
+            remaining = deadline - monotonic()
+            if process.poll() is None and remaining > 0.0:
+                try:
+                    process.wait(timeout=remaining)
+                except subprocess.TimeoutExpired as exc:
+                    cleanup_errors.append(f"{type(exc).__name__}: post-kill wait exceeded {timeout:g}s")
+                except BaseException as exc:
+                    cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+            elif process.poll() is None:
+                cleanup_errors.append("post-kill wait budget exhausted")
+            status["returncode"] = process.poll()
+            status["root_reaped"] = status["returncode"] is not None
+            status["reaped"] = status["root_reaped"]
+        finally:
+            if self._job is not None:
+                try:
+                    self._job.close()
+                except BaseException as exc:
+                    cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+                self._job = None
+            status["cleanup_error"] = " | ".join(cleanup_errors) or None
+            status["elapsed_s"] = monotonic() - started
+        return status
+
+
+def spawn_process_tree(
+    command: Sequence[str],
+
+    **popen_kwargs: object,
+) -> ProcessTree:
+    """Start a persistent subprocess behind the Windows pre-containment gate."""
+    if isinstance(command, (str, bytes)) or not isinstance(command, Sequence):
+        raise TypeError("command must be a nonempty sequence of strings")
+    if not command:
+        raise ValueError("command must be a nonempty sequence of strings")
+    if any(not isinstance(argument, str) or not argument for argument in command):
+        raise ValueError("command must contain only nonempty strings")
+    kwargs = dict(popen_kwargs)
+    if os.name == "nt":
+        if kwargs.get("stdin") is not subprocess.PIPE:
+            raise ValueError("persistent Windows process trees require stdin=subprocess.PIPE")
+        kwargs["creationflags"] = (
+            int(kwargs.get("creationflags", 0))
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+        launch_command = [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            _WINDOWS_GATED_LAUNCHER,
+            "vfe3-process-gate",
+            *command,
+        ]
+    else:
+        kwargs["start_new_session"] = True
+        launch_command = list(command)
+    process = subprocess.Popen(launch_command, **kwargs)
+    job: Optional[_WindowsJob] = None
+    if os.name == "nt":
+        try:
+            job = _WindowsJob()
+            job.assign(process)
+        except OSError as exc:
+            if job is not None:
+                try:
+                    job.close()
+                except BaseException:
+                    pass
+            _terminate_and_reap_after_interruption(process, None)
+            raise OSError("could not contain the persistent child in a Windows Job Object") from exc
+        gate = process.stdin
+        if gate is None:
+            _terminate_and_reap_after_interruption(process, job)
+            raise OSError("persistent Windows process gate was not created")
+        try:
+            gate.write("1" if kwargs.get("text") else b"1")
+            gate.flush()
+        except BaseException:
+            _terminate_and_reap_after_interruption(process, job)
+            raise
+    return ProcessTree(process=process, _job=job)
+
+
 def run_process_tree(
     command: Sequence[str],
 
@@ -185,7 +326,7 @@ def run_process_tree(
     timeout:        Optional[float]             = None,
     encoding:       Optional[str]               = None,
     errors:         Optional[str]               = None,
-) -> subprocess.CompletedProcess[str]:
+) -> 'subprocess.CompletedProcess[bytes] | subprocess.CompletedProcess[str]':
     r"""Run ``command`` in a process tree that is destroyed on timeout or parent exit.
 
     Windows descendants are assigned to a Job Object with

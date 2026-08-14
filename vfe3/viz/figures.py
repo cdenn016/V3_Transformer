@@ -10,8 +10,10 @@ Tensors are accepted as torch or numpy; everything is detached to numpy for plot
 A registry (``register_figure``) lets a new figure slot in by name.
 """
 
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
+from threading import Event, RLock
 from types import TracebackType
 from typing import Callable, Dict, List, Mapping, Optional, Sequence
 from uuid import uuid4
@@ -20,6 +22,9 @@ import matplotlib
 
 matplotlib.use("Agg")                                            # non-interactive (headless / tests)
 import matplotlib.pyplot as plt
+
+from vfe3.families.base import get_functional_display
+from vfe3.process_utils import ProcessTree, spawn_process_tree
 import numpy as np
 from matplotlib.colors import LogNorm
 from matplotlib.ticker import FuncFormatter, MaxNLocator
@@ -191,6 +196,24 @@ def _numba_cache_dir() -> Optional[str]:
     return None
 
 
+@dataclass(eq=False)
+class _UMAPWorkerRecord:
+    """Identity-bearing lifecycle state for one owned worker process."""
+
+    tree: ProcessTree
+    stderr_handle: object
+    identity: str = field(default_factory=lambda: uuid4().hex)
+    retiring: bool = False
+    retired: bool = False
+    requests_submitted: int = 0
+    retired_event: Event = field(default_factory=Event)
+    cleanup_status: Optional[Dict[str, object]] = None
+
+    @property
+    def process(self):
+        return self.tree.process
+
+
 class UMAPWorker:
     r"""A lazily started, crash-isolated POOL of UMAP interpreters reusable within a report.
 
@@ -205,89 +228,315 @@ class UMAPWorker:
         self,
 
         *,
-        timeout:     float         = 1200.0,
-        max_workers: Optional[int] = None,
+        timeout:         float         = 1200.0,
+        cleanup_timeout: float         = 5.0,
+        max_workers:     Optional[int] = None,
     ) -> None:
+        if timeout <= 0.0:
+            raise ValueError("UMAP worker timeout must be positive")
+        if cleanup_timeout <= 0.0:
+            raise ValueError("UMAP cleanup timeout must be positive")
         cores = os.cpu_count() or 1
         self.timeout = timeout
+        self.cleanup_timeout = cleanup_timeout
         self.max_workers = (max(1, min(_UMAP_MAX_WORKERS, cores - 1)) if max_workers is None
                             else max(1, int(max_workers)))
         self._counter = 0
-        self._procs: List[object] = []
-        self._stderr_handles: List[object] = []
+        self._workers: List[_UMAPWorkerRecord] = []
+        self._lifecycle_lock = RLock()
+        self._closing = False
+        self._request_paths: set[str] = set()
+        self.cleanup_statuses: List[Dict[str, object]] = []
         self._workdir = None
+
+    @property
+    def _procs(self) -> List[object]:
+        with self._lifecycle_lock:
+            return [record.process for record in self._workers]
+
+    @property
+    def _stderr_handles(self) -> List[object]:
+        with self._lifecycle_lock:
+            return [record.stderr_handle for record in self._workers]
+
+    def _record_cleanup_failure(self, *, reason: str, path: str, exc: BaseException) -> dict:
+        status: Dict[str, object] = {
+            "pid": None,
+            "reason": reason,
+            "terminated": False,
+            "reaped": False,
+            "root_reaped": False,
+            "tree_termination_confirmed": False,
+            "returncode": None,
+            "cleanup_error": f"{type(exc).__name__}: {exc}",
+            "elapsed_s": 0.0,
+            "path": path,
+        }
+        with self._lifecycle_lock:
+            self.cleanup_statuses.append(status)
+        return status
+
+    def _cleanup_request_path(self, path: str) -> None:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            with self._lifecycle_lock:
+                self._request_paths.discard(path)
+        except OSError as exc:
+            self._record_cleanup_failure(reason="request_cleanup", path=path, exc=exc)
+        else:
+            with self._lifecycle_lock:
+                self._request_paths.discard(path)
 
     def _ensure(self, count: int) -> None:
         r"""Guarantee at least ``count`` live interpreters (never more than ``max_workers``)."""
         import subprocess
         import sys
         import tempfile
-        if self._workdir is None:
-            self._workdir = tempfile.mkdtemp(prefix="vfe3_umap_")
-        cache_dir = _numba_cache_dir()
-        while len(self._procs) < min(count, self.max_workers):
-            index = len(self._procs)
-            worker_env = os.environ.copy()
-            if cache_dir is None:
-                worker_env.pop("NUMBA_CACHE_DIR", None)
-            else:
-                worker_env["NUMBA_CACHE_DIR"] = cache_dir
-            handle = open(os.path.join(self._workdir, f"stderr_{index}.log"), "w+b")
-            self._stderr_handles.append(handle)
-            self._procs.append(subprocess.Popen(
-                [sys.executable, "-c", _UMAP_WORKER_SRC],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=handle,
-                text=True,
-                env=worker_env,
-            ))
+        with self._lifecycle_lock:
+            if self._closing:
+                raise RuntimeError("UMAP worker pool is closing")
+            if self._workdir is None:
+                self._workdir = tempfile.mkdtemp(prefix="vfe3_umap_")
+            cache_dir = _numba_cache_dir()
+            while len(self._workers) < min(count, self.max_workers):
+                worker_env = os.environ.copy()
+                if cache_dir is None:
+                    worker_env.pop("NUMBA_CACHE_DIR", None)
+                else:
+                    worker_env["NUMBA_CACHE_DIR"] = cache_dir
+                handle = open(os.path.join(self._workdir, f"stderr_{uuid4().hex}.log"), "w+b")
+                try:
+                    tree = spawn_process_tree(
+                        [sys.executable, "-c", _UMAP_WORKER_SRC],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
+                        stderr=handle,
+                        text=True,
+                        env=worker_env,
+                    )
+                except BaseException:
+                    handle.close()
+                    raise
+                self._workers.append(_UMAPWorkerRecord(tree=tree, stderr_handle=handle))
 
-    def _error_tail(self, index: int) -> str:
-        if self._workdir is None or index >= len(self._stderr_handles):
-            return ""
-        self._stderr_handles[index].flush()
+    def _error_tail(self, record: _UMAPWorkerRecord) -> str:
+        stderr_handle = record.stderr_handle
         try:
-            with open(os.path.join(self._workdir, f"stderr_{index}.log"), "rb") as handle:
+            stderr_handle.flush()
+        except (OSError, ValueError):
+            return ""
+        try:
+            with open(stderr_handle.name, "rb") as handle:
                 handle.seek(0, os.SEEK_END)
                 handle.seek(max(0, handle.tell() - 1000), os.SEEK_SET)
                 return handle.read().decode(errors="replace")
-        except OSError:
+        except (OSError, ValueError):
             return ""
 
-    def _submit(self, index: int, request: Dict[str, object]) -> None:
-        import json
-        proc = self._procs[index]
+    def _retire(
+        self,
+        record: _UMAPWorkerRecord,
+        *,
+        reason: str,
+    ) -> Optional[Dict[str, object]]:
+        """Retire one identity exactly once, without holding the lock while waiting."""
+        with self._lifecycle_lock:
+            if record.retired:
+                return record.cleanup_status
+            if record.retiring:
+                owner = False
+            else:
+                record.retiring = True
+                owner = True
+        if not owner:
+            record.retired_event.wait(self.cleanup_timeout * 2.0 + 0.1)
+            return record.cleanup_status
+
+        from time import monotonic
+        retirement_started = monotonic()
+
+        proc = record.process
+        handle = record.stderr_handle
+        cleanup_errors: List[str] = []
+        returncode = proc.poll()
+        status: Dict[str, object] = {
+            "pid": int(proc.pid),
+            "reason": reason,
+            "terminated": True,
+            "reaped": returncode is not None,
+            "root_reaped": returncode is not None,
+            "tree_termination_confirmed": False,
+            "returncode": returncode,
+            "cleanup_error": None,
+            "elapsed_s": 0.0,
+        }
         try:
-            proc.stdin.write(json.dumps(request) + "\n")
-            proc.stdin.flush()
-        except BrokenPipeError as exc:
-            tail = self._error_tail(index)
+            try:
+                status = record.tree.terminate(reason=reason, timeout=self.cleanup_timeout)
+            except BaseException as exc:
+                cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+                returncode = proc.poll()
+                status.update(
+                    reaped=returncode is not None,
+                    root_reaped=returncode is not None,
+                    returncode=returncode,
+                )
+
+            # Only after bounded tree termination: close streams on daemon helpers sharing the
+            # remaining cleanup budget. TextIOWrapper.close() may flush behind a concurrent submit.
+            stdin = proc.stdin
+            proc.stdin = None
+            try:
+                stderr_path = handle.name
+            except BaseException as exc:
+                cleanup_errors.append(f"stderr path: {type(exc).__name__}: {exc}")
+                stderr_path = None
+
+            from threading import Thread
+            close_deadline = monotonic() + max(
+                0.0,
+                self.cleanup_timeout - float(status.get("elapsed_s", 0.0)),
+            )
+            pending_closes = []
+            for label, stream in (("stdin", stdin), ("stderr", handle)):
+                if stream is None:
+                    continue
+                completed = Event()
+                close_errors: List[BaseException] = []
+
+                def _close_stream(
+                    owned_stream=stream,
+                    errors=close_errors,
+                    done=completed,
+                ) -> None:
+                    try:
+                        owned_stream.close()
+                    except BaseException as exc:
+                        errors.append(exc)
+                    finally:
+                        done.set()
+
+                closer = Thread(
+                    target=_close_stream,
+                    name=f"umap-{label}-close-{proc.pid}",
+                    daemon=True,
+                )
+                try:
+                    closer.start()
+                except BaseException as exc:
+                    cleanup_errors.append(f"{label} close start: {type(exc).__name__}: {exc}")
+                    continue
+                pending_closes.append((label, completed, close_errors))
+
+            for label, completed, close_errors in pending_closes:
+                remaining = max(0.0, close_deadline - monotonic())
+                if not completed.wait(remaining):
+                    cleanup_errors.append(f"{label} close exceeded cleanup budget")
+                elif close_errors:
+                    exc = close_errors[0]
+                    cleanup_errors.append(f"{label} close: {type(exc).__name__}: {exc}")
+
+            if stderr_path is not None:
+                try:
+                    os.remove(stderr_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    cleanup_errors.append(f"{type(exc).__name__}: {exc}")
+        finally:
+            status["elapsed_s"] = monotonic() - retirement_started
+            existing_error = status.get("cleanup_error")
+            status["cleanup_error"] = " | ".join(
+                part for part in (existing_error, *cleanup_errors) if part
+            ) or None
+            with self._lifecycle_lock:
+                self._workers[:] = [
+                    active for active in self._workers if active.identity != record.identity
+                ]
+                record.cleanup_status = status
+                record.retired = True
+                record.retiring = False
+                self.cleanup_statuses.append(status)
+                record.retired_event.set()
+        return status
+
+    def _submit(self, record: _UMAPWorkerRecord, request: Dict[str, object]) -> None:
+        import json
+        from threading import Thread
+        proc = record.process
+        stream = proc.stdin
+        if stream is None:
+            raise OSError("UMAP worker input is unavailable")
+        payload = json.dumps(request) + "\n"
+        completed = Event()
+        outcome: List[BaseException] = []
+
+        def _write_request() -> None:
+            try:
+                stream.write(payload)
+                stream.flush()
+            except BaseException as exc:
+                outcome.append(exc)
+            finally:
+                completed.set()
+
+        writer = Thread(target=_write_request, name=f"umap-submit-{proc.pid}", daemon=True)
+        writer.start()
+        if not completed.wait(self.timeout):
+            self._retire(record, reason="submit_timeout")
+            raise TimeoutError(f"UMAP worker request submission exceeded {self.timeout:g} seconds")
+        if outcome:
+            exc = outcome[0]
+            tail = self._error_tail(record)
+            self._retire(record, reason="pipe_closed")
             if "ModuleNotFoundError" in tail and "umap" in tail:
                 raise ImportError("umap_embed needs umap-learn (pip install umap-learn)") from exc
-            raise OSError(f"UMAP worker pipe closed: {tail[-500:]}") from exc
+            if isinstance(exc, (BrokenPipeError, OSError, ValueError)):
+                raise OSError(f"UMAP worker pipe closed: {tail[-500:]}") from exc
+            raise exc
+        with self._lifecycle_lock:
+            if record.retired or record.retiring:
+                raise OSError("UMAP worker retired during request submission")
+            record.requests_submitted += 1
 
-    def _collect(self, index: int, status: str, fout: str) -> np.ndarray:
+    def _collect(self, record: _UMAPWorkerRecord, status: str, fout: str) -> np.ndarray:
         r"""Block on one submitted request. The timeout starts HERE, matching the serial contract.
 
         A queued request (more seeds than workers) therefore gets its full timeout from the moment
         it is awaited rather than sharing one budget with the whole batch.
         """
         import json
-        import time
-        proc = self._procs[index]
-        deadline = time.monotonic() + self.timeout
-        while not os.path.exists(status):
+        from threading import Thread
+        proc = record.process
+        ready = Event()
+        canceled = Event()
+
+        def _watch() -> None:
+            while not canceled.is_set():
+                if os.path.exists(status) or proc.poll() is not None:
+                    ready.set()
+                    return
+                canceled.wait(0.01)
+
+        watcher = Thread(target=_watch, name=f"umap-status-{proc.pid}", daemon=True)
+        watcher.start()
+        with self._lifecycle_lock:
+            first_request = record.requests_submitted == 1
+        startup_grace = min(0.25, self.cleanup_timeout) if first_request else 0.0
+        finished = ready.wait(self.timeout + startup_grace)
+        canceled.set()
+        watcher.join(timeout=self.cleanup_timeout)
+        if not finished and not os.path.exists(status):
+            self._retire(record, reason="timeout")
+            raise TimeoutError(f"UMAP worker exceeded {self.timeout:g} seconds")
+        if not os.path.exists(status):
             returncode = proc.poll()
-            if returncode is not None:
-                tail = self._error_tail(index)
-                if "ModuleNotFoundError" in tail and "umap" in tail:
-                    raise ImportError("umap_embed needs umap-learn (pip install umap-learn)")
-                raise OSError(f"UMAP worker exited (rc={returncode}): {tail[-500:]}")
-            if time.monotonic() >= deadline:
-                proc.kill()
-                raise TimeoutError(f"UMAP worker exceeded {self.timeout:.0f} seconds")
-            time.sleep(0.05)
+            tail = self._error_tail(record)
+            self._retire(record, reason="worker_exit")
+            if "ModuleNotFoundError" in tail and "umap" in tail:
+                raise ImportError("umap_embed needs umap-learn (pip install umap-learn)")
+            raise OSError(f"UMAP worker exited (rc={returncode}): {tail[-500:]}")
         with open(status, encoding="utf-8") as handle:
             response = json.load(handle)
         if not response.get("ok"):
@@ -332,52 +581,73 @@ class UMAPWorker:
         if len(set(ordered)) != len(ordered):
             raise ValueError(f"embed_many needs distinct seeds, got {ordered!r}")
         self._ensure(len(ordered))
-        assert self._workdir is not None
-        self._counter += 1
-        stem = os.path.join(self._workdir, f"request_{self._counter}")
+        with self._lifecycle_lock:
+            assert self._workdir is not None
+            self._counter += 1
+            stem = os.path.join(self._workdir, f"request_{self._counter}")
+            workers = tuple(self._workers)
         fin = f"{stem}_in.npy"
         np.save(fin, features)
         paths = [fin]
         jobs = []
         try:
             for position, seed in enumerate(ordered):
-                index = position % len(self._procs)
+                record = workers[position % len(workers)]
                 fout, status = f"{stem}_{seed}_out.npy", f"{stem}_{seed}_status.json"
                 paths += [fout, status, f"{status}.tmp"]
-                self._submit(index, dict(input=fin, output=fout, status=status,
-                                         n_neighbors=n_neighbors, min_dist=min_dist,
-                                         n_components=n_components, seed=seed))
-                jobs.append((index, seed, fout, status))
-            return {seed: self._collect(index, status, fout)
-                    for index, seed, fout, status in jobs}
+                with self._lifecycle_lock:
+                    self._request_paths.update((fout, status, f"{status}.tmp"))
+                self._submit(record, dict(input=fin, output=fout, status=status,
+                                          n_neighbors=n_neighbors, min_dist=min_dist,
+                                          n_components=n_components, seed=seed))
+                jobs.append((record, seed, fout, status))
+            with self._lifecycle_lock:
+                self._request_paths.add(fin)
+            return {seed: self._collect(record, status, fout)
+                    for record, seed, fout, status in jobs}
         finally:
             for path in paths:
-                try:
-                    os.remove(path)
-                except FileNotFoundError:
-                    pass
+                self._cleanup_request_path(path)
 
-    def close(self) -> None:
+    def close(self) -> List[Dict[str, object]]:
+        from time import monotonic
         import shutil
-        for proc in self._procs:
-            if proc.stdin is not None:
-                try:
-                    proc.stdin.close()
-                except OSError:
-                    pass
-            try:
-                proc.wait(timeout=5.0)
-            except Exception:
-                proc.kill()
-                proc.wait()
-        self._procs = []
-        for handle in self._stderr_handles:
-            handle.close()
-        self._stderr_handles = []
-        if self._workdir is not None:
-            # The numba cache lives OUTSIDE this tree on purpose; only the request scratch goes.
-            shutil.rmtree(self._workdir, ignore_errors=True)
+        statuses: List[Dict[str, object]] = []
+        with self._lifecycle_lock:
+            self._closing = True
+            workers = tuple(reversed(self._workers))
+            workdir = self._workdir
             self._workdir = None
+        for record in workers:
+            status = self._retire(record, reason="close")
+            if status is not None:
+                statuses.append(status)
+        with self._lifecycle_lock:
+            request_paths = tuple(self._request_paths)
+        for path in request_paths:
+            self._cleanup_request_path(path)
+        if workdir is not None:
+            # The numba cache lives OUTSIDE this tree on purpose; only the request scratch goes.
+            # Windows can retain a terminated worker's file handles briefly. Retry only inside
+            # the caller's explicit cleanup budget and publish the terminal failure, if any.
+            cleanup_deadline = monotonic() + self.cleanup_timeout
+            while True:
+                try:
+                    shutil.rmtree(workdir)
+                    break
+                except FileNotFoundError:
+                    break
+                except OSError as exc:
+                    remaining = cleanup_deadline - monotonic()
+                    if remaining <= 0.0:
+                        statuses.append(self._record_cleanup_failure(
+                            reason="workdir_cleanup", path=workdir, exc=exc,
+                        ))
+                        break
+                    Event().wait(min(0.01, remaining))
+        with self._lifecycle_lock:
+            self._closing = False
+        return statuses
 
     def __enter__(self) -> "UMAPWorker":
         return self
@@ -973,16 +1243,18 @@ def _fe_terms(history: Dict, lambda_beta, *, lambda_gamma=0.0, include_attention
 
 
 @register_figure("free_energy_codescent")
-def plot_free_energy_codescent(
+@register_figure("free_energy_relationship")
+def plot_free_energy_relationship(
     history: Dict,                       # step, self_coupling, belief_coupling, attention_entropy, val_ce, [hyper_prior_weighted, gamma_*]
 
     *,
     lambda_beta:               'float | np.ndarray' = 1.0,
     lambda_gamma:              float = 0.0,
     include_attention_entropy: bool  = True,
+    divergence_family:         str = "renyi",
     path:                      Optional[str] = None,
 ):
-    r"""Inner-energy-vs-CE co-descent for the per-token alignment terms and held-out loss.
+    r"""Descriptive relationship between the target-blind objective and held-out loss.
 
     Twin y-axes over the real training step -- the inner alignment energy (self-coupling +
     the lambda_beta-scaled belief-coupling and attention-entropy + the weighted hyper-prior and gamma
@@ -995,6 +1267,7 @@ def plot_free_energy_codescent(
     """
     step, _comps, total, ce = _fe_terms(history, lambda_beta, lambda_gamma=lambda_gamma,
                                         include_attention_entropy=include_attention_entropy)
+    objective_label, objective_units = _registered_divergence_axis(divergence_family)
     keep = np.isfinite(total) & np.isfinite(ce)
     step, total, ce = step[keep], total[keep], ce[keep]
     w = max(5, total.size // 80)
@@ -1004,7 +1277,8 @@ def plot_free_energy_codescent(
     # of the opposite (twin) axis tick labels -- the left energy tag overlaps the right CE ticks.
     flab = f"inner energy (left) = {total[-1]:.1f}" if step.size else "inner energy (left)"
     ln1, = ax.plot(step, _rolling_mean(total, w), lw=2.0, color=_CB[0], label=flab)
-    ax.set(xlabel="training step", ylabel="inner alignment energy (nats/token)")
+    ax.set(xlabel="training step", ylabel=_objective_axis_text(
+        f"inner {objective_label}", objective_units, per_token=True))
     ax.yaxis.label.set_color(_CB[0]); ax.tick_params(axis="y", colors=_CB[0])
     if step.size and _set_finite_xlim(ax, step):
         _step_xaxis(ax)
@@ -1016,12 +1290,29 @@ def plot_free_energy_codescent(
     ax2.set_ylabel("validation CE (nats/token)", color=_CB[1]); ax2.tick_params(axis="y", colors=_CB[1])
     if total.size > 2:
         r = float(np.corrcoef(total, ce)[0, 1])
-        ax.set_title(rf"Inner-energy / CE co-descent (Pearson $r={r:+.2f}$)")
+        ax.set_title(rf"Inner-objective / CE relationship (Pearson $r={r:+.2f}$)")
     else:
-        ax.set_title("Inner-energy / CE co-descent")
+        ax.set_title("Inner-objective / CE relationship")
     ax.legend([ln1, ln2], [ln1.get_label(), ln2.get_label()], loc="upper right", fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
+
+
+plot_free_energy_codescent = plot_free_energy_relationship
+
+
+def _registered_divergence_axis(name: str) -> tuple[str, Optional[str]]:
+    """Return typed display metadata, or a unit-free generic divergence fallback."""
+    try:
+        display = get_functional_display(name)
+    except KeyError:
+        return "divergence", None
+    return display.label, display.units
+
+
+def _objective_axis_text(label: str, units: Optional[str], *, per_token: bool = False) -> str:
+    suffix = "/token" if per_token else ""
+    return f"{label} ({units}{suffix})" if units else f"{label}{suffix}"
 
 
 @register_figure("free_energy_decomposition")
@@ -1032,6 +1323,7 @@ def plot_free_energy_decomposition(
     lambda_beta:               'float | np.ndarray' = 1.0,
     lambda_gamma:              float = 0.0,
     include_attention_entropy: bool  = True,
+    divergence_family:         str = "renyi",
     path:                      Optional[str] = None,
 ):
     r"""The per-token inner alignment-energy budget and how its terms move over training.
@@ -1048,8 +1340,13 @@ def plot_free_energy_decomposition(
     """
     step, comps, _total, _ce = _fe_terms(history, lambda_beta, lambda_gamma=lambda_gamma,
                                          include_attention_entropy=include_attention_entropy)
-    names  = [_FE_LABELS[k][1] for k, _ in comps]
-    labels = [_FE_LABELS[k][0] for k, _ in comps]
+    objective_label, objective_units = _registered_divergence_axis(divergence_family)
+    dynamic_labels = dict(_FE_LABELS)
+    dynamic_labels["self"] = ("self-coupling", f"self-coupling\n{objective_label}(q,p)")
+    dynamic_labels["belief"] = (
+        "belief coupling", f"belief-coupling\n{objective_label}(q,transported q)")
+    names  = [dynamic_labels[k][1] for k, _ in comps]
+    labels = [dynamic_labels[k][0] for k, _ in comps]
     series = [c for _, c in comps]
     colors = _CB[:len(series)]
     last = np.array([s[-1] for s in series])
@@ -1063,7 +1360,8 @@ def plot_free_energy_decomposition(
         axes[0].annotate(f"{val:.1f}", xy=(val, yi), xytext=(4, 0), textcoords="offset points",
                          va="center", ha="left", fontsize=9)
     axes[0].set_xlim(float(last.min()) * 0.5, float(last.max()) * 3.0)
-    axes[0].set(xlabel="inner-energy contribution (nats/token, log scale)",
+    axes[0].set(xlabel=_objective_axis_text(
+                    "inner-objective contribution", objective_units, per_token=True) + " (log scale)",
                 title=f"Budget at step {int(step[-1]):,}")
     # Panel B -- early/mid/late medians, log y so the flat dominant term and the moving terms coexist.
     thirds  = np.array_split(np.arange(step.size), 3)
@@ -1077,8 +1375,10 @@ def plot_free_energy_decomposition(
     axes[1].set_yscale("log")
     axes[1].set_ylim(top=axes[1].get_ylim()[1] * 2.2)            # headroom for the legend above the bars
     axes[1].set_xticks(centers); axes[1].set_xticklabels(["early", "mid", "late"])
-    axes[1].set(xlabel="training third", ylabel="inner term (median, nats/token, log scale)",
-                title="Self-coupling flat; other terms descend")
+    axes[1].set(xlabel="training third",
+                ylabel=_objective_axis_text(
+                    "inner term (median)", objective_units, per_token=True) + " (log scale)",
+                title="Inner-objective terms across training thirds")
     axes[1].legend(fontsize=7.5, frameon=False, ncol=2, loc="upper right")
     fig.tight_layout()
     return _save(fig, path)
@@ -1242,35 +1542,51 @@ def plot_estep_grad_norm_decomposition(
 
 
 @register_figure("estep_convergence")
-def plot_estep_convergence(
+@register_figure("iterate_trajectory")
+def plot_iterate_trajectory(
     trace:    Dict,                      # e_step_belief_trace output: mu, sigma, phi, free_energy
 
     *,
-    diagonal: Optional[bool] = None,
-    path:     Optional[str]  = None,
+    diagonal:          Optional[bool] = None,
+    divergence_family: str = "renyi",
+    evidence:           Optional[Mapping[str, object]] = None,
+    path:               Optional[str] = None,
 ):
-    r"""F2: E-step convergence -- free energy and belief motion across inner iterations.
+    r"""Free energy and belief motion across the configured E-step iterate trajectory.
 
     Panel A is the global F(t) over inner iterations with the trained budget marked. Panel B is the
-    belief-motion residuals on a log axis -- the mean step, the affine-invariant SPD covariance step,
-    and the gauge step -- each median + 10-90 band over tokens, shrinking toward a fixed point.
+    Step lengths are shown without treating small final movement as convergence unless structured
+    evidence establishes it.
     """
     from vfe3 import metrics
+    objective_label, objective_units = _registered_divergence_axis(divergence_family)
+    evidence = dict(evidence or {})
     fe = _np(trace["free_energy"])
     res = metrics.estep_residuals(trace["mu"], trace["sigma"], trace["phi"], diagonal=diagonal)
     fig, axes = plt.subplots(1, 2, figsize=(9, 3.6))
     axes[0].plot(np.arange(fe.size), fe, "o-", color=_CB[0], ms=4, lw=1.6)
     axes[0].axhline(fe[-1], color="#888888", ls=":", lw=1)
-    axes[0].set(xlabel="E-step inner iteration", ylabel="free energy (nats)", title="E-step descent")
+    trajectory_title = "E-step iterate trajectory"
+    if evidence.get("fixed_point_evidence"):
+        trajectory_title += " (fixed point established)"
+    elif evidence.get("descent_evidence"):
+        trajectory_title += " (descent established)"
+    axes[0].set(xlabel="E-step inner iteration",
+                ylabel=_objective_axis_text(objective_label, objective_units),
+                title=trajectory_title)
     t = np.arange(1, _np(res["r_mu"]).shape[0] + 1)
     _median_band(axes[1], t, _np(res["r_mu"]), _CB[0], r"$r_\mu$")
     _median_band(axes[1], t, _np(res["r_sigma"]), _CB[1], r"$r_\Sigma$ (SPD)")
     _median_band(axes[1], t, _np(res["r_phi"]), _CB[2], r"$r_\phi$")
     axes[1].set_yscale("log")
-    axes[1].set(xlabel="E-step inner iteration", ylabel="belief step length", title="Convergence to fixed point")
+    axes[1].set(xlabel="E-step inner iteration", ylabel="belief step length",
+                title="Final-iterate movement")
     axes[1].legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return _save(fig, path)
+
+
+plot_estep_convergence = plot_iterate_trajectory
 
 
 @register_figure("estep_depth_sensitivity")
@@ -3192,28 +3508,35 @@ def plot_capacity_scaling(
 def plot_estep_capacity(
     n_e_steps:    object,                # (T,) E-step iteration counts
     bpc:          object,                # (T,) val BPC
-    free_energy:  object,                # (T,) converged free energy
+    free_energy:  object,                # (T,) final-iterate objective
 
     *,
-    n_params:     Optional[int]   = None,
-    wall_time:    Optional[object] = None,
-    path:         Optional[str]   = None,
+    n_params:          Optional[int] = None,
+    wall_time:         Optional[object] = None,
+    divergence_family: str = "renyi",
+    evidence:          Optional[Mapping[str, object]] = None,
+    path:              Optional[str] = None,
 ):
-    r"""F11 Panel B: E-step-as-capacity -- more inner free-energy minimization lowers loss at flat params.
+    r"""E-step inference depth versus validation BPC and the final-iterate objective.
 
-    val BPC and converged F vs the number of E-step iterations on a twin axis (the controlled
-    intervention: parameters are constant, only inference depth changes). An optional wall-time inset
+    Parameters stay flat while inference depth changes. This displays the observed relationship;
+    it does not presume monotonic improvement or convergence. An optional wall-time inset
     shows the compute cost.
     """
     x = _np(n_e_steps)
+    objective_label, objective_units = _registered_divergence_axis(divergence_family)
+    evidence = dict(evidence or {})
     fig, ax = plt.subplots(figsize=(5.4, 4.0))
     ax.plot(x, _np(bpc), "o-", color=_CB[0], lw=2, label="val BPC")
     ax.set(xlabel="E-step iterations (n_e_steps)", ylabel="val BPC")
     ax2 = ax.twinx()
     ax2.plot(x, _np(free_energy), "s--", color=_CB[1], lw=2)
-    ax2.set_ylabel("converged F (nats)", color=_CB[1])
-    note = "capacity from inference" + (f"; params flat at {n_params:,}" if n_params else "")
-    ax.set_title(f"E-step-as-capacity ({note})")
+    ax2.set_ylabel(_objective_axis_text(
+        f"final-iterate {objective_label}", objective_units), color=_CB[1])
+    note = "inference-depth relationship" + (f"; params flat at {n_params:,}" if n_params else "")
+    if evidence.get("fixed_point_evidence"):
+        note += "; fixed point established"
+    ax.set_title(f"E-step capacity ({note})")
     if wall_time is not None:
         ins = ax.inset_axes([0.6, 0.6, 0.36, 0.34])
         ins.plot(x, _np(wall_time), "o-", color="#888888", ms=3)
@@ -4003,23 +4326,24 @@ def plot_rank_residual_by_depth(
 
 
 # ===========================================================================
-# C2 / EXP-5  --  structural non-Neal-Hinton EM: F-vs-CE decorrelation
+# C2 / EXP-5  --  structural non-Neal-Hinton EM: final-iterate objective / CE relationship
 # ===========================================================================
 
 @register_figure("f_ce_decorrelation")
-def plot_f_ce_decorrelation(
+@register_figure("f_ce_relationship")
+def plot_f_ce_relationship(
     arms,                                # list of {n_e_steps, final_f, ce, [label]} (one per n_e_steps cell)
 
     *,
+    divergence_family: str = "renyi",
     path: Optional[str] = None,
 ):
-    r"""C2/EXP-5: converged final E-step free energy per token vs held-out CE, one point per n_e_steps.
+    r"""Final-iterate target-blind objective per token versus held-out CE.
 
-    The structural non-Neal-Hinton EM prediction: the E-step descends its OWN target-blind functional
-    F, NOT the likelihood, so across an n_e_steps sweep final F should fall steeply (Pearson(n_e_steps,
-    F) < 0) while staying DECORRELATED from CE (Pearson(F, CE) ~ 0, or even > 0). A strongly NEGATIVE
-    Pearson(F, CE) would instead say F tracks the loss, contradicting the EM separation. Points are
-    ordered and annotated by n_e_steps; both Pearsons are in the title."""
+    Target blindness establishes structural separation from the prediction objective. It does not
+    imply any correlation sign across a finite depth sweep; the displayed correlations are descriptive.
+    Points are ordered and annotated by n_e_steps."""
+    objective_label, objective_units = _registered_divergence_axis(divergence_family)
     pts = sorted(arms, key=lambda a: float(a["n_e_steps"]))
     ne = np.array([float(a["n_e_steps"]) for a in pts])
     ff = np.array([float(a["final_f"]) for a in pts])
@@ -4037,10 +4361,15 @@ def plot_f_ce_decorrelation(
             ax.annotate(f"T={int(float(a['n_e_steps']))}", (float(a["final_f"]), float(a["ce"])),
                         textcoords="offset points", xytext=(6, 4), fontsize=8)
         fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.02, label="n_e_steps")
-    ax.set(xlabel="converged final E-step F / token (nats)", ylabel="held-out CE (nats)")
-    ax.set_title(rf"E-step F vs CE  (Pearson$(F,CE)$={r_fce:+.3f}, Pearson$(T,F)$={r_nef:+.3f})")
+    ax.set(xlabel=_objective_axis_text(
+               f"final-iterate {objective_label}", objective_units, per_token=True),
+           ylabel="held-out CE (nats)")
+    ax.set_title(rf"E-step objective / CE relationship  (Pearson$(F,CE)$={r_fce:+.3f}, Pearson$(T,F)$={r_nef:+.3f})")
     fig.tight_layout()
     return _save(fig, path)
+
+
+plot_f_ce_decorrelation = plot_f_ce_relationship
 
 
 # ===========================================================================

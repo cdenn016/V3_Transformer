@@ -706,7 +706,7 @@ BASELINE_CONFIG["kl_max"] = 8 * BASELINE_CONFIG["embed_dim"]
 # One sweep per sweepable VFE3Config toggle. `requires` pre-satisfies a cross-field constraint
 # so the cell is a clean single-variable comparison rather than a config error; multi-arm
 # `configs` is used where arms must differ in several fields at once. The few fields that are NOT
-# meaningfully ablatable are listed under NON_SWEPT_FIELDS below.
+# meaningfully ablatable are documented below.
 SWEEPS: Dict[str, Dict[str, Any]] = {
 
     # === model structure / capacity ========================================
@@ -1360,6 +1360,7 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
     # alpha form (diagonal-only), both of which a naive single-field sweep would have rejected.
     "covariance": {
         "description": "belief covariance structure (diagonal vs full Gaussian)",
+        "requires": {"decode_mode": "family_chunked"},
         "configs": [
             {"label": "diagonal", "family": "gaussian_diagonal"},
             {"label": "full",     "family": "gaussian_full", "e_step_update": "gradient",
@@ -1424,20 +1425,17 @@ SWEEPS: Dict[str, Dict[str, Any]] = {
         # to the priors/gauge-frame tables, while renyi_order == 1 uses the always-live analytic kernel.
         # Without this the sweep measures gradient-truncation, not divergence order (it makes alpha != 1
         # spuriously ~2.5x faster AND worse). No-op at renyi_order == 1 (the kernel ignores the toggle).
-        # alpha<1 is mass-covering, alpha>1 mode-seeking; for alpha>1 the non-PD blend saturates to
-        # kl_max with zero gradient (S27), predicting a non-monotone H(beta)-vs-alpha tail.
-        # collect_diagnostics captures attn_entropy (H(beta)) + energy_klmax_frac (the saturation
-        # fraction) per cell -> the renyi_saturation figure.
-        "description": "Renyi divergence order alpha (both sides of 1) + non-PD saturation diagnostic [B2/EXP-12]",
+        # This family-consistent prior-bank sweep is scoped to alpha<=1: Task 5's fail-closed domain
+        # rejects alpha>1 because its covariance blend is not guaranteed SPD. Keeping only the two
+        # mass-covering arms and the KL endpoint makes every registered arm constructible while
+        # preserving one-factor semantics. Diagnostics still capture H(beta) and guard activation.
+        "description": "Renyi divergence order alpha in the family-consistent alpha<=1 domain [B2/EXP-12]",
         "configs": [
             {"label": "renyi_order=0.5", "renyi_order": 0.5, "e_step_update": "gradient"},
             {"label": "renyi_order=0.8", "renyi_order": 0.8, "e_step_update": "gradient"},
             {"label": "renyi_order=1.0", "renyi_order": 1.0},
-            {"label": "renyi_order=1.2", "renyi_order": 1.2, "e_step_update": "gradient"},
-            {"label": "renyi_order=1.5", "renyi_order": 1.5, "e_step_update": "gradient"},
-            {"label": "renyi_order=2.0", "renyi_order": 2.0, "e_step_update": "gradient"},
         ],
-        "requires": {"oracle_unroll_grad": True},
+        "requires": {"oracle_unroll_grad": True, "decode_mode": "family_chunked"},
         "collect_diagnostics": True,
     },
 
@@ -1898,10 +1896,6 @@ SWEEPS["e_q_mu_sigma_lr_grid"] = {
 #  drives the full-covariance SPD retraction's eigh to non-convergence -- a deferred robust-eigh
 #  issue, separate from the now-fixed full-cov KL Cholesky.)
 # (gauge_parameterization is swept via the "gauge_parameterization" arm in SWEEPS, not here.)
-NON_SWEPT_FIELDS = (
-    "vocab_size", "encode_mode", "divergence_family", "seed",
-    "max_steps", "log_interval", "eval_interval", "checkpoint_interval", "eval_max_batches",
-)
 
 
 # Which sweeps run (and in what order) when CONFIG["sweep"] is None. This is a CURATED subset of
@@ -2368,7 +2362,7 @@ def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True
             valid_candidates = 0
             for index, overrides in enumerate(_parameter_grid_overrides(SWEEPS[name])):
                 try:
-                    VFE3Config(**{**BASELINE_CONFIG, **overrides})
+                    VFE3Config(**{**_resolved_sweep_baseline(), **overrides})
                     valid_candidates += 1
                 except (TypeError, ValueError):
                     pass
@@ -2407,7 +2401,7 @@ def validate_sweeps(sweep_names: List[str], *, require_construction: bool = True
         }
         abstain_per_arm: List[set] = []
         for label, overrides in runs:
-            cfg = dict(BASELINE_CONFIG)
+            cfg = _resolved_sweep_baseline()
             cfg.update(overrides)
             try:
                 # An INERT arm is a silent measurement failure, not a construction failure: the run
@@ -2571,44 +2565,22 @@ def make_run_overrides(sweep_name: str) -> List[Tuple[str, Dict[str, Any]]]:
         param = sweep["param"]
         for value in _sweep_values(sweep):
             runs.append((f"{param}={value}", {**requires, param: value}))
-    return [(label, _repair_arm_prerequisites(overrides)) for label, overrides in runs]
+    return runs
 
 
-# The three toggles pos_phi_compose='group_product' requires (config.py rejects any other value of
-# them alongside it). Kept next to the repair so the two cannot drift apart.
-_GROUP_PRODUCT_REQUIRES = {
-    "gauge_parameterization": "phi",
-    "transport_mode":         "flat",
-    "s_frame_mode":           "tied",
-}
+def _resolved_sweep_baseline() -> Dict[str, Any]:
+    r"""Return the one broadly compatible baseline used before applying every sweep arm.
 
-
-def _repair_arm_prerequisites(overrides: Dict[str, Any]) -> Dict[str, Any]:
-    r"""Downgrade baseline settings an arm's own overrides have made invalid.
-
-    ``pos_phi_compose='group_product'`` is the exact positional composition -- it forms the frame as
-    the true product ``exp(X) exp(Y)`` instead of a truncated-BCH single coordinate -- but it is
-    admissible ONLY with ``gauge_parameterization='phi'``, ``transport_mode='flat'`` and
-    ``s_frame_mode='tied'``. Sweeps exist to vary precisely those three, so once the BASELINE carries
-    group_product every such arm becomes unconstructible: 26 arms across seven sweeps failed
-    ``validate_sweeps`` this way. Since group_product is a property of the baseline rather than of
-    those arms, the arm keeps its swept dimension and falls back to the ordinary ``'bch'`` chart,
-    which every configuration accepts. Arms that set ``pos_phi_compose`` explicitly are left alone,
-    so the dedicated ``pos_phi_composition`` sweep still contrasts the two charts directly.
-
-    Returned as a NEW dict; the sweep declarations are never mutated.
+    ``BASELINE_CONFIG`` remains the user's explicit click-to-run declaration, including any
+    ``group_product`` selection. That chart is intentionally narrow, however, and cannot be
+    inherited by arms that vary its prerequisites. Resolve the common sweep baseline once, before
+    expansion, so labels and arm overrides state only their declared contrast; an arm that wants
+    group-product composition must still declare it explicitly.
     """
-    if overrides.get("pos_phi_compose", BASELINE_CONFIG.get("pos_phi_compose")) != "group_product":
-        return overrides
-    if "pos_phi_compose" in overrides:            # an explicit arm choice is authoritative
-        return overrides
-    conflicting = [
-        field for field, required in _GROUP_PRODUCT_REQUIRES.items()
-        if overrides.get(field, BASELINE_CONFIG.get(field)) != required
-    ]
-    if not conflicting:
-        return overrides
-    return {**overrides, "pos_phi_compose": "bch"}
+    resolved = copy.deepcopy(BASELINE_CONFIG)
+    if resolved.get("pos_phi_compose") == "group_product":
+        resolved["pos_phi_compose"] = "bch"
+    return resolved
 
 
 # =============================================================================
@@ -2683,7 +2655,7 @@ def _cell_cfg_dict(
     Single source of truth for cell construction, shared by ``run_single`` and the resume
     staleness check so the cached-config comparison is faithful.
     """
-    d = copy.deepcopy(BASELINE_CONFIG)
+    d = _resolved_sweep_baseline()
     d.update(overrides)
     d["checkpoint_interval"] = 0                             # no per-cell step_N.pt blowup
     d["seed"] = _require_exact_seed(seed, "seed")
@@ -2692,9 +2664,22 @@ def _cell_cfg_dict(
     return d
 
 
-def _gauge_reporting_fields(cfg: VFE3Config) -> Dict[str, object]:
-    """Return the executable gauge-purity classification carried by every ablation row."""
-    report = _pure_path_report(cfg, [])
+def _gauge_reporting_fields(
+    cfg: VFE3Config,
+    *,
+    history: Optional[List[Dict[str, object]]] = None,
+    executable_build=None,
+    reflection_scope=None,
+    reflection_group_component_count=None,
+) -> Dict[str, object]:
+    """Return the executable scientific-certificate fields carried by an ablation row."""
+    report = _pure_path_report(
+        cfg,
+        ([] if history is None else history),
+        executable_build=executable_build,
+        reflection_scope=reflection_scope,
+        reflection_group_component_count=reflection_group_component_count,
+    )
     toggles = report["config_toggles"]
     gauge_flags = report["gauge_flags"]
     return {
@@ -2704,7 +2689,50 @@ def _gauge_reporting_fields(cfg: VFE3Config) -> Dict[str, object]:
         "block_mlp_covariance_contract":     str(toggles["block_mlp_covariance_contract"]),
         "block_mlp_intertwiner_compatible":  bool(gauge_flags["block_mlp_intertwiner_compatible"]),
         "on_gauge_pure_path":                bool(report["on_gauge_pure_path"]),
+        "on_causal_lm_path":                 bool(report["on_causal_lm_path"]),
+        "transport_exactness_status":         str(report["transport_exactness_status"]),
+        "on_theory_pure_path":                bool(report["on_theory_pure_path"]),
+        "reflection_effective_scope":         str(report["reflection"]["effective_scope"]),
+        "reflection_accessible_component_count": report["reflection"]["accessible_component_count"],
     }
+
+_EXECUTION_DERIVED_REPORT_FIELDS = frozenset({
+    "block_mlp_structural_mode",
+    "block_mlp_covariance_contract",
+    "block_mlp_intertwiner_compatible",
+    "on_gauge_pure_path",
+    "transport_exactness_status",
+    "on_theory_pure_path",
+    "reflection_effective_scope",
+    "reflection_accessible_component_count",
+})
+_EXACTNESS_STATUSES = frozenset({"exact", "approximate", "not_applicable", "unknown"})
+
+
+def _merge_gauge_reporting_defaults(
+    result: Dict[str, object],
+    expected_fields: Mapping[str, object],
+) -> None:
+    """Fill absent report fields without replacing persisted execution-derived evidence."""
+    for key, value in expected_fields.items():
+        result.setdefault(key, value)
+
+
+def _execution_derived_reporting_fields_are_valid(result: Mapping[str, object]) -> bool:
+    """Fail closed on missing or malformed persisted execution-derived certificate fields."""
+    if not _EXECUTION_DERIVED_REPORT_FIELDS <= result.keys():
+        return False
+    component_count = result["reflection_accessible_component_count"]
+    return (
+        isinstance(result["block_mlp_structural_mode"], str)
+        and isinstance(result["block_mlp_covariance_contract"], str)
+        and type(result["block_mlp_intertwiner_compatible"]) is bool
+        and type(result["on_gauge_pure_path"]) is bool
+        and result["transport_exactness_status"] in _EXACTNESS_STATUSES
+        and type(result["on_theory_pure_path"]) is bool
+        and isinstance(result["reflection_effective_scope"], str)
+        and (component_count is None or type(component_count) is int)
+    )
 
 
 @torch.no_grad()
@@ -3015,7 +3043,11 @@ def run_single(
         "max_tokens":           (int(max_tokens) if max_tokens is not None else None),
         "_loaded_data_sources": loaded_data_sources,
     }
-    result.update(_gauge_reporting_fields(cfg))
+    result.update(_gauge_reporting_fields(
+        cfg, history=artifacts.history, executable_build=model.executable_build,
+        reflection_scope=model.prior_bank.reflection_scope,
+        reflection_group_component_count=len(model.group.irrep_dims),
+    ))
     result.update(terminal_result)                           # primary/final/best/terminal_checkpoint headline
 
     # PB-07 opt-in: publish the per-token validation nats (the paired within-run bootstrap the
@@ -3089,7 +3121,9 @@ _CSV_COLUMNS = [
     "n_params", "target_n_params", "param_difference", "param_relative_deviation",
     "head_mixer_compatibility", "head_mixer_gauge_compatible",
     "block_mlp_structural_mode", "block_mlp_covariance_contract",
-    "block_mlp_intertwiner_compatible", "on_gauge_pure_path",
+    "block_mlp_intertwiner_compatible", "on_gauge_pure_path", "on_causal_lm_path",
+    "transport_exactness_status", "on_theory_pure_path", "reflection_effective_scope",
+    "reflection_accessible_component_count",
     # opt-in per-cell converged-state diagnostics (S2; empty unless the sweep sets collect_diagnostics)
     "attn_entropy", "omega_identity_dev", "builder_resid", "gauge_resid_in", "gauge_resid_out",
     "rank_resid", "cov_gap", "energy_klmax_frac",
@@ -4165,7 +4199,13 @@ def _collect_sweep_results(
             required=bool(aggregation["diagnostic_flags"]["paired_token_bootstrap"]),
         ):
             continue
-        if any(result.get(key) != value for key, value in gauge_fields.items()):
+        if (
+            not _execution_derived_reporting_fields_are_valid(result)
+            or any(
+                key not in _EXECUTION_DERIVED_REPORT_FIELDS and result.get(key) != value
+                for key, value in gauge_fields.items()
+            )
+        ):
             continue
         results.append(dict(result))
 
@@ -4685,7 +4725,7 @@ def run_sweep(
                     and _paired_token_artifact_is_current(run_dir, required=paired_token_bootstrap)):
                 print(f"\n--- {i + 1}/{len(cells)}: {label}  [CACHED] ---")
                 cached_result = dict(cached_result)
-                cached_result.update(expected_gauge_fields)
+                _merge_gauge_reporting_defaults(cached_result, expected_gauge_fields)
                 cached_result["sweep"] = sweep_scope
                 cached_result["label"] = label
                 cached_result["seed"] = cell_seed
@@ -4758,14 +4798,23 @@ def run_sweep(
                 "param_difference":         parameter_record["param_difference"],
                 "param_relative_deviation": parameter_record["param_relative_deviation"],
             })
-        result.update(expected_gauge_fields or {
+        reporting_fields = expected_gauge_fields or {
             "head_mixer_compatibility":         "unavailable",
             "head_mixer_gauge_compatible":      False,
             "block_mlp_structural_mode":        "unavailable",
             "block_mlp_covariance_contract":    "unavailable",
             "block_mlp_intertwiner_compatible": False,
             "on_gauge_pure_path":               False,
-        })
+            "on_causal_lm_path":                False,
+            "transport_exactness_status":        "unknown",
+            "on_theory_pure_path":               False,
+            "reflection_effective_scope":        "unknown",
+            "reflection_accessible_component_count": None,
+        }
+        if result.get("error_kind") is None:
+            _merge_gauge_reporting_defaults(result, reporting_fields)
+        else:
+            result.update(reporting_fields)
         result["collect_diagnostics"] = diagnostic_flags["collect_diagnostics"]
         result["collect_extrapolation"] = diagnostic_flags["collect_extrapolation"]
         # The request flag always lands in the marker; the artifact identity fields default to null on
@@ -5017,6 +5066,26 @@ def _aggregate_cells(
     return out
 
 
+def _print_ablation_rows(rows: List[Dict[str, Any]], *, parameter_matched: bool) -> None:
+    """Print one reachable ablation table with the complete structural gauge label."""
+    if parameter_matched:
+        print(f"{'label':<34}{'val PPL':>12}{'params':>12}{'budget dev':>12}  gauge classification")
+        print("-" * 116)
+    else:
+        print(f"{'label':<34}{'val PPL':>12}{'params':>12}  gauge classification")
+        print("-" * 104)
+    for row in rows:
+        ppl = "inf" if row.get("_ppl", _as_float(row.get("primary_val_ppl"))) == float("inf") else f"{row.get('_ppl', _as_float(row.get('primary_val_ppl'))):.3f}"
+        params = f"{int(_as_float(row.get('n_params'))):,}" if row.get("n_params") not in ("", None) else "-"
+        gauge = _sensitivity_gauge_label(row)
+        if parameter_matched:
+            relative = _as_float(row.get("param_relative_deviation"))
+            deviation = "-" if relative == float("inf") else f"{relative * 100:.2f}%"
+            print(f"{row['label']:<34}{ppl:>12}{params:>12}{deviation:>12}  {gauge}")
+        else:
+            print(f"{row['label']:<34}{ppl:>12}{params:>12}  {gauge}")
+
+
 def analyze_sweep(sweep_dir: Path) -> None:
     rows = _read_sweep_csv(sweep_dir)
     if not rows:
@@ -5028,22 +5097,7 @@ def analyze_sweep(sweep_dir: Path) -> None:
 
     print(f"\n{'=' * 70}\nANALYSIS: {sweep_dir.name}\n{'=' * 70}")
     parameter_matched = any(r.get("target_n_params") not in ("", None) for r in rows)
-    if parameter_matched:
-        print(f"{'label':<34}{'val PPL':>12}{'params':>12}{'budget dev':>12}  gauge classification")
-        print("-" * 116)
-    else:
-        print(f"{'label':<34}{'val PPL':>12}{'params':>12}  gauge classification")
-        print("-" * 104)
-    for r in rows:
-        ppl = "inf" if r["_ppl"] == float("inf") else f"{r['_ppl']:.3f}"
-        params = f"{int(_as_float(r.get('n_params'))):,}" if r.get("n_params") not in ("", None) else "-"
-        gauge = r.get("head_mixer_compatibility") or "unavailable"
-        if parameter_matched:
-            relative = _as_float(r.get("param_relative_deviation"))
-            deviation = "-" if relative == float("inf") else f"{relative * 100:.2f}%"
-            print(f"{r['label']:<34}{ppl:>12}{params:>12}{deviation:>12}  {gauge}")
-        else:
-            print(f"{r['label']:<34}{ppl:>12}{params:>12}  {gauge}")
+    _print_ablation_rows(rows, parameter_matched=parameter_matched)
 
     finished = [r for r in rows if r["_ppl"] < float("inf")]
     if len(finished) > 1:
@@ -5062,15 +5116,6 @@ def analyze_sweep(sweep_dir: Path) -> None:
         print("-" * 68)
         for a in agg:
             print(f"{a['label']:<34}{a['n']:>4}{a['mean']:>12.3f}{a['sd']:>10.3f}{a['cv'] * 100:>8.1f}")
-
-
-def _sweep_is_complete(sweep_dir: Path) -> bool:
-    """Return true only when one persisted sweep explicitly completed its invocation."""
-    try:
-        meta = json.loads((sweep_dir / "sweep_meta.json").read_text(encoding="utf-8"))
-    except Exception:
-        return False
-    return isinstance(meta, Mapping) and meta.get("status") == "complete"
 
 
 def _cross_sweep_cohort_identity(
@@ -5146,7 +5191,7 @@ def summarize_sweeps(
         if not rows:
             continue
         best = min(rows, key=lambda r: _as_float(r.get("primary_val_ppl")))
-        gauge = best.get("head_mixer_compatibility") or "unavailable"
+        gauge = _sensitivity_gauge_label(best)
         print(f"{d.name:<24}{best['label']:<30}{_as_float(best['primary_val_ppl']):>10.3f}  {gauge}")
 
 

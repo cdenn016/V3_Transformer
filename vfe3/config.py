@@ -313,6 +313,7 @@ class VFE3Config:
     # full-covariance Gaussian family (family='gaussian_full') because J Sigma J^T is dense; the
     # means-only 'passthrough' is the pure default. Validated below.
     cg_covariance_mode:        str   = "passthrough"     # "passthrough" | "delta_full"
+    cg_covariance_floor:       float = 1e-6              # delta_full: J Sigma J^T + floor * Sigma
 
     # CG moment-energy regularizer weight (opt-in; default 0.0 = off, everything untouched). When
     # > 0 the outer objective adds ONCE cg_energy_weight * mean_layers(mean_tokens(D(q_post||q_pre))),
@@ -327,7 +328,7 @@ class VFE3Config:
     # axis. The theoretically PURE no-composition path is "none". Validated against the pos_phi
     # registry.
     pos_phi:                   str             = "learned"   # "none" | "learned" | "frozen"
-    pos_phi_compose:           str             = "group_product"       # composition chart: bch (default) | euclidean
+    pos_phi_compose:           str             = "bch"                 # composition chart: bch (default) | euclidean
     
     bch_pe_order:              int             = 4           # BCH Dynkin truncation order (compose_phi order) 4 is just as good as 6
     bch_residual_max:          Optional[float] = None        # opt-in fail-closed BCH/group-product relative residual
@@ -611,7 +612,7 @@ class VFE3Config:
     use_prior_bank:            bool  = False
     decode_bias:               bool  = False  # use_prior_bank=False only: learned per-vocab log-unigram bias on logits=mu_q@W^T+b (zero-init, weight-decay-free). Inert (warns) under use_prior_bank=True.
    
-    decode_tau:                float = 0.01
+    decode_tau:                float = 1.0
     decode_mode:               str   = "diagonal_chunked"    #"full_chunked", "diagonal_chunked", "expected_liklihood_chunked", "diagonal_untied", "full"
     
     # decode_chunk_size: vocabulary-chunk width V is iterated over by the fused CE kernels (the
@@ -1497,6 +1498,11 @@ class VFE3Config:
                 f"(family='gaussian_full'); the delta-method J Sigma J^T is dense and a "
                 f"diagonal/non-Gaussian family cannot carry it (got family={self.family!r})."
             )
+        if not (math.isfinite(self.cg_covariance_floor) and self.cg_covariance_floor > 0.0):
+            raise ValueError(
+                "cg_covariance_floor must be finite and strictly positive; got "
+                f"{self.cg_covariance_floor!r}")
+
         if not math.isfinite(self.cg_energy_weight) or self.cg_energy_weight < 0.0:
             raise ValueError(
                 f"cg_energy_weight must be finite and >= 0; got {self.cg_energy_weight!r}"
@@ -2634,6 +2640,15 @@ class VFE3Config:
         # sigma and its own active registration controls dense-vs-fused training; decode_mode does not
         # route that no-prior path, so the cross-check stays gated on use_prior_bank.
         decode_registration = _DECODERS[self.decode_mode]
+        if (self.use_prior_bank
+                and decode_registration.family_consistent
+                and self.divergence_family == "renyi"
+                and self.renyi_order > 1.0):
+            raise ValueError(
+                "family-consistent prior-bank Renyi decoding requires renyi_order <= 1 "
+                "because alpha > 1 cannot guarantee a finite score across the entire prior bank; "
+                f"got renyi_order={self.renyi_order}.")
+
         if (
             self.encode_mode in ("canonical_content_gauge", "canonical_content_projected")
             and not has_builtin_canonical_content_encoder(self.encode_mode)
@@ -2957,15 +2972,13 @@ class VFE3Config:
                 "block_mlp_expansion must be an integer >= 1, "
                 f"got {self.block_mlp_expansion!r}"
             )
-        if self.block_mlp_mode not in ("coordinate", "gauge_gate", "canonical_frame"):
+        from vfe3.model.block_mlp import get_block_mlp_registration
+        block_mlp_registration = get_block_mlp_registration(self.block_mlp_mode)
+        if self.block_mlp_covariance not in block_mlp_registration.covariance_kinds:
             raise ValueError(
-                "block_mlp_mode must be 'coordinate', 'gauge_gate', or 'canonical_frame'; "
-                f"got {self.block_mlp_mode!r}"
-            )
-        if self.block_mlp_covariance not in ("passthrough", "delta_full"):
-            raise ValueError(
-                "block_mlp_covariance must be 'passthrough' or 'delta_full'; "
-                f"got {self.block_mlp_covariance!r}"
+                f"block_mlp_covariance for mode {self.block_mlp_mode!r} must be one of "
+                f"{sorted(block_mlp_registration.covariance_kinds)}, got "
+                f"{self.block_mlp_covariance!r}"
             )
         if (isinstance(self.block_mlp_covariance_floor, bool)
                 or not isinstance(self.block_mlp_covariance_floor, Real)
@@ -2976,7 +2989,7 @@ class VFE3Config:
                 f"got {self.block_mlp_covariance_floor!r}"
             )
         if self.use_block_mlp and (
-                self.block_mlp_mode == "gauge_gate"
+                block_mlp_registration.gauge_class == "invariant_scalar_intertwiner"
                 or self.block_mlp_covariance == "delta_full"
         ) and self.family != "gaussian_full":
             raise ValueError(
@@ -2985,7 +2998,7 @@ class VFE3Config:
                 "Mahalanobis gates and dense J Sigma J^T cannot be represented by a "
                 f"diagonal/non-Gaussian family (got family={self.family!r})."
             )
-        if self.use_block_mlp and self.block_mlp_mode == "canonical_frame":
+        if self.use_block_mlp and block_mlp_registration.requires_frame_context:
             incompatible = []
             if self.transport_mode != "flat":
                 incompatible.append(f"transport_mode={self.transport_mode!r}")
@@ -3993,6 +4006,16 @@ def migrate_serialized_config(
             )
 
     migrated = {key: value for key, value in raw_config.items() if key in known}
+    # These fields were absent from older serialized-config schemas. Their historical values are
+    # deliberately declared here, rather than inherited from the current dataclass defaults: a
+    # future reusable-default change must not reinterpret an existing checkpoint.
+    _LEGACY_SERIALIZED_DEFAULTS = {
+        "pos_phi_compose": "bch",
+        "decode_tau": 1.0,
+        "decode_ce_checkpoint": "always",
+    }
+    for field_name, historical_value in _LEGACY_SERIALIZED_DEFAULTS.items():
+        migrated.setdefault(field_name, historical_value)
     migrated.setdefault("m_phi_update_mode", "adamw")
     bool_fields = {
         name for name, field in config_fields.items()

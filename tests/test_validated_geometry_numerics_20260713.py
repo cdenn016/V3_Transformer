@@ -19,6 +19,7 @@ from vfe3.geometry.transport import (
     get_transport,
     transport_covariance,
 )
+from vfe3.numerics import validated_cholesky_solve
 
 
 def test_query_adaptive_tau_warns_that_noncompact_gl_gauge_is_broken() -> None:
@@ -222,3 +223,70 @@ def test_laplace_off_diagonal_transport_is_variance_matching_projection() -> Non
     transported = family.transport_dispersion(scale, omega, diagonal_out=True)
     expected = torch.tensor([[[13.0 ** 0.5, 3.0]]])
     torch.testing.assert_close(transported, expected, rtol=0.0, atol=1e-7)
+
+
+def test_validated_cholesky_solve_pins_fast_escalate_and_fail_visible_routes() -> None:
+    rhs = torch.tensor([[0.25], [-0.5]], dtype=torch.float32)
+    well_conditioned = torch.tensor(
+        [[2.0, 0.125], [0.125, 1.0]], dtype=torch.float32)
+    # cond=100,000 lies below 1/(64 eps32), but above the dimension-aware
+    # 1/(64 K eps32) bound for K=2. This specifically pins the inner-product dimension factor.
+    uncertain = torch.diag(torch.tensor([1.0, 1.0e-5], dtype=torch.float32))
+    indefinite = torch.diag(torch.tensor([1.0, -0.25], dtype=torch.float32))
+
+    fast = validated_cholesky_solve(well_conditioned, rhs)
+    needs_escalation = validated_cholesky_solve(uncertain, rhs)
+    recovered = validated_cholesky_solve(uncertain.double(), rhs.double())
+    rejected_fast = validated_cholesky_solve(indefinite, rhs)
+    rejected_high = validated_cholesky_solve(indefinite.double(), rhs.double())
+
+    assert bool(fast.certified)
+    assert fast.solution is not None and fast.solution.dtype is torch.float32
+    assert float(fast.solve_residual) <= 64.0 * 2 * torch.finfo(torch.float32).eps
+    assert not bool(needs_escalation.certified)
+    assert 65_536.0 < float(needs_escalation.condition) < 131_072.0
+    assert bool(recovered.certified)
+    assert recovered.solution is not None and recovered.solution.dtype is torch.float64
+    assert not bool(rejected_fast.certified)
+    assert not bool(rejected_high.certified)
+
+
+def test_validated_cholesky_solve_rejects_normalized_residual_bound() -> None:
+    matrix = torch.eye(3, dtype=torch.float64)
+    rhs = torch.ones(3, 1, dtype=torch.float64)
+
+    certified = validated_cholesky_solve(matrix, rhs, residual_tol=0.0)
+
+    assert bool(certified.certified)
+    assert float(certified.symmetry_residual) == 0.0
+    assert float(certified.factor_residual) == 0.0
+    assert float(certified.solve_residual) == 0.0
+
+
+@pytest.mark.parametrize(
+    ("keyword", "value"),
+    [
+        ("residual_tol", float("nan")),
+        ("residual_tol", float("inf")),
+        ("residual_tol", float("-inf")),
+        ("condition_limit", float("nan")),
+        ("condition_limit", float("inf")),
+        ("condition_limit", float("-inf")),
+    ],
+)
+def test_validated_cholesky_solve_rejects_nonfinite_custom_bounds(
+    keyword: str,
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        validated_cholesky_solve(torch.eye(2), **{keyword: value})
+
+
+def test_validated_cholesky_solve_rejects_real_normalized_factor_residual_violation() -> None:
+    matrix = torch.tensor([[1.1, 0.3], [0.3, 0.7]], dtype=torch.float32)
+    rhs = torch.tensor([[0.2], [-0.4]], dtype=torch.float32)
+
+    certificate = validated_cholesky_solve(matrix, rhs, residual_tol=0.0)
+
+    assert float(certificate.factor_residual) > 0.0
+    assert not bool(certificate.certified)

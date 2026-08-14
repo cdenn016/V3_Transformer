@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 import scaling
@@ -25,6 +26,8 @@ def _pure_cfg(mode, covariance="passthrough"):
         pos_phi="none",
         pos_phi_compose="bch",
         pos_rotation="none",
+        sigma_max=None,
+        transport_chart_max_norm=12.0,
         e_phi_lr=0.0,
     )
 
@@ -66,6 +69,48 @@ def test_gauge_gate_parameter_accounting_uses_invariant_block_width():
 
     cost = _cost_model_fields(model, cfg, n_params=actual, tokens_seen=13)
     assert cost["block_mlp_params"] == cfg.n_layers * per_layer
+
+
+@pytest.mark.parametrize("mode", ("coordinate", "gauge_gate", "canonical_frame"))
+@pytest.mark.parametrize("covariance", ("passthrough", "delta_full"))
+def test_registered_block_mlp_accounting_and_cost_fields_preserve_legacy_parity(
+    mode,
+    covariance,
+):
+    cfg = _pure_cfg(mode, covariance)
+    model = VFEModel(cfg)
+    width = len(model.group.irrep_dims) if mode == "gauge_gate" else cfg.embed_dim
+    per_layer_params = (
+        2 * cfg.block_mlp_expansion * width * width
+        + (cfg.block_mlp_expansion + 1) * width
+    )
+    expected_params = cfg.n_layers * per_layer_params
+    expected_flops = (
+        4.0 * cfg.n_layers * cfg.block_mlp_expansion * width * width
+    )
+    if mode == "gauge_gate":
+        expected_flops += cfg.n_layers * sum(
+            2.0 * dim ** 3 + 2.0 * dim ** 2
+            for dim in model.group.irrep_dims
+        )
+    elif mode == "canonical_frame":
+        expected_flops += 4.0 * cfg.n_layers * cfg.embed_dim ** 2
+    if covariance == "delta_full":
+        expected_flops += 4.0 * cfg.n_layers * cfg.embed_dim ** 3
+
+    realized_params = sum(
+        parameter.numel() for parameter in model.block_mlps.parameters()
+    )
+    cost = _cost_model_fields(
+        model,
+        cfg,
+        n_params=sum(parameter.numel() for parameter in model.parameters()),
+        tokens_seen=13,
+    )
+    assert realized_params == expected_params
+    assert model.executable_build.block_mlp.parameter_count == expected_params
+    assert cost["block_mlp_params"] == expected_params
+    assert cost["flops_per_token_block_mlp"] == expected_flops
 
 
 @torch.no_grad()

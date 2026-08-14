@@ -18,7 +18,7 @@ from torch import nn
 from vfe3.families.base import _logdet_chol
 from vfe3.geometry.groups import GaugeGroup
 from vfe3.geometry.lie_ops import CompactBlockElement, _equal_diag_blocks
-from vfe3.numerics import safe_cholesky
+from vfe3.numerics import safe_cholesky, validated_cholesky_solve
 
 if TYPE_CHECKING:
     from vfe3.config import VFE3Config
@@ -458,6 +458,8 @@ class TransportRegistration:
     state_builder:              'Optional[TransportStateBuilder]'
     serialization_keys:         Tuple[str, ...]
     offdiag_serialization_keys: Tuple[str, ...]
+    gauge_equivariant:          bool
+    runtime_exactness_key:      Optional[str]
 
     def satisfies(self, requirement: str) -> bool:
         r"""Whether this transport meets a family's ``transport_requirement``."""
@@ -513,6 +515,8 @@ def register_transport(
     state_builder:              'Optional[TransportStateBuilder]' = None,
     serialization_keys:         Tuple[str, ...]                   = (),
     offdiag_serialization_keys: Tuple[str, ...]                   = (),
+    gauge_equivariant:          Optional[bool]                    = None,
+    runtime_exactness_key:      Optional[str]                     = None,
 ) -> Callable:
     """Decorator registering a transport (connection-regime) builder under ``name``.
 
@@ -571,6 +575,14 @@ def register_transport(
         )
     if not set(offdiag_serialization_keys).issubset(serialization_keys):
         raise ValueError("transport offdiag_serialization_keys must be declared serialization_keys")
+    if runtime_exactness_key is not None and (
+        not isinstance(runtime_exactness_key, str) or not runtime_exactness_key
+    ):
+        raise ValueError("transport runtime_exactness_key must be None or a nonempty string")
+    if gauge_equivariant is None:
+        # Compatibility for complete-record restore helpers written before this additive field.
+        # Unknown/custom covariance labels remain fail-closed.
+        gauge_equivariant = covariance_class in {"covariant", "covariant (flat)"}
 
     def _wrap(fn: Callable[..., TransportDict]) -> Callable[..., TransportDict]:
         if name in _TRANSPORTS and not override:
@@ -586,6 +598,8 @@ def register_transport(
             state_builder=state_builder,
             serialization_keys=serialization_keys,
             offdiag_serialization_keys=offdiag_serialization_keys,
+            gauge_equivariant=bool(gauge_equivariant),
+            runtime_exactness_key=runtime_exactness_key,
         )
         _TRANSPORTS[name] = registration
         # Compatibility views for existing hot-path membership checks. Their values are derived only
@@ -790,6 +804,7 @@ def _record_covariant_feature_exactness(
 @register_transport(
     "flat",
     covariance_class="covariant (flat)",
+    gauge_equivariant=True,
     rope_right_foldable=True,
     pair_transport_kind="coboundary",   # builds Omega_ij = U_i U_j^{-1} from ONE vertex table
 )
@@ -1012,6 +1027,8 @@ def _regime_ii_query_chunk(
 @register_transport(
     "regime_ii_covariant",
     covariance_class="covariant",
+    gauge_equivariant=True,
+    runtime_exactness_key="regime_ii_covariant_feature_exact",
     pair_transport_kind="pair_inverse",   # dense (..., N, N, K, K); invertible, not a coboundary
     needs_mu=True,
     needs_sigma=True,
@@ -1310,6 +1327,7 @@ def _build_regime_ii_link(
 @register_transport(
     "regime_ii_link_charted",
     covariance_class="covariant",
+    gauge_equivariant=True,
     rope_right_foldable=True,
     pair_transport_kind="opaque",   # DirectLinkTransport: contracts, never exposes a pairwise Omega
     state_builder=_build_regime_ii_link_state,
@@ -1409,11 +1427,11 @@ TRANSPORT_CLAMP_MAX_NORM: float = 20.0
 #
 # "fp64": the historical unconditional float64 island -- THE DEFAULT, so every run on disk stays
 #         bit-reproducible and nothing changes until the user opts in.
-# "fp32_escalate": contract in float32 and recompute in float64 only for a batch whose float32
-#         result lost finiteness. The congruence SQUARES cond(Omega), so this is a real accuracy
-#         trade at high ||phi||; the downstream KL's safe_cholesky already owns non-PD robustness,
-#         which is why the escalation trigger here is finiteness rather than an SPD test (an SPD
-#         test would need a Cholesky over the whole (B*N*N, K, K) grid and cost more than it saves).
+# "fp32_escalate": contract in float32 and accept only a finite, symmetric, zero-jitter
+#         Cholesky-valid result within the shared residual/condition bounds. Any failed fast
+#         certificate recomputes the complete affected structural congruence in float64 and retains
+#         float64; an uncertified float64 result raises. The congruence SQUARES cond(Omega), so the
+#         certificate is the required accuracy boundary rather than a finiteness-only guard.
 _FULL_COV_CONGRUENCE_PRECISIONS = ("fp64", "fp32_escalate")
 _FULL_COV_CONGRUENCE_PRECISION: str = "fp64"
 
@@ -1435,24 +1453,51 @@ def full_cov_congruence_precision() -> str:
     return _FULL_COV_CONGRUENCE_PRECISION
 
 
-def _escalate_congruence_if_nonfinite(
+def _certify_full_congruence(
     out:     torch.Tensor,               # contraction result at the working dtype
     work:    torch.dtype,                # the dtype it was contracted in
     recompute: "Callable[[torch.dtype], torch.Tensor]",
+    *,
+    source_dtype: torch.dtype,
+    retain_full_precision: bool = False,
 ) -> torch.Tensor:
-    r"""Redo a float32 congruence in float64 when it lost finiteness; inert on the float64 policy.
+    r"""Authoritative post-congruence boundary for every full-covariance structural route.
 
-    The congruence SQUARES cond(Omega), so a float32 contraction can overflow where a float64 one
-    would not. Non-PD-ness is deliberately NOT the trigger: the downstream KL's ``safe_cholesky``
-    already owns that, and an SPD test here would need a Cholesky over the whole (B*N*N, K, K) grid
-    -- more expensive than the contraction it guards. On the default "fp64" policy this returns
-    immediately without a sync, so the historical path is untouched.
+    Certification is zero-jitter: finiteness alone cannot accept a symmetric-but-indefinite or
+    accuracy-uncertain covariance. A working result may return at source dtype only when the cast
+    candidate independently certifies there. If a certified float64 working result loses its
+    certificate on cast, float64 is retained. Reduced dtypes outside the certificate API's
+    float32/float64 domain are treated as uncertifiable and retain the certified working tensor.
+    A failed fast representation recomputes and retains float64.
     """
+    certificate = validated_cholesky_solve(out)
+    if bool(certificate.certified.all()):
+        if retain_full_precision or out.dtype == source_dtype:
+            return out
+        cast_candidate = out.to(source_dtype)
+        if cast_candidate.dtype not in (torch.float32, torch.float64):
+            # The shared validator intentionally rejects reduced dtypes. Do not weaken it or call
+            # it outside its contract; retain the already certified working representation.
+            return out
+        cast_certificate = validated_cholesky_solve(cast_candidate)
+        if bool(cast_certificate.certified.all()):
+            return cast_candidate
+        # ``out`` itself is already certified. A failed lower-precision representation must not
+        # replace it; retaining this tensor also preserves the direct high-precision autograd path.
+        if out.dtype is torch.float64:
+            return out
     if work is torch.float64:
-        return out
-    if bool(torch.isfinite(out).all()):
-        return out
-    return recompute(torch.float64).to(work)
+        raise FloatingPointError(
+            "float64 congruence could not be certified as finite, symmetric, zero-jitter SPD "
+            "within the residual and conditioning bounds")
+    high_precision = recompute(torch.float64)
+    high_certificate = validated_cholesky_solve(high_precision)
+    if not bool(high_certificate.certified.all()):
+        raise FloatingPointError(
+            "congruence failed fast validation and its float64 recomputation could not be "
+            "certified as finite, symmetric, zero-jitter SPD within the residual and "
+            "conditioning bounds")
+    return high_precision
 
 
 def _congruence_compute_dtype(source_dtype: torch.dtype) -> torch.dtype:
@@ -2520,11 +2565,13 @@ def transport_covariance(
     work = _congruence_compute_dtype(sigma.dtype)          # fp64 by default; see the policy above
     out = torch.einsum("...ijkl,...jlm,...ijnm->...ijkn",
                        omega.to(work), sigma.to(work), omega.to(work))
-    out = _escalate_congruence_if_nonfinite(
+    return _certify_full_congruence(
         out, work,
         lambda hi: torch.einsum("...ijkl,...jlm,...ijnm->...ijkn",
-                                omega.to(hi), sigma.to(hi), omega.to(hi)))
-    return out if retain_full_precision else out.to(sigma.dtype)
+                                omega.to(hi), sigma.to(hi), omega.to(hi)),
+        source_dtype=sigma.dtype,
+        retain_full_precision=retain_full_precision,
+    )
 
 
 def transport_scale(
@@ -2667,30 +2714,26 @@ def _direct_link_full_covariance(
     sigma:  torch.Tensor,               # (..., N, K, K) full covariances
 ) -> torch.Tensor:                      # (..., N, N, K, K) full congruence output
     r"""Full direct-link congruence; the output is dense but no pairwise operator is built."""
-    if direct.exp_neg_phi is None:
-        key_cov = sigma.double()
-    else:
-        exp_neg_phi = direct.exp_neg_phi.double()
-        key_cov = torch.einsum(
-            "...jkl,...jlm,...jnm->...jkn",
-            exp_neg_phi,
-            sigma.double(),
-            exp_neg_phi,
-        )
-    exp_link = direct.exp_link.double()
-    edge_cov = torch.einsum(
-        "ijka,...jab,ijnb->...ijkn",
-        exp_link,
-        key_cov,
-        exp_link,
-    )
-    if direct.exp_phi is None:
-        out = edge_cov
-    else:
-        exp_phi = direct.exp_phi.double()
-        out = torch.einsum(
+    def _reduce(dtype: torch.dtype) -> torch.Tensor:
+        if direct.exp_neg_phi is None:
+            key_cov = sigma.to(dtype)
+        else:
+            exp_neg_phi = direct.exp_neg_phi.to(dtype)
+            key_cov = torch.einsum(
+                "...jkl,...jlm,...jnm->...jkn",
+                exp_neg_phi, sigma.to(dtype), exp_neg_phi)
+        exp_link = direct.exp_link.to(dtype)
+        edge_cov = torch.einsum(
+            "ijka,...jab,ijnb->...ijkn", exp_link, key_cov, exp_link)
+        if direct.exp_phi is None:
+            return edge_cov
+        exp_phi = direct.exp_phi.to(dtype)
+        return torch.einsum(
             "...ika,...ijab,...inb->...ijkn", exp_phi, edge_cov, exp_phi)
-    return out.to(sigma.dtype)
+
+    work = _congruence_compute_dtype(sigma.dtype)
+    return _certify_full_congruence(
+        _reduce(work), work, _reduce, source_dtype=sigma.dtype)
 
 
 def _compact_factored_mean(
@@ -2814,11 +2857,12 @@ def _compact_head_block_congruence(
     out = torch.einsum(                                            # (..., Ni, Nj, H, d, d)
         "...ijhkl,...jhlm,...ijhnm->...ijhkn",
         omega_blocks, sigma_diag.to(work), omega_blocks)
-    out = _escalate_congruence_if_nonfinite(
+    return _certify_full_congruence(
         out, work,
         lambda hi: torch.einsum("...ijhkl,...jhlm,...ijhnm->...ijhkn",
-                                omega_blocks.to(hi), sigma_diag.to(hi), omega_blocks.to(hi)))
-    return out.to(sigma.dtype)
+                                omega_blocks.to(hi), sigma_diag.to(hi), omega_blocks.to(hi)),
+        source_dtype=sigma.dtype,
+    )
 
 
 def _resolve_compact_for_head_blocks(
@@ -2946,11 +2990,15 @@ def _compact_factored_full_covariance(
     out = torch.einsum(
         "...ijhkl,...jhlgm,...ijgnm->...ijhkgn",
         omega_blocks, sigma_blocks.to(work), omega_blocks)
-    out = _escalate_congruence_if_nonfinite(
+    out = out.reshape(*out.shape[:-4], factored.K, factored.K)
+    return _certify_full_congruence(
         out, work,
-        lambda hi: torch.einsum("...ijhkl,...jhlgm,...ijgnm->...ijhkgn",
-                                omega_blocks.to(hi), sigma_blocks.to(hi), omega_blocks.to(hi)))
-    return out.reshape(*out.shape[:-4], factored.K, factored.K).to(sigma.dtype)
+        lambda hi: torch.einsum(
+            "...ijhkl,...jhlgm,...ijgnm->...ijhkgn",
+            omega_blocks.to(hi), sigma_blocks.to(hi), omega_blocks.to(hi),
+        ).reshape(*out.shape),
+        source_dtype=sigma.dtype,
+    )
 
 
 def _factored_per_head_mean(
@@ -3080,49 +3128,38 @@ def _factored_full_covariance(
     batch = sigma.shape[:-3]
     N = sigma.shape[-3]
 
-    if len(set(dims)) == 1:
-        H, d = len(dims), dims[0]
-        exp_phi = _equal_diag_blocks(factored.exp_phi, H, d).double()       # (..., N, H, d, d)
-        exp_neg = _equal_diag_blocks(factored.exp_neg_phi, H, d).double()  # (..., N, H, d, d)
-        sigma_blocks = sigma.reshape(*batch, N, H, d, H, d).double()
-        # One batched contraction over both explicit head axes. Algebraically this is
-        # Omega_h Sigma_(h,g) Omega_g^T with Omega_h = exp_phi_h exp_neg_h, but fusing the
-        # vertex factors avoids both the H^2 Python loop and H separate pair-operator builds.
-        out = torch.einsum(
-            "...ihax,...jhxb,...jhbgd,...igcy,...jgyd->...ijhagc",
-            exp_phi,
-            exp_neg,
-            sigma_blocks,
-            exp_phi,
-            exp_neg,
-        )
-        return out.reshape(*batch, N, N, K, K).to(sigma.dtype)
+    def _reduce(dtype: torch.dtype) -> torch.Tensor:
+        if len(set(dims)) == 1:
+            H, d = len(dims), dims[0]
+            exp_phi = _equal_diag_blocks(factored.exp_phi, H, d).to(dtype)
+            exp_neg = _equal_diag_blocks(factored.exp_neg_phi, H, d).to(dtype)
+            sigma_blocks = sigma.reshape(*batch, N, H, d, H, d).to(dtype)
+            # One batched contraction over both explicit head axes. Algebraically this is
+            # Omega_h Sigma_(h,g) Omega_g^T with Omega_h = exp_phi_h exp_neg_h, but fusing the
+            # vertex factors avoids both the H^2 Python loop and H separate pair-operator builds.
+            out = torch.einsum(
+                "...ihax,...jhxb,...jhbgd,...igcy,...jgyd->...ijhagc",
+                exp_phi, exp_neg, sigma_blocks, exp_phi, exp_neg)
+            return out.reshape(*batch, N, N, K, K)
 
-    out = sigma.new_zeros(*batch, N, N, K, K)
+        out = torch.zeros(
+            *batch, N, N, K, K, dtype=dtype, device=sigma.device)
+        blocks = []
+        start = 0
+        for d in dims:
+            end = start + d
+            ep = factored.exp_phi[..., start:end, start:end].to(dtype)
+            en = factored.exp_neg_phi[..., start:end, start:end].to(dtype)
+            omega_h = torch.einsum("...ikl,...jlm->...ijkm", ep, en)
+            blocks.append((start, end, omega_h))
+            start = end
+        for s1, e1, oh in blocks:
+            for s2, e2, oh2 in blocks:
+                sig_blk = sigma[..., s1:e1, s2:e2].to(dtype)
+                out[..., s1:e1, s2:e2] = torch.einsum(
+                    "...ijkl,...jlm,...ijnm->...ijkn", oh, sig_blk, oh2)
+        return out
 
-    # Per-head pairwise operators Omega^(h)_ij = exp(phi_i)^(h) @ exp(-phi_j)^(h), each (..., N, N, d, d):
-    # the per-head diagonal blocks of the dense Omega (its off-blocks are zero), never the dense K x K.
-    blocks = []
-    start = 0
-    for d in dims:
-        end = start + d
-        ep = factored.exp_phi[..., start:end, start:end]               # (..., N, d, d) exp(phi_i)^(h)
-        en = factored.exp_neg_phi[..., start:end, start:end]           # (..., N, d, d) exp(-phi_j)^(h)
-        omega_h = torch.einsum("...ikl,...jlm->...ijkm", ep, en)       # (..., N, N, d, d)
-        blocks.append((start, end, omega_h.double()))                  # float64 island (M4); cast ONCE per head
-        start = end
-
-    # Heterogeneous irrep dimensions cannot share one rectangular head tensor. Keep the exact
-    # block-pair fallback: (h, h') output block = Omega^(h)_ij Sigma_j^(h,h') (Omega^(h')_ij)^T,
-    # in a float64 island (the
-    # congruence squares cond(Omega); audit M4) at the block scale, then cast back. The per-head
-    # operators are pre-cast to float64 above (H casts) rather than re-cast inside this H x H loop
-    # (which would be O(H^2) redundant casts of the same oh/oh2); only the distinct per-pair sigma
-    # block is cast here.
-    for s1, e1, oh in blocks:
-        for s2, e2, oh2 in blocks:
-            sig_blk = sigma[..., s1:e1, s2:e2]                          # (..., N, d1, d2) key-side block
-            res = torch.einsum("...ijkl,...jlm,...ijnm->...ijkn",
-                               oh, sig_blk.double(), oh2)
-            out[..., s1:e1, s2:e2] = res.to(sigma.dtype)
-    return out
+    work = _congruence_compute_dtype(sigma.dtype)
+    return _certify_full_congruence(
+        _reduce(work), work, _reduce, source_dtype=sigma.dtype)

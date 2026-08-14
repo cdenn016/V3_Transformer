@@ -56,6 +56,8 @@ from vfe3.data.datasets import (
     make_dataloader,
     tokens_per_char as _tokens_per_char,
 )
+from vfe3.metric_contracts import perplexity_matches_ce
+from vfe3.model.block_mlp import get_block_mlp_registration
 from vfe3.model.head_mixer import HeadMixer
 from vfe3.model.model import VFEModel, build_group
 from vfe3.model.prior_bank import get_decode_registration, get_encode_registration
@@ -721,6 +723,19 @@ ROUTES: Dict[str, List[Dict[str, Any]]] = {
 # PARAMETER PREDICTION  -- size a grid to the GPU before committing to long runs.
 # =============================================================================
 
+def _scaling_knob_report(cfg: VFE3Config, name: str) -> Dict[str, object]:
+    """Report a configured knob without inventing an effect on an inactive path."""
+    is_named_field = isinstance(name, str)
+    configured = getattr(cfg, name, None) if is_named_field else None
+    active = is_named_field and not (name == "decode_tau" and not cfg.use_prior_bank)
+    return {
+        "name": name,
+        "active": active,
+        "configured_value": configured,
+        "effective_value": configured if active else None,
+    }
+
+
 def predict_n_params(cfg: VFE3Config) -> Tuple[int, int]:
     r"""Predicted total ``n_params`` and ``n_gen`` for ``cfg``, by building only the (cheap) gauge group
     and summing the prior-table sizes per ``PriorBank`` (prior_bank.py). Exact on the pure path and for
@@ -762,11 +777,12 @@ def predict_n_params(cfg: VFE3Config) -> Tuple[int, int]:
     if cfg.use_head_mixer:
         n += HeadMixer.parameter_count(group.irrep_dims, group.irrep_labels)
     if cfg.use_block_mlp:
-        expansion = int(cfg.block_mlp_expansion)
-        mlp_width = (
-            len(group.irrep_dims) if cfg.block_mlp_mode == "gauge_gate" else K)
-        n += int(cfg.n_layers) * (
-            2 * expansion * mlp_width * mlp_width + (expansion + 1) * mlp_width
+        registration = get_block_mlp_registration(cfg.block_mlp_mode)
+        n += registration.parameter_count(
+            embed_dim=K,
+            irrep_dims=group.irrep_dims,
+            expansion=int(cfg.block_mlp_expansion),
+            n_layers=int(cfg.n_layers),
         )
     return n, n_gen
 
@@ -1420,6 +1436,7 @@ def run_cell(
     cellmeta: Dict[str, object] = {
         "schema_version": _SCALING_CELL_SCHEMA_VERSION,
         "label": label, "route": cell["route"], "scale_knob": cell["scale_knob"],
+        "scale_knob_report": _scaling_knob_report(cfg, cell["scale_knob"]),
         "overrides": json.loads(json.dumps(cell["overrides"], default=str)),
         "predicted_n_params": pred_n, "n_gen": n_gen, "seed": seed,
         "max_tokens": (int(max_tokens) if max_tokens is not None else None),
@@ -1596,13 +1613,15 @@ def _scaling_result_status(result: Mapping[str, Any]) -> str:
     test_ppl = result["test_ppl"]
     test_bits = result["test_bits_per_token"]
     test_bpc = result["test_bpc"]
-    if not all(_finite_positive(value) for value in (test_ce, test_ppl, test_bits)):
+    if not all(_finite_positive(value) for value in (test_ce, test_bits)):
+        return "nonfinite"
+    if not (isinstance(test_ppl, (int, float)) and not isinstance(test_ppl, bool)
+            and float(test_ppl) > 0.0 and not math.isnan(float(test_ppl))):
         return "nonfinite"
     if test_bpc is not None and not _finite_positive(test_bpc):
         return "nonfinite"
-    expected_ppl = math.exp(min(float(test_ce), 20.0))
     expected_bits = float(test_ce) / math.log(2.0)
-    if (not math.isclose(float(test_ppl), expected_ppl, rel_tol=1e-9, abs_tol=1e-12)
+    if (not perplexity_matches_ce(test_ce, test_ppl)
             or not math.isclose(float(test_bits), expected_bits, rel_tol=1e-9, abs_tol=1e-12)):
         return "nonfinite"
     return "complete"

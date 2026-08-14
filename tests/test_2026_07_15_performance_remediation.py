@@ -532,9 +532,9 @@ def test_evaluate_transfers_only_padding_buckets_and_aggregate_and_preserves_tok
     assert result["bpc"] == pytest.approx(expected_ce / math.log(2.0) * 0.4)
     assert float_calls == 0
     assert int_calls == 0
-    # Two padded batches transfer their distinct valid-length buckets for correctness; all scalar
-    # metric totals still cross the device boundary together in one final aggregate transfer.
-    assert cpu_calls == 3
+    # Two padded batches transfer distinct length buckets; floating loss and exact integer
+    # accounting then cross in two final, type-stable aggregate transfers.
+    assert cpu_calls == 4
 
 
 def test_fixed_point_diagnostics_reuse_snapshot_and_run_only_one_new_iteration(

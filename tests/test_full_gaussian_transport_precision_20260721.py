@@ -82,18 +82,22 @@ def test_full_gaussian_transport_retains_spd_lost_by_float32_storage() -> None:
 
     stored_eigmin = torch.linalg.eigvalsh(stored.double())[..., 0]
     retained_eigmin = torch.linalg.eigvalsh(retained)[..., 0]
-    legacy_oracle = torch.einsum(
+    high_precision_oracle = torch.einsum(
         "...ijkl,...jlm,...ijnm->...ijkn",
         _OMEGA.double(),
         sigma.double(),
         _OMEGA.double(),
-    ).to(sigma.dtype)
+    )
+    rejected_cast = high_precision_oracle.to(sigma.dtype)
+    rejected_cast_eigmin = torch.linalg.eigvalsh(rejected_cast.double())[..., 0]
 
-    assert stored.dtype == torch.float32
-    assert torch.equal(stored, legacy_oracle)
-    assert -1.0e-7 < float(stored_eigmin) < 0.0
+    assert -1.0e-7 < float(rejected_cast_eigmin) < 0.0
+    assert stored.dtype == torch.float64
+    assert torch.equal(stored, high_precision_oracle)
+    assert 0.0 < float(stored_eigmin) < 1.0e-7
     assert retained.dtype == torch.float64
     assert 0.0 < float(retained_eigmin) < 1.0e-7
+    assert torch.equal(stored, retained)
     assert torch.equal(family_retained, retained)
 
 

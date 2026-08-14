@@ -747,7 +747,8 @@ def test_run_single_terminal_merge_preserves_metadata_and_primary_val_ppl(tmp_pa
         calls["n"] += 1
         ppl = 2.0 if calls["n"] == 1 else 100.0
         ce = math.log(ppl)
-        return {"ce": ce, "ppl": ppl, "bits_per_token": ce / math.log(2.0), "bpc": None}
+        return {"ce": ce, "ppl": ppl, "bits_per_token": ce / math.log(2.0), "bpc": None,
+                "expected_targets": 4, "scored_targets": 4, "excluded_targets": 0}
 
     monkeypatch.setattr("vfe3.train.evaluate", fake_evaluate)
 

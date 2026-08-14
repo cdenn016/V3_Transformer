@@ -104,8 +104,8 @@ def test_model_builds_selected_untied_block_mlp_type(mode, expected_type):
 
 
 class _MomentTransform(nn.Module):
-    def forward_moments(self, mu, sigma, *, frame=None):
-        assert frame is not None
+    def forward_moments(self, mu, sigma, *, frame_context=None):
+        assert frame_context is not None
         return SimpleNamespace(mu=mu + 3.0, sigma=sigma + 5.0)
 
 

@@ -29,9 +29,24 @@ import multiseed_analysis
 import scaling
 import scaling_analysis
 import train_vfe3
-from vfe3.config import VFE3Config
+from vfe3.config import ConfigNotice, VFE3Config
 from vfe3.run_artifacts import RunArtifacts
 from vfe3.viz import embedding_comparison, figures, report
+
+_PARAMETER_MATCHED_ONE_WIDTH_ERROR = (
+    "parameter-matched sweep retained 1 width(s), but at least 2 are required within relative "
+    "tolerance 0.020000; closest rejected candidates: embed_dim=32: n_params=19,331,473, "
+    "relative_deviation=0.355618; embed_dim=40: n_params=28,195,137, "
+    "relative_deviation=0.060162; embed_dim=48: n_params=28,997,221, "
+    "relative_deviation=0.033426; embed_dim=60: n_params=30,200,381, "
+    "relative_deviation=0.006679; embed_dim=64: n_params=25,764,609, "
+    "relative_deviation=0.141180; embed_dim=66: n_params=33,220,430, "
+    "relative_deviation=0.107348; embed_dim=75: n_params=33,971,701, "
+    "relative_deviation=0.132390; embed_dim=80: n_params=36,236,497, "
+    "relative_deviation=0.207883; embed_dim=96: n_params=48,320,705, "
+    "relative_deviation=0.610690"
+)
+
 
 
 def _tiny_config(**overrides: object) -> VFE3Config:
@@ -1488,43 +1503,20 @@ def test_scaling_rejects_integer_enum_seed_values():
         scaling._validated_scaling_seeds([Seed.ONE])
 
 
-def test_default_parameter_match_grid_retains_two_realized_30m_widths():
+def test_current_parameter_match_grid_fails_closed_with_one_width_within_tolerance():
     sweep = ablation.SWEEPS["parameter_matched"]
     grid = sweep["parameter_grid"]
     assert ablation.CONFIG["target_n_params"] == 30_000_000
     assert ablation.CONFIG["max_param_relative_deviation"] == 0.02
     assert grid == {
-        "embed_dim": [32, 40, 45, 48, 60, 64, 66, 75, 80, 96],
-        "n_heads": [4, 5, 6, 8, 10, 11, 12, 15, 16],
+        "embed_dim": [32, 40, 48, 60, 64, 66, 75, 80, 96],
+        "n_heads": [4, 6, 8, 10, 11, 12, 15, 16],
     }
-    assert len(ablation._parameter_grid_overrides(sweep)) == 90
+    assert len(ablation._parameter_grid_overrides(sweep)) == 72
 
-    selection = ablation._parameter_match_selection("parameter_matched")
-
-    assert len(selection["selected"]) == 2
-    assert [
-        (
-            record["overrides"]["embed_dim"],
-            record["overrides"]["n_heads"],
-            record["n_params"],
-        )
-        for record in selection["selected"]
-    ] == [(45, 5, 29_452_186), (60, 10, 30_200_281)]
-    assert [
-        (
-            record["label"],
-            record["overrides"]["kl_max"],
-        )
-        for record in selection["selected"]
-    ] == [
-        ("embed_dim=45__n_heads=5", 360),
-        ("embed_dim=60__n_heads=10", 480),
-    ]
-    assert all(
-        record["param_relative_deviation"]
-        <= selection["max_param_relative_deviation"]
-        for record in selection["selected"]
-    )
+    with pytest.raises(ValueError) as exc_info:
+        ablation._parameter_match_selection("parameter_matched")
+    assert str(exc_info.value) == _PARAMETER_MATCHED_ONE_WIDTH_ERROR
 
 
 def test_every_ablation_arm_constructs_with_only_invalid_arm_prerequisites_repaired():
@@ -1559,10 +1551,11 @@ def test_every_ablation_arm_constructs_with_only_invalid_arm_prerequisites_repai
 
     renyi = dict(ablation.make_run_overrides("renyi_order"))
     assert {arm["decode_mode"] for arm in renyi.values()} == {"family_chunked"}
+    assert set(renyi) == {"renyi_order=0.5", "renyi_order=0.8", "renyi_order=1.0"}
     assert "e_step_update" not in renyi["renyi_order=1.0"]
     assert all(
         renyi[f"renyi_order={value}"]["e_step_update"] == "gradient"
-        for value in (0.5, 0.8, 1.2, 1.5, 2.0)
+        for value in (0.5, 0.8)
     )
 
     gauges = dict(ablation.make_run_overrides("gauge_group"))
@@ -1584,16 +1577,47 @@ def test_every_ablation_arm_constructs_with_only_invalid_arm_prerequisites_repai
     assert pullback_group["transport_chart_max_norm"] == 6.0
 
     errors = []
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+    expected_warning_prefixes = (
+        "decode_bias=True is inert when use_prior_bank=True",
+        "inert configuration setting(s) --",
+        "lambda_h_mode='state_dependent' has no effect with lambda_h=0",
+        "cross_couplings collapses block_glk to a single irrep block",
+        "e_step_gradient='straight_through' severs the per-iteration E-step tangent",
+        "gauge_transport='frozen':",
+        "gauge_transport='off':",
+        "lambda_h_mode='state_dependent' ignores the lambda_h VALUE",
+        "pos_rotation='rope' is a deliberate residual gauge-FIXING layer",
+        "pos_rotation='rope' with rope_full_gauge=False",
+        "precision_weighted_attention=True uses a detached precision prior",
+        "query_adaptive_tau with query_tau_c>0 is an opt-in GL(K)-breaking baseline",
+        "s_e_step=True with lambda_h=0 and lambda_gamma=0",
+        "s_frame_mode='phi_tilde' with lambda_gamma=0",
+        "transport_mode='regime_ii' with family='gaussian_full'",
+        "transport_mode='regime_ii_covariant' with family='gaussian_full'",
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         for sweep_name in ablation.SWEEPS:
-            for label, overrides in ablation.make_run_overrides(sweep_name):
-                config = dict(ablation.BASELINE_CONFIG)
-                config.update(overrides)
+            try:
+                runs = ablation.make_run_overrides(sweep_name)
+            except ValueError as exc:
+                if (sweep_name == "parameter_matched"
+                        and str(exc) == _PARAMETER_MATCHED_ONE_WIDTH_ERROR):
+                    continue
+                raise
+            for label, overrides in runs:
                 try:
-                    VFE3Config(**config)
+                    VFE3Config(**ablation._cell_cfg_dict(overrides, seed=6))
                 except Exception as exc:
                     errors.append((sweep_name, label, str(exc)))
+    assert caught, "registered sweep construction must disclose its intentional non-pure/inert arms"
+    unexpected_warnings = [
+        (warning.category.__name__, str(warning.message))
+        for warning in caught
+        if warning.category not in (ConfigNotice, UserWarning)
+        or not str(warning.message).startswith(expected_warning_prefixes)
+    ]
+    assert unexpected_warnings == []
     assert errors == []
 
 

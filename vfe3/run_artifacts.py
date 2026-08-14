@@ -14,7 +14,7 @@ A training run produces a self-contained directory::
       val_ppl.png        validation perplexity trajectory (log-y, best marked)
       holonomy.png / gauge_trace_spread.png   gauge-geometry diagnostics
       free_energy_decomposition.png   per-token F budget snapshot + early/mid/late evolution
-      free_energy_codescent.png       F-vs-validation-CE co-descent (twin axis)
+      free_energy_relationship.png     final-iterate objective vs validation CE
 
 ``RunArtifacts`` is OPT-IN: ``train`` only touches it when an instance is passed, so the silent
 path (``artifacts=None``) writes nothing and is unchanged. ``finalize_run`` reloads the best-val
@@ -48,8 +48,12 @@ from vfe3.config import (
     VFE3Config,
     migrate_serialized_config,
 )
-from vfe3.contracts import DataState, DataStateBuffer
+from vfe3.contracts import DataState, DataStateBuffer, ExecutableBuildMetadata
 from vfe3.ema import EMA
+from vfe3.model.block_mlp import (
+    block_mlp_build_metadata,
+    get_block_mlp_registration,
+)
 from vfe3.model.prior_bank import normalize_legacy_model_state
 from vfe3.process_utils import run_process_tree
 from vfe3.runtime import deterministic_state
@@ -1611,19 +1615,25 @@ class RunArtifacts:
         self.code_identity_sha256 = _verified_process_code_identity()
         self.run_start_git_identity = dict(_git_code_identity())
         self.selection_data_identity: Optional[Dict[str, object]] = None
+        self.scheduler_base_lrs: List[float] = []
+        self.scheduler_group_roles: List[str] = []
 
         self.best_val_ppl: float = float("inf")
         self.best_step: Optional[int] = None
         self.history: List[Dict[str, float]] = []          # in-memory copy of the CSV rows (for figures)
         self._fieldnames: Optional[List[str]] = None
 
-        self.save_json("config.json", {
+        config_record = {
             "config":    asdict(cfg),
             "n_params":  int(sum(p.numel() for p in model.parameters())),
             "dataset":   dataset,
             "device":    str(device),
             "timestamp": timestamp,
-        })
+        }
+        executable_build = getattr(model, "executable_build", None)
+        if isinstance(executable_build, ExecutableBuildMetadata):
+            config_record["executable_build"] = asdict(executable_build)
+        self.save_json("config.json", config_record)
 
     def bind_selection_data_identity(self, identity: Mapping[str, object]) -> None:
         """Bind every selected-weight comparison in this run to one validation data contract."""
@@ -3034,16 +3044,25 @@ def _cost_model_fields(
     # coordinates; base token priors and every decode vocabulary prior remain diagonal.
     lower = K * (K - 1) // 2 if not cfg.diagonal_covariance else 0
     token_row = 2 * K + n_gen + (lower if cfg.prior_source == "model_channel" else 0)
-    block_mlp_active = bool(getattr(cfg, "use_block_mlp", False))
-    block_mlp_mode = getattr(cfg, "block_mlp_mode", "coordinate")
-    block_mlp_covariance = getattr(cfg, "block_mlp_covariance", "passthrough")
-    block_mlp_expansion = int(getattr(cfg, "block_mlp_expansion", 4))
-    block_mlp_width = n_blocks if block_mlp_mode == "gauge_gate" else K
-    block_mlp_params = (
-        int(cfg.n_layers)
-        * (2 * block_mlp_expansion * block_mlp_width * block_mlp_width
-           + (block_mlp_expansion + 1) * block_mlp_width)
-        if block_mlp_active else 0)
+    executable_build = getattr(model, "executable_build", None)
+    block_mlp_build = (
+        executable_build.block_mlp
+        if isinstance(executable_build, ExecutableBuildMetadata)
+        else block_mlp_build_metadata(
+            enabled=bool(getattr(cfg, "use_block_mlp", False)),
+            mode=getattr(cfg, "block_mlp_mode", "coordinate"),
+            covariance=getattr(cfg, "block_mlp_covariance", "passthrough"),
+            expansion=int(getattr(cfg, "block_mlp_expansion", 4)),
+            activation=getattr(cfg, "block_mlp_activation", "gelu"),
+            dropout=float(getattr(cfg, "block_mlp_dropout", 0.0)),
+            covariance_floor=float(getattr(cfg, "block_mlp_covariance_floor", 1e-4)),
+            embed_dim=K,
+            irrep_dims=model.group.irrep_dims,
+            n_layers=int(cfg.n_layers),
+        )
+    )
+    block_mlp_active = block_mlp_build.enabled
+    block_mlp_params = block_mlp_build.parameter_count
     if cfg.use_prior_bank:
         decode_readout = 2 * V * K
     else:
@@ -3064,17 +3083,7 @@ def _cost_model_fields(
     belief_estep       = L * T * estep_kernel
     model_estep        = T * estep_kernel if cfg.s_e_step else 0.0
     fpt_estep          = belief_estep + model_estep
-    fpt_block_mlp = 0.0
-    if block_mlp_active:
-        fpt_block_mlp = 4.0 * L * block_mlp_expansion * block_mlp_width * block_mlp_width
-        if block_mlp_mode == "gauge_gate":
-            # Per-block SPD solves for the Mahalanobis invariants; order-1 proxy constants.
-            fpt_block_mlp += L * sum(
-                2.0 * dim ** 3 + 2.0 * dim ** 2 for dim in model.group.irrep_dims)
-        elif block_mlp_mode == "canonical_frame":
-            fpt_block_mlp += 4.0 * L * K * K       # pull to and push from the vertex frame
-        if block_mlp_covariance == "delta_full":
-            fpt_block_mlp += 4.0 * L * K ** 3      # J Sigma J^T
+    fpt_block_mlp = block_mlp_build.flops_per_token if block_mlp_active else 0.0
     est_flops_analytic = (fpt_decode + fpt_estep + fpt_block_mlp) * float(tokens_seen)
     out: Dict[str, object] = {
         "embed_dim":               K,
@@ -3105,6 +3114,83 @@ def _cost_model_fields(
         out["wall_time_per_token"] = float(wall_time) / float(tokens_seen)
         out["wall_time_per_step"]  = float(wall_time) / max(1, int(cfg.max_steps))
     return out
+
+
+def _estep_iterate_evidence(
+    *,
+    free_energy: Iterable[float],
+    halted: bool,
+    fixed_point_residual: Optional[float],
+    fixed_point_tolerance: Optional[float],
+) -> Dict[str, object]:
+    """Gate scientific iterate labels on explicit mechanical evidence."""
+    values = [float(value) for value in free_energy]
+    descent = len(values) >= 2 and all(
+        current <= previous for previous, current in zip(values, values[1:]))
+    fixed = bool(
+        halted and fixed_point_residual is not None and fixed_point_tolerance is not None
+        and float(fixed_point_residual) <= float(fixed_point_tolerance)
+    )
+    return {
+        "iterate_label": "final_iterate",
+        "descent_evidence": descent,
+        "convergence_evidence": fixed,
+        "fixed_point_evidence": fixed,
+    }
+
+
+def _estep_endpoint_artifact(evidence: Mapping[str, object]) -> Dict[str, str]:
+    """Name the endpoint-delta artifact without claiming unproven iterate behavior."""
+    title = "E-step endpoint delta"
+    if evidence.get("descent_evidence"):
+        title += " (descent established)"
+    return {"filename": "estep_endpoint_delta.png", "title": title}
+
+
+def _target_blind_objective_interpretation() -> str:
+    """State only the justified structural conclusion of a target-blind E-step."""
+    return "The target-blind latent objective is structurally separate from held-out prediction."
+
+
+def _scheduler_metadata(
+    *,
+    min_lr: float,
+    min_lr_frac: float,
+    base_lrs: Iterable[float] = (),
+    group_roles: Iterable[str] = (),
+) -> Dict[str, object]:
+    """Describe the executable per-group floor, including frozen zero-base groups."""
+    bases = [float(value) for value in base_lrs]
+    roles = [str(value) for value in group_roles]
+    if roles and len(roles) != len(bases):
+        raise ValueError("scheduler group roles and base learning rates must have equal length")
+    if not roles:
+        roles = [f"group_{index}" for index in range(len(bases))]
+    groups = []
+    for index, (role, base) in enumerate(zip(roles, bases)):
+        if base < 0.0 or not math.isfinite(base):
+            raise ValueError(f"scheduler group {index} base LR must be finite and nonnegative")
+        frozen = base == 0.0
+        groups.append({
+            "index": index,
+            "role": role,
+            "base_lr": base,
+            "frozen": frozen,
+            "absolute_floor": 0.0 if frozen else float(min_lr),
+            "fractional_floor": 0.0 if frozen else float(min_lr_frac) * base,
+            "effective_floor": (0.0 if frozen else max(float(min_lr), float(min_lr_frac) * base)),
+        })
+    return {
+        "kind": "warmup_half_cosine_with_floor",
+        "absolute_floor": float(min_lr),
+        "fractional_floor": float(min_lr_frac),
+        "zero_base_groups_remain_frozen": True,
+        "floor_description": (
+            "0 for group_base_lr == 0; otherwise "
+            "max(absolute_floor, fractional_floor * group_base_lr)"
+        ),
+        "groups": groups,
+    }
 
 
 def finalize_run(
@@ -3172,6 +3258,12 @@ def finalize_run(
             "test_ppl":            m["ppl"],
             "test_bits_per_token": m["bits_per_token"],
             "test_bpc":            m["bpc"],
+            "expected_targets":    m["expected_targets"],
+            "scored_targets":      m["scored_targets"],
+            "excluded_targets":    m["excluded_targets"],
+            "test_expected_targets": m["expected_targets"],
+            "test_scored_targets":   m["scored_targets"],
+            "test_excluded_targets": m["excluded_targets"],
         })
         logger.info(
             "Test (held-out) | CE: %.4f | PPL: %.2f | BPT: %.4f | BPC: %s",
@@ -3216,7 +3308,7 @@ def finalize_run(
 
     # EXP-5 (C2): the converged final E-step free energy PER TOKEN -- the E-step's OWN target-blind
     # functional value (free_energy_value sums F over the N tokens; divide by N). Persisted so a
-    # cross-arm reader (scaling_analysis) can test whether final F DECORRELATES from CE across an
+    # cross-arm reader (scaling_analysis) can describe the final-F/CE relationship across an
     # n_e_steps sweep -- the structural non-Neal-Hinton EM prediction (the E-step serves a distinct
     # functional, not the likelihood). Off-graph, best-effort, on a fixed test batch (sequence 0).
     if test_loader is not None:
@@ -3225,8 +3317,13 @@ def finalize_run(
             _b = next(iter(test_loader))
             _tok = (_b[0] if isinstance(_b, (tuple, list)) else _b).to(device)
             _tr = e_step_belief_trace(model, _tok)              # n_iter defaults to cfg.n_e_steps
-            results["estep_final_f_per_token"] = float(_tr["free_energy"][-1]) / max(1, int(_tok.shape[1]))
-            logger.info("Converged final E-step F/token: %.4f", results["estep_final_f_per_token"])
+            results["estep_final_iterate_f_per_token"] = float(_tr["free_energy"][-1]) / max(1, int(_tok.shape[1]))
+            results["estep_final_f_per_token"] = results["estep_final_iterate_f_per_token"]  # compatibility alias
+            results["estep_iterate_evidence"] = _estep_iterate_evidence(
+                free_energy=[float(value) for value in _tr["free_energy"]],
+                halted=False, fixed_point_residual=None, fixed_point_tolerance=None,
+            )
+            logger.info("Final E-step iterate F/token: %.4f", results["estep_final_iterate_f_per_token"])
         except Exception as exc:
             logger.warning("estep final-F probe failed (%s); skipped", exc)
 
@@ -3325,6 +3422,9 @@ def finalize_run(
         "test_ppl":             results.get("test_ppl"),
         "test_bits_per_token":  results.get("test_bits_per_token"),
         "test_bpc":             results.get("test_bpc"),
+        "expected_targets":      results.get("expected_targets"),
+        "scored_targets":        results.get("scored_targets"),
+        "excluded_targets":      results.get("excluded_targets"),
     }
     try:
         scaling_point.update(_cost_model_fields(model, cfg, n_params, tokens_seen, wall_time=wall_time))
@@ -3346,8 +3446,22 @@ def finalize_run(
         "test_ce":      results.get("test_ce"),
         "test_bits_per_token": results.get("test_bits_per_token"),
         "test_bpc":     results.get("test_bpc"),
+        "expected_targets": results.get("expected_targets"),
+        "scored_targets": results.get("scored_targets"),
+        "excluded_targets": results.get("excluded_targets"),
+        "test_expected_targets": results.get("test_expected_targets"),
+        "test_scored_targets": results.get("test_scored_targets"),
+        "test_excluded_targets": results.get("test_excluded_targets"),
         "diagnostics":  results["diagnostics"],
+        "estep_final_iterate_f_per_token": results.get("estep_final_iterate_f_per_token"),
         "estep_final_f_per_token": results.get("estep_final_f_per_token"),
+        "estep_iterate_evidence": results.get("estep_iterate_evidence"),
+        "scheduler": _scheduler_metadata(
+            min_lr=cfg.min_lr,
+            min_lr_frac=cfg.min_lr_frac,
+            base_lrs=getattr(artifacts, "scheduler_base_lrs", ()),
+            group_roles=getattr(artifacts, "scheduler_group_roles", ()),
+        ),
         "final_train_loss": (losses[-1] if losses else None),
         "wall_time_s":  wall_time,
         "use_prior_bank":  cfg.use_prior_bank,
@@ -3361,7 +3475,13 @@ def finalize_run(
     # stress metrics that say whether the numerical guards stayed inert. A REPORT of where the run sits,
     # not a judgment that any toggle is wrong (toggles are changed intentionally). Best-effort.
     try:
-        artifacts.save_json("pure_path_report.json", _pure_path_report(cfg, artifacts.history))
+        artifacts.save_json("pure_path_report.json", _pure_path_report(
+            cfg,
+            artifacts.history,
+            executable_build=model.executable_build,
+            reflection_scope=model.prior_bank.reflection_scope,
+            reflection_group_component_count=len(model.group.irrep_dims),
+        ))
     except Exception as exc:
         logger.warning("pure-path report failed (%s); skipped", exc)
 
@@ -4231,6 +4351,11 @@ def finalize_validation_run(
         final_ppl = float(metrics["ppl"])
         final_bits_per_token = float(metrics["bits_per_token"])
         final_bpc = (float(metrics["bpc"]) if metrics["bpc"] is not None else None)
+        target_counts = {
+            "expected_targets": int(metrics["expected_targets"]),
+            "scored_targets": int(metrics["scored_targets"]),
+            "excluded_targets": int(metrics["excluded_targets"]),
+        }
 
         # Terminal metrics row: an empty history adopts the compact terminal schema. An established
         # training history retains its exact rectangular field set, but every non-terminal field is
@@ -4280,6 +4405,10 @@ def finalize_validation_run(
             "val_ppl":         final_ppl,
             "val_bits_per_token": final_bits_per_token,
             "val_bpc":         final_bpc,
+            **target_counts,
+            "val_expected_targets": target_counts["expected_targets"],
+            "val_scored_targets": target_counts["scored_targets"],
+            "val_excluded_targets": target_counts["excluded_targets"],
             "primary_val_ppl": float(primary_val_ppl),
             "best_val_ppl":    best_val_ppl,
             "best_step":       artifacts.best_step,
@@ -4293,7 +4422,13 @@ def finalize_validation_run(
             data_seed=data_seed, max_tokens=max_tokens, tokenizer_tag=tokenizer_tag,
         )
         try:
-            artifacts.save_json("pure_path_report.json", _pure_path_report(cfg, artifacts.history))
+            artifacts.save_json("pure_path_report.json", _pure_path_report(
+                cfg,
+                artifacts.history,
+                executable_build=model.executable_build,
+                reflection_scope=model.prior_bank.reflection_scope,
+                reflection_group_component_count=len(model.group.irrep_dims),
+            ))
         except Exception as exc:
             logger.warning("pure-path report failed (%s); skipped", exc)
         if bool(getattr(cfg, "generate_figures", True)):
@@ -4338,6 +4473,10 @@ def finalize_validation_run(
         "final_val_ppl":       final_ppl,
         "final_val_bits_per_token": final_bits_per_token,
         "final_val_bpc":       final_bpc,
+        **target_counts,
+        "val_expected_targets": target_counts["expected_targets"],
+        "val_scored_targets": target_counts["scored_targets"],
+        "val_excluded_targets": target_counts["excluded_targets"],
         "best_val_ppl":        best_val_ppl,
         "best_step":           artifacts.best_step,
         "n_steps":             completed_step,
@@ -4358,6 +4497,10 @@ def finalize_validation_run(
         "final_val_ce":        final_ce,
         "final_val_bits_per_token": final_bits_per_token,
         "final_val_bpc":       final_bpc,
+        **target_counts,
+        "val_expected_targets": target_counts["expected_targets"],
+        "val_scored_targets": target_counts["scored_targets"],
+        "val_excluded_targets": target_counts["excluded_targets"],
         "best_val_ppl":        best_val_ppl,
         "best_step":           artifacts.best_step,
         "final_train_loss":    final_train_loss,
@@ -4366,24 +4509,30 @@ def finalize_validation_run(
     }
 
 
-def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
+def _pure_path_report(
+    cfg: VFE3Config,
+    history: List[Dict],
+    *,
+    executable_build: Optional[ExecutableBuildMetadata] = None,
+    reflection_scope: Optional[str] = None,
+    reflection_group_component_count: Optional[int] = None,
+) -> Dict:
     r"""Where a run sits relative to the theoretically pure path: the toggle states that define it plus
     the converged-state stress metrics that say whether the numerical guards stayed inert.
 
-    A REPORT, not a verdict. The pure path must EXIST under appropriate toggles, but the user changes
-    toggles intentionally, so a non-pure run is recorded (``on_pure_path=False`` with the offending
-    flags), never flagged as wrong. ``pure_flags`` covers the principal gauge / decode / free-energy
-    purity axes (canonical attention entropy, flat transport, constant/static coupling weights,
-    prior-bank decode, full sigma updates, no two-hop/fixed-prior surrogate, no post-belief HeadMixer,
-    no PriorBank decoder head-evidence mixer, unweighted attention); it does NOT enumerate every
-    default-OFF learned-scalar toggle
-    (pos_phi, learnable_r, t5_learnable_bias, use_cg_coupling),
-    so ``on_pure_path`` certifies these axes rather than a full no-learned-parameter audit.
-    ``gauge_flags``/``on_gauge_pure_path`` is a SECOND, independent axis (audit 2026-07-01 F8): the
-    gauge / model-channel path (learned gauge transport, phi parameterization, no reflection or
-    positional rotation, family/group invariance, no model-channel coupling) -- a run can be pure on
-    the free-energy/decode axis while a gauge setting alters the executed belief path, and vice versa.
-    ``converged_stress`` reads the last finite value of each guard / flatness column (None if absent)."""
+    This is a report, not a rejection gate: diagnostic GL-breaking and noncausal configurations
+    remain executable and are labeled by independent certificate facets. ``on_pure_path`` preserves
+    the legacy free-energy/decode schema. ``on_gauge_pure_path`` is the executable gauge facet and
+    includes the active transport, norm, parameterization, clipping, temperature, emission, encoder,
+    HeadMixer, and immutable BlockMLP seams. ``on_causal_lm_path`` comes independently from both
+    active attention-prior registrations. ``transport_exactness_status`` is affirmative only when
+    complete runtime evidence warrants it; absent evidence is ``unknown``. The conjunctive
+    ``on_theory_pure_path`` combines the explicitly enumerated ``theory_flags``. Reflection scope is
+    runtime-owned metadata and records the block-zero-only product subgroup when applicable.
+
+    ``pure_flags`` intentionally retains its historical meaning and does not enumerate every
+    default-off learned-scalar toggle. ``converged_stress`` reads the last finite value of each guard
+    or flatness column (``None`` if absent)."""
     def _last(key: str) -> Optional[float]:
         for r in reversed(history):
             v = r.get(key)
@@ -4391,7 +4540,9 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
                 return float(v)
         return None
     from vfe3.geometry.groups import declared_invariant_families
-    from vfe3.geometry.transport import get_transport_registration
+    from vfe3.geometry.norms import get_norm_registration
+    from vfe3.geometry.transport import TRANSPORT_CLAMP_MAX_NORM, get_transport_registration
+    from vfe3.attention_prior import get_prior_registration
 
     invariant_families = declared_invariant_families(cfg.gauge_group)
     family_group_invariant = cfg.family in invariant_families
@@ -4406,44 +4557,72 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
     head_mixer_gauge_compatible = getattr(cfg, "head_mixer_gauge_compatible", None)
     if head_mixer_gauge_compatible is None:
         head_mixer_gauge_compatible = VFE3Config.head_mixer_gauge_compatible.fget(cfg)
-    block_mlp_active = bool(getattr(cfg, "use_block_mlp", False))
-    block_mlp_covariance_floor = float(getattr(cfg, "block_mlp_covariance_floor", 1e-4))
-    block_mlp_mode = getattr(cfg, "block_mlp_mode", "coordinate")
-    block_mlp_covariance = getattr(cfg, "block_mlp_covariance", "passthrough")
-    if not block_mlp_active:
-        block_mlp_structural_mode = "disabled"
-        block_mlp_covariance_contract = "not_applicable"
-        block_mlp_intertwiner_compatible = True
-    elif block_mlp_mode == "gauge_gate":
-        block_mlp_structural_mode = "invariant_scalar_gate"
-        block_mlp_covariance_contract = ("delta_full_plus_covariant_floor" if block_mlp_covariance == "delta_full" else block_mlp_covariance)
-        block_mlp_intertwiner_compatible = True
-    elif block_mlp_mode == "canonical_frame":
-        block_mlp_structural_mode = "canonical_frame_left_equivariant_right_fixed"
-        block_mlp_covariance_contract = ("delta_full_plus_covariant_floor" if block_mlp_covariance == "delta_full" else block_mlp_covariance)
-        block_mlp_intertwiner_compatible = False
+    if executable_build is not None:
+        block_mlp_build = executable_build.block_mlp
+        block_mlp_active = block_mlp_build.enabled
+        block_mlp_mode = block_mlp_build.mode
+        block_mlp_covariance = block_mlp_build.covariance
+        block_mlp_expansion = block_mlp_build.expansion
+        block_mlp_activation = block_mlp_build.activation
+        block_mlp_dropout = block_mlp_build.dropout
+        block_mlp_covariance_floor = block_mlp_build.covariance_floor
+        block_mlp_structural_mode = block_mlp_build.report_label
+        block_mlp_covariance_contract = block_mlp_build.covariance_report_label
+        block_mlp_intertwiner_compatible = block_mlp_build.intertwiner_compatible
     else:
+        block_mlp_active = bool(getattr(cfg, "use_block_mlp", False))
+        block_mlp_mode = getattr(cfg, "block_mlp_mode", "coordinate")
+        block_mlp_covariance = getattr(cfg, "block_mlp_covariance", "passthrough")
+        block_mlp_expansion = int(getattr(cfg, "block_mlp_expansion", 4))
+        block_mlp_activation = getattr(cfg, "block_mlp_activation", "gelu")
+        block_mlp_dropout = float(getattr(cfg, "block_mlp_dropout", 0.0))
+        block_mlp_covariance_floor = float(getattr(cfg, "block_mlp_covariance_floor", 1e-4))
+        registration = get_block_mlp_registration(block_mlp_mode)
         block_mlp_structural_mode = (
-            "coordinate_mean_only_nonintertwiner"
-            if block_mlp_covariance == "passthrough"
-            else "coordinate_delta_full_covariant_floor_nonintertwiner"
+            registration.report_label(block_mlp_covariance)
+            if block_mlp_active else "disabled"
         )
-        block_mlp_covariance_contract = ("delta_full_plus_covariant_floor" if block_mlp_covariance == "delta_full" else block_mlp_covariance)
-        block_mlp_intertwiner_compatible = False
-    covariance_feature_exact = _last("regime_ii_covariant_feature_exact")
-    feature_jitter_recovered = covariance_feature_exact is not None and covariance_feature_exact < 0.5
+        block_mlp_covariance_contract = (
+            "not_applicable" if not block_mlp_active else
+            "delta_full_plus_covariant_floor"
+            if block_mlp_covariance == "delta_full" else block_mlp_covariance
+        )
+        block_mlp_intertwiner_compatible = (
+            registration.intertwiner_compatible if block_mlp_active else True
+        )
+    runtime_exactness_key = transport_registration.runtime_exactness_key
     if cfg.transport_mode != "regime_ii_covariant":
-        regime_ii_covariant_exact = True
+        regime_ii_covariant_exact = cfg.transport_mode == "flat"
         regime_ii_covariant_exactness = "not_applicable"
     elif not family_group_invariant:
         regime_ii_covariant_exact = False
         regime_ii_covariant_exactness = "diagonal_projection_approximation"
-    elif feature_jitter_recovered:
-        regime_ii_covariant_exact = False
-        regime_ii_covariant_exactness = "jitter_recovered_approximation"
     else:
-        regime_ii_covariant_exact = True
-        regime_ii_covariant_exactness = "exact_valid_spd_factorization"
+        observations = [row.get(runtime_exactness_key) for row in history]
+        finite_observations = [
+            value for value in observations
+            if isinstance(value, (int, float)) and math.isfinite(value)
+        ]
+        complete = bool(observations) and all(
+            isinstance(value, (int, float)) and math.isfinite(value)
+            for value in observations
+        )
+        regime_ii_covariant_exact = complete and all(value >= 0.5 for value in observations)
+        regime_ii_covariant_exactness = (
+            "exact_valid_spd_factorization" if regime_ii_covariant_exact else
+            "jitter_recovered_approximation" if any(value < 0.5 for value in finite_observations) else
+            "unknown_missing_runtime_evidence"
+        )
+    if cfg.transport_mode == "flat":
+        transport_exactness_status = "not_applicable"
+    elif not transport_registration.gauge_equivariant or not family_group_invariant:
+        transport_exactness_status = "approximate"
+    elif runtime_exactness_key is None:
+        transport_exactness_status = "unknown"
+    elif regime_ii_covariant_exactness == "unknown_missing_runtime_evidence":
+        transport_exactness_status = "unknown"
+    else:
+        transport_exactness_status = "exact" if regime_ii_covariant_exact else "approximate"
 
     spd_retract_mode = getattr(cfg, "spd_retract_mode", "spd_affine")
     sigma_max = getattr(cfg, "sigma_max", 10.0)
@@ -4458,6 +4637,68 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             if spd_retraction_exact
             else "log_euclidean_projected_spectral_cap"
         )
+
+    beta_prior = get_prior_registration(getattr(cfg, "beta_attention_prior", "causal"))
+    gamma_prior = get_prior_registration(getattr(cfg, "gamma_attention_prior", "causal"))
+    causal_flags = {
+        "beta_prior_causal": beta_prior.is_causal_for_next_token_scoring(cfg),
+        "gamma_prior_causal": gamma_prior.is_causal_for_next_token_scoring(cfg),
+    }
+    on_causal_lm_path = all(causal_flags.values())
+
+    block_norm_name = getattr(cfg, "norm_type_block", "none")
+    final_norm_name = getattr(cfg, "norm_type_final", "none")
+    block_norm_registration = get_norm_registration(block_norm_name)
+    final_norm_registration = get_norm_registration(final_norm_name)
+    transport_chart_max_norm = getattr(cfg, "transport_chart_max_norm", None)
+    query_adaptive_trace_live = (
+        bool(getattr(cfg, "query_adaptive_tau", False))
+        and float(getattr(cfg, "query_tau_c", 1.0)) != 0.0
+    )
+    emission_live = (
+        getattr(cfg, "emission_mode", "off") != "off"
+        and float(getattr(cfg, "emission_weight", 0.0)) != 0.0
+    )
+
+    reflection_active = (
+        getattr(cfg, "omega_reflection", "off") != "off"
+        or getattr(cfg, "phi_reflection", "off") != "off"
+    )
+    block_count = reflection_group_component_count
+    if reflection_scope == "block_0_probe" and reflection_active:
+        effective_scope = "block_zero_only"
+        effective_subgroup = "GL(d_0) x product_{h>0} GL+(d_h)"
+        accessible_blocks = [0]
+        accessible_component_count = 2
+        total_component_count = 2 ** block_count if block_count is not None else None
+    elif reflection_active and reflection_scope == "full_element":
+        effective_scope = "full_represented_element"
+        effective_subgroup = "full_registered_reflection_extension"
+        accessible_blocks = list(range(block_count)) if block_count is not None else None
+        accessible_component_count = (
+            2 ** block_count if cfg.gauge_group == "block_glk" and block_count is not None else 2
+        )
+        total_component_count = accessible_component_count
+    elif reflection_active:
+        effective_scope = "unknown"
+        effective_subgroup = "unknown"
+        accessible_blocks = None
+        accessible_component_count = None
+        total_component_count = None
+    else:
+        effective_scope = "not_applicable"
+        effective_subgroup = "connected_component_only"
+        accessible_blocks = []
+        accessible_component_count = 1
+        total_component_count = 1
+    reflection_report = {
+        "configured_scope": reflection_scope,
+        "effective_scope": effective_scope,
+        "effective_subgroup": effective_subgroup,
+        "accessible_blocks": accessible_blocks,
+        "accessible_component_count": accessible_component_count,
+        "total_component_count": total_component_count,
+    }
 
     pure_flags = {
         "canonical_attention_entropy": bool(cfg.include_attention_entropy),
@@ -4485,6 +4726,7 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
     # which are inert while RoPE is off -- those are reported in config_toggles for transparency.
     gauge_flags = {
         "learned_gauge_transport":   cfg.gauge_transport == "on",
+        "transport_gauge_equivariant": transport_registration.gauge_equivariant,
         "no_positional_rotation":    cfg.pos_rotation == "none",
         "no_model_channel_coupling": cfg.lambda_gamma == 0.0 and not cfg.s_e_step,
         "phi_parameterization":      cfg.gauge_parameterization == "phi",
@@ -4492,12 +4734,38 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
         "family_group_invariant":    family_group_invariant,
         "head_mixer_intertwiner_compatible": head_mixer_gauge_compatible,
         "block_mlp_intertwiner_compatible": block_mlp_intertwiner_compatible,
+        "block_norm_gauge_equivariant": block_norm_registration.gauge_equivariant,
+        "final_norm_gauge_equivariant": final_norm_registration.gauge_equivariant,
+        "no_fixed_coordinate_spectral_cap": sigma_max is None,
+        "no_phi_mstep_chart_cap": getattr(cfg, "phi_mstep_max_matrix_norm", None) is None,
+        "no_pullback_trust_region": getattr(cfg, "m_phi_update_mode", "adamw") != "pullback_group",
+        "no_transport_exponential_clipping": (
+            transport_chart_max_norm is not None
+            and float(transport_chart_max_norm) <= float(TRANSPORT_CLAMP_MAX_NORM)
+        ),
+        "no_e_step_phi_retraction_clipping": float(getattr(cfg, "e_phi_lr", 0.0)) == 0.0,
+        "no_query_adaptive_trace_temperature": not query_adaptive_trace_live,
+        "no_fixed_basis_emission": not emission_live,
+        "no_additive_encoder_control": getattr(cfg, "encode_mode", "per_token") != "per_token_additive",
+    }
+    on_gauge_pure_path = all(gauge_flags.values())
+    theory_flags = {
+        **pure_flags,
+        "gauge_pure_path": on_gauge_pure_path,
+        "causal_lm_path": on_causal_lm_path,
+        "transport_exact_when_applicable": transport_exactness_status in {"exact", "not_applicable"},
     }
     return {
         "on_pure_path":       all(pure_flags.values()),
         "pure_flags":         pure_flags,
         "gauge_flags":        gauge_flags,
-        "on_gauge_pure_path": all(gauge_flags.values()),
+        "on_gauge_pure_path": on_gauge_pure_path,
+        "causal_flags":       causal_flags,
+        "on_causal_lm_path": on_causal_lm_path,
+        "transport_exactness_status": transport_exactness_status,
+        "theory_flags":       theory_flags,
+        "on_theory_pure_path": all(theory_flags.values()),
+        "reflection":         reflection_report,
         "config_toggles": {
             "include_attention_entropy":    bool(cfg.include_attention_entropy),
             "transport_mode":               cfg.transport_mode,
@@ -4507,13 +4775,16 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             "use_head_mixer":               bool(cfg.use_head_mixer),
             "use_priorbank_head_evidence_mixer": priorbank_head_evidence_mixer,
             "encode_mode":                  getattr(cfg, "encode_mode", "per_token"),
+            "beta_attention_prior":         getattr(cfg, "beta_attention_prior", "causal"),
+            "gamma_attention_prior":        getattr(cfg, "gamma_attention_prior", "causal"),
+            "t5_bidirectional":             bool(getattr(cfg, "t5_bidirectional", False)),
             "use_block_mlp":                block_mlp_active,
             "block_mlp_mode":               block_mlp_mode,
             "block_mlp_covariance":         block_mlp_covariance,
-            "block_mlp_expansion":          int(getattr(cfg, "block_mlp_expansion", 4)),
+            "block_mlp_expansion":          block_mlp_expansion,
             "block_mlp_covariance_floor":   block_mlp_covariance_floor,
-            "block_mlp_activation":         getattr(cfg, "block_mlp_activation", "gelu"),
-            "block_mlp_dropout":            float(getattr(cfg, "block_mlp_dropout", 0.0)),
+            "block_mlp_activation":         block_mlp_activation,
+            "block_mlp_dropout":            block_mlp_dropout,
             "block_mlp_lr_resolved":        float(
                 getattr(cfg, "m_block_mlp_lr", None)
                 if getattr(cfg, "m_block_mlp_lr", None) is not None else getattr(cfg, "m_p_mu_lr", 0.0)),
@@ -4571,6 +4842,18 @@ def _pure_path_report(cfg: VFE3Config, history: List[Dict]) -> Dict:
             "regime_ii_covariant_exactness": regime_ii_covariant_exactness,
             "spd_retraction_route":         spd_retraction_route,
             "spd_retraction_exact":         spd_retraction_exact,
+            "norm_type_block":              block_norm_name,
+            "norm_type_final":              final_norm_name,
+            "layernorm_affine":             bool(getattr(cfg, "layernorm_affine", False)),
+            "m_phi_update_mode":            getattr(cfg, "m_phi_update_mode", "adamw"),
+            "m_phi_group_trust_radius":      float(getattr(cfg, "m_phi_group_trust_radius", 0.1)),
+            "phi_mstep_max_matrix_norm":     getattr(cfg, "phi_mstep_max_matrix_norm", None),
+            "transport_chart_max_norm":      transport_chart_max_norm,
+            "e_phi_lr":                     float(getattr(cfg, "e_phi_lr", 0.0)),
+            "query_adaptive_tau":            bool(getattr(cfg, "query_adaptive_tau", False)),
+            "query_tau_c":                   float(getattr(cfg, "query_tau_c", 1.0)),
+            "emission_mode":                 getattr(cfg, "emission_mode", "off"),
+            "emission_weight":               float(getattr(cfg, "emission_weight", 0.0)),
             # Covariance class of the ACTIVE transport (audit C7), owned by its complete registry
             # record. An unregistered mode fails closed instead of inventing report metadata.
             "transport_covariance_class":   transport_registration.covariance_class,
@@ -4740,9 +5023,8 @@ def _save_figures(
                 fig = figs.plot_kappa_block_trajectory(
                     _hist_kb, path=str(run / "kappa_block_trajectory.png"))
                 figs.plt.close(fig)
-        # Optimization + convergence trends (history-only; no model re-run): the pre-clip gradient
-        # norm (THE optimization-health curve, previously discarded), the belief-covariance
-        # conditioning, and the per-eval E-step F-descent (negative = the inner loop reduced F).
+        # Optimization and endpoint trends (history-only; no model re-run): the pre-clip gradient
+        # norm, belief-covariance conditioning, and the per-eval E-step endpoint delta.
         nx, ny = _aligned("grad_norm")
         if ny:
             fig = figs.plot_trajectory(
@@ -4799,13 +5081,14 @@ def _save_figures(
             figs.plt.close(fig)
         ex, ey = _aligned("estep_f_drop")
         if ey:
+            _endpoint_artifact = _estep_endpoint_artifact({})
             fig = figs.plot_trajectory(
                 ey, ex, ylabel=r"$F_{\mathrm{end}}-F_{\mathrm{start}}$ (inner E-step)",
-                title="E-step free-energy descent", color=figs._CB[2 % len(figs._CB)],
-                median_line=True, path=str(run / "estep_convergence_trend.png"))
+                title=_endpoint_artifact["title"], color=figs._CB[2 % len(figs._CB)],
+                median_line=True, path=str(run / _endpoint_artifact["filename"]))
             figs.plt.close(fig)
-        # Free-energy figures: the per-token budget DECOMPOSITION (snapshot + early/mid/late evolution)
-        # and, as a SEPARATE figure, the F-vs-CE CO-DESCENT over training. Both need every plotted term
+        # Free-energy figures: the per-token budget decomposition (snapshot + early/mid/late evolution)
+        # and, separately, the final-iterate objective/CE relationship over training. Both need every plotted term
         # finite, so rows before the first eval (NaN val_*) are dropped.
         fe_keys = ("self_coupling", "belief_coupling", "attention_entropy", "val_ce")
         fe_rows = [r for r in artifacts.history
@@ -4827,11 +5110,13 @@ def _save_figures(
             iae = getattr(cfg, "include_attention_entropy", True)
             fig = figs.plot_free_energy_decomposition(
                 hist, lambda_beta=lam, lambda_gamma=gam, include_attention_entropy=iae,
+                divergence_family=getattr(cfg, "divergence_family", "renyi"),
                 path=str(run / "free_energy_decomposition.png"))
             figs.plt.close(fig)
-            fig = figs.plot_free_energy_codescent(
+            fig = figs.plot_free_energy_relationship(
                 hist, lambda_beta=lam, lambda_gamma=gam, include_attention_entropy=iae,
-                path=str(run / "free_energy_codescent.png"))
+                divergence_family=getattr(cfg, "divergence_family", "renyi"),
+                path=str(run / "free_energy_relationship.png"))
             figs.plt.close(fig)
         # Model-channel free-energy blocks (s-channel): the hyper-prior KL(s||r), the gamma
         # model-coupling, and its meta-entropy over training. Present only when the model channel

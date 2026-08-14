@@ -14,7 +14,8 @@ family), still non-equivariant. Both are ablations / baselines against the gauge
 remain ``none``/``mahalanobis``.
 """
 
-from typing import Callable, Dict
+from dataclasses import dataclass
+from typing import Callable, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -23,9 +24,20 @@ from vfe3.families.base import get_family
 from vfe3.numerics import safe_cholesky
 
 _NORMS: Dict[str, Callable] = {}
+_NORM_GAUGE_EQUIVARIANCE: Dict[str, tuple[Callable, bool]] = {}
 
 
-def register_norm(name: str, *, override: bool = False) -> Callable:
+@dataclass(frozen=True)
+class NormRegistration:
+    """One norm builder and its full-family GL(K)-equivariance declaration."""
+
+    callable: Callable
+    gauge_equivariant: bool
+
+
+def register_norm(
+    name: str, *, gauge_equivariant: Optional[bool] = None, override: bool = False,
+) -> Callable:
     """Decorator registering a norm builder under ``name``.
 
     Duplicate keys fail closed (audit 2026-07-01 round-3): a second registration under an
@@ -34,7 +46,13 @@ def register_norm(name: str, *, override: bool = False) -> Callable:
     def _wrap(fn: Callable) -> Callable:
         if name in _NORMS and not override:
             raise KeyError(f"norm {name!r} already registered; pass override=True to replace")
+        resolved = (
+            bool(getattr(fn, "_vfe3_gauge_equivariant", False))
+            if gauge_equivariant is None else bool(gauge_equivariant)
+        )
+        setattr(fn, "_vfe3_gauge_equivariant", resolved)
         _NORMS[name] = fn
+        _NORM_GAUGE_EQUIVARIANCE[name] = (fn, resolved)
         return fn
     return _wrap
 
@@ -44,6 +62,17 @@ def get_norm(name: str) -> Callable:
     if name not in _NORMS:
         raise KeyError(f"no norm registered under {name!r}; available: {sorted(_NORMS)}")
     return _NORMS[name]
+
+
+def get_norm_registration(name: str) -> NormRegistration:
+    """Return the active builder plus fail-closed gauge metadata."""
+    fn = get_norm(name)
+    record = _NORM_GAUGE_EQUIVARIANCE.get(name)
+    if record is not None and record[0] is fn:
+        _, gauge_equivariant = record
+    else:
+        gauge_equivariant = bool(getattr(fn, "_vfe3_gauge_equivariant", False))
+    return NormRegistration(fn, gauge_equivariant)
 
 
 class MahalanobisNorm:
@@ -211,7 +240,7 @@ class AffineLayerNorm(nn.Module):
         return _ln_standardize(mu, self.eps) * self.weight + self.bias
 
 
-@register_norm("none")
+@register_norm("none", gauge_equivariant=True)
 def _norm_none(K: int, **kwargs) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Identity norm (no rescaling)."""
     def _identity(mu: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
@@ -219,7 +248,7 @@ def _norm_none(K: int, **kwargs) -> Callable[[torch.Tensor, torch.Tensor], torch
     return _identity
 
 
-@register_norm("mahalanobis")
+@register_norm("mahalanobis", gauge_equivariant=True)
 def _norm_mahalanobis(
     K: int,
 

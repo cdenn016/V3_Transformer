@@ -59,7 +59,7 @@ _FULL_PAIR_MATRIX_WORKSETS = 8
 _COORDINATE_WORKSETS = 12
 
 _SINGLE_RUN_FIGURE_INVENTORY = (
-    "estep_convergence.png",
+    "iterate_trajectory.png",
     "belief_trajectories.png",
     "belief_category_separation.png",
     "attention_structure.png",
@@ -751,7 +751,7 @@ def generate_figures(
         or (mc_bank is not None and mc_bank["token_ids"].shape[0] == max_tokens)
     )
     availability = {
-        "estep_convergence":          trace is not None,
+        "iterate_trajectory":         trace is not None,
         "belief_trajectories":        trace is not None,
         "belief_category_separation": bank is not None,
         "attention_structure":        amaps is not None,
@@ -816,9 +816,9 @@ def generate_figures(
                 figs.plt.close(num)
             logger.warning("figure %r failed (%s); continuing", name, exc)
 
-    _emit("estep_convergence",
-          lambda p: figs.plot_estep_convergence(trace, path=p),
-          "estep_convergence.png" in planned_figures)
+    _emit("iterate_trajectory",
+          lambda p: figs.plot_iterate_trajectory(trace, divergence_family=cfg.divergence_family, path=p),
+          "iterate_trajectory.png" in planned_figures)
     _emit("belief_trajectories",
           lambda p: figs.plot_belief_trajectories(trace, layer_trace, path=p),
           "belief_trajectories.png" in planned_figures)
@@ -919,6 +919,15 @@ def generate_figures(
                       sidecar_path=(str(figdir / f"model_umap_{ch}.json")
                                     if controlled_bank else None)),
                   f"model_umap_{ch}.png" in planned_figures)
+    for cleanup_status in getattr(umap_worker, "cleanup_statuses", ()):
+        if (
+            cleanup_status.get("cleanup_error")
+            or cleanup_status.get("root_reaped") is False
+            or cleanup_status.get("tree_termination_confirmed") is False
+        ):
+            logger.warning(
+                "UMAP worker cleanup incomplete: %s", cleanup_status,
+            )
     # Next-token vocabulary-probability figures (single-arm here; the cross-run K70-vs-K120 contrast
     # is the two-arm vocab_comparison_figures driver). vocab_confusion needs the token decoder for its
     # category bucketing; decode_readout is None (skipped) on the use_prior_bank=True KL-decode path.

@@ -10,10 +10,12 @@ concrete-family module by hand.
 
 from vfe3.families.base import (
     BeliefParams,
+    FunctionalDisplayMetadata,
     divergence_families,
     family_cov_kind,
     get_family,
     get_functional,
+    get_functional_display,
     kl,
     register_family,
     register_functional,
@@ -27,10 +29,12 @@ from vfe3.families import exact_congruence as _exact_congruence  # noqa: F401  (
 
 __all__ = [
     "BeliefParams",
+    "FunctionalDisplayMetadata",
     "divergence_families",
     "family_cov_kind",
     "get_family",
     "get_functional",
+    "get_functional_display",
     "kl",
     "register_family",
     "register_functional",

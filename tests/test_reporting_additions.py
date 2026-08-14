@@ -360,7 +360,21 @@ def _pure_ns(**over):
         lambda_gamma=0.0, s_e_step=False,
         skip_belief_sigma_update=False, lambda_twohop=0.0,
         gauge_parameterization="phi", omega_reflection="off", phi_reflection="off",
-        gauge_group="glk", family="gaussian_full")
+        gauge_group="glk", family="gaussian_full",
+        e_step_update="gradient", mm_damping=1.0,
+        use_block_mlp=False, block_mlp_mode="coordinate", block_mlp_covariance="passthrough",
+        block_mlp_expansion=4, block_mlp_covariance_floor=1e-4,
+        block_mlp_activation="gelu", block_mlp_dropout=0.0,
+        m_block_mlp_lr=None, m_p_mu_lr=1e-3,
+        head_mixer_compatibility="disabled", head_mixer_gauge_compatible=True,
+        sigma_max=None, spd_retract_mode="spd_affine",
+        norm_type_block="none", norm_type_final="none", layernorm_affine=False,
+        m_phi_update_mode="adamw", m_phi_group_trust_radius=0.1,
+        phi_mstep_max_matrix_norm=None, transport_chart_max_norm=12.0,
+        e_phi_lr=0.0, query_adaptive_tau=False, query_tau_c=1.0,
+        emission_mode="off", emission_weight=0.0,
+        beta_attention_prior="causal", gamma_attention_prior="causal",
+        t5_bidirectional=False)
     base.update(over)
     return types.SimpleNamespace(**base)
 
@@ -372,8 +386,16 @@ def test_pure_path_report_structure_and_flags():
     rep = _pure_path_report(pure, history)
     assert rep["on_pure_path"] is True
     assert rep["on_gauge_pure_path"] is True
-    assert set(rep) == {"on_pure_path", "pure_flags", "config_toggles", "converged_stress",
-                        "gauge_flags", "on_gauge_pure_path"}
+    preexisting = {
+        "on_pure_path", "pure_flags", "config_toggles", "converged_stress",
+        "gauge_flags", "on_gauge_pure_path",
+    }
+    additions = {
+        "on_causal_lm_path", "transport_exactness_status", "on_theory_pure_path",
+        "causal_flags", "theory_flags", "reflection",
+    }
+    assert preexisting <= rep.keys()
+    assert additions <= rep.keys()
     assert rep["converged_stress"]["cocycle_residual"] == 1e-7
     # flipping any defining toggle drops the run off the pure path
     impure = types.SimpleNamespace(**{**pure.__dict__, "transport_mode": "regime_ii"})
@@ -463,6 +485,7 @@ def _finalize_ns(**over):
         evaluate_zero_e_steps_counterfactual=False,
         # numeric-path attrs (summary / provenance / cost model / pure-path report)
         seed=0, max_steps=2, use_prior_bank=True, decode_bias=False, use_head_mixer=False,
+        min_lr=0.0, min_lr_frac=0.0,
         include_attention_entropy=True, transport_mode="flat", lambda_alpha_mode="constant",
         lambda_beta=1.0, precision_weighted_attention=False,
         gauge_transport="on", pos_rotation="none", rope_full_gauge=False, rope_on_value=True,

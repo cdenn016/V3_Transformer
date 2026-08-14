@@ -570,7 +570,7 @@ def test_unroll_default_does_not_warn_about_frozen_parameters():
 def test_config_model_defaults():
     cfg = VFE3Config()
     assert cfg.embed_dim == 64 and cfg.n_heads == 8 and cfg.n_layers == 1
-    assert cfg.gauge_group == "block_glk" and cfg.decode_mode == "diagonal"
+    assert cfg.gauge_group == "block_glk" and cfg.decode_mode == "diagonal_chunked"
     assert cfg.use_prior_bank is False              # default is the linear-decode ablation
 
 
