@@ -585,6 +585,37 @@ def _default_sample_decoder(
     return lambda ids: enc.decode([int(t) for t in ids])
 
 
+def _periodic_generation(
+    model:      torch.nn.Module,
+    prompt:     torch.Tensor,
+    new_tokens: int,
+    decode:     Callable[[Sequence[int]], str],
+) -> Tuple[str, str]:
+    """Generate in eval mode without changing module modes or global RNG streams."""
+    modules = tuple(model.modules())
+    training_flags = tuple(module.training for module in modules)
+    cpu_rng = torch.get_rng_state().clone()
+    cuda_rng = (
+        tuple(state.clone() for state in torch.cuda.get_rng_state_all())
+        if torch.cuda.is_available()
+        else None
+    )
+    try:
+        model.eval()
+        generated = model.generate(prompt, new_tokens, greedy=True)[0]
+        prompt_text = decode(prompt[0].tolist())
+        continuation_text = decode(generated[prompt.shape[1]:].tolist())
+        return prompt_text, continuation_text
+    finally:
+        for module, was_training in zip(modules, training_flags):
+            module.training = was_training
+        try:
+            torch.set_rng_state(cpu_rng)
+        finally:
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(list(cuda_rng))
+
+
 def train_step(
     model:     VFEModel,
     optimizer: torch.optim.Optimizer,
@@ -2045,9 +2076,9 @@ def train(
             if decode is not None:
                 try:
                     prompt = tokens[:1, :sample_prompt_len]                       # (1, P) seq-0 prompt
-                    gen = model.generate(prompt, sample_new_tokens, greedy=True)[0]
-                    p_txt = decode(prompt[0].tolist())
-                    c_txt = decode(gen[prompt.shape[1]:].tolist())
+                    p_txt, c_txt = _periodic_generation(
+                        model, prompt, sample_new_tokens, decode,
+                    )
                     logger.info("       Sample: %r  ->  %r\n", p_txt, c_txt)
                 except Exception as exc:                                          # never let sampling kill training
                     logger.warning("       (sample generation failed: %s)", exc)

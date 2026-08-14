@@ -919,6 +919,11 @@ def generate_figures(
                       sidecar_path=(str(figdir / f"model_umap_{ch}.json")
                                     if controlled_bank else None)),
                   f"model_umap_{ch}.png" in planned_figures)
+    for cleanup_status in umap_worker.cleanup_statuses:
+        if cleanup_status.get("cleanup_error") or not cleanup_status.get("reaped"):
+            logger.warning(
+                "UMAP worker cleanup incomplete: %s", cleanup_status,
+            )
     # Next-token vocabulary-probability figures (single-arm here; the cross-run K70-vs-K120 contrast
     # is the two-arm vocab_comparison_figures driver). vocab_confusion needs the token decoder for its
     # category bucketing; decode_readout is None (skipped) on the use_prior_bank=True KL-decode path.

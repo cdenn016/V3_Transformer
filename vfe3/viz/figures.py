@@ -22,6 +22,7 @@ matplotlib.use("Agg")                                            # non-interacti
 import matplotlib.pyplot as plt
 
 from vfe3.families.base import get_functional_display
+from vfe3.process_utils import ProcessTree, spawn_process_tree
 import numpy as np
 from matplotlib.colors import LogNorm
 from matplotlib.ticker import FuncFormatter, MaxNLocator
@@ -207,16 +208,24 @@ class UMAPWorker:
         self,
 
         *,
-        timeout:     float         = 1200.0,
-        max_workers: Optional[int] = None,
+        timeout:         float         = 1200.0,
+        cleanup_timeout: float         = 5.0,
+        max_workers:     Optional[int] = None,
     ) -> None:
+        if timeout <= 0.0:
+            raise ValueError("UMAP worker timeout must be positive")
+        if cleanup_timeout <= 0.0:
+            raise ValueError("UMAP cleanup timeout must be positive")
         cores = os.cpu_count() or 1
         self.timeout = timeout
+        self.cleanup_timeout = cleanup_timeout
         self.max_workers = (max(1, min(_UMAP_MAX_WORKERS, cores - 1)) if max_workers is None
                             else max(1, int(max_workers)))
         self._counter = 0
         self._procs: List[object] = []
+        self._trees: List[ProcessTree] = []
         self._stderr_handles: List[object] = []
+        self.cleanup_statuses: List[Dict[str, object]] = []
         self._workdir = None
 
     def _ensure(self, count: int) -> None:
@@ -228,34 +237,74 @@ class UMAPWorker:
             self._workdir = tempfile.mkdtemp(prefix="vfe3_umap_")
         cache_dir = _numba_cache_dir()
         while len(self._procs) < min(count, self.max_workers):
-            index = len(self._procs)
             worker_env = os.environ.copy()
             if cache_dir is None:
                 worker_env.pop("NUMBA_CACHE_DIR", None)
             else:
                 worker_env["NUMBA_CACHE_DIR"] = cache_dir
-            handle = open(os.path.join(self._workdir, f"stderr_{index}.log"), "w+b")
+            handle = open(os.path.join(self._workdir, f"stderr_{uuid4().hex}.log"), "w+b")
+            try:
+                tree = spawn_process_tree(
+                    [sys.executable, "-c", _UMAP_WORKER_SRC],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=handle,
+                    text=True,
+                    env=worker_env,
+                )
+            except BaseException:
+                handle.close()
+                raise
+            self._trees.append(tree)
+            self._procs.append(tree.process)
             self._stderr_handles.append(handle)
-            self._procs.append(subprocess.Popen(
-                [sys.executable, "-c", _UMAP_WORKER_SRC],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.DEVNULL,
-                stderr=handle,
-                text=True,
-                env=worker_env,
-            ))
 
     def _error_tail(self, index: int) -> str:
         if self._workdir is None or index >= len(self._stderr_handles):
             return ""
-        self._stderr_handles[index].flush()
+        stderr_handle = self._stderr_handles[index]
+        stderr_handle.flush()
         try:
-            with open(os.path.join(self._workdir, f"stderr_{index}.log"), "rb") as handle:
+            with open(stderr_handle.name, "rb") as handle:
                 handle.seek(0, os.SEEK_END)
                 handle.seek(max(0, handle.tell() - 1000), os.SEEK_SET)
                 return handle.read().decode(errors="replace")
         except OSError:
             return ""
+
+    def _retire(self, index: int, *, reason: str) -> Dict[str, object]:
+        """Remove exactly one owned worker after bounded process-tree cleanup."""
+        proc = self._procs[index]
+        tree = self._trees[index]
+        handle = self._stderr_handles[index]
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except OSError:
+            pass
+        status = tree.terminate(reason=reason, timeout=self.cleanup_timeout)
+        stderr_path = handle.name
+        try:
+            handle.close()
+        except OSError as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            status["cleanup_error"] = " | ".join(
+                part for part in (status.get("cleanup_error"), detail) if part
+            )
+        del self._procs[index]
+        del self._trees[index]
+        del self._stderr_handles[index]
+        try:
+            os.remove(stderr_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            status["cleanup_error"] = " | ".join(
+                part for part in (status.get("cleanup_error"), detail) if part
+            )
+        self.cleanup_statuses.append(status)
+        return status
 
     def _submit(self, index: int, request: Dict[str, object]) -> None:
         import json
@@ -265,6 +314,7 @@ class UMAPWorker:
             proc.stdin.flush()
         except BrokenPipeError as exc:
             tail = self._error_tail(index)
+            self._retire(index, reason="pipe_closed")
             if "ModuleNotFoundError" in tail and "umap" in tail:
                 raise ImportError("umap_embed needs umap-learn (pip install umap-learn)") from exc
             raise OSError(f"UMAP worker pipe closed: {tail[-500:]}") from exc
@@ -276,20 +326,33 @@ class UMAPWorker:
         it is awaited rather than sharing one budget with the whole batch.
         """
         import json
-        import time
+        from threading import Event, Thread
         proc = self._procs[index]
-        deadline = time.monotonic() + self.timeout
-        while not os.path.exists(status):
+        ready = Event()
+        cancelled = Event()
+
+        def _watch() -> None:
+            while not cancelled.is_set():
+                if os.path.exists(status) or proc.poll() is not None:
+                    ready.set()
+                    return
+                cancelled.wait(0.01)
+
+        watcher = Thread(target=_watch, name=f"umap-status-{proc.pid}", daemon=True)
+        watcher.start()
+        finished = ready.wait(self.timeout)
+        cancelled.set()
+        watcher.join(timeout=self.cleanup_timeout)
+        if not finished and not os.path.exists(status):
+            self._retire(index, reason="timeout")
+            raise TimeoutError(f"UMAP worker exceeded {self.timeout:g} seconds")
+        if not os.path.exists(status):
             returncode = proc.poll()
-            if returncode is not None:
-                tail = self._error_tail(index)
-                if "ModuleNotFoundError" in tail and "umap" in tail:
-                    raise ImportError("umap_embed needs umap-learn (pip install umap-learn)")
-                raise OSError(f"UMAP worker exited (rc={returncode}): {tail[-500:]}")
-            if time.monotonic() >= deadline:
-                proc.kill()
-                raise TimeoutError(f"UMAP worker exceeded {self.timeout:.0f} seconds")
-            time.sleep(0.05)
+            tail = self._error_tail(index)
+            self._retire(index, reason="worker_exit")
+            if "ModuleNotFoundError" in tail and "umap" in tail:
+                raise ImportError("umap_embed needs umap-learn (pip install umap-learn)")
+            raise OSError(f"UMAP worker exited (rc={returncode}): {tail[-500:]}")
         with open(status, encoding="utf-8") as handle:
             response = json.load(handle)
         if not response.get("ok"):
@@ -359,27 +422,16 @@ class UMAPWorker:
                 except FileNotFoundError:
                     pass
 
-    def close(self) -> None:
+    def close(self) -> List[Dict[str, object]]:
         import shutil
-        for proc in self._procs:
-            if proc.stdin is not None:
-                try:
-                    proc.stdin.close()
-                except OSError:
-                    pass
-            try:
-                proc.wait(timeout=5.0)
-            except Exception:
-                proc.kill()
-                proc.wait()
-        self._procs = []
-        for handle in self._stderr_handles:
-            handle.close()
-        self._stderr_handles = []
+        statuses: List[Dict[str, object]] = []
+        while self._procs:
+            statuses.append(self._retire(len(self._procs) - 1, reason="close"))
         if self._workdir is not None:
             # The numba cache lives OUTSIDE this tree on purpose; only the request scratch goes.
             shutil.rmtree(self._workdir, ignore_errors=True)
             self._workdir = None
+        return statuses
 
     def __enter__(self) -> "UMAPWorker":
         return self
