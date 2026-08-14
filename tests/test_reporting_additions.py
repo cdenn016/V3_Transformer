@@ -609,6 +609,9 @@ def _write_scaling_analysis_run(
     seed,
     n_params,
     test_ce,
+    scale_knob="n_params",
+    n_e_steps=1,
+    estep_final_f_per_token=None,
     tokens_seen=1000,
     git_sha="git-a",
     train_sha="train-a",
@@ -622,7 +625,7 @@ def _write_scaling_analysis_run(
         "embed_dim": 4,
         "n_heads": 1,
         "n_layers": 1,
-        "n_e_steps": 1,
+        "n_e_steps": n_e_steps,
         "family": "gaussian_diagonal",
     }
     code_identity = {
@@ -633,7 +636,7 @@ def _write_scaling_analysis_run(
     cell = {
         "schema_version": 2,
         "route": route,
-        "scale_knob": "n_params",
+        "scale_knob": scale_knob,
         "label": label,
         "seed": seed,
         "dataset": "synthetic",
@@ -659,6 +662,7 @@ def _write_scaling_analysis_run(
     }
     (run / "summary.json").write_text(json.dumps({
         **metrics,
+        "estep_final_f_per_token": estep_final_f_per_token,
         "scaling_reuse_contract_sha256": digest,
         "scaling_point": {
             **metrics,
@@ -668,7 +672,7 @@ def _write_scaling_analysis_run(
             "n_gen": 16,
             "gauge_group": "glk",
             "n_layers": 1,
-            "n_e_steps": 1,
+            "n_e_steps": n_e_steps,
             "tokens_seen": tokens_seen,
         },
     }), encoding="utf-8")
@@ -685,7 +689,7 @@ def _write_scaling_analysis_run(
         "test_data_sha256": test_sha,
         "data_sha256": test_sha,
     }), encoding="utf-8")
-    _record_complete_scaling_cell(root, route, label, seed)
+    _record_complete_scaling_cell(root, route, label, seed, scale_knob=scale_knob)
 
 
 def test_all_scaling_tables_and_overlays_share_estimator(tmp_path, monkeypatch):
@@ -979,6 +983,49 @@ def test_write_scaling_md(tmp_path):
     for section in ("Pooled L(N) power law", "Per-route exponents", "Frontier-collapse F-test",
                     "E-step structural-EM check", "Provenance and confounds"):
         assert section in text
+    assert "expect strongly negative" not in text
+    assert "expect ~0" not in text
+    assert "separate objectives" in text
+
+def test_analyze_reports_target_blind_correlations_without_expected_signs(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    for n_e_steps, final_f, test_ce in (
+        (1, 3.0, 4.0),
+        (2, 2.4, 4.2),
+        (3, 2.1, 4.1),
+    ):
+        _write_scaling_analysis_run(
+            tmp_path,
+            route=scaling_analysis.INFERENCE_ROUTE,
+            label=f"T{n_e_steps}",
+            seed=1,
+            n_params=100,
+            test_ce=test_ce,
+            scale_knob="n_e_steps",
+            n_e_steps=n_e_steps,
+            estep_final_f_per_token=final_f,
+        )
+
+    monkeypatch.setitem(scaling_analysis.CONFIG, "input_dir", str(tmp_path))
+    monkeypatch.setitem(scaling_analysis.CONFIG, "with_offset", False)
+    monkeypatch.setitem(scaling_analysis.CONFIG, "n_bootstrap", 0)
+    monkeypatch.setattr(scaling_analysis, "_make_figures", lambda *args, **kwargs: None)
+
+    scaling_analysis.analyze()
+
+    console = capsys.readouterr().out
+    assert "Pearson(n_e_steps, final F/token)" in console
+    assert "Pearson(final F/token, test CE)" in console
+    assert "expect strongly negative" not in console
+    assert "expect ~0" not in console
+    assert "target blindness alone implies no Pearson sign" in console
+    summary = json.loads((tmp_path / "scaling_summary.json").read_text(encoding="utf-8"))
+    assert summary["estep_structural"]["interpretation"].endswith("no Pearson sign.")
+
+
 
 
 # =============================================================================

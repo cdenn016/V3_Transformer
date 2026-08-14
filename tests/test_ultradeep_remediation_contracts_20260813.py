@@ -53,10 +53,56 @@ def test_canonical_block_mlp_rejects_missing_frame_context() -> None:
         mlp.forward_moments(mu, sigma)
 
 
+def test_canonical_block_mlp_direct_call_requires_and_uses_frame_context() -> None:
+    mlp = build_block_mlp(**_block_mlp_kwargs("canonical_frame"))
+    mu = torch.zeros(1, 2, 4)
+    frame_context = CanonicalFrameContext(torch.eye(4), torch.eye(4))
+
+    with pytest.raises(ValueError, match="requires a realized canonical frame"):
+        mlp(mu)
+
+    assert mlp(mu, frame_context=frame_context).shape == mu.shape
+
+def test_canonical_block_mlp_rejects_structural_frame_impostors() -> None:
+    mlp = build_block_mlp(**_block_mlp_kwargs("canonical_frame"))
+    mu = torch.zeros(1, 2, 4)
+    sigma = torch.eye(4).expand(1, 2, 4, 4).clone()
+
+    class _FrameImpostor:
+        forward = torch.eye(4)
+        inverse = torch.eye(4)
+
+    impostor = _FrameImpostor()
+    with pytest.raises(TypeError, match="CanonicalFrameContext"):
+        mlp(mu, frame_context=impostor)
+    with pytest.raises(TypeError, match="CanonicalFrameContext"):
+        mlp.mean_update(mu, impostor)
+    with pytest.raises(TypeError, match="CanonicalFrameContext"):
+        mlp.forward_moments(mu, sigma, frame_context=impostor)
+
+
+
+
 @pytest.mark.parametrize("mode", ("coordinate", "gauge_gate", "canonical_frame"))
 def test_invalid_block_mlp_covariance_fails_at_common_construction_boundary(mode: str) -> None:
     with pytest.raises(ValueError, match="unknown BlockMLP covariance contract 'invalid'"):
         build_block_mlp(**_block_mlp_kwargs(mode, covariance="invalid"))
+
+
+@pytest.mark.parametrize(
+    ("constructor", "args"),
+    [
+        (block_mlp.BlockMLP, (4, 2, "gelu", 0.0)),
+        (block_mlp.GaugeGateBlockMLP, ((2, 2), 2, "gelu", 0.0)),
+        (block_mlp.CanonicalFrameBlockMLP, (4, 2, "gelu", 0.0)),
+    ],
+)
+def test_direct_block_mlp_constructors_reject_invalid_covariance(
+    constructor,
+    args: tuple,
+) -> None:
+    with pytest.raises(ValueError, match="unknown BlockMLP covariance contract 'invalid'"):
+        constructor(*args, covariance_contract="invalid")
 
 
 @pytest.mark.parametrize(

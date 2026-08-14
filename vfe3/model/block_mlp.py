@@ -16,6 +16,26 @@ _ACTIVATIONS = {
 }
 
 
+_BLOCK_MLP_COVARIANCE_CONTRACTS = frozenset({"passthrough", "delta_full"})
+
+
+def _validate_block_mlp_covariance_contract(covariance_contract: str) -> str:
+    if covariance_contract not in _BLOCK_MLP_COVARIANCE_CONTRACTS:
+        raise ValueError(f"unknown BlockMLP covariance contract {covariance_contract!r}")
+    return covariance_contract
+
+def _require_canonical_frame_context(
+    frame_context: Optional[CanonicalFrameContext],
+) -> CanonicalFrameContext:
+    if frame_context is None:
+        raise ValueError("canonical_frame block MLP requires a realized canonical frame")
+    if not isinstance(frame_context, CanonicalFrameContext):
+        raise TypeError(
+            "canonical_frame block MLP frame_context must be a CanonicalFrameContext")
+    return frame_context
+
+
+
 def block_mlp_activation(name: str) -> nn.Module:
     try:
         return _ACTIVATIONS[name]()
@@ -79,7 +99,7 @@ class BlockMLP(nn.Module):
         super().__init__()
         hidden_dim = embed_dim * expansion
         self.activation_name = activation
-        self.covariance_contract = covariance_contract
+        self.covariance_contract = _validate_block_mlp_covariance_contract(covariance_contract)
         self.covariance_floor = float(covariance_floor)
         self.fc1 = nn.Linear(embed_dim, hidden_dim)
         self.activation = block_mlp_activation(activation)
@@ -151,7 +171,7 @@ class GaugeGateBlockMLP(nn.Module):
         n_blocks = len(self.irrep_dims)
         hidden_dim = n_blocks * expansion
         self.activation_name = activation
-        self.covariance_contract = covariance_contract
+        self.covariance_contract = _validate_block_mlp_covariance_contract(covariance_contract)
         self.fc1 = nn.Linear(n_blocks, hidden_dim)
         self.covariance_floor = float(covariance_floor)
         self.activation = block_mlp_activation(activation)
@@ -297,11 +317,20 @@ class GaugeGateBlockMLP(nn.Module):
 class CanonicalFrameBlockMLP(BlockMLP):
     """Ordinary residual MLP in a realized, frame-fixed vertex coordinate system."""
 
+    def forward(
+        self,
+        mu: torch.Tensor,
+        *,
+        frame_context: Optional[CanonicalFrameContext] = None,
+    ) -> torch.Tensor:
+        return self.mean_update(mu, frame_context)
+
     def mean_update(
         self,
         mu: torch.Tensor,
-        frame: CanonicalFrameContext,
+        frame: Optional[CanonicalFrameContext],
     ) -> torch.Tensor:
+        frame = _require_canonical_frame_context(frame)
         canonical_mu = torch.einsum("...ij,...j->...i", frame.inverse, mu)
         canonical_out = super().forward(canonical_mu)
         return torch.einsum("...ij,...j->...i", frame.forward, canonical_out)
@@ -313,8 +342,7 @@ class CanonicalFrameBlockMLP(BlockMLP):
         *,
         frame_context: Optional[CanonicalFrameContext] = None,
     ) -> BlockMLPMomentResult:
-        if frame_context is None:
-            raise ValueError("canonical_frame block MLP requires a realized canonical frame")
+        frame_context = _require_canonical_frame_context(frame_context)
         canonical_mu = torch.einsum("...ij,...j->...i", frame_context.inverse, mu)
         if self.covariance_contract == "passthrough":
             canonical_out = super().forward(canonical_mu)
@@ -406,7 +434,7 @@ BLOCK_MLP_REGISTRATIONS: Mapping[str, BlockMLPRegistration] = MappingProxyType({
     "coordinate": BlockMLPRegistration(
         factory=_coordinate_factory,
         requires_frame_context=False,
-        covariance_kinds=frozenset({"passthrough", "delta_full"}),
+        covariance_kinds=_BLOCK_MLP_COVARIANCE_CONTRACTS,
         gauge_class="coordinate_nonintertwiner",
         intertwiner_compatible=False,
         width=lambda embed_dim, _irrep_dims: embed_dim,
@@ -416,7 +444,7 @@ BLOCK_MLP_REGISTRATIONS: Mapping[str, BlockMLPRegistration] = MappingProxyType({
     "gauge_gate": BlockMLPRegistration(
         factory=_gauge_gate_factory,
         requires_frame_context=False,
-        covariance_kinds=frozenset({"passthrough", "delta_full"}),
+        covariance_kinds=_BLOCK_MLP_COVARIANCE_CONTRACTS,
         gauge_class="invariant_scalar_intertwiner",
         intertwiner_compatible=True,
         width=lambda _embed_dim, irrep_dims: len(irrep_dims),
@@ -428,7 +456,7 @@ BLOCK_MLP_REGISTRATIONS: Mapping[str, BlockMLPRegistration] = MappingProxyType({
     "canonical_frame": BlockMLPRegistration(
         factory=_canonical_frame_factory,
         requires_frame_context=True,
-        covariance_kinds=frozenset({"passthrough", "delta_full"}),
+        covariance_kinds=_BLOCK_MLP_COVARIANCE_CONTRACTS,
         gauge_class="left_equivariant_right_fixed",
         intertwiner_compatible=False,
         width=lambda embed_dim, _irrep_dims: embed_dim,

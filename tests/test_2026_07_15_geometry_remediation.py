@@ -99,6 +99,7 @@ def test_singular_model_covariance_fails_closed_at_certified_congruence(
         n_e_steps=1,
         family="gaussian_full",
         transport_mode="regime_ii_covariant",
+        full_cov_congruence_certification=True,
     )
     model = VFEModel(cfg)
     original_encode = model.prior_bank.encode
@@ -166,14 +167,33 @@ def test_artifact_exactness_is_false_after_feature_jitter_recovery() -> None:
     assert report["config_toggles"]["regime_ii_covariant_exactness"] == "jitter_recovered_approximation"
 
 
-def test_capped_and_uncapped_airm_routes_have_distinct_artifact_labels() -> None:
-    projected = _pure_path_report(VFE3Config(spd_retract_mode="spd_affine", sigma_max=10.0), [])
-    exact = _pure_path_report(VFE3Config(spd_retract_mode="spd_affine", sigma_max=None), [])
+@pytest.mark.parametrize(
+    ("mode", "projected_route", "uncapped_route"),
+    [
+        (
+            "spd_affine",
+            "airm_trust_projected_exp_clipped_spectral_cap",
+            "airm_trust_projected_exp_clipped",
+        ),
+        (
+            "log_euclidean",
+            "log_euclidean_trust_projected_exp_clipped_spectral_cap",
+            "log_euclidean_trust_projected_exp_clipped",
+        ),
+    ],
+)
+def test_spd_retraction_routes_disclose_trust_projection_and_exponential_clipping(
+    mode: str,
+    projected_route: str,
+    uncapped_route: str,
+) -> None:
+    projected = _pure_path_report(VFE3Config(spd_retract_mode=mode, sigma_max=10.0), [])
+    uncapped = _pure_path_report(VFE3Config(spd_retract_mode=mode, sigma_max=None), [])
 
-    assert projected["config_toggles"]["spd_retraction_route"] == "airm_projected_spectral_cap"
-    assert projected["config_toggles"]["spd_retraction_exact"] is False
-    assert exact["config_toggles"]["spd_retraction_route"] == "airm_exact"
-    assert exact["config_toggles"]["spd_retraction_exact"] is True
+    assert projected["config_toggles"]["spd_retraction_route"] == projected_route
+    assert uncapped["config_toggles"]["spd_retraction_route"] == uncapped_route
+    for report in (projected, uncapped):
+        assert report["config_toggles"]["spd_retraction_exact"] is False
 
 
 def test_transport_chart_bound_fails_before_exponential_clamp() -> None:

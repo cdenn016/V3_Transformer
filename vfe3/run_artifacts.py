@@ -50,6 +50,7 @@ from vfe3.config import (
 )
 from vfe3.contracts import DataState, DataStateBuffer, ExecutableBuildMetadata
 from vfe3.ema import EMA
+from vfe3.metric_contracts import target_blind_objective_interpretation
 from vfe3.model.block_mlp import (
     block_mlp_build_metadata,
     get_block_mlp_registration,
@@ -3149,7 +3150,7 @@ def _estep_endpoint_artifact(evidence: Mapping[str, object]) -> Dict[str, str]:
 
 def _target_blind_objective_interpretation() -> str:
     """State only the justified structural conclusion of a target-blind E-step."""
-    return "The target-blind latent objective is structurally separate from held-out prediction."
+    return target_blind_objective_interpretation()
 
 
 def _scheduler_metadata(
@@ -4626,17 +4627,21 @@ def _pure_path_report(
 
     spd_retract_mode = getattr(cfg, "spd_retract_mode", "spd_affine")
     sigma_max = getattr(cfg, "sigma_max", 10.0)
-    spd_retraction_exact = sigma_max is None
-    if spd_retract_mode == "spd_affine":
-        spd_retraction_route = (
-            "airm_exact" if spd_retraction_exact else "airm_projected_spectral_cap"
-        )
-    else:
-        spd_retraction_route = (
-            "log_euclidean_exact"
-            if spd_retraction_exact
-            else "log_euclidean_projected_spectral_cap"
-        )
+    spd_trust_region = getattr(cfg, "e_sigma_q_trust", 5.0)
+    spd_retraction_trust_projection_active = (
+        spd_trust_region is not None and float(spd_trust_region) > 0.0)
+    # Both registered SPD routes call an exp_bounded kernel with fixed [-50, 50] bounds.
+    spd_retraction_exponential_clipping_active = True
+    spd_route_parts = [
+        "airm" if spd_retract_mode == "spd_affine" else "log_euclidean"]
+    if spd_retraction_trust_projection_active:
+        spd_route_parts.append("trust_projected")
+    if spd_retraction_exponential_clipping_active:
+        spd_route_parts.append("exp_clipped")
+    if sigma_max is not None:
+        spd_route_parts.append("spectral_cap")
+    spd_retraction_route = "_".join(spd_route_parts)
+    spd_retraction_exact = len(spd_route_parts) == 1
 
     beta_prior = get_prior_registration(getattr(cfg, "beta_attention_prior", "causal"))
     gamma_prior = get_prior_registration(getattr(cfg, "gamma_attention_prior", "causal"))
@@ -4842,6 +4847,8 @@ def _pure_path_report(
             "regime_ii_covariant_exactness": regime_ii_covariant_exactness,
             "spd_retraction_route":         spd_retraction_route,
             "spd_retraction_exact":         spd_retraction_exact,
+            "spd_retraction_trust_projection_active": spd_retraction_trust_projection_active,
+            "spd_retraction_exponential_clipping_active": spd_retraction_exponential_clipping_active,
             "norm_type_block":              block_norm_name,
             "norm_type_final":              final_norm_name,
             "layernorm_affine":             bool(getattr(cfg, "layernorm_affine", False)),

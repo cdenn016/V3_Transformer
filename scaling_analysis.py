@@ -86,7 +86,7 @@ if os.environ.get(_CHILD_SENTINEL) == "1":
 
 import numpy as np
 
-from vfe3.metric_contracts import perplexity_matches_ce  # noqa: E402
+from vfe3.metric_contracts import perplexity_matches_ce, target_blind_objective_interpretation  # noqa: E402
 from vfe3.path_utils import portable_path_component_key
 from vfe3.viz.sweep_adapters import aggregate_validation_points, capacity_scaling_kwargs, pareto_frontier_kwargs
 from vfe3.run_artifacts import _write_json_atomic
@@ -791,6 +791,25 @@ def _as_float(x: Any) -> float:
     except (TypeError, ValueError):
         return float("nan")
 
+def _pearson_correlation(left: Sequence[float], right: Sequence[float]) -> float:
+    """Compute Pearson correlation without NumPy's unstable native corrcoef path."""
+    left_values = [float(value) for value in left]
+    right_values = [float(value) for value in right]
+    if (len(left_values) != len(right_values) or len(left_values) < 2
+            or any(not math.isfinite(value) for value in (*left_values, *right_values))):
+        return float("nan")
+    left_mean = math.fsum(left_values) / len(left_values)
+    right_mean = math.fsum(right_values) / len(right_values)
+    left_centered = [value - left_mean for value in left_values]
+    right_centered = [value - right_mean for value in right_values]
+    denominator = math.sqrt(
+        math.fsum(value * value for value in left_centered)
+        * math.fsum(value * value for value in right_centered))
+    if denominator == 0.0:
+        return float("nan")
+    return math.fsum(a * b for a, b in zip(left_centered, right_centered)) / denominator
+
+
 
 def _sorted_strings(rows: List[Dict[str, Any]], key: str) -> List[str]:
     return sorted({str(r[key]) for r in rows if r.get(key)})
@@ -1307,14 +1326,17 @@ def analyze() -> None:
         ff = np.array([p["f_mean"] for p in estep_pts])
         ce = np.array([p["ce_mean"] for p in estep_pts])
 
-        def _pear(a, b):
-            return float(np.corrcoef(a, b)[0, 1]) if a.std() > 0 and b.std() > 0 else float("nan")
+        pearson_ne_f = _pearson_correlation(ne, ff)
+        pearson_f_ce = _pearson_correlation(ff, ce)
+        interpretation = target_blind_objective_interpretation()
         print(f"\nE-step structural-EM check ({len(estep_pts)} n_e_steps arms):"
-              f"\n  Pearson(n_e_steps, final F/token) = {_pear(ne, ff):+.4f}  (expect strongly negative)"
-              f"\n  Pearson(final F/token, test CE)   = {_pear(ff, ce):+.4f}  (expect ~0 / >=0 if F is target-blind)")
+              f"\n  Pearson(n_e_steps, final F/token) = {pearson_ne_f:+.4f}"
+              f"\n  Pearson(final F/token, test CE)   = {pearson_f_ce:+.4f}"
+              f"\n  Interpretation: {interpretation}")
         summary["estep_structural"] = {
-            "n_arms": len(estep_pts), "pearson_ne_final_f": _pear(ne, ff),
-            "pearson_final_f_test_ce": _pear(ff, ce),
+            "n_arms": len(estep_pts), "pearson_ne_final_f": pearson_ne_f,
+            "pearson_final_f_test_ce": pearson_f_ce,
+            "interpretation": interpretation,
         }
 
     # ---- persist the analysis summary (json + a human-readable markdown report); best-effort so a
@@ -1439,8 +1461,9 @@ def _write_scaling_md(path: Path, summary: Dict[str, Any]) -> None:
     if es:
         L += ["## E-step structural-EM check", "",
               f"- arms: {es['n_arms']}",
-              f"- Pearson(n_e_steps, final F/token) = {es['pearson_ne_final_f']:+.4f}  (expect strongly negative)",
-              f"- Pearson(final F/token, test CE) = {es['pearson_final_f_test_ce']:+.4f}  (expect ~0 / >=0)", ""]
+              f"- Pearson(n_e_steps, final F/token) = {es['pearson_ne_final_f']:+.4f}",
+              f"- Pearson(final F/token, test CE) = {es['pearson_final_f_test_ce']:+.4f}",
+              f"- interpretation: {es.get('interpretation', target_blind_objective_interpretation())}", ""]
     path.write_text("\n".join(L), encoding="utf-8")
 
 
