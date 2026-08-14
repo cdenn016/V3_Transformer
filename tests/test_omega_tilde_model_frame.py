@@ -1,6 +1,5 @@
 """Independent model-channel gauge-frame contracts (phi-tilde)."""
 
-import copy
 import csv
 
 import pytest
@@ -198,7 +197,7 @@ def test_model_frame_sweeps_are_registered_but_inactive() -> None:
     # the repair does it centrally instead of every affected sweep re-declaring it.
     arms = dict(ablation.make_run_overrides("s_frame_mode"))
     assert "s_frame_mode=phi_tilde" in arms
-    values = copy.deepcopy(ablation.BASELINE_CONFIG)
+    values = ablation._resolved_sweep_baseline()
     values.update(arms["s_frame_mode=phi_tilde"])
     assert values["s_frame_mode"] == "phi_tilde"
     VFE3Config(**values)

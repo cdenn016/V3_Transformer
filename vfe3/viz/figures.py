@@ -510,14 +510,14 @@ class UMAPWorker:
         from threading import Thread
         proc = record.process
         ready = Event()
-        cancelled = Event()
+        canceled = Event()
 
         def _watch() -> None:
-            while not cancelled.is_set():
+            while not canceled.is_set():
                 if os.path.exists(status) or proc.poll() is not None:
                     ready.set()
                     return
-                cancelled.wait(0.01)
+                canceled.wait(0.01)
 
         watcher = Thread(target=_watch, name=f"umap-status-{proc.pid}", daemon=True)
         watcher.start()
@@ -525,7 +525,7 @@ class UMAPWorker:
             first_request = record.requests_submitted == 1
         startup_grace = min(0.25, self.cleanup_timeout) if first_request else 0.0
         finished = ready.wait(self.timeout + startup_grace)
-        cancelled.set()
+        canceled.set()
         watcher.join(timeout=self.cleanup_timeout)
         if not finished and not os.path.exists(status):
             self._retire(record, reason="timeout")

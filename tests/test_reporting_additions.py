@@ -485,6 +485,7 @@ def _finalize_ns(**over):
         evaluate_zero_e_steps_counterfactual=False,
         # numeric-path attrs (summary / provenance / cost model / pure-path report)
         seed=0, max_steps=2, use_prior_bank=True, decode_bias=False, use_head_mixer=False,
+        min_lr=0.0, min_lr_frac=0.0,
         include_attention_entropy=True, transport_mode="flat", lambda_alpha_mode="constant",
         lambda_beta=1.0, precision_weighted_attention=False,
         gauge_transport="on", pos_rotation="none", rope_full_gauge=False, rope_on_value=True,

@@ -70,7 +70,7 @@ def test_chunked_ce_honors_ignore_index():
     ch.load_state_dict(full.state_dict())
     mu, sigma = _converged(ch, tokens)
     ce = ch.prior_bank.decode_ce_diagonal_chunked(mu, sigma, targets)
-    assert torch.allclose(ce, full_loss, atol=1e-3)
+    assert torch.allclose(ce.double(), full_loss.double(), atol=1e-3)
 
 
 def test_chunked_ce_all_ignore_is_finite_zero():

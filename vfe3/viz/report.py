@@ -919,7 +919,7 @@ def generate_figures(
                       sidecar_path=(str(figdir / f"model_umap_{ch}.json")
                                     if controlled_bank else None)),
                   f"model_umap_{ch}.png" in planned_figures)
-    for cleanup_status in umap_worker.cleanup_statuses:
+    for cleanup_status in getattr(umap_worker, "cleanup_statuses", ()):
         if (
             cleanup_status.get("cleanup_error")
             or cleanup_status.get("root_reaped") is False

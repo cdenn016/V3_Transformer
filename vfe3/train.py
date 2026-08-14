@@ -636,6 +636,15 @@ def _periodic_generation(
             ) from restoration_errors[0][1]
 
 
+def _excluded_token_count(decode_stats: object, expected: int) -> torch.Tensor:
+    """Resolve the optional legacy exclusion channel without a host synchronization."""
+    scored = decode_stats.scored_tokens
+    excluded = decode_stats.excluded_tokens
+    if excluded is not None:
+        return excluded
+    return scored.new_tensor(expected, dtype=torch.int64) - scored
+
+
 def train_step(
     model:     VFEModel,
     optimizer: torch.optim.Optimizer,
@@ -703,7 +712,7 @@ def train_step(
             tokens, targets, estep_grad_out=_egrad, return_decode_stats=True)
         ce = decode_stats.ce
         _scored_det = decode_stats.scored_tokens.detach()
-        _excluded_det = decode_stats.excluded_tokens.detach()
+        _excluded_det = _excluded_token_count(decode_stats, targets.numel()).detach()
         _expected_det = torch.tensor(targets.numel(), dtype=torch.int64, device=targets.device)
         _scaler.scale(loss).backward()
         _loss_det = loss.detach()                               # host read DEFERRED: fused with the grad-finite
@@ -732,7 +741,8 @@ def train_step(
             ce_mb = decode_stats_mb.ce
             count_mb = decode_stats_mb.scored_tokens.detach()
             count_tensors.append(count_mb)
-            excluded_count_tensors.append(decode_stats_mb.excluded_tokens.detach())
+            excluded_count_tensors.append(
+                _excluded_token_count(decode_stats_mb, tgt_mb.numel()).detach())
             expected_count_tensors.append(torch.tensor(
                 tgt_mb.numel(), dtype=torch.int64, device=tgt_mb.device))
             if _egrad_mb is not None:
@@ -1076,7 +1086,7 @@ def _evaluation_totals_from_device(
     """Transfer floating nats separately from the exact int64 target partition."""
     if not isinstance(total_nats, torch.Tensor) or total_nats.numel() != 1:
         raise TypeError("evaluation total_nats must be a scalar tensor")
-    total_nats_value = float(total_nats.to(dtype=torch.float64).cpu())
+    total_nats_value = total_nats.to(dtype=torch.float64).cpu().item()
     accounting = _target_accounting_from_device(expected, scored, excluded)
     return total_nats_value, accounting
 
@@ -1144,14 +1154,15 @@ def evaluate(
                     n_b = decode_stats.scored_tokens
                     total_nats.add_(decode_stats.ce.to(dtype=torch.float64) * n_b)
                     total_tok.add_(n_b)
-                    total_excluded.add_(decode_stats.excluded_tokens)
+                    total_excluded.add_(_excluded_token_count(
+                        decode_stats, group_targets.numel()))
                     total_excluded.add_(rows.sum() * (targets.shape[1] - length))
             else:
                 _, _, decode_stats = model(tokens, targets, return_decode_stats=True)
                 n_b = decode_stats.scored_tokens
                 total_nats.add_(decode_stats.ce.to(dtype=torch.float64) * n_b)
                 total_tok.add_(n_b)
-                total_excluded.add_(decode_stats.excluded_tokens)
+                total_excluded.add_(_excluded_token_count(decode_stats, targets.numel()))
             if max_batches is not None and i + 1 >= max_batches:
                 break               # draw exactly max_batches (process-then-break; no extra pull)
         total_nats_value, accounting = _evaluation_totals_from_device(

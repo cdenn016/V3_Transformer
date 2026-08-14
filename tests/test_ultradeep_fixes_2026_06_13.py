@@ -273,7 +273,7 @@ def test_m4_full_cov_sandwich_is_float64_island():
         # the fix evaluates the contraction in float64 then casts back: the result must be bit-identical
         # to the float64-computed-then-cast reference (the old fp32 einsum differed by accumulation)
         ref = torch.einsum("ijkl,jlm,ijnm->ijkn",
-                           omega.double(), sigma.double(), omega.double()).to(torch.float32)
+                           omega.double(), sigma.double(), omega.double())
         assert torch.equal(got, ref)
     finally:
         set_full_cov_congruence_precision(previous)

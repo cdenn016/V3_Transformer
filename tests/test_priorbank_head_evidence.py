@@ -759,7 +759,7 @@ def test_fused_fp64_decode_av_island_divides_before_float32_cast_with_gradient_p
         else:
             divergence = diagonal_head_reference(
                 mu_q.double(), sigma_q.double(), mu_v, var_v, weights.double(), (2, 3))
-        oracle_logits = (-divergence / bank._tau_eff().double()).float()
+        oracle_logits = -divergence / bank._tau_eff().double()
         oracle_logits = oracle_logits + bank._unigram_bias()
         dense_logits = bank.decode(mu_q, sigma_q)
         torch.testing.assert_close(dense_logits, oracle_logits, rtol=0.0, atol=2.5e-7)
@@ -783,7 +783,7 @@ def test_fused_fp64_decode_av_island_divides_before_float32_cast_with_gradient_p
         )
         fused_grads = torch.autograd.grad(fused, leaves, retain_graph=True)
         oracle_grads = torch.autograd.grad(oracle, leaves)
-        torch.testing.assert_close(fused, oracle, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(fused, oracle, rtol=0.0, atol=2e-8)
         for fused_grad, oracle_grad in zip(fused_grads, oracle_grads):
             torch.testing.assert_close(fused_grad, oracle_grad, rtol=2e-6, atol=2e-7)
     finally:

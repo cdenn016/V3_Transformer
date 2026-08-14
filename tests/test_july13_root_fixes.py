@@ -1,6 +1,5 @@
 import json
 import os
-import subprocess
 
 import numpy as np
 import pytest
@@ -9,6 +8,29 @@ import torch
 import vfe3.viz.figures as figures
 from vfe3.geometry.retraction import retract_spd_diagonal, retract_spd_full
 from vfe3.metrics import belief_spectrum
+
+
+class _FakeProcessTree:
+    """Containment-aware test double for the UMAP worker's ProcessTree seam."""
+
+    def __init__(self, process) -> None:
+        self.process = process
+
+    def terminate(self, *, reason: str, timeout: float) -> dict[str, object]:
+        if self.process.stdin is not None and not getattr(self.process.stdin, "closed", False):
+            self.process.stdin.close()
+        returncode = self.process.wait(timeout=timeout)
+        return {
+            "pid": int(self.process.pid),
+            "reason": reason,
+            "terminated": True,
+            "reaped": True,
+            "root_reaped": True,
+            "tree_termination_confirmed": True,
+            "returncode": returncode,
+            "cleanup_error": None,
+            "elapsed_s": 0.0,
+        }
 
 
 def test_belief_spectrum_surfaces_nonpositive_covariance() -> None:
@@ -106,6 +128,7 @@ def test_umap_worker_mocked_protocol_reuses_one_process(monkeypatch) -> None:
         def __init__(self, args, **kwargs) -> None:
             self.args = args
             self.kwargs = kwargs
+            self.pid = 101
             self.stdin = _Stdin()
             self.wait_timeouts = []
             self.kill_count = 0
@@ -114,6 +137,8 @@ def test_umap_worker_mocked_protocol_reuses_one_process(monkeypatch) -> None:
 
         def poll(self):
             self.poll_count += 1
+            if not self.stdin.pending_statuses:
+                return 0
             status = self.stdin.pending_statuses.pop(0)
             with open(status, "w", encoding="utf-8") as handle:
                 json.dump({"ok": True}, handle)
@@ -132,7 +157,7 @@ def test_umap_worker_mocked_protocol_reuses_one_process(monkeypatch) -> None:
         processes.append(process)
         return process
 
-    monkeypatch.setattr(subprocess, "Popen", _popen)
+    monkeypatch.setattr(figures, "spawn_process_tree", lambda *a, **k: _FakeProcessTree(_popen(*a, **k)))
     first_features = np.arange(15, dtype=float).reshape(5, 3)
     second_features = first_features + 10.0
 
@@ -148,6 +173,7 @@ def test_umap_worker_mocked_protocol_reuses_one_process(monkeypatch) -> None:
             seed=7,
         )
         process = worker._procs[0]
+        process_stdin = process.stdin
         workdir = worker._workdir
         second = worker.embed(
             second_features,
@@ -186,7 +212,7 @@ def test_umap_worker_mocked_protocol_reuses_one_process(monkeypatch) -> None:
         )
         assert os.path.isdir(workdir)
 
-    assert process.stdin.closed
+    assert process_stdin.closed
     assert process.wait_timeouts == [5.0]
     assert process.kill_count == 0
     assert worker._procs == []
@@ -206,7 +232,6 @@ def test_embed_many_fans_the_seeds_across_concurrent_interpreters(monkeypatch) -
     serial loop with extra machinery, and the wall clock would not move -- so the ordering, not
     merely the process count, is what this pins.
     """
-    import subprocess
 
     from vfe3.viz import figures
 
@@ -235,9 +260,12 @@ def test_embed_many_fans_the_seeds_across_concurrent_interpreters(monkeypatch) -
 
     class _Process:
         def __init__(self, index) -> None:
+            self.pid = 200 + index
             self.stdin = _Stdin(index)
 
         def poll(self):
+            if not self.stdin.pending:
+                return 0
             status, seed = self.stdin.pending.pop(0)
             events.append(("collect", self.stdin.owner, seed))
             with open(status, "w", encoding="utf-8") as handle:
@@ -257,7 +285,7 @@ def test_embed_many_fans_the_seeds_across_concurrent_interpreters(monkeypatch) -
         created.append(process)
         return process
 
-    monkeypatch.setattr(subprocess, "Popen", _popen)
+    monkeypatch.setattr(figures, "spawn_process_tree", lambda *a, **k: _FakeProcessTree(_popen(*a, **k)))
     features = np.arange(24, dtype=float).reshape(8, 3)
 
     with figures.UMAPWorker(timeout=5.0, max_workers=4) as worker:
@@ -279,7 +307,6 @@ def test_embed_many_fans_the_seeds_across_concurrent_interpreters(monkeypatch) -
 
 def test_embed_many_never_exceeds_max_workers(monkeypatch) -> None:
     r"""More seeds than workers queues onto the existing pool rather than forking per seed."""
-    import subprocess
 
     from vfe3.viz import figures
 
@@ -303,9 +330,12 @@ def test_embed_many_never_exceeds_max_workers(monkeypatch) -> None:
 
     class _Process:
         def __init__(self) -> None:
+            self.pid = 301
             self.stdin = _Stdin()
 
         def poll(self):
+            if not self.stdin.pending:
+                return 0
             status = self.stdin.pending.pop(0)
             with open(status, "w", encoding="utf-8") as handle:
                 json.dump({"ok": True}, handle)
@@ -318,7 +348,9 @@ def test_embed_many_never_exceeds_max_workers(monkeypatch) -> None:
             raise AssertionError("no worker should be killed")
 
     created = []
-    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: created.append(_Process()) or created[-1])
+    monkeypatch.setattr(
+        figures, "spawn_process_tree",
+        lambda *a, **k: _FakeProcessTree(created.append(_Process()) or created[-1]))
     features = np.arange(24, dtype=float).reshape(8, 3)
 
     with figures.UMAPWorker(timeout=5.0, max_workers=2) as worker:
@@ -344,7 +376,6 @@ def test_numba_cache_is_persistent_and_survives_close(monkeypatch, tmp_path) -> 
     umap-learn's numba kernels were therefore JIT-compiled from scratch on every report and the
     cache never survived a single run. It must now live OUTSIDE the request scratch.
     """
-    import subprocess
 
     from vfe3.viz import figures
 
@@ -355,7 +386,11 @@ def test_numba_cache_is_persistent_and_survives_close(monkeypatch, tmp_path) -> 
 
     class _Process:
         def __init__(self) -> None:
+            self.pid = 401
             self.stdin = type("S", (), {"close": lambda self: None})()
+        def poll(self):
+            return None
+
 
         def wait(self, timeout=None):
             return 0
@@ -365,9 +400,9 @@ def test_numba_cache_is_persistent_and_survives_close(monkeypatch, tmp_path) -> 
 
     def _popen(args, **kwargs):
         envs.append(kwargs["env"])
-        return _Process()
+        return _FakeProcessTree(_Process())
 
-    monkeypatch.setattr(subprocess, "Popen", _popen)
+    monkeypatch.setattr(figures, "spawn_process_tree", _popen)
 
     worker = figures.UMAPWorker(timeout=5.0)
     worker._ensure(2)

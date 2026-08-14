@@ -77,8 +77,8 @@ def test_batched_forward_equals_per_sample():
         batched = m(tok)                                   # (2, 6, V)
         s0 = m(tok[0:1])
         s1 = m(tok[1:2])
-    assert torch.allclose(batched[0], s0[0], atol=1e-5)
-    assert torch.allclose(batched[1], s1[0], atol=1e-5)
+    assert torch.allclose(batched[0].double(), s0[0].double(), atol=1e-5)
+    assert torch.allclose(batched[1].double(), s1[0].double(), atol=1e-5)
 
 
 # --- frozen transport oracle (block_glk K=8 n_heads=2 -> irrep_dims [4,4], seed 0) ---

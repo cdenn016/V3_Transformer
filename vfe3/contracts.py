@@ -34,6 +34,11 @@ class CanonicalFrameContext:
                 f"{self.forward.device} and {self.inverse.device}")
         if not self.forward.is_floating_point() or not self.inverse.is_floating_point():
             raise ValueError("canonical frame factors must use a floating-point dtype")
+        # Meta tensors carry shape/dtype/device contracts but no materialized values. Let callers
+        # reject a meta frame at their explicit device boundary instead of forcing Tensor.item()
+        # while attempting a data-dependent finiteness/inverse check here.
+        if self.forward.device.type == "meta":
+            return
         if not torch.isfinite(self.forward).all() or not torch.isfinite(self.inverse).all():
             raise ValueError("canonical frame factors must contain only finite values")
 

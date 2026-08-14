@@ -38,6 +38,9 @@ def _tokens() -> torch.Tensor:
 def _assert_scalar_dict_equal(actual: dict, expected: dict) -> None:
     assert actual.keys() == expected.keys()
     for key in actual:
+        if actual[key] is None or expected[key] is None:
+            assert actual[key] is expected[key], key
+            continue
         if isinstance(actual[key], list):
             assert actual[key] == pytest.approx(expected[key], rel=1e-5, abs=1e-6), key
         else:

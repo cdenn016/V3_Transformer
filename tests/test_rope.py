@@ -265,7 +265,8 @@ def test_diagnostics_runs_under_rope():
     x = torch.randint(0, 6, (1, 8))
     roped = VFEModel(_rope_cfg(pos_rotation="rope", rope_insertion="left"))
     diag = roped.diagnostics(x)
-    assert diag and all(abs(v) < float("inf") for v in diag.values())
+    available = [value for value in diag.values() if value is not None]
+    assert diag and available and all(abs(value) < float("inf") for value in available)
 
 
 from vfe3.gradients.kernels import belief_gradients

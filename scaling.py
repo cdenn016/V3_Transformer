@@ -725,8 +725,9 @@ ROUTES: Dict[str, List[Dict[str, Any]]] = {
 
 def _scaling_knob_report(cfg: VFE3Config, name: str) -> Dict[str, object]:
     """Report a configured knob without inventing an effect on an inactive path."""
-    configured = getattr(cfg, name, None)
-    active = not (name == "decode_tau" and not cfg.use_prior_bank)
+    is_named_field = isinstance(name, str)
+    configured = getattr(cfg, name, None) if is_named_field else None
+    active = is_named_field and not (name == "decode_tau" and not cfg.use_prior_bank)
     return {
         "name": name,
         "active": active,

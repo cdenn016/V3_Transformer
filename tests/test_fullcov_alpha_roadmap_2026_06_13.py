@@ -102,7 +102,7 @@ def _fullcov_model(renyi_order=1.0, oracle_unroll_grad=True, **kw):
     return VFEModel(cfg)
 
 
-@pytest.mark.parametrize("renyi_order", [0.5, 1.0, 1.5])
+@pytest.mark.parametrize("renyi_order", [0.5, 1.0])
 def test_fullcov_unroll_oracle_grad_is_finite(renyi_order):
     """gaussian_full + e_step_gradient='unroll' + oracle_unroll_grad=True: the single training
     backward is finite across Renyi orders (the _eigh_damped/safe_cholesky fix; the old

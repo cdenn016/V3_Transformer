@@ -32,6 +32,7 @@ def test_shared_contracts_pin_only_the_cited_mutable_dict_schemas() -> None:
             "prior": BeliefState,
             "out": BeliefState,
             "beta_prior_context": contracts.EffectiveBetaPriorContext,
+            "canonical_frame": contracts.CanonicalFrameContext,
             "cg_moment_energy_rows": List[torch.Tensor],
             "cg_pre_moments": List[Tuple[torch.Tensor, torch.Tensor]],
         },
@@ -80,6 +81,7 @@ def test_prior_bank_registries_use_concrete_callable_aliases() -> None:
     assert prior_bank.FusedCECallable != Callable[..., torch.Tensor]
     assert set(get_args(prior_bank.FusedCECallable)) == {
         prior_bank.GeometricFusedCECallable,
+        prior_bank.FrameAwareGeometricFusedCECallable,
         prior_bank.LinearFusedCECallable,
     }
 
@@ -97,6 +99,7 @@ def test_prior_bank_registries_use_concrete_callable_aliases() -> None:
         ("tau", Parameter.KEYWORD_ONLY),
         ("chunk_size", Parameter.KEYWORD_ONLY),
         ("ignore_index", Parameter.KEYWORD_ONLY),
+        ("return_stats", Parameter.KEYWORD_ONLY),
     ]
     geometric_hints = get_type_hints(prior_bank.GeometricFusedCECallable.__call__)
     assert geometric_hints == {
@@ -108,12 +111,14 @@ def test_prior_bank_registries_use_concrete_callable_aliases() -> None:
         "tau": Optional[float],
         "chunk_size": Optional[int],
         "ignore_index": int,
-        "return": torch.Tensor,
+        "return_stats": bool,
+        "return": torch.Tensor | prior_bank.DecodeCEResult,
     }
     assert geometric.parameters["z_loss_weight"].default == 0.0
     assert geometric.parameters["tau"].default is None
     assert geometric.parameters["chunk_size"].default is None
     assert geometric.parameters["ignore_index"].default == -100
+    assert geometric.parameters["return_stats"].default is False
 
     linear = signature(prior_bank.LinearFusedCECallable.__call__)
     assert [
@@ -127,6 +132,7 @@ def test_prior_bank_registries_use_concrete_callable_aliases() -> None:
         ("z_loss_weight", Parameter.KEYWORD_ONLY),
         ("chunk_size", Parameter.KEYWORD_ONLY),
         ("ignore_index", Parameter.KEYWORD_ONLY),
+        ("return_stats", Parameter.KEYWORD_ONLY),
     ]
     linear_hints = get_type_hints(prior_bank.LinearFusedCECallable.__call__)
     assert linear_hints == {
@@ -136,11 +142,13 @@ def test_prior_bank_registries_use_concrete_callable_aliases() -> None:
         "z_loss_weight": float,
         "chunk_size": Optional[int],
         "ignore_index": int,
-        "return": torch.Tensor,
+        "return_stats": bool,
+        "return": torch.Tensor | prior_bank.DecodeCEResult,
     }
     assert linear.parameters["z_loss_weight"].default == 0.0
     assert linear.parameters["chunk_size"].default is None
     assert linear.parameters["ignore_index"].default == -100
+    assert linear.parameters["return_stats"].default is False
 
     module_hints = get_type_hints(prior_bank)
     assert module_hints["_ENCODERS"] == Dict[str, prior_bank.EncodeCallable]
