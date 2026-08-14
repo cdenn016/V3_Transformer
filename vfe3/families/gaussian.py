@@ -895,22 +895,29 @@ class FullGaussian(BeliefParams):
             # entirely on the float64 policy, which is why that path stays bit-identical to the
             # pre-policy build.
             #
-            # TRIGGER (Task 5, audit 2026-08-13). Successful jittered Cholesky is not an accuracy
-            # certificate. Both fp32 policies reuse Task 4's zero-jitter validated solve, which
-            # quantifies symmetry/factor residuals and rejects condition numbers above
-            # 1/(64 K eps). The *_cond spelling retains its older, stricter pivot-ratio trigger in
-            # addition to the shared certificate. The whole grid promotes if any row is uncertified
-            # so vocabulary ranking never mixes arithmetic precisions.
+            # The base fp32_escalate policy is the production hot path: reuse the Cholesky result
+            # above and promote only on an actual failed row. The opt-in *_cond policy adds Task 4's
+            # zero-jitter residual/spectral certificate plus the older pivot-ratio trigger. That
+            # strict check is deliberately gated because a full pair grid can contain millions of
+            # matrices; running a second Cholesky and eigvalsh on every one caused a 3x baseline
+            # regression and a whole-grid float64 cliff once a single row crossed the condition
+            # limit. The strict route retains that behavior for accuracy-sensitive experiments.
             #
             # The default limit is conservative and dimension/dtype dependent; at K=20 float32 it
             # is about 6.55e3, so upper-tail rows may promote even when Cholesky succeeds.
-            # That is the explicit accuracy policy, not a failure fallback.
+            # That is the explicit opt-in accuracy policy, not a failure fallback.
             if compute_dtype is not torch.float64:
-                q_certificate = validated_cholesky_solve(sigma_q)
-                t_certificate = validated_cholesky_solve(sigma_t)
-                escalate_mask = (~ok | ~q_certificate.certified | ~t_certificate.certified)
-                if (full_cov_kl_precision() if policy is None else policy) == "fp32_escalate_cond":
-                    escalate_mask = escalate_mask | (inv_cond < _FULL_COV_KL_COND_FLOOR)
+                active_policy = full_cov_kl_precision() if policy is None else policy
+                escalate_mask = ~ok
+                if active_policy == "fp32_escalate_cond":
+                    q_certificate = validated_cholesky_solve(sigma_q)
+                    t_certificate = validated_cholesky_solve(sigma_t)
+                    escalate_mask = (
+                        escalate_mask
+                        | ~q_certificate.certified
+                        | ~t_certificate.certified
+                        | (inv_cond < _FULL_COV_KL_COND_FLOOR)
+                    )
                 if bool(escalate_mask.any()):
                     div, ok, _ = _full_gaussian_kl_terms(
                         mu_q.double(), sigma_q.double(), mu_t.double(), sigma_t.double(), K, eps)

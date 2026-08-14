@@ -993,6 +993,13 @@ class VFE3Config:
     # escalating at ~1e9; post-softmax attention moves <=2e-4 on adversarial synthetic spectra and
     # 4e-6 on real trained matrices. A float64 PUBLIC family still computes in float64 either way.
     full_cov_kl_precision:     str   = "fp64"        # "fp64" | "fp32_escalate"
+    # Optional strict accuracy certificate for the fp32 full-covariance KL. False keeps the hot
+    # path on the Cholesky result it already computed and escalates only when that factorization
+    # fails. True selects the existing fp32_escalate_cond policy: it additionally runs fresh
+    # zero-jitter Cholesky/eigenvalue certificates over the pair grid and promotes the complete
+    # grid to float64 when any row is uncertified. The strict route is intentionally opt-in: at
+    # B=64, N=128, H=2 it certifies roughly 2.1 million head-block matrices per coupling call.
+    full_cov_kl_condition_escalation: bool = False
 
     # Working precision of the full-covariance CONGRUENCE Omega Sigma Omega^T (audit 2026-08-06
     # C1/F3). Distinct from full_cov_kl_precision above: that governs the pair DIVERGENCE, this
@@ -2485,6 +2492,10 @@ class VFE3Config:
             raise ValueError(
                 "full_cov_kl_precision must be one of ('fp64', 'fp32_escalate', "
                 f"'fp32_escalate_cond'), got {self.full_cov_kl_precision!r}")
+        if not isinstance(self.full_cov_kl_condition_escalation, bool):
+            raise ValueError(
+                "full_cov_kl_condition_escalation must be bool, got "
+                f"{self.full_cov_kl_condition_escalation!r}")
         if self.full_cov_congruence_precision not in ("fp64", "fp32_escalate"):
             raise ValueError(
                 "full_cov_congruence_precision must be one of ('fp64', 'fp32_escalate'), "
@@ -3720,7 +3731,7 @@ class VFE3Config:
             and get_functional(self.divergence_family) is renyi
             and type(self.renyi_order) in (int, float)
             and self.renyi_order == 1.0
-            and self.full_cov_kl_precision == "fp32_escalate"
+            and self.effective_full_cov_kl_precision == "fp32_escalate"
         )
         if (_decode_registry[_active_decode_mode].family_consistent
                 and not canonical_family_dispatch_reachable
@@ -3829,6 +3840,14 @@ class VFE3Config:
         """
         from vfe3.divergence import family_cov_kind
         return family_cov_kind(self.family) == "diagonal"
+
+    @property
+    def effective_full_cov_kl_precision(self) -> str:
+        """Model-owned KL policy after applying the optional condition certificate."""
+        if (self.full_cov_kl_condition_escalation
+                and self.full_cov_kl_precision == "fp32_escalate"):
+            return "fp32_escalate_cond"
+        return self.full_cov_kl_precision
 
     @property
     def head_mixer_gauge_compatible(self) -> bool:

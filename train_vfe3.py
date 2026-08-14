@@ -492,6 +492,11 @@ config = dict(
                                              # data-keyed, not a blanket downcast. Verified single-pass through
                                              # cond(Sigma)~1e6, escalates at ~1e9; post-softmax attention moves
                                              # <=2e-4 on adversarial synthetic spectra, 4e-6 on real trained ones.
+    full_cov_kl_condition_escalation = False, # False: production fast path, reuse the existing
+                                              # KL Cholesky and promote only on factorization failure.
+                                              # True: run a second spectral certificate across the
+                                              # full pair grid and promote all rows if any row fails;
+                                              # substantially slower at B=64, N=128, gaussian_full.
                                              
     full_cov_congruence_precision = "fp32_escalate",      # "fp64" | "fp32_escalate"                                        
 

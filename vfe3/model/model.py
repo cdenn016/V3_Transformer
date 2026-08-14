@@ -347,8 +347,11 @@ class VFEModel(nn.Module):
         self.cfg = cfg
         # The full-covariance KL precision policy is immutable model state. The standalone module
         # default remains available to direct family callers, but constructing another model must
-        # never change this model's transport, divergence, decoder, or workspace behavior.
-        self.full_cov_kl_precision = validate_full_cov_kl_precision(cfg.full_cov_kl_precision)
+        # never change this model's transport, divergence, decoder, or workspace behavior. The
+        # boolean config is compiled into the already-supported strict policy spelling here, so
+        # every model-owned family object continues to carry one immutable precision value.
+        self.full_cov_kl_precision = validate_full_cov_kl_precision(
+            cfg.effective_full_cov_kl_precision)
         # Same one-place-set rule for the congruence that feeds it (audit 2026-08-06 C1).
         set_full_cov_congruence_precision(cfg.full_cov_congruence_precision)
         set_safe_cholesky_jitter_mode(cfg.safe_cholesky_jitter_mode)
